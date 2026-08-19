@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpt-voicecoding"
+version = "0.0.0"
+description = "Voice-controlling terminal coding agents through a realtime voice call."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [{ name = "okqixiaobao727-design" }]
+keywords = ["voice", "coding-agent", "claude-code", "codex", "realtime"]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Environment :: MacOS X",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/okqixiaobao727-design/GPT-VoiceCoding"
+Issues = "https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues"
+
+[project.scripts]
+bridgectl = "gpt_voicecoding.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpt_voicecoding"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
