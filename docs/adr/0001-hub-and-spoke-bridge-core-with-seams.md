@@ -4,6 +4,9 @@ Date: 2026-08-20
 
 Status: Accepted
 
+Amended: 2026-08-20 — the Session Launcher's verb list gains `close`. See
+[Seam verbs](#seam-verbs).
+
 Carried over from: [Grilling: module map and seams for the new core](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy/issues/18)
 
 ## Context
@@ -74,7 +77,9 @@ those files, or the disk becomes a second truth.
   `approval_relay(session, request, verdict)`. Events up: Session stopped,
   awaiting approval, delivery receipts (delivered / held / expired). Reply-Window
   queueing is Bridge Core policy — adapters deliver, never queue.
-- **Session Launcher**: launch a Session into a workspace; report launch outcome.
+- **Session Launcher**: `launch` a Session into a workspace and report the
+  launch outcome; `close` a Session and report what closed. Pane semantics
+  never cross this seam.
 - **Companion Channel**: `send(message)` · `verify`. Events up: inbound user text.
   Classifying that text — control-plane command vs Answer Relay vs delegation — is
   Bridge Core's job, never the channel's.
@@ -82,12 +87,22 @@ those files, or the disk becomes a second truth.
   socket). Surfaces: menu-bar shell, `bridgectl`, Companion Channel, spoken
   commands in-call. Never gated by switches — see ADR 0002.
 
+`close` was added to the Session Launcher on 2026-08-20. This list was written
+before that verb was synced across the build issues, and the authority for it is
+the [migration inventory](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy/issues/27)'s `closing.md` dispositions: exactly one session
+target, fail closed on a missing or stale identity, idempotent repeats, and
+truthful per-child outcomes only where the adapter actually owns child
+destinations. Closing was never missing from the product — the reference
+implementation had a `close` action, wrongly gated behind the Duty Switch — it
+was missing from this list, which is what an adapter implements against.
+
 ## Consequences
 
 The repository layout is this decision made physical: `core` may not import
-`adapters`, and no protocol library may be imported from `core`.
-`tests/test_architecture.py` enforces both, so principle 1 fails CI rather than
-eroding quietly.
+`adapters`, no protocol library may be imported from `core`, and `seams` — the
+contract both sides implement against — imports neither of them, so the
+dependency runs one way only. `tests/test_architecture.py` enforces all three, so
+principle 1 fails CI rather than eroding quietly.
 
 Naming: the hub is **Bridge Core**. "Bridge Control Center" was proposed and
 rejected — a third `Control`-prefixed term would collide with Control Plane and
