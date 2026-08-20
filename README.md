@@ -4,9 +4,10 @@ Voice-controlling terminal coding agents through a realtime voice call: the syst
 speaks agent progress to you, and carries your spoken instructions back to the
 agents.
 
-> **Status: skeleton.** The architecture is locked and this repository is its
-> layout; the engine is not built yet. Nothing here runs. If you are looking for
-> working software, the first-generation implementation lives at
+> **Status: early build.** Bridge Core, the control plane and the engine's
+> composition root are built and tested; no real adapter is, so the engine can
+> only be assembled over fakes and nothing yet speaks or launches. If you are
+> looking for working software, the first-generation implementation lives at
 > [GPT-VoiceCoding-legacy](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy).
 
 ## What it is
@@ -29,12 +30,19 @@ launching, the Companion Channel — through seams with swappable adapters.
 
 ```
 src/gpt_voicecoding/
-├── core/        Bridge Core — the hub. All policy, all state.
-├── seams/       The interfaces Bridge Core calls through.
-├── adapters/    The implementations behind them. Protocol libraries live only here.
-└── cli/         bridgectl — a control-plane surface.
-shell/           The Swift menu-bar shell (see ADR 0005).
+├── core/           Bridge Core — the hub. All policy, all state.
+├── seams/          The interfaces Bridge Core calls through, and the control plane's vocabulary.
+├── adapters/       The implementations behind them. Protocol libraries live only here.
+├── control_plane/  The JSON-over-UDS surface: framing, sockets, translation.
+├── engine/         The composition root — config in, one running engine out.
+└── cli/            bridgectl — a control-plane surface.
+shell/              The Swift menu-bar shell (see ADR 0005).
 ```
+
+The engine runs standalone, without the menu-bar shell:
+`python -m gpt_voicecoding.engine --config <file>`. See
+[`docs/control-plane.md`](docs/control-plane.md) for the interface, the command
+set and the configuration file.
 
 Start with [`docs/adr/0001`](docs/adr/0001-hub-and-spoke-bridge-core-with-seams.md).
 
@@ -48,6 +56,8 @@ macOS-shaped; cross-platform support is not planned.
 1. [`CONTEXT.md`](CONTEXT.md) — the vocabulary. Every term in this repo means what
    it says there.
 2. [`docs/adr/`](docs/adr/README.md) — the decisions, and where each one came from.
+3. [`docs/control-plane.md`](docs/control-plane.md) — the interface every surface
+   speaks, and what the engine is configured with.
 
 ## Contributing
 
