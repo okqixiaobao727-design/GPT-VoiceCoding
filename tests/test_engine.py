@@ -45,6 +45,7 @@ def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
     """
     return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -86,7 +87,8 @@ def configured(home: Path, text: str = CONFIG) -> Path:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
-        ), encoding="utf-8"
+        ),
+        encoding="utf-8",
     )
     return path
 
@@ -105,9 +107,7 @@ async def running(engine: Engine, work) -> object:
 
 
 class TestAssembly:
-    def test_the_engine_serves_the_control_plane_it_was_configured_with(
-        self, home: Path
-    ) -> None:
+    def test_the_engine_serves_the_control_plane_it_was_configured_with(self, home: Path) -> None:
         engine = assembled(home)
 
         async def scenario() -> Reply:
@@ -233,9 +233,7 @@ class TestAdapterLifecycle:
         assert LIFECYCLE == ["connect", "aclose"]
         assert not engine.socket_path.exists()
 
-    def test_a_start_refused_by_a_live_engine_leaves_its_socket_alone(
-        self, home: Path
-    ) -> None:
+    def test_a_start_refused_by_a_live_engine_leaves_its_socket_alone(self, home: Path) -> None:
         """Never displacing a live engine, applied to the failure path."""
         first = assembled(home)
 
@@ -296,9 +294,7 @@ class TestEventsReachTheHub:
                     ),
                     path=engine.socket_path,
                 )
-                engine.core.events.emit(
-                    ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN)
-                )
+                engine.core.events.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
                 await asyncio.sleep(0.05)  # the dispatch loop is the thing under test
                 return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
             finally:

@@ -47,6 +47,7 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 #: so it says which software is holding the connection.
 CLIENT_NAME = "gpt-voicecoding"
 
+
 class AppServerError(Exception):
     """An app-server could not be started, or could not be reached."""
 

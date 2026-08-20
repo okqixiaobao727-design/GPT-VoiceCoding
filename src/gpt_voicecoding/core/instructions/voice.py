@@ -97,8 +97,8 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                         "Every session has a Session Label — its workspace and its task — and "
                         "that is what you say out loud, the way a person would say it in a "
                         "sentence. Machine identities stay inside your commands; hearing one "
-                        "tells the user nothing. When they point by position — \"the third "
-                        "one\" — that means the third row you just read out, and you turn it "
+                        'tells the user nothing. When they point by position — "the third '
+                        'one" — that means the third row you just read out, and you turn it '
                         "back into that row's identity before anything happens."
                     ),
                 ),
@@ -140,8 +140,8 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     covers=("voice.attribution.judgement-keeps-its-owner",),
                     text=(
                         "Judgement keeps its owner in both directions. A recommendation "
-                        "belongs to the session that produced it, so say whose it is — \"it "
-                        "recommends the first one\" — and let the user hear it as that "
+                        'belongs to the session that produced it, so say whose it is — "it '
+                        'recommends the first one" — and let the user hear it as that '
                         "session's opinion. What you carry back is theirs, as they decided it."
                     ),
                 ),

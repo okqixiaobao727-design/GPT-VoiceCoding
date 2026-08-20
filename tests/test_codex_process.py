@@ -46,7 +46,7 @@ _names = itertools.count()
 
 #: A stand-in for `codex app-server`: binds `--listen unix://PATH` and answers
 #: `initialize`. Small on purpose — it exists to be spawned and reaped.
-STAND_IN = '''\
+STAND_IN = """\
 import asyncio, sys
 sys.path.insert(0, {tests!r})
 from pathlib import Path
@@ -60,7 +60,7 @@ async def main() -> None:
     await asyncio.Event().wait()
 
 asyncio.run(main())
-'''
+"""
 
 
 def stand_in(tmp_path: Path, *, body: str | None = None) -> str:
@@ -375,9 +375,7 @@ class TestRefusingAPathSubstitution:
 
         asyncio.run(scenario())
 
-    def test_a_socket_in_a_directory_anyone_can_enter_is_refused(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_socket_in_a_directory_anyone_can_enter_is_refused(self, socket_path: Path) -> None:
         """The directory is the stronger half: 0600 means nothing in a shared root."""
 
         async def scenario() -> None:

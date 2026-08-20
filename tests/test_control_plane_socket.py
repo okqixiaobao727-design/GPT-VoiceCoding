@@ -199,9 +199,7 @@ class TestOneBadLineCostsOneRequest:
         assert bad.action is None
         assert good.ok
 
-    def test_a_bad_line_does_not_close_the_connection_it_arrived_on(
-        self, socket_dir: Path
-    ) -> None:
+    def test_a_bad_line_does_not_close_the_connection_it_arrived_on(self, socket_dir: Path) -> None:
         async def scenario() -> tuple[Reply, Reply]:
             server = await serving(socket_dir, StubPlane())
             try:
@@ -227,6 +225,7 @@ class TestOneBadLineCostsOneRequest:
 
     def test_an_oversized_line_is_bounded_and_answered(self, socket_dir: Path) -> None:
         """A peer must not be able to make the engine hold an unbounded buffer."""
+
         async def scenario() -> tuple[Reply, Reply]:
             server = await serving(socket_dir, StubPlane())
             try:
@@ -291,6 +290,7 @@ class TestTwoSurfacesAtOnce:
 
     def test_every_reply_names_the_action_it_answers(self, socket_dir: Path) -> None:
         """A surface that guessed which reply was its own is a surface that races."""
+
         async def scenario() -> list[Reply]:
             server = await serving(socket_dir, StubPlane())
             try:
@@ -349,9 +349,7 @@ class TestClaimingThePath:
 
 
 class TestAPathThatCannotBeBound:
-    def test_a_path_past_the_platform_limit_is_refused_in_words(
-        self, socket_dir: Path
-    ) -> None:
+    def test_a_path_past_the_platform_limit_is_refused_in_words(self, socket_dir: Path) -> None:
         """Otherwise this arrives as an errno from inside asyncio, at install time."""
         too_long = socket_dir / ("x" * 120) / "control.sock"
 

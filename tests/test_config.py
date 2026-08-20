@@ -61,9 +61,7 @@ class TestACompleteConfiguration:
         assert config.adapters.agents == {AgentKind.CODEX: "tests.fakes:FakeAgent"}
         assert config.delegated_turn_model == "a-model-the-user-chose"
 
-    def test_the_durations_are_the_locked_defaults_until_configured(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_durations_are_the_locked_defaults_until_configured(self, tmp_path: Path) -> None:
         config = load(written(tmp_path, COMPLETE))
 
         assert config.policy.relay_ceiling_seconds == 600.0
@@ -223,9 +221,7 @@ class TestWhatItRefuses:
 
         assert "model" in str(refusal.value)
 
-    @pytest.mark.parametrize(
-        "seam", ["call", "companion_channel", "session_launcher"]
-    )
+    @pytest.mark.parametrize("seam", ["call", "companion_channel", "session_launcher"])
     def test_a_seam_with_nothing_behind_it(self, tmp_path: Path, seam: str) -> None:
         text = "\n".join(line for line in COMPLETE.splitlines() if not line.startswith(seam))
 

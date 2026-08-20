@@ -57,9 +57,7 @@ async def _slowly(_params: dict) -> dict:
 
 
 class TestCarryingOneCall:
-    def test_a_request_carries_its_params_and_returns_the_result(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_request_carries_its_params_and_returns_the_result(self, socket_path: Path) -> None:
         async def scenario() -> tuple[dict, list[dict]]:
             async with FakeAppServer(socket_path) as server:
                 server.answers("thread/read", {"thread": {"id": "t-1"}})
@@ -222,9 +220,7 @@ class TestHearingBack:
 
 
 class TestWhenItGoesWrong:
-    def test_the_app_server_dying_fails_every_outstanding_request(
-        self, socket_path: Path
-    ) -> None:
+    def test_the_app_server_dying_fails_every_outstanding_request(self, socket_path: Path) -> None:
         """A caller waiting forever cannot classify anything, which is the worst outcome."""
 
         async def scenario() -> None:
@@ -274,9 +270,7 @@ class TestWhenItGoesWrong:
 
         assert asyncio.run(scenario()) is False
 
-    def test_using_a_closed_connection_says_so_rather_than_hanging(
-        self, socket_path: Path
-    ) -> None:
+    def test_using_a_closed_connection_says_so_rather_than_hanging(self, socket_path: Path) -> None:
         async def scenario() -> None:
             async with FakeAppServer(socket_path) as server:
                 connection = AppServerConnection(server.path)

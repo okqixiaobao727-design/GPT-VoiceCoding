@@ -33,6 +33,7 @@ def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
     """A Launcher with exactly one Session to hand out."""
     return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"

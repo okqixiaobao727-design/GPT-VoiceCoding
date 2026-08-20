@@ -97,9 +97,7 @@ def approval_id_of(method: str, params: dict[str, Any]) -> str:
     return f"{method}:{params.get('turnId', '')}:{params.get('itemId', '')}"
 
 
-def request_from(
-    method: str, params: dict[str, Any], *, target: SessionTarget
-) -> ApprovalRequest:
+def request_from(method: str, params: dict[str, Any], *, target: SessionTarget) -> ApprovalRequest:
     """One Codex permission prompt, as the Agent seam describes it."""
     return ApprovalRequest(
         approval_id=approval_id_of(method, params),

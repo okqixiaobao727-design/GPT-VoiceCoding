@@ -68,9 +68,7 @@ class TestReadingTheTable:
 
     def test_a_table_is_kept_whole_and_uninspected(self) -> None:
         """Nonsense inside is the adapter's to refuse, not configuration's."""
-        config = of(
-            document(settings={"call": {"anything": [1, 2], "at": {"all": True}}})
-        )
+        config = of(document(settings={"call": {"anything": [1, 2], "at": {"all": True}}}))
         assert config.adapters.settings_for("call") == {"anything": [1, 2], "at": {"all": True}}
 
     def test_an_agent_seam_is_addressed_by_its_dotted_name(self) -> None:

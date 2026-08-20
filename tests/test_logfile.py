@@ -353,9 +353,7 @@ def run_adopting(
     later line of test output with it.
     """
     script = ADOPTING_SCRIPT.format(cap=CAP, retained=retained, body=body)
-    return subprocess.run(
-        [sys.executable, "-c", script, str(log)], capture_output=True, text=True
-    )
+    return subprocess.run([sys.executable, "-c", script, str(log)], capture_output=True, text=True)
 
 
 class TestAdoptionTakesTheStandardStreams:
@@ -449,9 +447,7 @@ class TestTheWriterThatCannotAskForRotation:
 
         assert path.with_name("engine.log.1").exists(), "the clock never rotated it"
 
-    def test_a_child_holding_the_inherited_descriptor_is_not_lost(
-        self, log_path: Path
-    ) -> None:
+    def test_a_child_holding_the_inherited_descriptor_is_not_lost(self, log_path: Path) -> None:
         """A child cannot be told to reopen, so its output has to ride the chain.
 
         Trimming a rotated generation by replacing the file would leave that
@@ -464,9 +460,9 @@ class TestTheWriterThatCannotAskForRotation:
             log_path,
             (
                 "child = subprocess.Popen([sys.executable, '-c',\n"
-                "    \"import sys, time\\n\"\n"
+                '    "import sys, time\\n"\n'
                 "    \"sys.stderr.write('CHILD BEFORE\\\\n'); sys.stderr.flush()\\n\"\n"
-                "    \"time.sleep(1.0)\\n\"\n"
+                '    "time.sleep(1.0)\\n"\n'
                 "    \"sys.stderr.write('CHILD AFTER\\\\n'); sys.stderr.flush()\\n\"])\n"
                 "time.sleep(0.3)\n"
                 "stream.write('z' * 200 + '\\n')\n"
@@ -477,22 +473,17 @@ class TestTheWriterThatCannotAskForRotation:
         )
 
         assert result.returncode == 0, result.stderr
-        everywhere = "".join(
-            path.read_text(errors="replace") for path in family(log_path.parent)
-        )
+        everywhere = "".join(path.read_text(errors="replace") for path in family(log_path.parent))
         assert "CHILD AFTER" in everywhere, "the child's output went to an unlinked inode"
 
-
-    def test_a_child_survives_a_rotation_that_keeps_no_generations(
-        self, log_path: Path
-    ) -> None:
+    def test_a_child_survives_a_rotation_that_keeps_no_generations(self, log_path: Path) -> None:
         """The same rule on the other branch: keep nothing, but keep the inode."""
         result = run_adopting(
             log_path,
             (
                 "child = subprocess.Popen([sys.executable, '-c',\n"
-                "    \"import sys, time\\n\"\n"
-                "    \"time.sleep(0.8)\\n\"\n"
+                '    "import sys, time\\n"\n'
+                '    "time.sleep(0.8)\\n"\n'
                 "    \"sys.stderr.write('CHILD AFTER\\\\n'); sys.stderr.flush()\\n\"])\n"
                 "time.sleep(0.2)\n"
                 "stream.write('z' * 200 + '\\n')\n"

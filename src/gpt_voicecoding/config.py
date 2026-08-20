@@ -297,9 +297,7 @@ def _reference(reference: str, key: str, where: str) -> str:
     """A factory reference is `module:attribute`; anything else fails now, not later."""
     module, separator, attribute = reference.strip().partition(":")
     if not separator or not module.strip() or not attribute.strip():
-        raise ConfigError(
-            f"{key}{where} must be written module:attribute; {reference!r} is not"
-        )
+        raise ConfigError(f"{key}{where} must be written module:attribute; {reference!r} is not")
     return reference.strip()
 
 
@@ -367,8 +365,7 @@ def _prefixes(section: dict[str, Any], where: str) -> tuple[str, ...]:
         not isinstance(prefix, str) or not prefix.strip() for prefix in value
     ):
         raise ConfigError(
-            f"[log] stripped_environment_prefixes{where} must be a list of variable-name "
-            "prefixes"
+            f"[log] stripped_environment_prefixes{where} must be a list of variable-name prefixes"
         )
     return tuple(prefix.strip() for prefix in value)
 

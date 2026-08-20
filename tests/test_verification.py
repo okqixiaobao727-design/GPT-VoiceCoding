@@ -109,9 +109,7 @@ class TestThePresenceOfAnAdapter:
         assert "a.channel" in detail and "nothing" in detail
 
     def test_nothing_configured_and_nothing_loaded_is_handed_to_the_operator(self) -> None:
-        core = hub(
-            inventory=(SeamLoad(seam=LAUNCHER_SEAM, configured=""),), launcher=None
-        )
+        core = hub(inventory=(SeamLoad(seam=LAUNCHER_SEAM, configured=""),), launcher=None)
 
         assert verified(core)[LAUNCHER_SEAM][0] is VerifyOutcome.MANUAL
 

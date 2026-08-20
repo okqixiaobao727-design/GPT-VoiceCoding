@@ -125,9 +125,7 @@ class Codex(FakeAppServer):
         items = []
         if self.readback_shows_words:
             for landed in self.delivered:
-                items.extend(
-                    [{"type": "userMessage", "clientId": landed}] * self.readback_copies
-                )
+                items.extend([{"type": "userMessage", "clientId": landed}] * self.readback_copies)
         return {"thread": {"id": self.thread_id, "turns": [{"items": items}]}}
 
 
@@ -244,9 +242,7 @@ class TestCarryingTheUsersWords:
         assert receipt.outcome is Delivery.UNKNOWN
         assert "contradicted" in receipt.reason
 
-    def test_a_refused_turn_never_reached_the_thread_so_it_failed(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_refused_turn_never_reached_the_thread_so_it_failed(self, socket_path: Path) -> None:
         """A rejected request started no turn, so the words provably did not land."""
 
         async def scenario():
@@ -304,9 +300,7 @@ class TestCarryingTheUsersWords:
 class TestSupplement:
     def test_both_routes_are_offered_because_steer_is_stable(self) -> None:
         adapter = CodexAgentAdapter()
-        assert adapter.supported_routes() == frozenset(
-            {RelayRoute.DELIVER, RelayRoute.SUPPLEMENT}
-        )
+        assert adapter.supported_routes() == frozenset({RelayRoute.DELIVER, RelayRoute.SUPPLEMENT})
 
     def test_a_supplement_goes_into_the_running_turn(self, socket_path: Path) -> None:
         async def scenario():
@@ -318,8 +312,10 @@ class TestSupplement:
                     )
                     await _settled()
                     receipt = await adapter.answer_relay(
-                        TARGET, "also fix the tests",
-                        request_id=rid(), route=RelayRoute.SUPPLEMENT,
+                        TARGET,
+                        "also fix the tests",
+                        request_id=rid(),
+                        route=RelayRoute.SUPPLEMENT,
                     )
                     return receipt, server.calls_to("turn/steer")
                 finally:
@@ -331,9 +327,7 @@ class TestSupplement:
         assert steers[0]["clientUserMessageId"] == "r-1"
         assert steers[0]["input"] == [{"type": "text", "text": "also fix the tests"}]
 
-    def test_a_supplement_with_no_running_turn_fails_and_says_so(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_supplement_with_no_running_turn_fails_and_says_so(self, socket_path: Path) -> None:
         """What to do instead is Bridge Core's policy, so the adapter only reports."""
 
         async def scenario():
@@ -350,9 +344,7 @@ class TestSupplement:
         assert receipt.outcome is Delivery.FAILED
         assert "no turn is running" in receipt.reason
 
-    def test_a_turn_that_ended_first_fails_closed_quoting_codex(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_turn_that_ended_first_fails_closed_quoting_codex(self, socket_path: Path) -> None:
         """The race: the turn ended between the user speaking and the words landing."""
 
         async def scenario():
@@ -382,9 +374,7 @@ class TestNoticeRelay:
             async with Codex(socket_path).script() as server:
                 adapter = await watching(server, Sink())
                 try:
-                    receipt = await adapter.notice_relay(
-                        TARGET, "you are needed", request_id=rid()
-                    )
+                    receipt = await adapter.notice_relay(TARGET, "you are needed", request_id=rid())
                     return receipt, server.calls_to("turn/start")[0]["input"][0]["text"]
                 finally:
                     await adapter.aclose()
@@ -537,9 +527,7 @@ class TestApprovals:
 
 
 class TestApprovalRouting:
-    def test_a_thread_nobody_has_pinned_is_unpinned_not_misrouted(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_thread_nobody_has_pinned_is_unpinned_not_misrouted(self, socket_path: Path) -> None:
         """Never spoken to is a different fact from provably mis-routed."""
 
         async def scenario():
@@ -677,9 +665,7 @@ class TestWhatItRaisesUpward:
         asyncio.run(scenario())
         assert sink.of(SessionStopped) == []
 
-    def test_a_closed_thread_is_reported_as_a_session_that_ended(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_closed_thread_is_reported_as_a_session_that_ended(self, socket_path: Path) -> None:
         sink = Sink()
 
         async def scenario():
@@ -725,6 +711,7 @@ class TestWhenTheAppServerDies:
 
         async def scenario():
             async with Codex(socket_path).script() as server:
+
                 async def never_answers(_params: dict) -> dict:
                     await asyncio.sleep(30)
                     return {}
@@ -792,9 +779,7 @@ class TestSettings:
             CodexSettings.of({"receipt_timeout_seconds": 0})
 
     def test_paths_and_executables_are_read_as_what_they_are(self) -> None:
-        settings = CodexSettings.of(
-            {"executable": "/opt/codex", "socket_directory": "~/sockets"}
-        )
+        settings = CodexSettings.of({"executable": "/opt/codex", "socket_directory": "~/sockets"})
         assert settings.executable == "/opt/codex"
         assert settings.socket_directory == Path("~/sockets").expanduser()
 
@@ -892,9 +877,7 @@ class TestWhenTheSessionsAppServerDies:
         # Dropped from the roster, so nothing keeps addressing a dead socket.
         assert still_watched == ()
 
-    def test_a_relay_after_it_died_fails_before_anything_is_sent(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_relay_after_it_died_fails_before_anything_is_sent(self, socket_path: Path) -> None:
         sink = Sink()
 
         async def scenario():
@@ -911,9 +894,7 @@ class TestWhenTheSessionsAppServerDies:
         assert receipt.outcome is Delivery.FAILED
         assert "no Codex Session is registered" in receipt.reason
 
-    def test_an_orderly_close_is_not_reported_as_a_session_ending(
-        self, socket_path: Path
-    ) -> None:
+    def test_an_orderly_close_is_not_reported_as_a_session_ending(self, socket_path: Path) -> None:
         """Shutting the engine down must not tell the hub every Session died."""
         sink = Sink()
 

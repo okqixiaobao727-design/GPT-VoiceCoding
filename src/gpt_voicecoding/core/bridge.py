@@ -345,14 +345,10 @@ class BridgeCore:
             self._state.sessions.resolve(target)
         except StaleSessionError:
             if self._already_ended(target):
-                return CloseOutcome(
-                    request_id=new_request_id(), status=CloseStatus.ALREADY_CLOSED
-                )
+                return CloseOutcome(request_id=new_request_id(), status=CloseStatus.ALREADY_CLOSED)
             raise
 
-        outcome = await launcher.close(
-            CloseRequest(request_id=new_request_id(), target=target)
-        )
+        outcome = await launcher.close(CloseRequest(request_id=new_request_id(), target=target))
         if outcome.status in (CloseStatus.CLOSED, CloseStatus.ALREADY_CLOSED):
             self._state.sessions.mark_ended(target)
             self._state.persist()

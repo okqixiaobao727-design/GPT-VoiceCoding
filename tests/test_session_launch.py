@@ -35,15 +35,11 @@ CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 def launched(core: BridgeCore) -> object:
     """One launch of the one agent these tests use."""
-    return asyncio.run(
-        core.launch_session(agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL)
-    )
+    return asyncio.run(core.launch_session(agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL))
 
 
 def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
-    state = BridgeState(
-        switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue()
-    )
+    state = BridgeState(switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue())
     return BridgeCore(
         state=state,
         call=FakeCall(),

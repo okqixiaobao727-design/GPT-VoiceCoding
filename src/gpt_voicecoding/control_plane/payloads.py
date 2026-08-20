@@ -92,8 +92,9 @@ def read_agent(payload: Mapping[str, Any], key: str = "agent") -> AgentKind:
         return AgentKind(read_text(payload, key))
     except ValueError:
         known = ", ".join(str(kind) for kind in AgentKind)
-        raise InvalidPayload(f"{payload.get(key)!r} is not an agent this system runs: {known}") \
-            from None
+        raise InvalidPayload(
+            f"{payload.get(key)!r} is not an agent this system runs: {known}"
+        ) from None
 
 
 def read_label(payload: Mapping[str, Any], key: str = "label") -> SessionLabel:

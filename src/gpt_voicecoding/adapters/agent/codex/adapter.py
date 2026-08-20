@@ -103,11 +103,7 @@ def default_own_socket_path(settings: CodexSettings) -> Path:
     and a socket is only as private as the directory holding it — the runtime
     root is shared `/tmp`, which cannot be made private to anyone.
     """
-    return (
-        settings.socket_directory
-        / f"gpt-voicecoding-{os.geteuid()}"
-        / "codex-app-server.sock"
-    )
+    return settings.socket_directory / f"gpt-voicecoding-{os.geteuid()}" / "codex-app-server.sock"
 
 
 def notice_text(text: str) -> str:
@@ -202,9 +198,7 @@ class CodexAgentAdapter:
             on_server_request=self._asked,
             on_closed=lambda reason, held=target: self._connection_lost(held, reason),
         )
-        watched = WatchedThread(
-            target=target, socket_path=socket_path, connection=connection
-        )
+        watched = WatchedThread(target=target, socket_path=socket_path, connection=connection)
         self._threads[target] = watched
         try:
             await self._subscribe(watched)

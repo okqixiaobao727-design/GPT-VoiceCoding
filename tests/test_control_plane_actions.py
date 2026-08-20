@@ -49,9 +49,7 @@ class Surface:
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
         self.launcher = FakeSessionLauncher(targets=[CODEX]) if launcher else None
-        state = BridgeState(
-            switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue()
-        )
+        state = BridgeState(switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue())
         state.switches.flip(SwitchName.DUTY, duty)
         state.switches.flip(SwitchName.VOICE, duty)
         state.switches.flip(SwitchName.MESSAGE, duty)
@@ -78,9 +76,7 @@ class Surface:
 
     def open_window(self) -> None:
         """The Session says it will take a user turn now."""
-        asyncio.run(
-            self.core.dispatch(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
-        )
+        asyncio.run(self.core.dispatch(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN)))
 
 
 class TestWithEverySwitchOff:
@@ -150,8 +146,9 @@ class TestStatus:
         surface = Surface()
         surface.launch()
 
-        assert surface.ask(Action.SESSIONS).data["sessions"] == (
-            surface.ask(Action.STATUS).data["sessions"]
+        assert (
+            surface.ask(Action.SESSIONS).data["sessions"]
+            == (surface.ask(Action.STATUS).data["sessions"])
         )
 
 
@@ -240,9 +237,7 @@ class TestLaunchingAndClosing:
         surface.launch()
 
         assert surface.ask(Action.CLOSE, target=CODEX_ADDRESS).data["status"] == "closed"
-        assert (
-            surface.ask(Action.CLOSE, target=CODEX_ADDRESS).data["status"] == "already_closed"
-        )
+        assert surface.ask(Action.CLOSE, target=CODEX_ADDRESS).data["status"] == "already_closed"
 
 
 class TestRelayingAndApproving:
