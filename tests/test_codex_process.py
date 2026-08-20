@@ -36,6 +36,9 @@ from gpt_voicecoding.adapters.codex_app_server.process import (
     AppServerError,
     OwnedAppServer,
     attach,
+    prepare_private_directory,
+    verify_private_directory,
+    verify_private_socket,
 )
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
 
@@ -350,3 +353,81 @@ class TestClaimingTheSocketPath:
     def test_a_free_path_is_simply_taken(self, tmp_path: Path, socket_path: Path) -> None:
         self._owned(tmp_path, socket_path)._claim_socket_path()
         assert not socket_path.exists()
+
+
+class TestRefusingAPathSubstitution:
+    """A shared runtime root is somewhere anyone can plant a name.
+
+    `stat` follows symbolic links, so a link planted in `/tmp` and aimed at
+    something this user really does own passes every ownership and mode check
+    while the endpoint actually used belongs to whoever made the link. These
+    are the tests that fail if the checks ever go back to following them.
+    """
+
+    def test_a_socket_reached_through_a_symlink_is_refused(self, socket_path: Path) -> None:
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path):
+                planted = socket_path.parent / "planted.sock"
+                planted.symlink_to(socket_path)
+                # Everything about the target is correct; only the path is a lie.
+                with pytest.raises(AppServerError, match="symbolic link"):
+                    verify_private_socket(planted)
+
+        asyncio.run(scenario())
+
+    def test_a_socket_in_a_directory_anyone_can_enter_is_refused(
+        self, socket_path: Path
+    ) -> None:
+        """The directory is the stronger half: 0600 means nothing in a shared root."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path):
+                socket_path.parent.chmod(0o755)
+                try:
+                    with pytest.raises(AppServerError, match="reachable by other accounts"):
+                        verify_private_socket(socket_path)
+                finally:
+                    socket_path.parent.chmod(0o700)
+
+        asyncio.run(scenario())
+
+    def test_a_directory_reached_through_a_symlink_is_refused(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        pointing = tmp_path / "elsewhere"
+        pointing.symlink_to(socket_path.parent)
+        with pytest.raises(AppServerError, match="symbolic link"):
+            verify_private_directory(pointing)
+
+    def test_preparing_a_directory_that_is_a_symlink_is_refused(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """`mkdir(exist_ok=True)` succeeds against a link to a directory."""
+        pointing = tmp_path / "elsewhere"
+        pointing.symlink_to(socket_path.parent)
+        with pytest.raises(AppServerError, match="symbolic link"):
+            prepare_private_directory(pointing)
+
+    def test_binding_through_a_planted_symlink_is_refused(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """Claiming a path must not follow a link either, or it binds elsewhere."""
+        planted = socket_path.parent / "planted.sock"
+        planted.symlink_to(socket_path.parent / "somewhere-else.sock")
+        owned = OwnedAppServer(
+            settings=quick(executable=stand_in(tmp_path, body="sleep 30")),
+            socket_path=planted,
+        )
+        with pytest.raises(AppServerError, match="symbolic link"):
+            owned._claim_socket_path()
+        assert planted.is_symlink(), "the link is somebody else's; it is refused, not removed"
+
+    def test_a_private_directory_and_socket_are_accepted(self, socket_path: Path) -> None:
+        """The check has to pass for the ordinary case, or it is just an outage."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path):
+                verify_private_directory(socket_path.parent)
+                verify_private_socket(socket_path)
+
+        asyncio.run(scenario())

@@ -59,48 +59,77 @@ PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_SOCKET_MODE = 0o600
 
 
-def prepare_private_directory(directory: Path) -> None:
-    """Make a directory that only this user can enter, and prove it is theirs.
+def _own_stat(path: Path, what: str) -> os.stat_result:
+    """Look at the path entry itself, never at whatever it points to.
 
-    A socket is exactly as private as the directory holding it, and the default
-    runtime root is shared `/tmp`. The reference implementation established both
-    halves of this and both are needed: creating it 0700 does nothing if it
-    already existed as somebody else's, so ownership and mode are *verified*
-    after the fact rather than assumed from the call that made it.
+    `stat` follows symlinks, and following them is the whole vulnerability: a
+    symlink planted in shared `/tmp` can aim at something this user really does
+    own, so every ownership and mode check passes while the endpoint actually
+    used is somebody else's. `lstat` looks at the link, and a symlink here is
+    refused outright rather than resolved — nothing this adapter needs is ever
+    legitimately reached through one.
     """
-    directory.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
     try:
-        found = directory.stat()
+        found = os.lstat(path)
     except OSError as unreadable:
-        raise AppServerError(f"cannot inspect {directory}: {unreadable}") from None
+        raise AppServerError(f"cannot inspect {path}: {unreadable}") from None
+    if stat.S_ISLNK(found.st_mode):
+        raise AppServerError(
+            f"{path} is a symbolic link; refusing to use a {what} reached through one"
+        )
     if found.st_uid != os.geteuid():
         raise AppServerError(
-            f"{directory} belongs to uid {found.st_uid}, not to this user; refusing to "
-            "put a coding session's socket somewhere another account owns"
+            f"{path} belongs to uid {found.st_uid}, not to this user; refusing to use a "
+            f"{what} another account owns"
         )
-    if stat.S_IMODE(found.st_mode) != PRIVATE_DIRECTORY_MODE:
-        # It pre-existed with a wider mode. Narrowing is safe and is the point.
+    return found
+
+
+def verify_private_directory(directory: Path) -> None:
+    """Prove nobody else can enter the directory, so nobody else can swap its contents.
+
+    This is where the privacy actually comes from, and it is also what closes
+    the gap between checking a socket and connecting to it: inside a directory
+    only this user may enter, no other account can plant or replace anything
+    between the two.
+    """
+    found = _own_stat(directory, "directory")
+    if not stat.S_ISDIR(found.st_mode):
+        raise AppServerError(f"{directory} is not a directory")
+    if stat.S_IMODE(found.st_mode) & ~PRIVATE_DIRECTORY_MODE:
+        raise AppServerError(
+            f"{directory} is reachable by other accounts (mode "
+            f"{stat.S_IMODE(found.st_mode):04o}); refusing to keep a coding session's "
+            "socket there"
+        )
+
+
+def prepare_private_directory(directory: Path) -> None:
+    """Make a directory only this user can enter, and prove that is what it is.
+
+    Creating it 0700 proves nothing on its own — it may already have existed,
+    as somebody else's — so what it *is* afterwards is checked rather than
+    inferred from the call that made it.
+    """
+    directory.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+    found = _own_stat(directory, "directory")
+    if stat.S_ISDIR(found.st_mode) and stat.S_IMODE(found.st_mode) != PRIVATE_DIRECTORY_MODE:
+        # It pre-existed with a wider mode, and it is ours, so narrow it.
         os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+    verify_private_directory(directory)
 
 
 def verify_private_socket(path: Path) -> None:
     """Refuse to speak to a socket this user does not own, or others can reach.
 
-    Codex creates its own socket 0600, so this is a check rather than a repair —
-    but it is the check that stops this engine from carrying the user's words
-    into something another account put in a shared directory.
+    The directory is checked first and is the stronger half: codex creates its
+    own socket 0600, but only a private directory makes that mode mean anything
+    in a shared runtime root.
     """
-    try:
-        found = path.stat()
-    except OSError as unreadable:
-        raise AppServerError(f"cannot inspect {path}: {unreadable}") from None
+    verify_private_directory(path.parent)
+    found = _own_stat(path, "socket")
     if not stat.S_ISSOCK(found.st_mode):
         raise AppServerError(f"{path} is not a socket")
-    if found.st_uid != os.geteuid():
-        raise AppServerError(
-            f"{path} belongs to uid {found.st_uid}, not to this user; refusing to "
-            "speak to an app-server another account owns"
-        )
     if stat.S_IMODE(found.st_mode) & ~PRIVATE_SOCKET_MODE:
         raise AppServerError(
             f"{path} is reachable by other accounts (mode "
@@ -307,8 +336,10 @@ class OwnedAppServer:
     def _claim_socket_path(self) -> None:
         """Take the path only when nothing is listening on it."""
         path = self._socket_path
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             return
+        if path.is_symlink():
+            raise AppServerError(f"{path} is a symbolic link; refusing to bind through one")
         if not path.is_socket():
             raise AppServerError(f"{path} exists and is not a socket; refusing to remove it")
         if _something_listens(path):

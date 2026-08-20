@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -132,10 +133,17 @@ class Codex(FakeAppServer):
 
 @pytest.fixture
 def socket_path() -> Iterator[Path]:
-    """Short enough to bind: Darwin caps an ``AF_UNIX`` path at 103 bytes."""
-    path = Path("/tmp") / f"vc-agent-{next(_names)}-{id(object())}.sock"
-    yield path
-    path.unlink(missing_ok=True)
+    """A private directory, under a root short enough to bind.
+
+    Darwin caps an ``AF_UNIX`` path at 103 bytes, so it cannot live under
+    pytest's ``tmp_path``; and it needs a directory only this user can enter,
+    because the adapter refuses to speak to a socket sitting anywhere every
+    account on the machine could swap it out from under the check.
+    """
+    home = Path("/tmp") / f"vc-agent-{next(_names)}-{id(object())}"
+    home.mkdir(mode=0o700)
+    yield home / "app-server.sock"
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def quick(**overrides: Any) -> CodexSettings:
