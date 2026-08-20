@@ -18,7 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.config import ConfigError, EngineConfig, default_socket_path, load
+from gpt_voicecoding.config import (
+    ConfigError,
+    EngineConfig,
+    default_log_path,
+    default_socket_path,
+    load,
+)
 from gpt_voicecoding.seams.identity import AgentKind
 
 COMPLETE = """
@@ -32,6 +38,11 @@ codex = "tests.fakes:FakeAgent"
 
 [delegate]
 model = "a-model-the-user-chose"
+
+[log]
+max_bytes = 8388608
+retained_files = 3
+stripped_environment_prefixes = ["Malloc"]
 """
 
 
@@ -101,6 +112,97 @@ class TestWhereThingsLive:
         config = load(written(tmp_path, COMPLETE + '\n[engine]\nstate_path = "~/state.json"\n'))
 
         assert config.state_path == Path.home() / "state.json"
+
+
+class TestTheLogItOwns:
+    """ADR 0004's four values: one location with a default, three decisions without.
+
+    The split is the point. A cap, a retention count and a list of noisy variable
+    prefixes are what a 68 MB outage *measured*, so a fallback in code would
+    quietly reinstate a number the measurement proved matters. The log's path is
+    a location, like the state file's and the socket's, so it defaults by the
+    same rule those two do.
+    """
+
+    def test_the_bounds_are_carried_as_written(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, COMPLETE))
+
+        assert config.log.max_bytes == 8388608
+        assert config.log.retained_files == 3
+        assert config.log.stripped_environment_prefixes == ("Malloc",)
+
+    def test_the_path_defaults_beside_the_state_file(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, COMPLETE))
+
+        assert config.log.path == default_log_path()
+        assert config.log.path.parent == config.state_path.parent
+        assert config.log.path.name == "engine.log"
+
+    def test_the_path_may_be_moved_and_is_expanded(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, COMPLETE + '\npath = "~/somewhere/engine.log"\n'))
+
+        assert config.log.path == Path.home() / "somewhere" / "engine.log"
+
+    def test_stripping_nothing_is_a_legitimate_answer(self, tmp_path: Path) -> None:
+        """An empty list is a decision; an absent key is a decision not taken."""
+        text = COMPLETE.replace(
+            'stripped_environment_prefixes = ["Malloc"]',
+            "stripped_environment_prefixes = []",
+        )
+
+        config = load(written(tmp_path, text))
+
+        assert config.log.stripped_environment_prefixes == ()
+
+    @pytest.mark.parametrize(
+        "key", ["max_bytes", "retained_files", "stripped_environment_prefixes"]
+    )
+    def test_a_decision_left_unsaid_refuses_to_start(self, tmp_path: Path, key: str) -> None:
+        text = "\n".join(line for line in COMPLETE.splitlines() if not line.startswith(key))
+
+        with pytest.raises(ConfigError) as refusal:
+            load(written(tmp_path, text))
+
+        assert key in str(refusal.value)
+
+    def test_a_configuration_with_no_log_table_at_all_refuses_to_start(
+        self, tmp_path: Path
+    ) -> None:
+        text = COMPLETE.split("[log]")[0]
+
+        with pytest.raises(ConfigError) as refusal:
+            load(written(tmp_path, text))
+
+        assert "[log]" in str(refusal.value)
+
+    @pytest.mark.parametrize(
+        "written_as",
+        [
+            "max_bytes = 0",
+            'max_bytes = "8388608"',
+            "max_bytes = true",
+            "max_bytes = 8388608.5",
+            "retained_files = -1",
+            'retained_files = "3"',
+            'stripped_environment_prefixes = "Malloc"',
+            "stripped_environment_prefixes = [1]",
+            'stripped_environment_prefixes = ["  "]',
+        ],
+    )
+    def test_a_bound_that_does_not_bind_anything(self, tmp_path: Path, written_as: str) -> None:
+        key = written_as.split(" =")[0]
+        text = "\n".join(line for line in COMPLETE.splitlines() if not line.startswith(key))
+
+        with pytest.raises(ConfigError) as refusal:
+            load(written(tmp_path, text + "\n" + written_as + "\n"))
+
+        assert key in str(refusal.value)
+
+    def test_a_log_path_that_is_not_a_path(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as refusal:
+            load(written(tmp_path, COMPLETE + '\npath = ""\n'))
+
+        assert "[log] path" in str(refusal.value)
 
 
 class TestWhatItRefuses:

@@ -59,6 +59,12 @@ codex = "fakes:FakeAgent"
 
 [delegate]
 model = "the-model-the-user-chose"
+
+[log]
+path = "{log}"
+max_bytes = 4096
+retained_files = 2
+stripped_environment_prefixes = ["GVC_TEST_NOISE_"]
 """
 
 
@@ -75,7 +81,11 @@ def home() -> Iterator[Path]:
 def configured(home: Path, text: str = CONFIG) -> Path:
     path = home / "config.toml"
     path.write_text(
-        text.format(socket=home / "control.sock", state=home / "state.json"), encoding="utf-8"
+        text.format(
+            socket=home / "control.sock",
+            state=home / "state.json",
+            log=home / "engine.log",
+        ), encoding="utf-8"
     )
     return path
 

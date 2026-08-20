@@ -17,21 +17,25 @@ with the privileges of the user who wrote it, and is exactly as trusted as the
 engine itself*. It lives in that user's own application-support directory for
 the same reason.
 
-**Two things have no default.** An unconfigured Call, Companion Channel or
+**Some things have no default.** An unconfigured Call, Companion Channel or
 Session Launcher seam refuses to start, because an engine that silently loaded
-nothing behind one is precisely ADR 0003's outage. And the Delegated Turn's
-model is a user-facing setting — the cost lever — so a default here would be
-the hard-coding this repository forbids.
+nothing behind one is precisely ADR 0003's outage. The Delegated Turn's model is
+a user-facing setting — the cost lever — so a default here would be the
+hard-coding this repository forbids. And ADR 0004's three log *decisions* — the
+cap, the retained generations, the stripped environment prefixes — are numbers a
+68 MB outage measured, so an in-code fallback would quietly reinstate a value
+that measurement proved matters.
 
 Paths *do* have defaults, because they are locations rather than decisions, and
-they are two different locations on purpose: the durable state lives in
-Application Support, and the socket lives in a short runtime root because Darwin
-caps an `AF_UNIX` path at 103 bytes. See `docs/control-plane.md`.
+they are three different locations on purpose: the durable state and the log live
+in Application Support, and the socket lives in a short runtime root because
+Darwin caps an `AF_UNIX` path at 103 bytes. See `docs/control-plane.md`. The log
+path is a location by that same rule, which is why it has a default while the
+three log decisions beside it do not.
 
-Keys this file does not know about are left for the tickets that own them: the
-log's four numbers are ADR 0004's and arrive with the log port; packaging keys
-arrive with the bundle. Reserving names for other people's work is designing it
-for them.
+Keys this file does not know about are left for the tickets that own them:
+packaging keys arrive with the bundle. Reserving names for other people's work is
+designing it for them.
 """
 
 from __future__ import annotations
@@ -54,6 +58,9 @@ CONFIG_FILE_NAME = "config.toml"
 RUNTIME_ROOT = Path("/tmp")
 SOCKET_FILE_NAME = "control.sock"
 
+#: The engine's own log, beside its own state. ADR 0004: it owns this file.
+LOG_FILE_NAME = "engine.log"
+
 #: Every seam the composition root must fill before the engine may serve.
 REQUIRED_SEAMS = ("call", "companion_channel", "session_launcher")
 
@@ -75,6 +82,11 @@ def default_socket_path(uid: int | None = None) -> Path:
 def default_config_path(base_dir: Path | None = None) -> Path:
     """Beside the state file, in the engine's own application-support directory."""
     return default_state_path(base_dir).with_name(CONFIG_FILE_NAME)
+
+
+def default_log_path(base_dir: Path | None = None) -> Path:
+    """Also beside the state file. A location, so it defaults; see the module note."""
+    return default_state_path(base_dir).with_name(LOG_FILE_NAME)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +114,26 @@ class AdapterSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class LogConfig:
+    """ADR 0004's four values: one location, and three decisions with no default.
+
+    The engine opens `path` itself and rotates it by rename, so this is the whole
+    of what it needs to be told about its own log. Nothing here describes an
+    adapter's log: a log the engine cannot tell to reopen belongs to whoever owns
+    the process holding it, and Bridge Core never enumerates such paths.
+    """
+
+    path: Path
+    #: The cap every generation is held to. `max_bytes` x (`retained_files` + 1)
+    #: is the ceiling the family occupies on disk.
+    max_bytes: int
+    retained_files: int
+    #: Environment variables whose names start with one of these are dropped once,
+    #: by the process that spawns others, rather than at each spawn site.
+    stripped_environment_prefixes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EngineConfig:
     """Everything the composition root needs, and nothing it does not."""
 
@@ -111,6 +143,7 @@ class EngineConfig:
     socket_path: Path
     state_path: Path
     policy: CorePolicy
+    log: LogConfig
 
 
 def load(path: Path) -> EngineConfig:
@@ -150,6 +183,7 @@ def of(document: dict[str, Any], *, source: Path | None = None) -> EngineConfig:
         socket_path=_path(engine, "socket_path", default_socket_path(), where),
         state_path=_path(engine, "state_path", default_state_path(), where),
         policy=_policy(_section(document, "policy", where), where),
+        log=_log(_section(document, "log", where), where),
     )
 
 
@@ -221,13 +255,64 @@ def _reference(reference: str, key: str, where: str) -> str:
     return reference.strip()
 
 
-def _path(section: dict[str, Any], key: str, fallback: Path, where: str) -> Path:
+def _path(
+    section: dict[str, Any], key: str, fallback: Path, where: str, *, table: str = "engine"
+) -> Path:
+    """A location, so it has a fallback. Decisions elsewhere in this file do not."""
     value = section.get(key)
     if value is None:
         return fallback
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"[engine] {key}{where} must be a path")
+        raise ConfigError(f"[{table}] {key}{where} must be a path")
     return Path(value.strip()).expanduser()
+
+
+def _log(section: dict[str, Any], where: str) -> LogConfig:
+    """ADR 0004's log, read whole. Its three decisions must be said out loud."""
+    return LogConfig(
+        path=_path(section, "path", default_log_path(), where, table="log"),
+        max_bytes=_whole_number(section, "max_bytes", where, least=1),
+        retained_files=_whole_number(section, "retained_files", where, least=0),
+        stripped_environment_prefixes=_prefixes(section, where),
+    )
+
+
+def _whole_number(section: dict[str, Any], key: str, where: str, *, least: int) -> int:
+    """A log bound the operator set. There is no fallback: see ADR 0004."""
+    value = section.get(key)
+    if value is None:
+        raise ConfigError(
+            f"no [log] {key}{where}: ADR 0004 gives the engine its own log and the "
+            "bound is measured, not guessed, so this engine has no default for it"
+        )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"[log] {key}{where} must be a whole number of {_unit(key)}")
+    if value < least:
+        raise ConfigError(f"[log] {key}{where} must be at least {least}")
+    return value
+
+
+def _unit(key: str) -> str:
+    return "bytes" if key == "max_bytes" else "files"
+
+
+def _prefixes(section: dict[str, Any], where: str) -> tuple[str, ...]:
+    """The noise to drop from the environment. An empty list is an answer; absent is not."""
+    value = section.get("stripped_environment_prefixes")
+    if value is None:
+        raise ConfigError(
+            f"no [log] stripped_environment_prefixes{where}: one inherited variable was "
+            "98.1% of the reference implementation's log, so this list is stated even "
+            "when it is empty"
+        )
+    if not isinstance(value, list) or any(
+        not isinstance(prefix, str) or not prefix.strip() for prefix in value
+    ):
+        raise ConfigError(
+            f"[log] stripped_environment_prefixes{where} must be a list of variable-name "
+            "prefixes"
+        )
+    return tuple(prefix.strip() for prefix in value)
 
 
 def _policy(section: dict[str, Any], where: str) -> CorePolicy:

@@ -48,6 +48,12 @@ codex = "fakes:FakeAgent"
 
 [delegate]
 model = "the-model-the-user-chose"
+
+[log]
+path = "{log}"
+max_bytes = 4096
+retained_files = 2
+stripped_environment_prefixes = ["GVC_TEST_NOISE_"]
 """
 
 
@@ -70,7 +76,12 @@ def engine_at(home: Path) -> Iterator[Path]:
     """
     config_path = home / "config.toml"
     config_path.write_text(
-        CONFIG.format(socket=home / "control.sock", state=home / "state.json"), encoding="utf-8"
+        CONFIG.format(
+            socket=home / "control.sock",
+            state=home / "state.json",
+            log=home / "engine.log",
+        ),
+        encoding="utf-8",
     )
     engine = Engine.assemble(load(config_path))
     serving = threading.Event()
