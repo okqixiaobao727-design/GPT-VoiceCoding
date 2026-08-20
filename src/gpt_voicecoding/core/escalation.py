@@ -74,7 +74,19 @@ class NoticeRoute(StrEnum):
 
 
 class Reach(StrEnum):
-    """How many outlets one escalation uses."""
+    """How many outlets one escalation uses.
+
+    The two reaches read permission at different moments, and that is one
+    principle rather than two behaviours: **permission is read at the moment an
+    attempt becomes irrevocable.** FIRST_OUTLET re-reads between routes because
+    each route is a fresh decision point, so Duty going off mid-escalation halts
+    what has not gone yet. EVERY_OUTLET reads once at the top because both
+    attempts become irrevocable together — a switch flipped a moment later
+    cannot recall a call already in flight.
+
+    A closing notice is its own later emission and is adjudicated at its own
+    time, by the same rule.
+    """
 
     #: Stop at the first outlet that proved delivery — a Stop Notice heard
     #: twice is worse than one heard once. The default, and what a Stop Notice
