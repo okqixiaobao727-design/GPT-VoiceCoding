@@ -109,11 +109,23 @@ class SessionRegistry:
 
         The query is matched as a fragment, and **more than one match refuses**,
         with every candidate named. An exact label is deliberately *not* given
-        precedence: when one Session is labelled "ship it" and another "ship it
-        later", the words "ship it" identify both, and a user who said them may
-        have meant either. Preferring the exact one would be picking, which is
-        the guess this repository exists to avoid. Labels are for matching and
-        for speech; a command that must not ask carries a `SessionTarget`.
+        precedence, for three reasons:
+
+        - The costs are asymmetric. A refusal costs one spoken round trip; a
+          wrong pick delivers the user's own words into the wrong Session,
+          silently, carrying the user's authority.
+        - Exactness is only evidence when the text is trustworthy, and the
+          primary source here is a realtime voice transcript. "ship it" may be
+          the user meaning the short label, or the transcriber clipping "ship it
+          later". Exactness of lossy text says nothing about intent.
+        - "A label is not a target" is locked. Letting an exact label win
+          promotes it to a target by right, which is the first step back toward
+          addressing by label.
+
+        The collision only exists while two live labels stand in a fragment
+        relation. That is worth fixing where labels are minted — by keeping a
+        fresh title word-level distinct from the live ones — rather than by
+        making matching cleverer here.
         """
         wanted = _normalise(query)
         candidates = [held for held in self.live() if wanted in _normalise(str(held.label))]
