@@ -143,10 +143,14 @@ class FakeCall:
         self,
         *,
         delegated_text: str = "the delegated answer",
+        reachable: bool = True,
         verify_result: VerifyResult | None = None,
         sink: EventSink | None = None,
     ) -> None:
         self.delegated_text = delegated_text
+        #: False makes every attempt stall at CONNECTING — a call that never
+        #: comes up, which is not the same as one that came up and went away.
+        self.reachable = reachable
         self.verify_result = verify_result or VerifyResult(
             outcome=VerifyOutcome.PASS, loaded="tests.fakes.FakeCall"
         )
@@ -154,12 +158,18 @@ class FakeCall:
         self.spoken: list[str] = []
         self.delegated: list[tuple[str, str]] = []
         self._snapshot = CallSnapshot(state=CallState.DOWN)
-        self._calls_started = 0
+        #: How many calls this adapter actually brought up. A policy test asserts
+        #: on it to prove the one-call invariant stopped a second one.
+        self.calls_started = 0
 
     async def ensure_call(self) -> CallSnapshot:
-        if not self._snapshot.is_up:
-            self._calls_started += 1
-            self._snapshot = CallSnapshot(state=CallState.UP, call_id=f"call-{self._calls_started}")
+        if self._snapshot.is_up:
+            return self._snapshot
+        if not self.reachable:
+            self._snapshot = CallSnapshot(state=CallState.CONNECTING)
+            return self._snapshot
+        self.calls_started += 1
+        self._snapshot = CallSnapshot(state=CallState.UP, call_id=f"call-{self.calls_started}")
         return self._snapshot
 
     async def end_call(self) -> CallSnapshot:

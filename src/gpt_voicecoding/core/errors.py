@@ -118,3 +118,18 @@ class StateFormatError(BridgeCoreError):
         super().__init__(f"cannot read persisted state at {path}: {reason}")
         self.path = path
         self.reason = reason
+
+
+class SecondCallRefused(BridgeCoreError):
+    """Something asked to open a voice surface while the system already owns one.
+
+    The one-call-at-a-time invariant, raised rather than silently absorbed: a
+    caller that meant to *open* a call has a different plan to make when one is
+    already up, and hiding that is how the reference implementation's escalation
+    path pressed the toggle on top of a system-owned call and left two
+    assistants talking to each other.
+    """
+
+    def __init__(self, call_id: str) -> None:
+        super().__init__(f"the system already owns call {call_id!r}; nothing may open a second")
+        self.call_id = call_id

@@ -12,7 +12,9 @@ touches — nothing else may read those files, or the disk becomes a second trut
 
 Bridge Core may grow internal components (escalation pipeline, relay queue,
 approval budget, persistence), separately testable but *not* new external seams:
-outsiders see one Bridge Core. The ones that hold state are here now:
+outsiders see one Bridge Core.
+
+The ones that hold state:
 
 - ``switches`` — the Duty / Voice / Message hierarchy and the Feature Switches
   configuration declares beneath it.
@@ -23,6 +25,25 @@ outsiders see one Bridge Core. The ones that hold state are here now:
 - ``persistence`` — the durable subset, and the only component that touches disk.
 - ``state`` — the three of them assembled, and the single persistence path.
 - ``events`` — the one queue every seam's events arrive on.
+
+The ones that decide — the policy, all of it:
+
+- ``adjudication`` — what the switches permit the *system* to do. Never consulted
+  by the control plane (ADR 0002).
+- ``interlock`` — one call at a time, above the Call seam. The only door to
+  opening one.
+- ``escalation`` — the Stop Notice route matrix, and the retention that makes
+  no-loss true.
+- ``relays`` — queueing the user's own words against the Reply Window, and the
+  ceiling on how long they may wait.
+- ``approvals`` — the Approval Relay budget, its never-deny fallback, and the
+  notice that closes the loop.
+- ``router`` — what inbound text means. Unknown or ambiguous fails closed.
+- ``bridge`` — the five of them assembled, and the one dispatch that feeds them.
+
+And the substrate all of them share: ``lifecycle`` (the four state names for
+anything pending), ``policy`` (every configurable duration), ``clock`` (where a
+duration is measured from), and ``errors`` (what a refusal looks like).
 
 **Hard constraint (ADR 0001, principle 1):** no protocol library — WebRTC,
 Telegram, JSON-RPC framing, tmux — may ever be imported from this package, and

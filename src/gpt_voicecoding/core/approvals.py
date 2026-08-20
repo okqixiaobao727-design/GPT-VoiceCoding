@@ -1,0 +1,201 @@
+"""The Approval Relay budget, its fallback, and the notice that closes the loop.
+
+A pending permission dialog is one more attention-needing stall, so its delivery
+**rides the Stop Notice escalation pipeline** rather than getting a flow of its
+own — same route matrix, same switches, same retention. The one thing it asks
+for that a Stop Notice does not is `Reach.EVERY_OUTLET`: the push fires
+immediately, in parallel with the voice attempt, because the user may be nowhere
+near the screen and waiting to see whether the call worked wastes the budget.
+
+**The budget never denies.** Running out means the user was not reachable, not
+that they said no, so expiry answers `ask` and the on-screen dialog takes over.
+The number is `CorePolicy`'s and configurable; the never-deny rule is not.
+
+**A closing notice fires on every resolution.** That is what absorbs the
+duplicate the parallel push created — and the expiry case is the one that
+matters most, because a never-deny fallback otherwise leaves the pushed user
+believing a decision is still wanted from them. A verdict that arrives after
+the loop was already closed is discarded and emits nothing: its closing notice
+already went out.
+
+Pending approvals are held here rather than in the undelivered Relay queue, on
+that queue's own instruction — an Approval Relay has a budget and a fallback, so
+it is answered or handed back; it never waits in the ledger.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from gpt_voicecoding.core.clock import Clock, default_clock
+from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, Reach
+from gpt_voicecoding.core.lifecycle import Lifecycle
+from gpt_voicecoding.core.policy import CorePolicy
+from gpt_voicecoding.seams.agent import AgentAdapter, ApprovalRequest, ApprovalVerdict
+from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, new_request_id
+
+_log = logging.getLogger(__name__)
+
+
+def announcement_for(request: ApprovalRequest) -> str:
+    """What the user is told is waiting. Names the tool, never guesses the answer."""
+    detail = f" — {request.detail}" if request.detail.strip() else ""
+    return f"a session is waiting for your permission to use {request.tool_name}{detail}"
+
+
+#: What closes the loop, per resolution. Kept together so no path can resolve a
+#: request without a wording for it.
+CLOSING_NOTICES: dict[ApprovalVerdict, str] = {
+    ApprovalVerdict.ALLOW: "approved by voice",
+    ApprovalVerdict.DENY: "denied by voice",
+    ApprovalVerdict.ASK: "the voice window closed — it's waiting at the on-screen dialog",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PendingApproval:
+    """One permission request the user has a budget to answer by voice."""
+
+    request: ApprovalRequest
+    #: Bridge Core's id for the verdict it will carry back. Distinct from the
+    #: adapter's `approval_id`, which names the dialog the Session raised.
+    request_id: RequestId
+    opened_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalOutcome:
+    """How one pending request resolved, and what the user is told about it."""
+
+    request: ApprovalRequest
+    verdict: ApprovalVerdict
+    state: Lifecycle
+    #: Fires on every resolution. Exactly one per request.
+    closing_notice: str
+    outcome: Delivery = Delivery.UNKNOWN
+
+
+class ApprovalPipeline:
+    """Announces pending dialogs, carries verdicts, and never denies on timeout."""
+
+    def __init__(
+        self,
+        *,
+        agents: Mapping[AgentKind, AgentAdapter],
+        escalation: EscalationPipeline,
+        policy: CorePolicy | None = None,
+        clock: Clock = default_clock,
+    ) -> None:
+        self._agents = dict(agents)
+        self._escalation = escalation
+        self._policy = policy or CorePolicy()
+        self._clock = clock
+        self._pending: dict[str, PendingApproval] = {}
+
+    def pending(self) -> tuple[PendingApproval, ...]:
+        """Every request still inside its budget, in the order they arrived."""
+        return tuple(self._pending.values())
+
+    async def opened(self, request: ApprovalRequest) -> PendingApproval:
+        """A dialog is on screen. Start the budget and announce it everywhere.
+
+        The budget starts here and ticks regardless of whether any outlet took
+        the announcement: the dialog is stalled either way, and a budget that
+        only ran when someone was listening would never expire on the one path
+        where the fallback matters most.
+        """
+        now = self._clock()
+        waiting = PendingApproval(
+            request=request,
+            request_id=new_request_id(),
+            opened_at=now,
+            expires_at=now + self._policy.approval_budget_seconds,
+        )
+        self._pending[request.approval_id] = waiting
+
+        await self._escalation.escalate(
+            Notice(
+                request_id=waiting.request_id,
+                target=request.target,
+                text=announcement_for(request),
+            ),
+            reach=Reach.EVERY_OUTLET,
+        )
+        return waiting
+
+    async def answer(self, approval_id: str, verdict: ApprovalVerdict) -> ApprovalOutcome | None:
+        """Carry the user's verdict. Returns None when nothing is waiting for it.
+
+        A verdict for a request that already resolved — expired, or answered —
+        is **discarded safely**: it carries nothing and emits nothing, because
+        the closing notice for that request has already gone out.
+        """
+        waiting = self._pending.pop(approval_id, None)
+        if waiting is None:
+            _log.info(
+                "verdict %s for %s arrived after it resolved; discarded", verdict, approval_id
+            )
+            return None
+        return await self._resolve(waiting, verdict)
+
+    async def sweep_expired(self) -> tuple[ApprovalOutcome, ...]:
+        """Every request past its budget falls back to the on-screen dialog.
+
+        `ask`, never deny. Popping first is what makes it exactly once, and what
+        makes a verdict arriving a moment later discardable rather than racing.
+        """
+        now = self._clock()
+        expired = [waiting for waiting in self._pending.values() if waiting.expires_at <= now]
+        resolved: list[ApprovalOutcome] = []
+        for waiting in expired:
+            del self._pending[waiting.request.approval_id]
+            resolved.append(await self._resolve(waiting, ApprovalVerdict.ASK))
+        return tuple(resolved)
+
+    async def _resolve(self, waiting: PendingApproval, verdict: ApprovalVerdict) -> ApprovalOutcome:
+        """Carry the verdict, then close the loop on every surface that was told."""
+        outcome = Delivery.UNKNOWN
+        adapter = self._agents.get(waiting.request.target.agent)
+        if adapter is not None:
+            receipt = await adapter.approval_relay(
+                waiting.request, verdict, request_id=waiting.request_id
+            )
+            outcome = receipt.outcome
+
+        # Retire the announcement before closing the loop. If no outlet took it,
+        # it is still retained, and a later outlet transition would speak a
+        # prompt for a decision that has already been made — the duplicate the
+        # closing notice exists to absorb, arriving *after* the absorption.
+        self._escalation.retire(waiting.request_id)
+
+        closing = CLOSING_NOTICES[verdict]
+        await self._escalation.escalate(
+            Notice(
+                request_id=new_request_id(),
+                target=waiting.request.target,
+                text=closing,
+            ),
+            reach=Reach.EVERY_OUTLET,
+        )
+
+        # RETAINED is deliberately unreachable here. A pending approval has a
+        # budget and a fallback, so it is resolved or handed back — it never
+        # waits for a later attempt, which is why it is not in the ledger. An
+        # `ask` is terminal for the voice path even when the adapter carried it
+        # cleanly, and that is exactly what the closing notice tells the user.
+        state = (
+            Lifecycle.DELIVERED
+            if verdict is not ApprovalVerdict.ASK and outcome.is_delivered
+            else Lifecycle.REPORTED_FAILED
+        )
+        return ApprovalOutcome(
+            request=waiting.request,
+            verdict=verdict,
+            state=state,
+            closing_notice=closing,
+            outcome=outcome,
+        )
