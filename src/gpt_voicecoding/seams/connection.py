@@ -15,6 +15,12 @@ alone.
 Both verbs are idempotent and neither may raise on a second call: a shutdown
 that is already under way must not be made worse by an adapter objecting to
 being closed twice.
+
+**Closed at two verbs.** Health checks, restarts and reconnection policy are not
+a third method here — that is how an optional capability becomes a lifecycle
+framework, and each of them is a decision about *policy*, which belongs to
+Bridge Core or to the menu-bar shell's process parenthood (ADR 0005), not to a
+contract about opening a connection.
 """
 
 from __future__ import annotations
