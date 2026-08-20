@@ -37,6 +37,8 @@ packages = ["src/gpt_voicecoding"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# Test modules import the shared fakes bare (`from fakes import ...`); this pins that path.
+pythonpath = ["tests"]
 
 [tool.ruff]
 src = ["src", "tests"]
