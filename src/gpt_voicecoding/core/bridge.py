@@ -18,6 +18,12 @@ reply is not a push, and the Companion Channel is one of the control-plane's
 surfaces, so an inbound message always gets an answer. If that were gated, the
 one way to turn Duty back on from away from the computer would be gated too.
 
+**Launching and closing are hub verbs, not surface ones.** The Session registry
+is the hub's truth, so the hub is what writes it: the Launcher is injected here
+like every other adapter, and a surface asks the hub to launch rather than
+calling the Launcher and registering the result itself. A surface that held
+that transaction would hold half of it the moment the second half failed.
+
 Three things are recorded here rather than decided here. `UserSpeech` is the
 in-call transcript, and Bridge Core never parses one: spoken intent arrives as
 structured control-plane calls the voice thread makes, so the event is written
@@ -31,11 +37,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
-from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.errors import BridgeCoreError, UnknownRelayError
+from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
+from gpt_voicecoding.core.errors import (
+    BridgeCoreError,
+    SeamUnavailableError,
+    StaleSessionError,
+    UnknownRelayError,
+)
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.interlock import CallInterlock
@@ -43,13 +55,25 @@ from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, SessionState
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
+from gpt_voicecoding.core.verification import (
+    AGENT_SEAM_PREFIX,
+    CALL_SEAM,
+    CHANNEL_SEAM,
+    LAUNCHER_SEAM,
+    SeamLoad,
+    SeamVerification,
+    Verifiable,
+    compare,
+)
 from gpt_voicecoding.seams.agent import (
     AgentAdapter,
+    ApprovalVerdict,
     AwaitingApproval,
     RelayReceipt,
+    RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -65,7 +89,21 @@ from gpt_voicecoding.seams.call import (
 )
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.events import Event
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
+from gpt_voicecoding.seams.identity import (
+    AgentKind,
+    SessionLabel,
+    SessionTarget,
+    new_request_id,
+)
+from gpt_voicecoding.seams.session_launcher import (
+    CloseOutcome,
+    CloseRequest,
+    CloseStatus,
+    LaunchOutcome,
+    LaunchRequest,
+    LaunchStatus,
+    SessionLauncher,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -109,19 +147,30 @@ class BridgeCore:
         call: CallAdapter,
         channel: CompanionChannel,
         agents: Mapping[AgentKind, AgentAdapter],
+        launcher: SessionLauncher | None = None,
         events: EventQueue | None = None,
         policy: CorePolicy | None = None,
         grammar: TextGrammar | None = None,
         clock: Clock = default_clock,
+        stamp: Clock = wall_clock,
         control: Callable[[Classification], Awaitable[str]] | None = None,
         delegate: Callable[[Classification], Awaitable[str]] | None = None,
+        inventory: tuple[SeamLoad, ...] = (),
     ) -> None:
         self._state = state
+        self._call = call
         self._channel = channel
+        self._agents = dict(agents)
+        self._launcher = launcher
         self._events = events or EventQueue()
         self._policy = policy or CorePolicy()
         self._control = control
         self._delegate = delegate
+        self._inventory = inventory
+        #: Durations are measured with `clock`; anything written to disk is
+        #: stamped with `stamp`. A Session's `registered_at` is read back by the
+        #: next engine, and a monotonic reading would come back as the future.
+        self._stamp = stamp
 
         self.interlock = CallInterlock(call)
         self.adjudicator = SwitchAdjudicator(state.switches)
@@ -217,6 +266,140 @@ class BridgeCore:
         livelock.
         """
         await self.escalation.sweep()
+
+    async def launch_session(
+        self,
+        *,
+        agent: AgentKind,
+        workspace: Path,
+        label: SessionLabel,
+        env: Mapping[str, str] | None = None,
+    ) -> LaunchOutcome:
+        """Bring one Session into existence, and record the one that arrived.
+
+        The registry is the hub's truth, so the hub is what writes it. A surface
+        that called the Launcher itself and then registered the result would be
+        holding half a transaction — the shape the reference implementation had,
+        and the one that leaves a live child nothing knows about the moment the
+        second half fails.
+
+        Only a `LAUNCHED` outcome registers anything: an outcome is
+        authoritative, and a failed launch that wrote a row would be the system
+        inventing a Session to Relay into.
+        """
+        launcher = self._require_launcher()
+        outcome = await launcher.launch(
+            LaunchRequest(
+                request_id=new_request_id(),
+                agent=agent,
+                workspace=workspace,
+                label=label,
+                env=env or {},
+            )
+        )
+        if outcome.status is not LaunchStatus.LAUNCHED:
+            return outcome
+
+        assert outcome.target is not None  # the seam refuses a LAUNCHED without one
+        self._state.sessions.register(
+            Session(
+                target=outcome.target,
+                label=label,
+                workspace=workspace,
+                registered_at=self._stamp(),
+            )
+        )
+        self._state.persist()
+        return outcome
+
+    async def close_session(self, target: SessionTarget) -> CloseOutcome:
+        """Close exactly one Session, by exact identity, and record that it ended.
+
+        Fails closed on an identity this engine never registered, and on a wrong
+        pid under a known session id — that is a fork, not a typo. A Session the
+        registry already holds as ended answers `already_closed` without
+        touching the Launcher: the caller asked for a state that already holds,
+        which is what idempotent means, and dialling the Launcher again to be
+        told the same thing risks reaping whatever now owns that identity.
+        """
+        launcher = self._require_launcher()
+        try:
+            self._state.sessions.resolve(target)
+        except StaleSessionError:
+            if self._already_ended(target):
+                return CloseOutcome(
+                    request_id=new_request_id(), status=CloseStatus.ALREADY_CLOSED
+                )
+            raise
+
+        outcome = await launcher.close(
+            CloseRequest(request_id=new_request_id(), target=target)
+        )
+        if outcome.status in (CloseStatus.CLOSED, CloseStatus.ALREADY_CLOSED):
+            self._state.sessions.mark_ended(target)
+            self._state.persist()
+        return outcome
+
+    async def relay(
+        self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
+    ) -> RelayOutcome:
+        """An Answer Relay: the user's own words, for one exact Session.
+
+        A hub verb rather than a pipeline a surface reaches into. Outsiders see
+        one Bridge Core (ADR 0001), and a surface that knew which pipeline owned
+        which decision would be a surface that has to be changed when the hub
+        rearranges itself.
+        """
+        return await self.relays.relay(target, text, route=route)
+
+    async def answer_approval(
+        self, approval_id: str, verdict: ApprovalVerdict
+    ) -> ApprovalOutcome | None:
+        """Carry the user's verdict. None when nothing is waiting under that id."""
+        return await self.approvals.answer(approval_id, verdict)
+
+    async def verify(self) -> tuple[SeamVerification, ...]:
+        """What configuration named, against what this engine actually loaded.
+
+        ADR 0003: the comparison is the hub's because only the hub knows the
+        configured side, and **every** pluggable seam is asked for itself. The
+        ADR generalises past the Companion Channel deliberately — `verify` is a
+        seam verb on all four for exactly this reason — so a Call adapter whose
+        far side is down reports that, rather than the engine reciting the
+        configuration back and calling it an observation.
+        """
+        reports: list[SeamVerification] = []
+        for load in self._inventory:
+            adapter = self._behind(load.seam)
+            reports.append(compare(load, await adapter.verify() if adapter is not None else None))
+        return tuple(reports)
+
+    def _behind(self, seam: str) -> Verifiable | None:
+        """The adapter this engine actually holds for one seam name, if any."""
+        if seam == CALL_SEAM:
+            return self._call
+        if seam == CHANNEL_SEAM:
+            return self._channel
+        if seam == LAUNCHER_SEAM:
+            return self._launcher
+        if seam.startswith(AGENT_SEAM_PREFIX):
+            try:
+                return self._agents.get(AgentKind(seam[len(AGENT_SEAM_PREFIX) :]))
+            except ValueError:
+                return None
+        return None
+
+    def _require_launcher(self) -> SessionLauncher:
+        if self._launcher is None:
+            raise SeamUnavailableError("Session Launcher")
+        return self._launcher
+
+    def _already_ended(self, target: SessionTarget) -> bool:
+        """Whether this exact identity is one the registry holds as finished."""
+        return any(
+            held.target == target and held.state is SessionState.ENDED
+            for held in self._state.sessions.all()
+        )
 
     # ------------------------------------------------------------------
     # The dispatch loop.

@@ -39,6 +39,8 @@ The ones that decide — the policy, all of it:
 - ``approvals`` — the Approval Relay budget, its never-deny fallback, and the
   notice that closes the loop.
 - ``router`` — what inbound text means. Unknown or ambiguous fails closed.
+- ``verification`` — what configuration named against what the engine loaded
+  (ADR 0003); only the hub knows the configured side.
 - ``bridge`` — the five of them assembled, and the one dispatch that feeds them.
 
 And the substrate all of them share: ``lifecycle`` (the four state names for

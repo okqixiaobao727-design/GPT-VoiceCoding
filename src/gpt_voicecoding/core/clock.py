@@ -14,6 +14,12 @@ report a queued Relay as ten minutes stale when it was thirty seconds.
 nothing after a restart, and the durable subset — switch state and the Session
 registry — outlives the process. Those timestamps come from the surface that
 records them; this clock measures durations inside one engine run.
+
+So there are two, and they are never interchangeable: `default_clock` measures
+elapsed time inside one run, and `wall_clock` stamps a record that outlives the
+run. A Session's `registered_at` is written to disk and read back by the next
+engine, so it is stamped from the second — a monotonic reading there would come
+back after a restart as a moment in the future.
 """
 
 from __future__ import annotations
@@ -24,5 +30,8 @@ from collections.abc import Callable
 #: Reads the current elapsed-seconds value. Injected everywhere it is needed.
 Clock = Callable[[], float]
 
-#: The one Bridge Core uses when nothing overrides it.
+#: The one Bridge Core uses when nothing overrides it. Elapsed time only.
 default_clock: Clock = time.monotonic
+
+#: The one used to stamp anything that outlives this process. Never for durations.
+wall_clock: Clock = time.time

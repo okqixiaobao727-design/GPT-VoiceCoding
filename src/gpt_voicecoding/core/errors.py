@@ -120,6 +120,20 @@ class StateFormatError(BridgeCoreError):
         self.reason = reason
 
 
+class SeamUnavailableError(BridgeCoreError):
+    """Something was asked for that needs a seam this engine has nothing behind.
+
+    Raised rather than answered with a hopeful default: an engine assembled
+    without a Session Launcher cannot launch, and the honest answer to "launch
+    this" is that this engine cannot, not a failure that reads like the
+    Launcher tried.
+    """
+
+    def __init__(self, seam: str) -> None:
+        super().__init__(f"this engine has nothing loaded behind the {seam} seam")
+        self.seam = seam
+
+
 class SecondCallRefused(BridgeCoreError):
     """Something asked to open a voice surface while the system already owns one.
 
