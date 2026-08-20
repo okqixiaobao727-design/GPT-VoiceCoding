@@ -81,6 +81,8 @@ class Codex(FakeAppServer):
         self.readback_shows_words = True
         #: How many copies the readback claims. More than one contradicts.
         self.readback_copies = 1
+        #: Whether `turn/start`'s approval override actually takes effect.
+        self.honours_the_pin = True
 
         self.answers("initialize", {})
         self.answers(
@@ -98,11 +100,15 @@ class Codex(FakeAppServer):
         return self
 
     def _turn_start(self, params: dict) -> dict:
-        # The real server applies the turn's approval overrides to the thread.
-        if params.get("approvalsReviewer"):
-            self.reviewer = params["approvalsReviewer"]
-        if params.get("approvalPolicy"):
-            self.approval_policy = params["approvalPolicy"]
+        # A real server applies the turn's approval overrides to the thread —
+        # unless `honours_the_pin` is off, which is the case that matters: the
+        # request succeeds, the override is silently dropped, and only the
+        # readback can tell. A fake that always applied it could never fail.
+        if self.honours_the_pin:
+            if params.get("approvalsReviewer"):
+                self.reviewer = params["approvalsReviewer"]
+            if params.get("approvalPolicy"):
+                self.approval_policy = params["approvalPolicy"]
         self.delivered.append(params["clientUserMessageId"])
         return {"turn": {"id": TURN, "status": "inProgress"}}
 
@@ -731,6 +737,8 @@ class TestWhenTheAppServerDies:
         receipt, starts = asyncio.run(scenario())
         # The words were on the wire, so nothing here may claim they did not go.
         assert receipt.outcome is Delivery.UNKNOWN
+        # Classified, Session marked, and sent exactly once — no retry storm.
+        assert [event.target for event in sink.of(SessionEnded)] == [TARGET]
         assert len(starts) == 1
 
     def test_a_relay_into_a_session_whose_socket_is_gone_never_reached_it(
@@ -802,3 +810,110 @@ async def _until(condition, timeout: float = 2.0) -> None:
             return
         await asyncio.sleep(0.005)
     raise AssertionError("the far side never got there")
+
+
+class TestWhenCodexIgnoresThePin:
+    def test_a_turn_whose_pin_was_dropped_is_caught_by_the_readback(
+        self, socket_path: Path
+    ) -> None:
+        """`turn/start` answers with the turn only, so the assertion needs an echo."""
+
+        async def scenario():
+            async with Codex(socket_path).script(
+                approval_policy="never", reviewer="auto_review"
+            ) as server:
+                server.honours_the_pin = False
+                adapter = await watching(server, Sink())
+                try:
+                    first = await adapter.answer_relay(TARGET, "one", request_id=rid("r-1"))
+                    routing = adapter._threads[TARGET].routing
+                    second = await adapter.answer_relay(TARGET, "two", request_id=rid("r-2"))
+                    return first, routing, second, server.calls_to("turn/start")
+                finally:
+                    await adapter.aclose()
+
+        first, routing, second, starts = asyncio.run(scenario())
+        # The words did arrive, and the receipt says only that.
+        assert first.outcome is Delivery.DELIVERED
+        # The mis-route is caught without waiting for a notification to land.
+        assert routing is ApprovalRouting.MISROUTED
+        assert second.outcome is Delivery.FAILED
+        assert "auto_review" in second.reason
+        assert [call["clientUserMessageId"] for call in starts] == ["r-1"]
+
+    def test_a_server_that_honours_the_pin_leaves_the_session_usable(
+        self, socket_path: Path
+    ) -> None:
+        async def scenario():
+            async with Codex(socket_path).script(
+                approval_policy="never", reviewer="auto_review"
+            ) as server:
+                adapter = await watching(server, Sink())
+                try:
+                    first = await adapter.answer_relay(TARGET, "one", request_id=rid("r-1"))
+                    second = await adapter.answer_relay(TARGET, "two", request_id=rid("r-2"))
+                    return first, second, adapter._threads[TARGET].routing
+                finally:
+                    await adapter.aclose()
+
+        first, second, routing = asyncio.run(scenario())
+        assert first.outcome is Delivery.DELIVERED
+        assert second.outcome is Delivery.DELIVERED
+        assert routing is ApprovalRouting.PINNED
+
+
+class TestWhenTheSessionsAppServerDies:
+    def test_the_session_is_marked_ended_exactly_once(self, socket_path: Path) -> None:
+        """A TUI is a thin client of its app-server: no app-server, no Session."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.drop_everyone()
+                    await _until(lambda: bool(sink.of(SessionEnded)))
+                    await _settled()
+                    return sink.of(SessionEnded), adapter.watching()
+                finally:
+                    await adapter.aclose()
+
+        ended, still_watched = asyncio.run(scenario())
+        assert [event.target for event in ended] == [TARGET]
+        assert ended[0].detail
+        # Dropped from the roster, so nothing keeps addressing a dead socket.
+        assert still_watched == ()
+
+    def test_a_relay_after_it_died_fails_before_anything_is_sent(
+        self, socket_path: Path
+    ) -> None:
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.drop_everyone()
+                    await _until(lambda: bool(sink.of(SessionEnded)))
+                    return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
+                finally:
+                    await adapter.aclose()
+
+        receipt = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.FAILED
+        assert "no Codex Session is registered" in receipt.reason
+
+    def test_an_orderly_close_is_not_reported_as_a_session_ending(
+        self, socket_path: Path
+    ) -> None:
+        """Shutting the engine down must not tell the hub every Session died."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                await adapter.aclose()
+                await _settled()
+
+        asyncio.run(scenario())
+        assert sink.of(SessionEnded) == []

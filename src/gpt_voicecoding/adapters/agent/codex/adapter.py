@@ -97,11 +97,17 @@ NOTICE_FRAME = (
 def default_own_socket_path(settings: CodexSettings) -> Path:
     """Where the engine's own app-server listens, when nothing states otherwise.
 
-    Per-uid, for the reason `config.py` gives its control socket the same shape:
-    two accounts on one machine each get their own, rather than the second one
-    finding the first still listening and refusing to start.
+    Per-uid, and inside a directory of its own, for the two reasons `config.py`
+    gives its control socket exactly this shape: two accounts on one machine
+    each get their own rather than the second finding the first still listening,
+    and a socket is only as private as the directory holding it — the runtime
+    root is shared `/tmp`, which cannot be made private to anyone.
     """
-    return settings.socket_directory / f"gpt-voicecoding-codex-{os.geteuid()}.sock"
+    return (
+        settings.socket_directory
+        / f"gpt-voicecoding-{os.geteuid()}"
+        / "codex-app-server.sock"
+    )
 
 
 def notice_text(text: str) -> str:
@@ -194,6 +200,7 @@ class CodexAgentAdapter:
             settings=self._settings,
             on_notification=self._heard,
             on_server_request=self._asked,
+            on_closed=lambda reason, held=target: self._connection_lost(held, reason),
         )
         watched = WatchedThread(
             target=target, socket_path=socket_path, connection=connection
@@ -382,7 +389,9 @@ class CodexAgentAdapter:
             return _unknown(request_id, f"codex never answered the turn: {lost}")
 
         watched.assert_pinned()
-        return await self._await_receipt(watched, request_id)
+        receipt = await self._await_receipt(watched, request_id)
+        await self._read_routing_back(watched)
+        return receipt
 
     async def _steer(
         self, watched: WatchedThread, text: str, *, request_id: RequestId
@@ -411,7 +420,9 @@ class CodexAgentAdapter:
         except WireError as lost:
             return _unknown(request_id, f"codex never answered the supplement: {lost}")
 
-        return await self._await_receipt(watched, request_id)
+        receipt = await self._await_receipt(watched, request_id)
+        await self._read_routing_back(watched)
+        return receipt
 
     async def _await_receipt(
         self, watched: WatchedThread, request_id: RequestId
@@ -500,6 +511,43 @@ class CodexAgentAdapter:
         watched.subscribe_blocked = ""
         watched.read_routing(echo)
         self._note_status(watched, thread.get("status"))
+
+    async def _read_routing_back(self, watched: WatchedThread) -> None:
+        """Ask codex where this thread's approvals now go, having just said.
+
+        `turn/start` answers with the turn and nothing else, so the assertion it
+        carried is unverified until something echoes it. A
+        `thread/settings/updated` notification does arrive — but a notification
+        is not something a caller can wait for, and a mis-route that is only
+        noticed if a message happens to land in time is a mis-route that is
+        sometimes not noticed at all. `thread/resume` echoes the settings, is
+        non-destructive on a live thread, and is already how this adapter reads
+        them, so it is asked directly.
+
+        The Relay's own receipt is not touched by what comes back. The words
+        either reached the thread or did not, and that is what a receipt grades;
+        a disagreement here is recorded against the thread, and the *next* Relay
+        or verdict is the one that refuses. Grading arrived words FAILED would
+        make Bridge Core re-deliver them, which is how duplicates get made.
+        """
+        try:
+            echo = await watched.connection.request(
+                "thread/resume", {"threadId": watched.thread_id}
+            )
+        except (WireError, AppServerError) as unreadable:
+            _log.info(
+                "could not read back where %s routes approvals: %s",
+                watched.thread_id,
+                unreadable,
+            )
+            return
+        watched.read_routing(echo)
+        if watched.routing is ApprovalRouting.MISROUTED:
+            _log.warning(
+                "codex ignored the approval pin on %s: %s",
+                watched.thread_id,
+                watched.routing_detail,
+            )
 
     def _misrouted(self, watched: WatchedThread) -> str:
         """The refusal for a thread whose approvals provably do not reach the user."""
@@ -596,6 +644,29 @@ class CodexAgentAdapter:
                     detail="that session stopped with an error" if kind == "systemError" else "",
                 )
             )
+
+    def _connection_lost(self, target: SessionTarget, reason: str) -> None:
+        """The app-server holding that Session went away. Say so, exactly once.
+
+        A Codex TUI is a thin client of its app-server, so an app-server that is
+        gone means the Session on it is gone too — there is no surviving process
+        for it to be a session of. That makes `SessionEnded` the honest event
+        rather than a guess, and it is what stops the hub from holding a target
+        it can never reach: the Relay queue answers a Session that ended, while
+        a Session merely marked unreachable would keep words waiting for a
+        window that will never open.
+
+        No reconnect is attempted, and that is the "no retry storm" half of the
+        contract: the socket belongs to a process that is not this engine's to
+        restart, and dialling a dead one in a loop would be this adapter
+        inventing a recovery it cannot perform.
+        """
+        watched = self._threads.pop(target, None)
+        if watched is None:
+            return
+        watched.subscribed = False
+        watched.pending.clear()
+        self._emit(SessionEnded(target=target, detail=reason))
 
     async def _resubscribe(self, watched: WatchedThread) -> None:
         """Try again to resume a thread that had nothing to resume."""

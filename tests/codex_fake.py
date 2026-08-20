@@ -21,6 +21,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import struct
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -72,6 +73,10 @@ class FakeAppServer:
 
     async def start(self) -> FakeAppServer:
         self._server = await asyncio.start_unix_server(self._serve, path=str(self.path))
+        # Real codex creates its socket 0600, and the adapter refuses to speak to
+        # one that is more open than that. A fake that left it at whatever the
+        # umask gave would be a fake the privacy check could never pass.
+        os.chmod(self.path, 0o600)
         return self
 
     async def aclose(self) -> None:

@@ -81,6 +81,9 @@ class RemoteError(WireError):
 Message = dict[str, Any]
 NotificationHandler = Callable[[Message], None]
 ServerRequestHandler = Callable[[Message], Awaitable[None] | None]
+#: Called once, with the reason, when the far side goes away by itself. Not
+#: called for a close this side asked for: the owner already knows about those.
+ClosedHandler = Callable[[str], None]
 
 
 class AppServerConnection:
@@ -92,12 +95,14 @@ class AppServerConnection:
         *,
         on_notification: NotificationHandler | None = None,
         on_server_request: ServerRequestHandler | None = None,
+        on_closed: ClosedHandler | None = None,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
     ) -> None:
         self._path = Path(socket_path)
         self._on_notification = on_notification
         self._on_server_request = on_server_request
+        self._on_closed = on_closed
         self._request_timeout = request_timeout_seconds
         self._max_frame_bytes = max_frame_bytes
 
@@ -233,6 +238,12 @@ class AppServerConnection:
         except (WireError, OSError, asyncio.IncompleteReadError) as ending:
             self._closed_reason = f"the codex app-server connection ended: {ending}"
             self._fail_pending(self._closed_reason)
+            # Only an ending this side did not ask for is announced. A caller
+            # that closed the connection itself already knows, and telling it
+            # would turn every ordinary shutdown into a loss event.
+            self._closed = True
+            if self._on_closed is not None:
+                self._on_closed(self._closed_reason)
 
     def _route(self, message: Message) -> None:
         """Three kinds of message, three destinations. See the module docstring."""

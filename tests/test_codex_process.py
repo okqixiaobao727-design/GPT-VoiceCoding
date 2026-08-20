@@ -21,6 +21,7 @@ import errno
 import inspect
 import itertools
 import os
+import shutil
 import stat
 import sys
 from collections.abc import Iterator
@@ -75,10 +76,17 @@ def stand_in(tmp_path: Path, *, body: str | None = None) -> str:
 
 @pytest.fixture
 def socket_path() -> Iterator[Path]:
-    """Short enough to bind: Darwin caps an ``AF_UNIX`` path at 103 bytes."""
-    path = Path("/tmp") / f"vc-proc-{next(_names)}-{id(object())}.sock"
-    yield path
-    path.unlink(missing_ok=True)
+    """A private directory, under a root short enough to bind.
+
+    Darwin caps an ``AF_UNIX`` path at 103 bytes, so it cannot live under
+    pytest's ``tmp_path``; and it needs a directory of its own because the
+    adapter refuses to put a coding session's socket anywhere every account on
+    the machine can walk into.
+    """
+    home = Path("/tmp") / f"vc-proc-{next(_names)}-{id(object())}"
+    home.mkdir(mode=0o700)
+    yield home / "app-server.sock"
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def quick(**overrides: object) -> CodexSettings:

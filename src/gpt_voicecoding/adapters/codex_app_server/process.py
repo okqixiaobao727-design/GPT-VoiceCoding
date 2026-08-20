@@ -30,21 +30,82 @@ import asyncio
 import contextlib
 import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import IO
 
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
-from gpt_voicecoding.adapters.codex_app_server.wire import AppServerConnection, Message
+from gpt_voicecoding.adapters.codex_app_server.wire import (
+    AppServerConnection,
+    ClosedHandler,
+    Message,
+)
 
 #: What this client calls itself when it initialises. The far side records it,
 #: so it says which software is holding the connection.
 CLIENT_NAME = "gpt-voicecoding"
 
-
 class AppServerError(Exception):
     """An app-server could not be started, or could not be reached."""
+
+
+#: A directory only its owner may enter. Anything under it is unreachable to
+#: every other account on the machine, whatever the mode on the thing itself.
+PRIVATE_DIRECTORY_MODE = 0o700
+
+#: What a socket carrying a live coding session must not be more open than.
+PRIVATE_SOCKET_MODE = 0o600
+
+
+def prepare_private_directory(directory: Path) -> None:
+    """Make a directory that only this user can enter, and prove it is theirs.
+
+    A socket is exactly as private as the directory holding it, and the default
+    runtime root is shared `/tmp`. The reference implementation established both
+    halves of this and both are needed: creating it 0700 does nothing if it
+    already existed as somebody else's, so ownership and mode are *verified*
+    after the fact rather than assumed from the call that made it.
+    """
+    directory.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+    try:
+        found = directory.stat()
+    except OSError as unreadable:
+        raise AppServerError(f"cannot inspect {directory}: {unreadable}") from None
+    if found.st_uid != os.geteuid():
+        raise AppServerError(
+            f"{directory} belongs to uid {found.st_uid}, not to this user; refusing to "
+            "put a coding session's socket somewhere another account owns"
+        )
+    if stat.S_IMODE(found.st_mode) != PRIVATE_DIRECTORY_MODE:
+        # It pre-existed with a wider mode. Narrowing is safe and is the point.
+        os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+
+
+def verify_private_socket(path: Path) -> None:
+    """Refuse to speak to a socket this user does not own, or others can reach.
+
+    Codex creates its own socket 0600, so this is a check rather than a repair —
+    but it is the check that stops this engine from carrying the user's words
+    into something another account put in a shared directory.
+    """
+    try:
+        found = path.stat()
+    except OSError as unreadable:
+        raise AppServerError(f"cannot inspect {path}: {unreadable}") from None
+    if not stat.S_ISSOCK(found.st_mode):
+        raise AppServerError(f"{path} is not a socket")
+    if found.st_uid != os.geteuid():
+        raise AppServerError(
+            f"{path} belongs to uid {found.st_uid}, not to this user; refusing to "
+            "speak to an app-server another account owns"
+        )
+    if stat.S_IMODE(found.st_mode) & ~PRIVATE_SOCKET_MODE:
+        raise AppServerError(
+            f"{path} is reachable by other accounts (mode "
+            f"{stat.S_IMODE(found.st_mode):04o}); refusing to use it"
+        )
 
 
 async def initialise(
@@ -75,6 +136,7 @@ async def attach(
     settings: CodexSettings,
     on_notification: Callable[[Message], None] | None = None,
     on_server_request: Callable[[Message], Awaitable[None] | None] | None = None,
+    on_closed: ClosedHandler | None = None,
     experimental: bool = False,
 ) -> AppServerConnection:
     """Become one more client of an app-server somebody else owns.
@@ -83,10 +145,12 @@ async def attach(
     socket belongs to the user's terminal, and this engine's only relationship
     to it is that it may talk to it while it is there.
     """
+    verify_private_socket(Path(socket_path))
     connection = AppServerConnection(
         socket_path,
         on_notification=on_notification,
         on_server_request=on_server_request,
+        on_closed=on_closed,
         request_timeout_seconds=settings.request_timeout_seconds,
     )
     await connection.connect()
@@ -157,8 +221,8 @@ class OwnedAppServer:
                 f"no {self._settings.executable!r} on PATH: this adapter drives the codex "
                 "CLI and cannot run without it"
             )
+        prepare_private_directory(self._socket_path.parent)
         self._claim_socket_path()
-        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             self._spawn(executable)

@@ -62,7 +62,7 @@ TMUX_VARIABLES = ("TMUX", "TMUX_PANE")
 WAIT_FOR_A_HUMAN_SECONDS = 300.0
 
 
-class Watching:
+class EventRecorder:
     """Collects what the adapter raised upward, and prints it as it arrives."""
 
     def __init__(self) -> None:
@@ -107,9 +107,9 @@ async def main(relay: bool) -> int:
     settings = CodexSettings(receipt_timeout_seconds=60.0)
 
     app_server: subprocess.Popen[bytes] | None = None
-    watcher = None
+    session_connection = None
     adapter = None
-    watching = Watching()
+    recorder = EventRecorder()
 
     try:
         say("1. app-server, as a direct child, with no tmux in its environment")
@@ -132,7 +132,7 @@ async def main(relay: bool) -> int:
                 if isinstance(thread.get("id"), str):
                     started.append(thread["id"])
 
-        watcher = await attach(
+        session_connection = await attach(
             socket_path, version="proof", settings=settings, on_notification=heard
         )
         print("\n   Open a terminal that is NOT inside tmux, and run:\n")
@@ -148,7 +148,7 @@ async def main(relay: bool) -> int:
 
         say("3. registering it, and observing it")
         target = SessionTarget(agent=AgentKind.CODEX, session_id=thread_id)
-        adapter = codex_agent(sink=watching, settings={"receipt_timeout_seconds": 60.0})
+        adapter = codex_agent(sink=recorder, settings={"receipt_timeout_seconds": 60.0})
         await adapter.register_session(target, socket_path)
         held = adapter._threads[target]
         print(f"   registered: {target}")
@@ -160,7 +160,7 @@ async def main(relay: bool) -> int:
             )
         print(f"   observed. reply window: {held.reply_window}")
         print(f"   approval routing, as read back: {held.routing}")
-        print(f"   events raised upward so far: {len(watching.events)}")
+        print(f"   events raised upward so far: {len(recorder.events)}")
 
         if not relay:
             say(
@@ -185,9 +185,9 @@ async def main(relay: bool) -> int:
         if adapter is not None:
             with contextlib.suppress(Exception):
                 await adapter.aclose()
-        if watcher is not None:
+        if session_connection is not None:
             with contextlib.suppress(Exception):
-                await watcher.aclose()
+                await session_connection.aclose()
         if app_server is not None and app_server.poll() is None:
             # This takes the Session down with it — which is exactly the coupling
             # the engine's real topology avoids. The engine never owns the
