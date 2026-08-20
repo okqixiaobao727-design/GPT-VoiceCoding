@@ -290,6 +290,8 @@ class TestHangingUpMidHandshake:
                 snapshot = await opening
 
                 assert ended.state is CallState.DOWN
+                # The invariant: an `ensure_call` that was hung up never comes
+                # back UP. Anything weaker and the hang-up is only advisory.
                 assert snapshot.state is CallState.DOWN
                 assert (await adapter.call_state()).state is CallState.DOWN
                 assert audio.closed

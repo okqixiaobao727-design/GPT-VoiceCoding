@@ -14,11 +14,12 @@ make when one is already there, and hiding that is how the loop got built.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from fakes import HOUSE_RULES, FakeCall
-from gpt_voicecoding.core.errors import SecondCallRefused
+from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.seams.call import CallState
 
@@ -61,6 +62,45 @@ class TestOwnership:
 
         assert snapshot.state is not CallState.UP
         assert guard.owns_call() is False
+
+
+class TestTheOtherRefusal:
+    """A voice thread is never started on nothing, and the rule lives here alone.
+
+    It has to be *one* place. The hub and the escalation pipeline both open
+    calls, and when each carried its own copy of this check the two wordings had
+    already drifted apart before anything noticed — which is how a rule becomes
+    two rules that disagree.
+    """
+
+    def test_opening_a_call_on_no_instructions_is_refused(self) -> None:
+        guard, call = interlock()
+
+        with pytest.raises(VoiceInstructionsMissing):
+            asyncio.run(guard.open_call(""))
+
+        assert call.calls_started == 0
+        assert guard.owns_call() is False
+
+    def test_whitespace_is_not_instructions(self) -> None:
+        guard, call = interlock()
+
+        with pytest.raises(VoiceInstructionsMissing):
+            asyncio.run(guard.open_call("   \n  "))
+
+        assert call.calls_started == 0
+
+    def test_the_refusal_is_worded_in_exactly_one_place(self) -> None:
+        """Nothing else may restate it — a second copy is a second rule."""
+        package = Path(__file__).resolve().parents[1] / "src" / "gpt_voicecoding"
+        wording = "generated no voice instructions"
+        holding = [
+            path.relative_to(package)
+            for path in sorted(package.rglob("*.py"))
+            if wording in path.read_text(encoding="utf-8")
+        ]
+
+        assert [str(path) for path in holding] == ["core/errors.py"]
 
 
 class TestTheInvariant:

@@ -146,6 +146,22 @@ def test_seams_never_imports_bridge_core() -> None:
     )
 
 
+def test_adapters_never_import_bridge_core() -> None:
+    """The other direction of the same one-way rule, and the one that erodes quietly.
+
+    `test_core_never_imports_an_adapter` closes the hub's side. This closes the
+    spokes': an adapter reaching into `gpt_voicecoding.core` for a constant, a
+    path helper or a dataclass makes the two mutually dependent, and a
+    refactor inside the hub then breaks components that are supposed to be
+    swappable. It is easy to do by accident — the Call adapter once took its
+    default workspace from Bridge Core's persistence layout — and nothing but a
+    read catches it. Adapters depend on `seams`, and on nothing else here.
+    """
+    offences = _imports_under(ADAPTERS, CORE_PREFIX)
+    named = "; ".join(offences)
+    assert not offences, f"an adapter depends on the seams, never on the hub: {named}"
+
+
 def test_seams_never_imports_an_adapter() -> None:
     offences = _imports_under(SEAMS, FORBIDDEN_INTERNAL_PREFIX)
     assert not offences, "a contract may not depend on one of its implementations: " + "; ".join(

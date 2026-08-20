@@ -20,6 +20,7 @@ import asyncio
 
 from fakes import HOUSE_RULES, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
+from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.escalation import (
     EscalationPipeline,
     Notice,
@@ -52,6 +53,7 @@ class Harness:
         message: bool = True,
         call: FakeCall | None = None,
         channel: FakeCompanionChannel | None = None,
+        voice_instructions: str = HOUSE_RULES,
     ) -> None:
         self.switches = Switchboard()
         self.switches.flip(SwitchName.DUTY, duty)
@@ -68,7 +70,7 @@ class Harness:
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),
             relays=self.relays,
-            voice_instructions=HOUSE_RULES,
+            voice_instructions=voice_instructions,
             clock=lambda: 1_000.0,
         )
 
@@ -187,6 +189,35 @@ class TestOpeningACallToEscalateInto:
         assert harness.channel.sent == ["you are needed"]
         assert outcome.state is Lifecycle.DELIVERED
         assert harness.interlock.owns_call() is False
+
+
+class TestWithNoHouseRulesToOpenOn:
+    def test_escalation_opens_no_call_and_the_notice_is_not_lost(self) -> None:
+        """The same refusal the hub meets, turned into a reason the notice carries.
+
+        It is not raised out of a sweep: a notice that could not go out is
+        retained for the next available outlet, and an engine with no
+        instructions still has a Companion Channel.
+        """
+        harness = Harness(message=False, voice_instructions="")
+
+        outcome = harness.escalate(notice())
+
+        assert harness.call.calls_started == 0
+        assert harness.call.spoken == []
+        assert outcome.state is Lifecycle.RETAINED
+
+    def test_the_reason_is_the_one_the_interlock_worded(self) -> None:
+        """Not this pipeline's own sentence — the same one, from the same door."""
+        harness = Harness(message=False, voice_instructions="")
+
+        outcome = harness.escalate(notice())
+
+        assert [attempt.route for attempt in outcome.attempts] == [
+            NoticeRoute.OPEN_CALL_AND_SPEAK
+        ]
+        assert outcome.attempts[0].outcome is Delivery.FAILED
+        assert str(VoiceInstructionsMissing()) == outcome.attempts[0].reason
 
 
 class TestSwitchIndependence:
