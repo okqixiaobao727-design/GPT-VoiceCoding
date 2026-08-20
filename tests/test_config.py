@@ -268,3 +268,40 @@ class TestWhatItRefuses:
             load(written(tmp_path, text))
 
         assert "module:attribute" in str(refusal.value)
+
+
+def with_cli(text: str, stated: str) -> str:
+    """State `cli` inside `[delegate]`, which is no longer the file's last table."""
+    return text.replace(
+        'model = "a-model-the-user-chose"', f'model = "a-model-the-user-chose"\ncli = "{stated}"'
+    )
+
+
+class TestWhereTheControlPlaneCliIs:
+    """A location this file may state, and usually does not.
+
+    The engine derives the CLI from its own installation; a bundle moves it, so
+    the bundle can say where. Stating nothing is the ordinary case, and it is
+    not the same as stating nothing useful.
+    """
+
+    def test_it_is_absent_until_an_installation_states_it(self, tmp_path: Path) -> None:
+        assert load(written(tmp_path, COMPLETE)).control_plane_cli is None
+
+    def test_a_stated_location_is_read_as_a_path(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, with_cli(COMPLETE, "/Applications/GVC.app/bridgectl")))
+
+        assert config.control_plane_cli == Path("/Applications/GVC.app/bridgectl")
+
+    def test_a_home_relative_location_is_expanded(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, with_cli(COMPLETE, "~/bin/bridgectl")))
+
+        assert config.control_plane_cli == Path("~/bin/bridgectl").expanduser()
+
+    def test_an_empty_location_is_refused_rather_than_treated_as_absent(
+        self, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ConfigError) as refusal:
+            load(written(tmp_path, with_cli(COMPLETE, "   ")))
+
+        assert "cli" in str(refusal.value)

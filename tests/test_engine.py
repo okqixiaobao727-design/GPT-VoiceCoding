@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -365,3 +366,66 @@ class TestTheTick:
         asyncio.run(scenario())
 
         assert ticks
+
+
+def with_cli(stated: Path) -> str:
+    """State `cli` inside `[delegate]`, which is no longer the file's last table."""
+    return CONFIG.replace(
+        'model = "the-model-the-user-chose"',
+        f'model = "the-model-the-user-chose"\ncli = "{stated}"',
+    )
+
+
+class TestTheInstructionsThisEngineGenerates:
+    """Bridge Core carries both instruction sets; this root tells it where the CLI is.
+
+    The two facts a generated instruction must not invent — where the
+    control-plane CLI is, and which engine it reaches — are exactly the two only
+    this root knows. So they are stated here, verified here, and refused here.
+    """
+
+    def test_an_assembled_hub_carries_both_sets(self, home: Path) -> None:
+        engine = Engine.assemble(load(configured(home)))
+        instructions = engine.core.instructions
+        assert instructions is not None
+        assert instructions.voice.text and instructions.delegated.text
+
+    def test_the_sets_name_the_socket_this_engine_serves(self, home: Path) -> None:
+        engine = Engine.assemble(load(configured(home)))
+        assert engine.core.instructions is not None
+        assert str(engine.socket_path) in engine.core.instructions.delegated.text
+
+    def test_the_console_script_beside_this_interpreter_is_the_default(self, home: Path) -> None:
+        engine = Engine.assemble(load(configured(home)))
+        assert engine.core.instructions is not None
+        derived = Path(sys.executable).parent / "bridgectl"
+        assert str(derived) in engine.core.instructions.delegated.text
+
+    def test_configuration_may_state_where_a_bundle_put_it(self, home: Path) -> None:
+        """The bundle moves the binary, so it is the one thing that can say where."""
+        bundled = home / "bridgectl"
+        bundled.write_text("#!/bin/sh\n", encoding="utf-8")
+        bundled.chmod(0o755)
+        engine = Engine.assemble(load(configured(home, with_cli(bundled))))
+        assert engine.core.instructions is not None
+        assert str(bundled) in engine.core.instructions.delegated.text
+
+    def test_a_stated_cli_that_is_not_there_stops_assembly(self, home: Path) -> None:
+        missing = home / "nowhere" / "bridgectl"
+        with pytest.raises(EngineAssemblyError, match="cannot be run"):
+            Engine.assemble(load(configured(home, with_cli(missing))))
+
+    def test_a_stated_cli_that_cannot_be_run_stops_assembly(self, home: Path) -> None:
+        unrunnable = home / "bridgectl.txt"
+        unrunnable.write_text("not executable", encoding="utf-8")
+        unrunnable.chmod(0o644)
+        with pytest.raises(EngineAssemblyError, match="cannot be run"):
+            Engine.assemble(load(configured(home, with_cli(unrunnable))))
+
+    def test_no_cli_anywhere_is_a_refusal_rather_than_a_guess(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An instruction naming a CLI that is not there is an invented detail."""
+        monkeypatch.setattr(sys, "executable", str(home / "python"))
+        with pytest.raises(EngineAssemblyError, match="no control-plane CLI"):
+            Engine.assemble(load(configured(home)))

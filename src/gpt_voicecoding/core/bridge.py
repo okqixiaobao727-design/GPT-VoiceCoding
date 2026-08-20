@@ -50,6 +50,7 @@ from gpt_voicecoding.core.errors import (
 )
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice
 from gpt_voicecoding.core.events import EventQueue
+from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
@@ -156,6 +157,7 @@ class BridgeCore:
         control: Callable[[Classification], Awaitable[str]] | None = None,
         delegate: Callable[[Classification], Awaitable[str]] | None = None,
         inventory: tuple[SeamLoad, ...] = (),
+        instruction_context: InstructionContext | None = None,
     ) -> None:
         self._state = state
         self._call = call
@@ -167,6 +169,11 @@ class BridgeCore:
         self._control = control
         self._delegate = delegate
         self._inventory = inventory
+        #: Both generated instruction sets, made once from facts only the
+        #: composition root knows — where the control-plane CLI is, and which
+        #: engine it reaches. None until a root supplies them; a hub assembled
+        #: for a test has no CLI to name and does not pretend to.
+        self._instructions = generate(instruction_context) if instruction_context else None
         #: Durations are measured with `clock`; anything written to disk is
         #: stamped with `stamp`. A Session's `registered_at` is read back by the
         #: next engine, and a monotonic reading would come back as the future.
@@ -196,6 +203,17 @@ class BridgeCore:
             clock=clock,
         )
         self.router = InboundRouter(sessions=state.sessions, grammar=grammar)
+
+    @property
+    def instructions(self) -> Instructions | None:
+        """The voice and delegated-turn instruction sets, as plain data.
+
+        Generated once, from the catalogue and this engine's own installation.
+        The Call adapter starts its realtime thread with the voice set and the
+        Codex adapter starts a Delegated Turn with the delegated one; neither
+        rewrites them, and neither reads anything from disk to get them.
+        """
+        return self._instructions
 
     @property
     def events(self) -> EventQueue:
