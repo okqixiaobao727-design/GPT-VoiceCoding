@@ -12,8 +12,32 @@ venv/
 
 # Swift / Xcode
 shell/.build/
+shell/.swiftpm/
 shell/*.xcodeproj/xcuserdata/
 DerivedData/
+*.xcuserdatad
 
-# Local-only research notes and throwaway prototypes.
+# Local agent and tooling state
+.claude/
+.code-review-graph/
+
+# Local-only research notes, scratch work, and throwaway prototypes.
 docs/research/
+notes/
+scratch/
+*.local.md
+
+# Agent working conventions. Local to this checkout, not part of the published
+# project: they describe how the AI agents operate here, not how the code runs.
+CLAUDE.md
+AGENTS.md
+docs/agents/
+
+# Secrets and local runtime config
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts
+*.log
+logs/
