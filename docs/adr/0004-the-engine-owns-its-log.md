@@ -49,8 +49,14 @@ tail is the part that explains what just happened.
 names match a configured prefix are removed once, by every process that spawns
 others.
 
-All four numbers — log path, max bytes, retained generations, stripped prefixes —
-are configuration with no fallback in code.
+**Three of the four values have no fallback in code**: max bytes, retained
+generations and stripped prefixes are decisions this outage measured, and a
+default compiled in beside them would quietly reinstate a number the measurement
+proved matters. The log *path* is a location rather than a decision, so it
+defaults beside the state file by the same rule the state file and the socket
+follow — see the note in `config.py`. Amended during the port (issue #4), because
+the sentence this replaces lumped the path in with the three and the code would
+otherwise have contradicted it silently.
 
 ## Consequences
 
@@ -59,6 +65,18 @@ third-party child process — cannot use rename-and-reopen and falls back to
 truncate-in-place, accepting that rollover window for that log only. It must never
 be `bridge.logFile`. The reference implementation hit exactly this with the Codex
 app-server logs; see its ADR for the reasoning.
+
+**A child that is already running when a rotation happens cannot be told to
+reopen either.** Its inherited descriptor keeps referring to the file that was
+renamed, so its output rides the generation chain from that point on — carried
+along by later rotations and dropped by retention like any other old bytes,
+rather than following the engine into the new live file. Two things follow, and
+both are load bearing: a rotated generation is trimmed **on its own inode** and
+never by replacing the file, because a replacement would leave that child writing
+into an unlinked inode for the rest of its life; and the only way to remove the
+limitation rather than bound it is for the launcher to give its children a pipe
+the engine reads, instead of the log descriptor itself. Recorded during the port
+(issue #4), where both were measured; the pipe is left to the launcher's ticket.
 
 Output produced before adoption (argument parsing, configuration loading) has
 nowhere to go and is discarded. An engine that dies that early never answers a
