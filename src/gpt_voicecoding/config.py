@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +106,16 @@ class AdapterSelection:
     companion_channel: str
     session_launcher: str
     agents: dict[AgentKind, str] = field(default_factory=dict)
+    #: `[adapters.settings.<seam>]`, forwarded to that seam's factory untouched.
+    #: The root never reads a key: only the adapter knows what its own keys mean,
+    #: and a root that parsed them would be growing adapter-shaped knowledge.
+    #: A seam with no table is handed nothing at all, so an adapter that takes
+    #: only the sink stays constructible exactly as before.
+    settings: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def settings_for(self, seam: str) -> dict[str, Any] | None:
+        """The table this seam was given, or None when it was given none."""
+        return self.settings.get(seam)
 
     def as_mapping(self) -> dict[str, str]:
         """Every seam name to what configuration named for it — the configured side."""
@@ -231,12 +241,41 @@ def _adapters(section: dict[str, Any], where: str) -> AdapterSelection:
             raise ConfigError(f"[adapters.agents] {name}{where} names no implementation")
         agents[agent] = _reference(reference, f"[adapters.agents] {name}", where)
 
-    return AdapterSelection(
+    chosen = AdapterSelection(
         call=filled["call"],
         companion_channel=filled["companion_channel"],
         session_launcher=filled["session_launcher"],
         agents=agents,
     )
+    return replace(chosen, settings=_adapter_settings(section, chosen, where))
+
+
+def _adapter_settings(
+    section: dict[str, Any], chosen: AdapterSelection, where: str
+) -> dict[str, dict[str, Any]]:
+    """Read `[adapters.settings]`, checking only that each table names a real seam.
+
+    What is *inside* a table is never inspected here — that is the adapter's, and
+    it refuses the keys it does not have. What is checked is the name on the
+    table, because settings addressed to a seam this engine has no adapter for
+    are settings that will silently never be applied.
+    """
+    raw = section.get("settings", {})
+    if not isinstance(raw, dict):
+        raise ConfigError(f"[adapters.settings]{where} must be a table")
+
+    seams = set(chosen.as_mapping())
+    read: dict[str, dict[str, Any]] = {}
+    for seam, table in raw.items():
+        if seam not in seams:
+            raise ConfigError(
+                f'[adapters.settings."{seam}"]{where} names no seam this engine fills: '
+                + ", ".join(sorted(seams))
+            )
+        if not isinstance(table, dict):
+            raise ConfigError(f'[adapters.settings."{seam}"]{where} must be a table')
+        read[seam] = table
+    return read
 
 
 def _nothing_behind(seam: str, where: str) -> str:
