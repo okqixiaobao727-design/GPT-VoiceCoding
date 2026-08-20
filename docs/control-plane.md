@@ -297,6 +297,7 @@ approval_budget_seconds = 600
 
 [delegate]
 model = "the-model-you-chose"       # required: the cost lever has no default
+cli   = "/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"  # optional
 ```
 
 Each adapter reference is `module:attribute`, resolved by the composition root —
@@ -319,6 +320,15 @@ adapters by reference: a compiled-in table of allowed names could not name a
 deployment's own private wiring, and keeping that wiring private is a charter
 decision. The file lives in the user's own application-support directory for the
 same reason.
+
+`[delegate] cli` is where the control-plane CLI really is. Bridge Core names it
+in the instructions it generates for the voice thread and for a Delegated Turn,
+so it has to be true: an instruction naming a binary that is not there is exactly
+the invented detail those instructions forbid. Left out — the ordinary case — the
+engine uses the console script installed beside its own interpreter, and uses it
+only after finding that it exists and can be run. A bundle moves that binary, so
+a bundle states this key. If neither is really there, the engine **refuses to
+start** rather than describing a CLI nobody can run.
 
 An unconfigured Call, Companion Channel or Session Launcher seam **refuses to
 start**, with a named error. An engine that silently loaded nothing behind a seam

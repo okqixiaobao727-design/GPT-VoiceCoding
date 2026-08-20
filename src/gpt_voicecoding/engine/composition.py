@@ -16,6 +16,11 @@ Assembled here and nowhere else:
   so `/status` in the Companion Channel and `bridgectl status` are one command;
 - the Delegated Turn handler, carrying the model from configuration — the cost
   lever is a user-facing setting and nothing here may default it;
+- the generation context for Bridge Core's two instruction sets: where the
+  control-plane CLI really is on this machine, and which engine it reaches.
+  Only this root can know either, and it states them rather than guessing —
+  configuration first, then the console script beside this interpreter, and a
+  refusal when neither is really there;
 - the two loops the engine needs to be alive: one that drains events into the
   hub's dispatch, and one that advances the hub's two ceilings on a timer.
 
@@ -32,18 +37,22 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import shlex
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from gpt_voicecoding import __version__
 from gpt_voicecoding.config import EngineConfig
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
 from gpt_voicecoding.control_plane.server import ControlPlaneServer
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.events import EventQueue
+from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.core.persistence import StateStore
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.router import Classification, TextGrammar
@@ -65,6 +74,9 @@ _log = logging.getLogger(__name__)
 #: How often the hub's two ceilings are advanced. Mechanism, not policy: the
 #: durations themselves are configuration, this is only how finely they are read.
 DEFAULT_TICK_SECONDS = 1.0
+
+#: The console script `pyproject.toml` installs beside the interpreter.
+CONTROL_PLANE_CLI_NAME = "bridgectl"
 
 #: How an adapter factory is called. One argument, because the sink is the one
 #: thing every adapter needs and the only thing this root can honestly supply.
@@ -176,6 +188,7 @@ class Engine:
             control=control,
             delegate=delegate,
             inventory=_inventory(config),
+            instruction_context=_instruction_context(config),
         )
         plane = ControlPlane(core)
         held["plane"] = plane
@@ -302,6 +315,48 @@ def _adapters(
             agent: built(reference) for agent, reference in config.adapters.agents.items()
         },
     )
+
+
+def _instruction_context(config: EngineConfig) -> InstructionContext:
+    """Where the control-plane CLI is, so the generated instructions can name it.
+
+    Stated, then derived, then refused. Configuration wins because the bundle
+    moves the binary and is the only thing that knows where to; otherwise the
+    console script beside this interpreter is the one this installation ships,
+    and it is used only after it is found to be there and runnable. A generated
+    instruction naming a CLI that does not exist is an invented detail, which is
+    the first thing those instructions themselves forbid — so the last branch is
+    a refusal, not a guess.
+    """
+    stated = config.control_plane_cli
+    if stated is not None:
+        if not _runnable(stated):
+            raise EngineAssemblyError(
+                f"[delegate] cli names {stated}, which is not there or cannot be run"
+            )
+        command = stated
+    else:
+        derived = Path(sys.executable).parent / CONTROL_PLANE_CLI_NAME
+        if not _runnable(derived):
+            raise EngineAssemblyError(
+                f"no control-plane CLI to tell a generated thread about: {derived} is not "
+                "there or cannot be run. Install this package so its console script exists, "
+                "or name the one this installation ships in [delegate] cli"
+            )
+        command = derived
+
+    return InstructionContext(
+        cli=ControlPlaneCli(
+            command=command,
+            version=__version__,
+            socket_path=config.socket_path,
+        )
+    )
+
+
+def _runnable(command: Path) -> bool:
+    """A file that is really there and really executable. Nothing weaker counts."""
+    return command.is_file() and os.access(command, os.X_OK)
 
 
 def _inventory(config: EngineConfig) -> tuple[SeamLoad, ...]:

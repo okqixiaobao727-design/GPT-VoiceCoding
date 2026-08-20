@@ -23,6 +23,11 @@ nothing behind one is precisely ADR 0003's outage. And the Delegated Turn's
 model is a user-facing setting — the cost lever — so a default here would be
 the hard-coding this repository forbids.
 
+**The control-plane CLI is a location that may be stated.** A generated thread
+is told where the CLI really is, and the engine derives that from its own
+installation. A bundle moves it, so `[delegate] cli` exists for the bundle to
+say where — an override, read as a path and never as a default.
+
 Paths *do* have defaults, because they are locations rather than decisions, and
 they are two different locations on purpose: the durable state lives in
 Application Support, and the socket lives in a short runtime root because Darwin
@@ -108,6 +113,9 @@ class EngineConfig:
     adapters: AdapterSelection
     #: The Delegated Turn's model — the cost lever, and the user's to set.
     delegated_turn_model: str
+    #: Where the control-plane CLI really is, when this installation moved it.
+    #: None means the engine derives it from its own interpreter's scripts.
+    control_plane_cli: Path | None
     socket_path: Path
     state_path: Path
     policy: CorePolicy
@@ -147,6 +155,7 @@ def of(document: dict[str, Any], *, source: Path | None = None) -> EngineConfig:
     return EngineConfig(
         adapters=adapters,
         delegated_turn_model=model.strip(),
+        control_plane_cli=_optional_path(delegate, "cli", where),
         socket_path=_path(engine, "socket_path", default_socket_path(), where),
         state_path=_path(engine, "state_path", default_state_path(), where),
         policy=_policy(_section(document, "policy", where), where),
@@ -219,6 +228,16 @@ def _reference(reference: str, key: str, where: str) -> str:
             f"{key}{where} must be written module:attribute; {reference!r} is not"
         )
     return reference.strip()
+
+
+def _optional_path(section: dict[str, Any], key: str, where: str) -> Path | None:
+    """A path this file may state and usually does not. Absent is not empty."""
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"[delegate] {key}{where} must be a path, or be left out entirely")
+    return Path(value.strip()).expanduser()
 
 
 def _path(section: dict[str, Any], key: str, fallback: Path, where: str) -> Path:
