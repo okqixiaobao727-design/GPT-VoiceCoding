@@ -328,7 +328,13 @@ def rotate_by_rename(
                 return False
             _shift_generations(path, retained_files, max_bytes)
             if retained_files <= 0:
-                _unlink(path)
+                # Emptied in place rather than unlinked, for the same reason a
+                # generation is trimmed in place: never sever an inode a writer
+                # may hold. Unlinking here would leave a child that inherited the
+                # descriptor appending into a file nothing links to, for the rest
+                # of its life. Keeping nothing is what this configuration asked
+                # for; losing the writer is not.
+                os.truncate(path, 0)
                 if on_renamed is not None:
                     on_renamed()
             else:

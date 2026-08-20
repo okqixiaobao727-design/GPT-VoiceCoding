@@ -77,6 +77,21 @@ into an unlinked inode for the rest of its life; and the only way to remove the
 limitation rather than bound it is for the launcher to give its children a pipe
 the engine reads, instead of the log descriptor itself. Recorded during the port
 (issue #4), where both were measured; the pipe is left to the launcher's ticket.
+The same rule governs the zero-retention case: a rotation that keeps nothing
+empties the live file in place rather than unlinking it, because keeping nothing
+is what that configuration asked for and losing the writer is not.
+
+**Three properties compete here and only two are available at once**: a ceiling
+that is exact at every instant, no inode ever severed from a writer that holds
+it, and no window in which a write can be dropped. This decision takes the first
+two. The accepted residual is the third, in its narrowest form — a raw write
+landing inside a generation's in-place trim can be lost — and it is not a new
+concession: it is the truncate-in-place fallback this section already grants to
+writers the engine cannot tell to reopen, bounded to that writer and to the
+milliseconds of one trim. The alternative that would close it, trimming a
+generation only as it ages, breaks "the cap is real and binds every generation"
+for every deployment all the time, which is a headline guarantee traded for a
+bounded one. Adjudicated in #4.
 
 Output produced before adoption (argument parsing, configuration loading) has
 nowhere to go and is discarded. An engine that dies that early never answers a

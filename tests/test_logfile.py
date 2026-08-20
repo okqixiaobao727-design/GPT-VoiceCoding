@@ -205,12 +205,23 @@ class TestRotationByRename:
 
         assert log_path.with_name("engine.log.1").stat().st_size <= CAP
 
-    def test_retaining_nothing_simply_empties_the_log(self, tmp_path: Path, log_path: Path) -> None:
+    def test_retaining_nothing_empties_the_log_without_severing_it(
+        self, tmp_path: Path, log_path: Path
+    ) -> None:
+        """Keeping nothing is what this configuration asked for; losing the writer is not.
+
+        Unlinking would leave a child that inherited the descriptor appending
+        into a file nothing links to — the same defect the in-place trim exists
+        to avoid, on the other branch of the same function.
+        """
         log_path.write_bytes(b"x" * CAP)
+        before = log_path.stat().st_ino
 
         assert rotate(log_path, retained_files=0) is True
 
-        assert family(tmp_path) == []
+        assert [path.name for path in family(tmp_path)] == ["engine.log"]
+        assert log_path.stat().st_size == 0
+        assert log_path.stat().st_ino == before, "the inode a writer may hold was severed"
 
     def test_a_missing_log_is_not_an_error(self, tmp_path: Path) -> None:
         """Every caller is a writer whose real work is something else."""
@@ -333,13 +344,15 @@ stream.adopt()
 """
 
 
-def run_adopting(log: Path, body: str) -> subprocess.CompletedProcess[str]:
+def run_adopting(
+    log: Path, body: str, *, retained: int = RETAINED
+) -> subprocess.CompletedProcess[str]:
     """Run adoption where hijacking the standard streams is the point.
 
     In-process, pointing this runner's stdout at a scratch file would take every
     later line of test output with it.
     """
-    script = ADOPTING_SCRIPT.format(cap=CAP, retained=RETAINED, body=body)
+    script = ADOPTING_SCRIPT.format(cap=CAP, retained=retained, body=body)
     return subprocess.run(
         [sys.executable, "-c", script, str(log)], capture_output=True, text=True
     )
@@ -468,6 +481,31 @@ class TestTheWriterThatCannotAskForRotation:
             path.read_text(errors="replace") for path in family(log_path.parent)
         )
         assert "CHILD AFTER" in everywhere, "the child's output went to an unlinked inode"
+
+
+    def test_a_child_survives_a_rotation_that_keeps_no_generations(
+        self, log_path: Path
+    ) -> None:
+        """The same rule on the other branch: keep nothing, but keep the inode."""
+        result = run_adopting(
+            log_path,
+            (
+                "child = subprocess.Popen([sys.executable, '-c',\n"
+                "    \"import sys, time\\n\"\n"
+                "    \"time.sleep(0.8)\\n\"\n"
+                "    \"sys.stderr.write('CHILD AFTER\\\\n'); sys.stderr.flush()\\n\"])\n"
+                "time.sleep(0.2)\n"
+                "stream.write('z' * 200 + '\\n')\n"
+                "stream.rotate_if_needed()\n"
+                "child.wait()\n"
+                "time.sleep(0.2)\n"
+            ),
+            retained=0,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert [path.name for path in family(log_path.parent)] == ["engine.log"]
+        assert "CHILD AFTER" in log_path.read_text(errors="replace")
 
 
 class TestRotationRacesAConcurrentWrite:
