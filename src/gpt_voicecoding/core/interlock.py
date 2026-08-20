@@ -23,7 +23,7 @@ events the seam raises upward. A call the *user* started is adopted, because
 
 from __future__ import annotations
 
-from gpt_voicecoding.core.errors import SecondCallRefused
+from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
 from gpt_voicecoding.seams.call import CallAdapter, CallSnapshot
 
 
@@ -42,16 +42,24 @@ class CallInterlock:
         """The call the system owns, or None. Opaque; only compared for identity."""
         return self._call_id
 
-    async def open_call(self) -> CallSnapshot:
-        """Bring a Live Call up. Refuses when the system already owns one.
+    async def open_call(self, instructions: str) -> CallSnapshot:
+        """Bring a Live Call up on those house rules. Refuses when one is owned.
 
         A snapshot that is not UP — CONNECTING, or down — is deliberately *not*
         claimed. Claiming a call that never arrived would bar the retry that
         fixes it, which is the no-loss invariant inverted.
+
+        The instructions are Bridge Core's and are passed straight through: this
+        object decides *whether* a call may open, never what it is told — except
+        for the one case where there is nothing to tell. Both refusals live here
+        because this is the only door, and a rule enforced at each caller
+        instead is a rule that grows a second, divergent copy.
         """
         if self._call_id is not None:
             raise SecondCallRefused(self._call_id)
-        snapshot = await self._call.ensure_call()
+        if not instructions.strip():
+            raise VoiceInstructionsMissing()
+        snapshot = await self._call.ensure_call(instructions)
         if snapshot.is_up and snapshot.call_id is not None:
             self._call_id = snapshot.call_id
         return snapshot

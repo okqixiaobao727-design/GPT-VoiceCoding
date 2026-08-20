@@ -21,6 +21,15 @@ from pathlib import Path
 PACKAGE = Path(__file__).resolve().parents[1] / "src" / "gpt_voicecoding"
 CORE = PACKAGE / "core"
 SEAMS = PACKAGE / "seams"
+ADAPTERS = PACKAGE / "adapters"
+
+#: Where a real-time audio stack is allowed to be imported, and nowhere else.
+#: One file, so the Call adapter's signalling and classification — the part CI
+#: actually runs — stays free of anything that wants a microphone or a network.
+AUDIO_MODULE = ADAPTERS / "call" / "realtime" / "webrtc.py"
+
+#: The distributions that file exists to confine.
+AUDIO_LIBRARIES = frozenset({"aiortc", "av", "sounddevice"})
 
 # Top-level distribution names that carry a wire, terminal or transport protocol.
 # Adding to this list is cheap; removing from it needs a new ADR.
@@ -164,3 +173,27 @@ def test_core_frames_no_wire_of_its_own() -> None:
 def test_seams_frame_no_wire_of_their_own() -> None:
     offences = _wire_imports(SEAMS)
     assert not offences, "a seam names a verb, never a frame: " + "; ".join(offences)
+
+
+def test_the_audio_stack_lives_in_exactly_one_file() -> None:
+    """`aiortc`, `av` and `sounddevice` are confined, and it is asserted here.
+
+    They are an optional extra CI does not install, so an import that escaped
+    this file would not fail in CI — it would fail on a user's machine, at the
+    moment they tried to speak. The rule has to be checked by reading, which is
+    what this does.
+    """
+    offences = [
+        f"{path.relative_to(PACKAGE)} imports {module}"
+        for path in _sources(PACKAGE)
+        if path != AUDIO_MODULE
+        for module in _imported_modules(path.read_text(encoding="utf-8"))
+        if module.split(".")[0] in AUDIO_LIBRARIES
+    ]
+    named = "; ".join(offences)
+    assert not offences, f"the audio stack belongs in {AUDIO_MODULE.name} alone: {named}"
+
+
+def test_the_audio_module_is_where_it_says_it_is() -> None:
+    """A guard that silently stops guarding is worse than no guard."""
+    assert AUDIO_MODULE.is_file(), f"{AUDIO_MODULE} is not there, so nothing is confined"

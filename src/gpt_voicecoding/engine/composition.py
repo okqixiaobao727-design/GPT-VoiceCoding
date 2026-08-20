@@ -78,6 +78,14 @@ DEFAULT_TICK_SECONDS = 1.0
 #: The console script `pyproject.toml` installs beside the interpreter.
 CONTROL_PLANE_CLI_NAME = "bridgectl"
 
+#: What a Delegated Turn is answered with when the hub generated no instructions
+#: for its thread. Unreachable from this root, which refuses to assemble without
+#: a control-plane CLI to name; stated rather than asserted so the failure is a
+#: sentence the user hears instead of a traceback in the log.
+NO_DELEGATED_INSTRUCTIONS = (
+    "I can't take a delegated turn right now — this engine generated no instructions for one"
+)
+
 #: How an adapter factory is called. One argument, because the sink is the one
 #: thing every adapter needs and the only thing this root can honestly supply.
 Factory = Callable[..., Any]
@@ -150,6 +158,7 @@ class Engine:
         """Build one engine from configuration. Nothing is constructed twice."""
         events = EventQueue()
         adapters = _adapters(config, events, factory_of)
+        _share_the_app_server(adapters)
 
         state = BridgeState(
             switches=Switchboard(),
@@ -163,13 +172,23 @@ class Engine:
         # The knot is tied with one late binding rather than by giving either of
         # them a way to be half-built.
         held: dict[str, ControlPlane] = {}
+        # The Delegated Turn's thread instructions are Bridge Core's, generated
+        # by the hub this closure is being built for, so the hub is read at call
+        # time rather than captured before it exists.
+        hub: dict[str, BridgeCore] = {}
 
         async def control(found: Classification) -> str:
             return await _answer_text(held["plane"], found)
 
         async def delegate(found: Classification) -> str:
+            instructions = hub["core"].instructions
+            if instructions is None:  # unreachable from here: this root always generates them
+                return NO_DELEGATED_INSTRUCTIONS
             reply = await adapters.call.delegate(
-                found.text, model=config.delegated_turn_model, request_id=new_request_id()
+                found.text,
+                model=config.delegated_turn_model,
+                instructions=instructions.delegated.text,
+                request_id=new_request_id(),
             )
             return reply.text
 
@@ -190,6 +209,7 @@ class Engine:
             inventory=_inventory(config),
             instruction_context=_instruction_context(config),
         )
+        hub["core"] = core
         plane = ControlPlane(core)
         held["plane"] = plane
 
@@ -329,6 +349,45 @@ def _adapters(
             for agent, reference in config.adapters.agents.items()
         },
     )
+
+
+def _share_the_app_server(adapters: Adapters) -> None:
+    """Hand the Call adapter the app-server the Codex Agent adapter owns.
+
+    One `codex app-server` exists in this engine, and the Codex Agent adapter is
+    the component that spawns, owns and reaps it. The Call adapter's realtime
+    route rides the same process rather than starting a second one, so somebody
+    has to introduce them — and the only place allowed to know two adapters at
+    once is this root.
+
+    The wiring is deliberately shaped so nothing about it can be half-done:
+
+    - it happens after construction and before any `connect`, so no adapter can
+      be asked to open before it holds what it needs;
+    - a Call adapter that wants a transport and finds no Codex Agent adapter
+      configured stops the assembly by name, rather than starting an engine
+      whose voice surface can never come up;
+    - a Call adapter that wants none is left alone, so a null or fake
+      implementation needs to know nothing about any of this.
+
+    Ownership itself does not move. The Call adapter is handed the component,
+    not a socket path, precisely so it has nothing it could reopen: when that
+    process dies, what the Call adapter sees is its own connection ending, which
+    it reports upward as a dropped call and nothing more.
+    """
+    call = adapters.call
+    consumer = getattr(call, "use_app_server", None)
+    if consumer is None:
+        return
+    codex = adapters.agents.get(AgentKind.CODEX)
+    provider = getattr(codex, "app_server", None) if codex is not None else None
+    if provider is None:
+        raise EngineAssemblyError(
+            f"[adapters] call names {type(call).__module__}:{type(call).__name__}, which rides "
+            "the codex app-server the Codex Agent adapter owns. Name one in "
+            "[adapters.agents] codex, or configure a Call adapter that needs none"
+        )
+    consumer(provider)
 
 
 def _instruction_context(config: EngineConfig) -> InstructionContext:

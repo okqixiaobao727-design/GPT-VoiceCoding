@@ -18,7 +18,13 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
+from fakes import (
+    FakeAgent,
+    FakeCall,
+    FakeCompanionChannel,
+    FakeSessionLauncher,
+    instruction_context,
+)
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.relay_queue import RelayQueue
@@ -60,6 +66,7 @@ class Surface:
             agents={AgentKind.CODEX: self.agent},
             launcher=self.launcher,
             inventory=(SeamLoad(seam="call", configured="a.call"),),
+            instruction_context=instruction_context(),
         )
         self.plane = ControlPlane(self.core)
 

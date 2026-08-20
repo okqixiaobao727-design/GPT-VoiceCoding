@@ -17,7 +17,7 @@ import asyncio
 
 import pytest
 
-from fakes import FakeCall
+from fakes import HOUSE_RULES, FakeCall
 from gpt_voicecoding.core.errors import SecondCallRefused
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.seams.call import CallState
@@ -38,7 +38,7 @@ class TestOwnership:
     def test_opening_a_call_takes_ownership_of_it(self) -> None:
         guard, call = interlock()
 
-        snapshot = asyncio.run(guard.open_call())
+        snapshot = asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert snapshot.state is CallState.UP
         assert guard.owns_call() is True
@@ -46,7 +46,7 @@ class TestOwnership:
 
     def test_ending_a_call_releases_ownership(self) -> None:
         guard, _ = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
 
         asyncio.run(guard.end_call())
 
@@ -57,7 +57,7 @@ class TestOwnership:
         """CONNECTING is not UP. Claiming it would bar the retry that fixes it."""
         guard, call = interlock(FakeCall(reachable=False))
 
-        snapshot = asyncio.run(guard.open_call())
+        snapshot = asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert snapshot.state is not CallState.UP
         assert guard.owns_call() is False
@@ -66,29 +66,29 @@ class TestOwnership:
 class TestTheInvariant:
     def test_opening_a_second_call_is_refused(self) -> None:
         guard, call = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
 
         with pytest.raises(SecondCallRefused) as refusal:
-            asyncio.run(guard.open_call())
+            asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert refusal.value.call_id == guard.call_id()
 
     def test_the_refusal_never_reaches_the_adapter(self) -> None:
         """The adapter neither knows nor enforces this rule (ADR 0001)."""
         guard, call = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
 
         with pytest.raises(SecondCallRefused):
-            asyncio.run(guard.open_call())
+            asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert call.calls_started == 1
 
     def test_ending_a_call_makes_opening_the_next_one_legal_again(self) -> None:
         guard, call = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
         asyncio.run(guard.end_call())
 
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert call.calls_started == 2
 
@@ -105,7 +105,7 @@ class TestWhatTheCallSeamReportsUpward:
 
     def test_a_dropped_call_releases_ownership_so_escalation_may_open_one(self) -> None:
         guard, _ = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
         held = guard.call_id()
         assert held is not None
 
@@ -116,7 +116,7 @@ class TestWhatTheCallSeamReportsUpward:
     def test_an_end_reported_for_some_other_call_does_not_release_this_one(self) -> None:
         """A late event about a finished call must not unlock the live one."""
         guard, _ = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
 
         assert guard.note_ended("call-from-last-week") is False
         assert guard.owns_call() is True
@@ -130,7 +130,7 @@ class TestWhatTheCallSeamReportsUpward:
     def test_only_a_real_release_reports_the_transition(self) -> None:
         """Callers sweep on this answer, so a stale event must not claim one."""
         guard, _ = interlock()
-        asyncio.run(guard.open_call())
+        asyncio.run(guard.open_call(HOUSE_RULES))
         held = guard.call_id()
         assert held is not None
 

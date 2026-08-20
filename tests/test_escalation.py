@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fakes import FakeCall, FakeCompanionChannel
+from fakes import HOUSE_RULES, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.escalation import (
     EscalationPipeline,
@@ -68,6 +68,7 @@ class Harness:
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),
             relays=self.relays,
+            voice_instructions=HOUSE_RULES,
             clock=lambda: 1_000.0,
         )
 
@@ -136,7 +137,7 @@ class TestSpeakingIntoTheCallThatIsUp:
     def test_a_stop_that_arrives_mid_call_opens_no_second_call(self) -> None:
         """The exact failure this pipeline exists to prevent."""
         harness = Harness()
-        asyncio.run(harness.interlock.open_call())
+        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
 
         outcome = harness.escalate(notice("build finished"))
 
@@ -146,7 +147,7 @@ class TestSpeakingIntoTheCallThatIsUp:
 
     def test_a_delivered_notice_never_pushes_the_same_words_as_text(self) -> None:
         harness = Harness()
-        asyncio.run(harness.interlock.open_call())
+        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
 
         harness.escalate(notice())
 
@@ -154,7 +155,7 @@ class TestSpeakingIntoTheCallThatIsUp:
 
     def test_a_delivered_notice_leaves_no_entry_in_the_ledger(self) -> None:
         harness = Harness()
-        asyncio.run(harness.interlock.open_call())
+        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
 
         harness.escalate(notice())
 
@@ -224,9 +225,9 @@ class TestSwitchIndependence:
 
         original = harness.call.ensure_call
 
-        async def flip_duty_off_while_connecting() -> object:
+        async def flip_duty_off_while_connecting(instructions: str) -> object:
             harness.switches.flip(SwitchName.DUTY, False)
-            return await original()
+            return await original(instructions)
 
         harness.call.ensure_call = flip_duty_off_while_connecting  # type: ignore[method-assign]
 

@@ -283,13 +283,16 @@ socket_path = "/tmp/gpt-voicecoding-501/control.sock"   # optional
 state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"  # optional
 
 [adapters]
-call              = "gpt_voicecoding.adapters.call.realtime:build"
+call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
 companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
 session_launcher  = "gpt_voicecoding.adapters.session_launcher.child:build"
 
 [adapters.agents]
 claude = "gpt_voicecoding.adapters.agent.claude:build"
-codex  = "gpt_voicecoding.adapters.agent.codex:build"
+codex  = "gpt_voicecoding.adapters.agent.codex:codex_agent"
+
+[adapters.settings.call]            # optional; every key belongs to that adapter
+workspace = "~/code"                # where the bridge's own threads run; default is ~
 
 [policy]                            # optional; these are the locked defaults
 relay_ceiling_seconds   = 600
@@ -303,6 +306,25 @@ cli   = "/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"  # optional
 Each adapter reference is `module:attribute`, resolved by the composition root —
 the only thing in the system that imports an adapter. A factory is called as
 `factory(sink=<event sink>)` and returns the adapter.
+
+`[adapters.settings.<seam>]` is that seam's own table, and the composition root
+**forwards it without reading a key**: only the adapter knows what its own keys
+mean, and a root that parsed them would be the hub growing adapter-shaped
+knowledge (ADR 0001). A seam given no table is called with the sink alone. Every
+adapter that takes one refuses to start on a key it does not recognise, because a
+misspelled setting that silently falls back to a default is the
+configuration-shaped version of the silent fallback this project bans.
+
+The shipped Call and Codex Agent adapters **share one `codex app-server`**. The
+Codex Agent adapter spawns, owns and reaps it; the Call adapter's realtime route
+rides it and starts none of its own. The composition root introduces them, which
+is why naming the shipped Call adapter without also naming a Codex Agent adapter
+in `[adapters.agents]` refuses to assemble rather than starting an engine whose
+voice surface could never come up.
+
+The shipped Call adapter also needs the voice extra —
+`pip install 'gpt-voicecoding[voice]'` — and its factory says so at assembly
+time rather than at the moment somebody tries to speak.
 
 An adapter with a connection, a reader task or a child of its own may implement
 the optional `Connectable` shape (`seams/connection.py`): `async connect()` and

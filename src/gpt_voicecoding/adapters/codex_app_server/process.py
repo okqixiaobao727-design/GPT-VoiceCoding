@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import stat
@@ -46,6 +47,8 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 #: What this client calls itself when it initialises. The far side records it,
 #: so it says which software is holding the connection.
 CLIENT_NAME = "gpt-voicecoding"
+
+_log = logging.getLogger(__name__)
 
 
 class AppServerError(Exception):
@@ -219,6 +222,13 @@ class OwnedAppServer:
         self._log: IO[bytes] | None = None
         self._owns_socket = False
         self._connection: AppServerConnection | None = None
+        #: Everyone who wants to hear this server's notifications. A connection
+        #: carries one handler, and two components share this process — the
+        #: Agent seam's adapter owns it, the Call seam's adapter rides it — so
+        #: the fan-out lives here rather than either of them being the only one
+        #: who can listen. Registration is accepted before or after `start`, so
+        #: neither has to be constructed or connected in a particular order.
+        self._listeners: list[Callable[[Message], None]] = []
 
     @property
     def socket_path(self) -> Path:
@@ -235,6 +245,19 @@ class OwnedAppServer:
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
+    def listen(self, handler: Callable[[Message], None]) -> None:
+        """Also hear this server's notifications. Any number of listeners, any time."""
+        if handler not in self._listeners:
+            self._listeners.append(handler)
+
+    def _heard(self, message: Message) -> None:
+        """Fan one notification out. A listener that raises must not silence the rest."""
+        for listener in list(self._listeners):
+            try:
+                listener(message)
+            except Exception:
+                _log.exception("a codex app-server notification listener raised")
+
     async def start(
         self,
         *,
@@ -244,6 +267,8 @@ class OwnedAppServer:
         """Spawn it, wait for its socket, and connect. Idempotent."""
         if self._connection is not None:
             return self._connection
+        if on_notification is not None:
+            self.listen(on_notification)
 
         executable = shutil.which(self._settings.executable)
         if executable is None:
@@ -261,7 +286,7 @@ class OwnedAppServer:
                 self._socket_path,
                 version=self._version,
                 settings=self._settings,
-                on_notification=on_notification,
+                on_notification=self._heard,
                 on_server_request=on_server_request,
                 # The engine's own server is the one the realtime route rides,
                 # and that family is experimental-gated.

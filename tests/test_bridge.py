@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
@@ -96,6 +96,7 @@ class Hub:
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]
             delegate=delegate,  # type: ignore[arg-type]
+            instruction_context=instruction_context(),
         )
 
     def emit(self, *events: object) -> int:
@@ -446,9 +447,9 @@ class TestSwitchAdjudicationEndToEnd:
         hub.call.reachable = False
         original = hub.call.ensure_call
 
-        async def go_off_duty_while_connecting() -> object:
+        async def go_off_duty_while_connecting(instructions: str) -> object:
             hub.state.switches.flip(SwitchName.DUTY, False)
-            return await original()
+            return await original(instructions)
 
         hub.call.ensure_call = go_off_duty_while_connecting  # type: ignore[method-assign]
 

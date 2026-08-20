@@ -147,3 +147,18 @@ class SecondCallRefused(BridgeCoreError):
     def __init__(self, call_id: str) -> None:
         super().__init__(f"the system already owns call {call_id!r}; nothing may open a second")
         self.call_id = call_id
+
+
+class VoiceInstructionsMissing(BridgeCoreError):
+    """Something asked to open a voice surface on an engine that generated no rules.
+
+    Raised at the one door a call can be opened through, so the rule lives in
+    exactly one place and every caller meets the same refusal. An engine with no
+    instruction context has no house rules to start a voice thread on, and
+    starting one anyway would put a model on the user's speakers with nothing
+    telling it what it may say — which is the one thing the generated
+    instructions exist to prevent.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("this engine generated no voice instructions, so it cannot start a call")

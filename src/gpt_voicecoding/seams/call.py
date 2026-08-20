@@ -4,6 +4,14 @@ Verbs Bridge Core calls: `ensure_call` and `end_call` (the two halves of the Liv
 Toggle), `call_state`, `speak(text)`, `delegate(text) -> reply` (the Delegated
 Turn — the cost lever, whose model the caller selects), and `verify`.
 
+**Instructions arrive at the call site, as plain data.** Both verbs that start a
+thread take the instruction set that thread begins with, because Bridge Core
+generates them and is their only source (ADR 0001; the instruction-generation
+issue). Handing them in per attempt rather than installing them once keeps the
+adapter stateless about them: there is no window in which a call could be opened
+with instructions from a generation that is no longer the hub's. An adapter may
+not hold them past the call they were given for.
+
 Events raised upward: the user's speech transcript, and call started / ended /
 dropped.
 
@@ -109,8 +117,13 @@ CallEvent = UserSpeech | CallStarted | CallEnded | CallDropped
 class CallAdapter(Protocol):
     """The one voice surface. Holds the call; holds no policy about it."""
 
-    async def ensure_call(self) -> CallSnapshot:
-        """Bring a call up, or report the one already up. Idempotent."""
+    async def ensure_call(self, instructions: str) -> CallSnapshot:
+        """Bring a call up on those house rules, or report the one already up.
+
+        Idempotent: a call that is already up is reported as it is, and the
+        instructions are not re-applied to it. Only the thread this verb starts
+        is ever given them.
+        """
         ...
 
     async def end_call(self) -> CallSnapshot:
@@ -125,7 +138,9 @@ class CallAdapter(Protocol):
         """Say something into the call. Graded from this adapter's own state."""
         ...
 
-    async def delegate(self, text: str, *, model: str, request_id: RequestId) -> DelegatedReply:
+    async def delegate(
+        self, text: str, *, model: str, instructions: str, request_id: RequestId
+    ) -> DelegatedReply:
         """Hand work to a coding model on the user's behalf — the Delegated Turn."""
         ...
 

@@ -23,6 +23,12 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+# The bridge-owned Live Call's audio path. An extra rather than a dependency:
+# every one of these carries a compiled media stack, and the engine's control
+# plane, its Relays and its whole test suite run without them. They are imported
+# in exactly one module (`adapters/call/realtime/webrtc.py`), and the Call
+# adapter's factory refuses to build without them rather than failing mid-call.
+voice = ["aiortc>=1.9", "av>=12", "sounddevice>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/okqixiaobao727-design/GPT-VoiceCoding"

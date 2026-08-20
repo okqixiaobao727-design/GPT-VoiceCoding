@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from fakes import (
+    HOUSE_RULES,
     FakeAgent,
     FakeCall,
     FakeCompanionChannel,
@@ -175,8 +176,8 @@ class TestTheAgentContract:
 class TestTheCallContract:
     def test_ensuring_a_call_twice_returns_the_same_call(self) -> None:
         call = FakeCall()
-        first = asyncio.run(call.ensure_call())
-        second = asyncio.run(call.ensure_call())
+        first = asyncio.run(call.ensure_call(HOUSE_RULES))
+        second = asyncio.run(call.ensure_call(HOUSE_RULES))
         assert first == second
         assert first.state is CallState.UP
 
@@ -187,7 +188,7 @@ class TestTheCallContract:
 
     def test_ending_a_call_is_idempotent(self) -> None:
         call = FakeCall()
-        asyncio.run(call.ensure_call())
+        asyncio.run(call.ensure_call(HOUSE_RULES))
         asyncio.run(call.end_call())
         assert asyncio.run(call.end_call()).state is CallState.DOWN
 
@@ -196,7 +197,10 @@ class TestTheCallContract:
         call = FakeCall()
         reply = asyncio.run(
             call.delegate(
-                "summarise the diff", model="claude-sonnet-5", request_id=new_request_id()
+                "summarise the diff",
+                model="claude-sonnet-5",
+                instructions=HOUSE_RULES,
+                request_id=new_request_id(),
             )
         )
         assert reply.model == "claude-sonnet-5"
@@ -205,6 +209,22 @@ class TestTheCallContract:
     def test_delegate_has_no_default_model(self) -> None:
         parameters = inspect.signature(CallAdapter.delegate).parameters
         assert parameters["model"].default is inspect.Parameter.empty
+
+    def test_instructions_arrive_at_the_call_site(self) -> None:
+        """Bridge Core generates them; nothing installs them into an adapter first.
+
+        Both verbs that start a thread take them, and neither has a default —
+        an adapter that could fall back to instructions of its own would be a
+        second source for the one thing the hub is the only source of.
+        """
+        for verb in (CallAdapter.ensure_call, CallAdapter.delegate):
+            parameters = inspect.signature(verb).parameters
+            assert parameters["instructions"].default is inspect.Parameter.empty
+
+    def test_the_house_rules_a_call_opened_on_came_from_the_caller(self) -> None:
+        call = FakeCall()
+        asyncio.run(call.ensure_call(HOUSE_RULES))
+        assert call.opened_on == [HOUSE_RULES]
 
 
 class TestTheCompanionChannelContract:
