@@ -12,16 +12,22 @@ Run it **from your own terminal**, not from an agent or an IDE. The macOS
 microphone grant attaches to the process that asks, so a call started anywhere
 else will be silently muted.
 
-    python3 scripts/realtime_call_smoke.py
-    python3 scripts/realtime_call_smoke.py --silent   # no audio devices at all
-    python3 scripts/realtime_call_smoke.py --delegate "list the files here"
+    .venv/bin/python scripts/realtime_call_smoke.py
+    .venv/bin/python scripts/realtime_call_smoke.py --silent   # no audio devices
+    .venv/bin/python scripts/realtime_call_smoke.py --delegate "list the files"
+
+Through the project venv, the way the tests and the linter are run: a bare
+`python3` is the system interpreter, which has neither this package nor the
+voice extra. Run it any other way and the first thing you meet is the
+dependency refusal — which is the check working, but it is not the check you
+came here for.
 
 `--silent` opens neither microphone nor speaker: it sends paced silence and
 counts the audio frames that come back. That proves the whole signalling route
 against a real app-server on a machine with no microphone grant — which is worth
 having, but it is *not* the proof this script exists for. Only hearing it is.
 
-Requires the voice extra: `pip install -e '.[voice]'`.
+Requires the voice extra: `.venv/bin/pip install -e '.[voice]'`.
 """
 
 from __future__ import annotations
