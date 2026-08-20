@@ -5,8 +5,10 @@ this module is shaped to prevent.
 
 **The engine's own.** One process, spawned here, owned here, shut down here. It
 is what the Call adapter's realtime route and the Delegated Turn ride on, which
-is why it initialises with `experimentalApi` — the `thread/realtime/*` family is
-gated behind that capability in codex 0.148.0. Nothing else spawns one: the Call
+is why it is spawned with `--enable realtime_conversation` *and* initialises with
+`experimentalApi`. Both are needed and they are not the same thing: the feature
+decides whether the process has the `thread/realtime/*` family, the capability
+decides whether this client may call it. Nothing else spawns one: the Call
 adapter consumes this component rather than starting a second server, which is
 the single-ownership rule the Codex adapter issue fixes.
 
@@ -47,6 +49,17 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 #: What this client calls itself when it initialises. The far side records it,
 #: so it says which software is holding the connection.
 CLIENT_NAME = "gpt-voicecoding"
+
+#: The codex feature the realtime route lives behind, enabled on the engine's
+#: own app-server because that is the process the Live Call rides.
+#:
+#: `experimentalApi: true` at `initialize` is **not** enough, and the difference
+#: is worth stating because it cost a smoke run: the capability says this client
+#: may call experimental methods, while the feature says this server has the
+#: `thread/realtime/*` family at all. Without it `thread/realtime/start` is
+#: accepted and then refused with "thread ... does not support realtime
+#: conversation" — a per-thread-sounding message for a per-process cause.
+REALTIME_FEATURE = "realtime_conversation"
 
 _log = logging.getLogger(__name__)
 
@@ -331,7 +344,14 @@ class OwnedAppServer:
             # drains eventually blocks the child. Discard is the honest choice.
             output = subprocess.DEVNULL
         self._process = subprocess.Popen(
-            [executable, "app-server", "--listen", f"unix://{self._socket_path}"],
+            [
+                executable,
+                "app-server",
+                "--enable",
+                REALTIME_FEATURE,
+                "--listen",
+                f"unix://{self._socket_path}",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
