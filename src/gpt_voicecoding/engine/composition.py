@@ -298,21 +298,35 @@ async def _answer_text(plane: ControlPlane, found: Classification) -> str:
 def _adapters(
     config: EngineConfig, sink: EventSink, factory_of: Callable[[str], Factory]
 ) -> Adapters:
-    def built(reference: str) -> Any:
+    def built(seam: str, reference: str) -> Any:
+        """Construct one adapter with the sink, and its settings table if it has one.
+
+        The table is forwarded **opaque**: this root never reads a key inside it,
+        because only the adapter knows what its own keys mean and a root that
+        parsed them would be the hub growing adapter-shaped knowledge (ADR 0001).
+        A seam with no table is called exactly as it always was, so an adapter
+        that takes only the sink needs no change to keep working.
+        """
         factory = factory_of(reference)
+        settings = config.adapters.settings_for(seam)
+        arguments: dict[str, Any] = {"sink": sink}
+        if settings is not None:
+            arguments["settings"] = settings
         try:
-            return factory(sink=sink)
+            return factory(**arguments)
         except TypeError as error:
+            asked = " and its settings table" if settings is not None else ""
             raise EngineAssemblyError(
-                f"{reference} could not be constructed with the event sink: {error}"
+                f"{reference} could not be constructed with the event sink{asked}: {error}"
             ) from None
 
     return Adapters(
-        call=built(config.adapters.call),
-        channel=built(config.adapters.companion_channel),
-        launcher=built(config.adapters.session_launcher),
+        call=built("call", config.adapters.call),
+        channel=built("companion_channel", config.adapters.companion_channel),
+        launcher=built("session_launcher", config.adapters.session_launcher),
         agents={
-            agent: built(reference) for agent, reference in config.adapters.agents.items()
+            agent: built(f"agent.{agent}", reference)
+            for agent, reference in config.adapters.agents.items()
         },
     )
 

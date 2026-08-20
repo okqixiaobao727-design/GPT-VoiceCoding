@@ -46,6 +46,13 @@ PROTOCOL_LIBRARIES = frozenset(
     }
 )
 
+# Standard-library modules whose only purpose is speaking a wire. They matter
+# because this repository hand-rolls what it needs rather than taking a
+# dependency — the Codex adapter frames its own WebSocket — and a rule that only
+# named third-party distributions would let exactly that hand-rolling smuggle a
+# protocol into the hub while every listed library stayed absent.
+WIRE_MODULES = frozenset({"http", "socket", "socketserver", "ssl", "struct"})
+
 FORBIDDEN_INTERNAL_PREFIX = "gpt_voicecoding.adapters"
 CORE_PREFIX = "gpt_voicecoding.core"
 
@@ -75,6 +82,16 @@ def _protocol_imports(package: Path) -> list[str]:
     for path in _sources(package):
         for module in _imported_modules(path.read_text(encoding="utf-8")):
             if module.split(".")[0] in PROTOCOL_LIBRARIES:
+                offences.append(f"{path.name} imports {module}")
+    return offences
+
+
+def _wire_imports(package: Path) -> list[str]:
+    """Every import in ``package`` that speaks a wire without naming a library."""
+    offences: list[str] = []
+    for path in _sources(package):
+        for module in _imported_modules(path.read_text(encoding="utf-8")):
+            if module.split(".")[0] in WIRE_MODULES:
                 offences.append(f"{path.name} imports {module}")
     return offences
 
@@ -131,3 +148,19 @@ def test_seams_imports_no_protocol_library() -> None:
     """A seam names what varies; the protocol that varies lives behind it."""
     offences = _protocol_imports(SEAMS)
     assert not offences, "the seams describe verbs, never wires: " + "; ".join(offences)
+
+
+def test_core_frames_no_wire_of_its_own() -> None:
+    """Hand-rolling a protocol may not be the way one gets into Bridge Core.
+
+    The library list above catches a dependency being added; this catches the
+    same protocol arriving with no dependency at all, which is exactly how the
+    Codex adapter's WebSocket client is built.
+    """
+    offences = _wire_imports(CORE)
+    assert not offences, "Bridge Core speaks seam verbs, not frames: " + "; ".join(offences)
+
+
+def test_seams_frame_no_wire_of_their_own() -> None:
+    offences = _wire_imports(SEAMS)
+    assert not offences, "a seam names a verb, never a frame: " + "; ".join(offences)
