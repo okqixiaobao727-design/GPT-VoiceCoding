@@ -23,12 +23,21 @@ reference outage was a line that looked like an observation and was an echo.
 are two notations for the same fact, and demanding they match character for
 character would fail on every correctly wired machine — the cry-wolf failure
 ADR 0003 explicitly refuses. The disagreement that matters is the one the
-reference outage was made of: configuration names an adapter and the engine is
-running the null one, or nothing is configured and something is loaded anyway.
+reference outage was made of: a seam was named and the engine is running with
+nothing behind it, or nothing was named and something is loaded anyway.
+
+**One thing this deliberately cannot catch**: configuration naming a real
+adapter whose factory resolved to the null one. Telling those apart would need
+a table here of which references are null, which is the hub growing
+adapter-shaped knowledge — and within one process, what was configured is what
+was constructed, so it cannot happen without a defect in the composition root
+itself. The residual is stated rather than papered over.
 
 Every seam here is pluggable and every one of them has a `verify` verb, so
 `reported` being absent means one thing only: nothing is loaded behind that
-seam at all.
+seam at all — which is **not** what an adapter reporting an empty `loaded`
+means. That one is the null implementation, present and answering, and an engine
+that deliberately runs without a seam filled says so by naming it.
 """
 
 from __future__ import annotations
@@ -79,35 +88,71 @@ class SeamVerification:
 
 
 def compare(load: SeamLoad, reported: VerifyResult | None) -> SeamVerification:
-    """Judge one seam. `reported` is None when nothing is loaded behind it."""
-    loaded = reported.loaded if reported is not None else ""
+    """Judge one seam. `reported` is None when nothing is loaded behind it.
 
-    if not load.configured and not loaded:
-        return SeamVerification(
-            seam=load.seam,
-            outcome=VerifyOutcome.MANUAL,
-            configured=load.configured,
-            loaded=loaded,
-            detail="nothing is configured behind this seam, and nothing is loaded",
-        )
-
-    if not load.configured or not loaded:
+    The two ways a seam can have "nothing real" behind it are **not** the same
+    thing, and reading them as one was a defect: `reported is None` means no
+    adapter is there at all, while an adapter reporting an empty `loaded` is the
+    *null implementation*, which is a real implementation that answered — the
+    seam contract says so in as many words. Collapsing them made an engine that
+    deliberately runs without text reach, and names the null adapter to say so,
+    report the outage it was configured to avoid.
+    """
+    if reported is None:
+        if not load.configured:
+            return SeamVerification(
+                seam=load.seam,
+                outcome=VerifyOutcome.MANUAL,
+                configured=load.configured,
+                loaded="",
+                detail="nothing is configured behind this seam, and nothing is loaded",
+            )
         return SeamVerification(
             seam=load.seam,
             outcome=VerifyOutcome.FAIL,
             configured=load.configured,
-            loaded=loaded,
-            detail=(
-                f"configuration names {load.configured or 'nothing'}; "
-                f"the engine loaded {loaded or 'nothing'}"
-            ),
+            loaded="",
+            detail=f"configuration names {load.configured}; the engine loaded nothing",
         )
 
-    assert reported is not None  # a loaded seam is one that answered
+    if not reported.loaded:
+        # The null implementation, answering for itself. Its own outcome is the
+        # answer — but only if it is the one outcome that shape may carry: a
+        # `VerifyResult` refuses MANUAL beside a real module string and cannot
+        # refuse PASS beside an empty one, so that combination is caught here
+        # rather than trusted through.
+        if reported.outcome is not VerifyOutcome.MANUAL:
+            return SeamVerification(
+                seam=load.seam,
+                outcome=VerifyOutcome.FAIL,
+                configured=load.configured,
+                loaded="",
+                detail=(
+                    f"an adapter reported {reported.outcome} while naming no implementation, "
+                    "which is not a state this system has"
+                ),
+            )
+        return SeamVerification(
+            seam=load.seam,
+            outcome=reported.outcome,
+            configured=load.configured,
+            loaded="",
+            detail=reported.detail,
+        )
+
+    if not load.configured:
+        return SeamVerification(
+            seam=load.seam,
+            outcome=VerifyOutcome.FAIL,
+            configured=load.configured,
+            loaded=reported.loaded,
+            detail=f"configuration names nothing; the engine loaded {reported.loaded}",
+        )
+
     return SeamVerification(
         seam=load.seam,
         outcome=reported.outcome,
         configured=load.configured,
-        loaded=loaded,
+        loaded=reported.loaded,
         detail=reported.detail,
     )

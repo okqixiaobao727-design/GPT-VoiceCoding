@@ -96,17 +96,45 @@ class TestThePresenceOfAnAdapter:
         assert outcome is VerifyOutcome.FAIL
         assert "a.launcher" in detail and "nothing" in detail
 
-    def test_an_adapter_reporting_the_null_implementation_fails(self) -> None:
-        """Empty `loaded` is a known state, and beside a configured name it is the outage."""
+    def test_the_null_implementation_answering_for_itself_is_not_an_outage(self) -> None:
+        """Empty `loaded` is the null implementation, which is present and answering.
+
+        This once failed, on the reading that an empty `loaded` beside a
+        configured name *was* the outage. It is not: the two ways a seam can
+        have "nothing real" behind it are different facts, and the seam contract
+        already says which is which. An engine that deliberately runs without
+        text reach names the null adapter to say so — and was then told it had
+        loaded nothing, which was false and looked like the failure it had been
+        configured to avoid.
+        """
         channel = FakeCompanionChannel(
-            verify_result=VerifyResult(outcome=VerifyOutcome.MANUAL, loaded="")
+            verify_result=VerifyResult(
+                outcome=VerifyOutcome.MANUAL, loaded="", detail="no text reach, deliberately"
+            )
+        )
+        core = hub(inventory=(loaded(CHANNEL_SEAM, "a.null_channel"),), channel=channel)
+
+        outcome, detail = verified(core)[CHANNEL_SEAM]
+
+        assert outcome is VerifyOutcome.MANUAL
+        assert detail == "no text reach, deliberately"
+
+    def test_an_adapter_that_names_no_implementation_and_claims_to_pass_fails(self) -> None:
+        """The one shape `VerifyResult` cannot refuse for itself is refused here.
+
+        It forbids MANUAL beside a real module string, and cannot forbid PASS
+        beside an empty one. Trusting that through would let an adapter report
+        health while naming nothing that could be healthy.
+        """
+        channel = FakeCompanionChannel(
+            verify_result=VerifyResult(outcome=VerifyOutcome.PASS, loaded="")
         )
         core = hub(inventory=(loaded(CHANNEL_SEAM, "a.channel"),), channel=channel)
 
         outcome, detail = verified(core)[CHANNEL_SEAM]
 
         assert outcome is VerifyOutcome.FAIL
-        assert "a.channel" in detail and "nothing" in detail
+        assert "no implementation" in detail
 
     def test_nothing_configured_and_nothing_loaded_is_handed_to_the_operator(self) -> None:
         core = hub(inventory=(SeamLoad(seam=LAUNCHER_SEAM, configured=""),), launcher=None)
