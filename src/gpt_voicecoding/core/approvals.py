@@ -48,10 +48,18 @@ def announcement_for(request: ApprovalRequest) -> str:
 
 #: What closes the loop, per resolution. Kept together so no path can resolve a
 #: request without a wording for it.
+#: The `ASK` wording is conditional on purpose, and it was not always. It read
+#: "it's waiting at the on-screen dialog", which is false on the path the Claude
+#: hook route made visible: a human who answers the dialog themselves ends the
+#: request, and the budget can then run out up to ten minutes later on something
+#: nobody is looking at any more. Surfaces render these notices verbatim, so the
+#: sentence has to be true in every path that can fire it.
 CLOSING_NOTICES: dict[ApprovalVerdict, str] = {
     ApprovalVerdict.ALLOW: "approved by voice",
     ApprovalVerdict.DENY: "denied by voice",
-    ApprovalVerdict.ASK: "the voice window closed — it's waiting at the on-screen dialog",
+    ApprovalVerdict.ASK: (
+        "the voice window closed — if the dialog is still on screen, answer it there"
+    ),
 }
 
 

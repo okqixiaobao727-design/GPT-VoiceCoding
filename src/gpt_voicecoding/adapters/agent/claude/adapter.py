@@ -16,14 +16,22 @@ therefore kept, for a second and longer budget, purely so a late receipt can be
 raised upward and the hub can drop what it was holding. Only DELIVERED is ever
 raised that way; a late anything-else is logged and changes nothing.
 
-**Two verbs of three, over two different wires.** This package is the shared
-Claude adapter. The Answer Relay rides the MCP Session Channel, described above.
-The Notice Relay rides the **peer socket** — a separate route with a separate
-proof, delegated to `notice.py`, and separate because the peer socket wraps every
+**Three verbs over three different wires.** This package is the shared Claude
+adapter. The Answer Relay rides the MCP Session Channel, described above. The
+Notice Relay rides the **peer socket** — a separate route with a separate proof,
+delegated to `notice.py`, and separate because the peer socket wraps every
 message in a hard-coded "not typed by your user" preamble that is correct for
 system-authored words and a lie about the user's own. The Approval Relay rides
-the `PermissionRequest` hook and is not here yet, so it answers with a classified
-refusal naming what is missing rather than pretending either wire can carry it.
+the **`PermissionRequest` hook**, delegated to `approval.py`, and it is the one
+route where *we* are the server: a hook process dials in holding a displayed
+dialog open, and the verdict travels back down the connection it is waiting on.
+
+The Approval Relay is also the one verb whose route this adapter cannot start.
+The hook only exists for a Session launched with `--plugin-dir` naming the
+rendered hook plugin, and only reaches us when the launch also carried the
+approval socket's address — so a Session launched without either has no Approval
+Relay, and the honest report for a verdict aimed at it is a classified failure
+naming what is not there.
 
 **The Reply Window is reported from the registry**, by `window.py`. Without it
 nothing ever tells Bridge Core that a Claude Session is ready for a user turn, so
@@ -39,6 +47,7 @@ import logging
 from contextlib import suppress
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
 from gpt_voicecoding.adapters.agent.claude.notice import NoticeRelay
 from gpt_voicecoding.adapters.agent.claude.peer import ReceiptListener
 from gpt_voicecoding.adapters.agent.claude.protocol import (
@@ -70,12 +79,13 @@ from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 
 _log = logging.getLogger(__name__)
 
-#: What a Relay that has no route here is told. Named by issue, because "not
-#: implemented" without a way to find out when is a dead end for whoever reads
-#: the log.
-APPROVAL_UNAVAILABLE = (
-    "this build carries the Answer Relay only; the Approval Relay rides the "
-    "PermissionRequest hook and arrives with issue #14"
+#: What a verdict aimed at a Session with no hook route is told. It names the two
+#: things a launch has to have done, because "no request is waiting" read alone
+#: looks like a race that was lost rather than a route that was never there.
+APPROVAL_UNROUTED = (
+    "no permission dialog is parked on this engine for that Session; a Claude Session "
+    "answers by voice only when its launch carried both the hook plugin (--plugin-dir) "
+    "and this engine's approval socket address"
 )
 SUPPLEMENT_UNAVAILABLE = (
     "the Claude Session Channel has no mid-turn route: a channel message delivered inside "
@@ -102,19 +112,39 @@ class ClaudeAgentAdapter:
             settings=self._settings, listener=self._receipts, emit=self._emit
         )
         self._windows = ReplyWindowWatcher(settings=self._settings, emit=self._emit)
+        #: The second socket this adapter owns, and the only one it is the
+        #: *server* on: hook processes dial in here holding a dialog open.
+        self._approvals = ApprovalListener(
+            settings=self._settings, resolve=self._registered_as, emit=self._emit
+        )
 
     # -- lifecycle --------------------------------------------------------
 
     async def connect(self) -> None:
-        """Start watching Reply Windows. Channels still belong to Sessions, not to us.
+        """Start watching Reply Windows, and open the socket dialogs are parked on.
 
         The receipt listener is deliberately *not* bound here. It lives in a
         directory Claude Code owns, and binding a socket there on the strength of
         "this engine started" would leave one sitting in a shared namespace for
         every run that never sends a Notice Relay. It is bound on first use and
         removed on `aclose`.
+
+        The approval socket is the opposite case and is bound here for exactly
+        the reason the receipt listener is not: it lives in a directory of this
+        engine's own, and its address has to be knowable *before* any Session
+        launches, because the launch is what carries it to the hook. A socket
+        bound on first use would be one no launch could ever have named.
+
+        A socket that will not bind is logged and not raised. It costs the
+        Approval Relay and nothing else — every verdict aimed at this adapter is
+        then a classified failure — and taking the whole Agent seam down over it
+        would trade one lost route for two working ones.
         """
         await self._windows.start()
+        try:
+            await self._approvals.start()
+        except ApprovalError as refused:
+            _log.warning("no Approval Relay this run: %s", refused)
 
     async def aclose(self) -> None:
         """Stop everything this adapter started, and take its socket back out.
@@ -143,6 +173,10 @@ class ClaudeAgentAdapter:
         await self._notices.aclose()
         await self._windows.aclose()
         await self._receipts.aclose()
+        # Closes last of the three, and releases every parked dialog to its human
+        # on the way out: an engine shutting down must never be the reason a
+        # permission prompt resolves without the person it was asked of.
+        await self._approvals.aclose()
         self._channels.clear()
 
     # -- the Session roster this adapter can reach ------------------------
@@ -210,8 +244,60 @@ class ClaudeAgentAdapter:
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:
-        """Not this route's to carry. Refused by name rather than mis-sent."""
-        return _failed(request_id, APPROVAL_UNAVAILABLE)
+        """Carry one verdict into the hook that is holding the dialog open.
+
+        A verdict for a dialog nothing is parked on is a failure and not a
+        silence, because there are several ways to arrive here with nothing
+        waiting — the human answered on screen, the request already resolved,
+        or the Session never had a hook route at all — and Bridge Core can only
+        record what it is told.
+        """
+        if request.target.agent is not AgentKind.CLAUDE:
+            return _failed(
+                request_id, f"{request.target.agent} sessions are not this adapter's to reach"
+            )
+        if not self._approvals.listening:
+            return _failed(request_id, APPROVAL_UNROUTED)
+        return await self._approvals.answer(request.approval_id, verdict, request_id=request_id)
+
+    def approval_socket_path(self) -> Path:
+        """Where a launch should tell this Session's hook to find us.
+
+        Answered whether or not the socket is bound, because it is derived rather
+        than discovered and a launcher asking where to point a hook is asking a
+        question about this engine's identity, not about its current state.
+        """
+        return self._approvals.path
+
+    def _registered_as(self, session_id: str) -> SessionTarget | None:
+        """The authority check behind the approval socket, in this adapter's own terms.
+
+        A Claude target is addressed by pid and the hook payload carries only a
+        session id, so the two are matched here against the roster the launcher
+        registered — the same roster every other verb addresses. A session id
+        this adapter holds no channel for is not this engine's Session, and its
+        dialog is not this engine's to answer.
+
+        **An ambiguous session id is refused rather than guessed.** `--resume`
+        forks a second process under one session id, which is the whole reason a
+        Claude target carries a pid, and a hook payload carries no pid to break
+        the tie with. Answering anyway would still deliver the verdict — it
+        travels back down the hook's own connection either way — but it would
+        announce the dialog against the wrong process, and a notice naming the
+        wrong Session is the truthfulness failure, not the lost approval. The
+        dialog stays with its human, which is the safe direction to be wrong in.
+        """
+        matches = [target for target in self._channels if target.session_id == session_id]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            _log.warning(
+                "session id %s names %d registered Claude processes; refusing to guess which "
+                "one raised the dialog",
+                session_id,
+                len(matches),
+            )
+        return None
 
     async def verify(self) -> VerifyResult:
         """Report what is loaded, and whether any registered channel really answers."""
