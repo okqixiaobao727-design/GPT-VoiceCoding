@@ -50,10 +50,12 @@ packages = ["src/gpt_voicecoding"]
 testpaths = ["tests"]
 addopts = "-q"
 # Test modules import the shared fakes bare (`from fakes import ...`); this pins that path.
-pythonpath = ["tests"]
+# The repository root is here for `app_bundle`, the build pipeline, which lives
+# outside `src/` on purpose: the product does not ship its own build system.
+pythonpath = ["tests", "."]
 
 [tool.ruff]
-src = ["src", "tests"]
+src = ["src", "tests", "app_bundle"]
 line-length = 100
 target-version = "py312"
 

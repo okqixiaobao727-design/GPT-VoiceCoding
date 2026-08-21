@@ -3,11 +3,15 @@
 <!--
   The bundle's identity, in one file.
 
-  This is what #12 (the app bundle and signing pipeline) consumes or supersedes.
-  Three values here are load-bearing rather than decorative:
+  The app-bundle pipeline (`app_bundle/`) reads this file rather than repeating
+  any of it: the bundle's name, its executable and its identifier are decided
+  here and nowhere else. Three values are load-bearing rather than decorative:
 
   * CFBundleIdentifier — ADR 0005: the microphone grant attaches to the bundle,
-    so this string is what the grant belongs to.
+    so this string is what the grant belongs to. It names the *product*, not the
+    component: "shell" was an internal name, and the person granting a microphone
+    is granting it to GPT-VoiceCoding. Changing it re-prompts everyone who has
+    already granted, so it was chosen once, at the last moment it was free.
   * NSMicrophoneUsageDescription — the sentence macOS shows when it asks. The
     TCC probe confirmed it is the *app's* string that appears, beside the app's
     own name; the bundled interpreter never does.
@@ -21,7 +25,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>GPT-VoiceCoding</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.gptvoicecoding.shell</string>
+	<string>com.gptvoicecoding.GPT-VoiceCoding</string>
 	<key>CFBundleExecutable</key>
 	<string>GPTVoiceCodingShell</string>
 	<key>CFBundlePackageType</key>

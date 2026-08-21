@@ -4,13 +4,12 @@ Voice-controlling terminal coding agents through a realtime voice call: the syst
 speaks agent progress to you, and carries your spoken instructions back to the
 agents.
 
-> **Status: early build.** Bridge Core, the control plane, the engine's
-> composition root, the Codex Agent adapter, the bridge-owned Live Call, the
-> Companion Channel, the Claude adapter's Answer and Notice Relays and the
-> menu-bar shell are built and tested; the Session Launcher, the Claude
-> adapter's Approval Relay and the signed app bundle are not, so nothing yet
-> launches a session for you. If you are
-> looking for working software, the first-generation implementation lives at
+> **Status: early build.** Every part is now built and tested — Bridge Core, the
+> control plane, the composition root, the Codex and Claude Agent adapters with
+> all three Relays, the bridge-owned Live Call, the Companion Channel, the
+> Session Launcher, the menu-bar shell, and the signed app bundle. It has not
+> been through a release. If you want software with users on it, the
+> first-generation implementation lives at
 > [GPT-VoiceCoding-legacy](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy).
 
 ## What it is
@@ -40,7 +39,16 @@ src/gpt_voicecoding/
 ├── engine/         The composition root — config in, one running engine out.
 └── cli/            bridgectl — a control-plane surface.
 shell/              The Swift menu-bar shell (see ADR 0005).
+app_bundle/         The build pipeline. Builds the product; is not part of it.
 ```
+
+One command turns a clean checkout into a signed `.app`:
+
+```bash
+scripts/build-app.sh
+```
+
+See [`docs/app-bundle.md`](docs/app-bundle.md).
 
 The engine runs standalone, without the menu-bar shell:
 `python -m gpt_voicecoding.engine --config <file>`. The Live Call's audio path is
@@ -63,6 +71,8 @@ macOS-shaped; cross-platform support is not planned.
 2. [`docs/adr/`](docs/adr/README.md) — the decisions, and where each one came from.
 3. [`docs/control-plane.md`](docs/control-plane.md) — the interface every surface
    speaks, and what the engine is configured with.
+4. [`docs/app-bundle.md`](docs/app-bundle.md) — how the `.app` is built and
+   signed, and every decision that pipeline holds.
 
 ## Contributing
 

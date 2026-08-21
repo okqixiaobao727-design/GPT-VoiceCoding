@@ -2,8 +2,8 @@ import Foundation
 
 /// What the shell spawns, and where that interpreter came from.
 ///
-/// One resolver, because the bundled interpreter's name is #12's to change and a
-/// name sprinkled through the shell would be #12 editing the shell in five
+/// One resolver, because the bundled interpreter's name belongs to the app-bundle
+/// pipeline and a name sprinkled through the shell would mean editing it in five
 /// places. It stays in ``BundleLayout``.
 public struct EngineCommand: Equatable, Sendable {
     public enum Source: Equatable, Sendable {

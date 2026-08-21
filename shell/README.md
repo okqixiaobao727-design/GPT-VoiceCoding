@@ -40,35 +40,33 @@ all need a real bundle, so the shell cannot be shown to work as a bare
 executable:
 
 ```bash
-shell/scripts/dev-app.sh          # then: open shell/.build/GPT-VoiceCoding.app
+scripts/build-app.sh --debug --without-engine   # then: open shell/.build/GPT-VoiceCoding.app
 ```
 
-That script assembles a **development** bundle and ad-hoc-signs it. It is not a
-distribution pipeline — #12 owns that and may replace the script wholesale. The
-bundle's identity lives in [`Resources/Info.plist`](Resources/Info.plist), which
-is the one place #12 consumes or supersedes.
+That builds the shell and lays a bundle around it, ad-hoc-signed, with no engine
+inside — so the shell's resolver falls through to `GPTVOICECODING_ENGINE_PYTHON`
+or `PATH`. It is the fastest loop for working on the shell itself. The bundle's
+identity lives in [`Resources/Info.plist`](Resources/Info.plist), which is the
+one file that holds it; the pipeline reads it rather than repeating any of it.
 
 To exercise the path ADR 0005 is actually about — an engine spawned from *inside*
-the bundle — hand it an interpreter tree you already have:
+the bundle — drop `--without-engine` and build the real thing:
 
 ```bash
-shell/scripts/dev-app.sh debug --engine .venv
+scripts/build-app.sh --debug
 ```
 
-It is copied to `Contents/Resources/engine/`, where the shell looks first. The
-flag copies; it downloads nothing and vendors nothing. What it proves is that
-the bundled branch really spawns and that the child is the shell's own. What it
-does **not** prove is #12's part: python-build-standalone, the inside-out
-enumerate-and-sign, the entitlement on the bundled interpreter, and the binary's
-name. Those stay #12's acceptance.
+That fetches the pinned python-build-standalone interpreter, installs the locked
+wheels into `Contents/Resources/engine/`, and signs the ~85 Mach-O files inside
+out. See [`docs/app-bundle.md`](../docs/app-bundle.md).
 
-One thing worth knowing before you pick a tree: a **framework** CPython (the
-Homebrew one, and any virtual environment over it) re-executes
-`Python.app/Contents/MacOS/Python` from its original location, so the process
-that ends up running is outside the bundle even though the shell spawned the one
-inside it. That is the interpreter's own behaviour, not the shell's — and it is
-the reason #12's locked choice is python-build-standalone's relocatable
-`install_only` build, which does not do it.
+One thing worth knowing if you are ever tempted to point the bundle at an
+interpreter you already have: a **framework** CPython (the Homebrew one, and any
+virtual environment over it) re-executes `Python.app/Contents/MacOS/Python` from
+its original location, so the process that ends up running is outside the bundle
+even though the shell spawned the one inside it. That is the interpreter's own
+behaviour, not the shell's — and it is the reason the bundle carries
+python-build-standalone's relocatable `install_only` build, which does not do it.
 
 If nothing appears in the menu bar, the menu bar is full: macOS creates the
 status item and places it off-screen rather than dropping it. `System Events`

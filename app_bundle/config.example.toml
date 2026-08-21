@@ -1,0 +1,72 @@
+# GPT-VoiceCoding — an example engine configuration.
+#
+# The bundle SHIPS this file and never writes one. The engine's configuration is
+# a file the user owns and the engine only reads, so an installer that authored
+# it would be claiming ownership of something that is not the installer's — and
+# this file names adapters by import reference, which means it runs with the
+# privileges of whoever wrote it. That is exactly as trusted as the engine, and
+# it is trusted because *you* wrote it.
+#
+# Copy it into place and edit it:
+#
+#   mkdir -p ~/Library/Application\ Support/GPT-VoiceCoding/engine
+#   cp /Applications/GPT-VoiceCoding.app/Contents/Resources/config.example.toml \
+#      ~/Library/Application\ Support/GPT-VoiceCoding/engine/config.toml
+#
+# Until it is there, the engine refuses to start and says so on the terminal that
+# started it (exit 2). That refusal is the design: an engine that silently loaded
+# nothing behind a seam looks exactly like a healthy one until it is needed.
+#
+# `docs/control-plane.md` is the canonical description of every key here.
+
+[engine]
+# Both optional; the defaults are the ones documented in docs/control-plane.md.
+# The socket lives in a short runtime root because Darwin caps an AF_UNIX path
+# at 103 bytes, and it is per-uid so two accounts do not fight over one engine.
+# socket_path = "/tmp/gpt-voicecoding-501/control.sock"
+# state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"
+
+[adapters]
+# Each is `module:attribute`, imported by the composition root and nothing else.
+call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
+companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"
+session_launcher  = "gpt_voicecoding.adapters.session_launcher:direct_child_launcher"
+
+# With no text reach at all, name the null channel instead — running without a
+# Companion Channel is legitimate, but it has to be said out loud:
+# companion_channel = "gpt_voicecoding.adapters.companion_channel:null_channel"
+
+[adapters.agents]
+claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"
+codex  = "gpt_voicecoding.adapters.agent.codex:codex_agent"
+
+[adapters.settings.companion_channel]
+# The token is named by variable and never written here: a configuration file is
+# a file that gets committed by accident, and this is the shape that cannot be.
+token_env = "GPTVOICECODING_TELEGRAM_TOKEN"
+chat_id   = "000000000"
+
+# One Telegram bot may have exactly one `getUpdates` consumer. If the
+# first-generation bridge is still running on this machine, give this engine a
+# DIFFERENT bot until that one is retired — otherwise the two steal each other's
+# inbound messages, `verify` still passes, and only inbound goes quiet.
+
+[adapters.settings.call]
+# Where the bridge's own threads run. A location, so it defaults to ~.
+# workspace = "~/code"
+
+[policy]
+# Optional; these are the locked defaults.
+# relay_ceiling_seconds   = 600
+# approval_budget_seconds = 600
+
+[delegate]
+# Required: the Delegated Turn's model is the cost lever, and a default here
+# would be a decision this project does not get to make for you.
+model = "the-model-you-chose"
+
+# Required *for the bundle*, and only for the bundle. Left out, the engine uses
+# the console script installed beside its own interpreter — which is right for a
+# `pip install`, and wrong here, because the bundle's interpreter is inside the
+# .app and so is its CLI. Point this at wherever the .app really is.
+cli = "/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/bridgectl"

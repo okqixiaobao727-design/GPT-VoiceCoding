@@ -300,7 +300,7 @@ approval_budget_seconds = 600
 
 [delegate]
 model = "the-model-you-chose"       # required: the cost lever has no default
-cli   = "/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"  # optional
+cli   = "/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/bridgectl"
 ```
 
 Each adapter reference is `module:attribute`, resolved by the composition root —
@@ -351,6 +351,16 @@ engine uses the console script installed beside its own interpreter, and uses it
 only after finding that it exists and can be run. A bundle moves that binary, so
 a bundle states this key. If neither is really there, the engine **refuses to
 start** rather than describing a CLI nobody can run.
+
+In the bundle that key is not optional, and it points into `Contents/Resources`
+rather than `Contents/MacOS`: `pip` installs a console script beside the
+interpreter that installed it, and the bundle's interpreter is under
+`Contents/Resources/engine/`. There is no second copy in `Contents/MacOS/` — a
+duplicate binary that shadowed the real one would be two things to sign and two
+things to be wrong. The bundled `bridgectl` is a two-line wrapper that execs the
+interpreter sitting beside it, because `pip`'s own console script carries an
+*absolute* shebang and would stop working the moment the `.app` is moved. See
+[`docs/app-bundle.md`](app-bundle.md).
 
 An unconfigured Call, Companion Channel or Session Launcher seam **refuses to
 start**, with a named error. An engine that silently loaded nothing behind a seam

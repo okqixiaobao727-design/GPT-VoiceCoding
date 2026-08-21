@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The rights the *bundled interpreter* is signed with.
+
+  Entitlements go on executables. `python3.12` is the process that opens the
+  microphone, so `python3.12` is what carries the right; the sentence the user
+  reads lives in the app's own Info.plist, and the TCC probe confirmed it is that
+  string, beside the app's name, that appears — `python3.12` never does.
+
+  Two things about this file are deliberate and easy to misread later:
+
+  * It is **the only extra entitlement in v0.** No `allow-jit`, which is added
+    only if the CFFI audio callback actually crashes (the escape hatch is
+    blocking-mode PortAudio), and no `disable-library-validation` at all.
+  * Without the App Sandbox or the hardened runtime — neither of which v0 turns
+    on, because v0 is not notarized — this entitlement is **inert**, belt and
+    braces rather than load-bearing. Bundle containment is what earns the grant
+    (ADR 0005). It is here so the bundle is already the right shape when the
+    notarization-era ticket turns the hardened runtime on, which is also where
+    `allow-jit` becomes live again.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

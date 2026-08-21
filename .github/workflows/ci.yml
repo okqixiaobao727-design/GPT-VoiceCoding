@@ -62,3 +62,42 @@ jobs:
         run: |
           cd shell
           swift format lint --recursive --strict Sources Tests Package.swift
+
+  bundle:
+    # The app bundle, built and signed for real. A runner has no microphone, so
+    # the one thing this cannot prove is the grant — that is a person with a
+    # mouse (scripts/microphone_grant_proof.py). Everything else is here:
+    # fetching the pinned interpreter, installing the hash-pinned wheels,
+    # pre-compiling, signing ~85 Mach-O files inside out, verifying, and running
+    # the bundled bridgectl from a path the bundle was not built at.
+    #
+    # Signing is ad-hoc, which is exactly what v0 ships — a self-signed
+    # certificate in a temporary keychain would test a path the product does not
+    # use. "Throwaway identity" is read as "no Developer ID", and ad-hoc is that.
+    #
+    # The plan tests in the `check` job run against a fixture tree and are fast;
+    # this runs against the real wheel set. They are complements: a plan that is
+    # right about a fixture and wrong about `av`'s eighteen dylibs is precisely
+    # the gap the plan/do split exists to close.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Keyed on both inputs the bundle's contents are pinned by, so a cache hit
+      # can only ever be the interpreter the checksum names.
+      - name: Cache the pinned interpreter
+        uses: actions/cache@v4
+        with:
+          path: shell/.build/cache
+          key: pbs-${{ hashFiles('app_bundle/inputs.py', 'app_bundle/locks/*.lock') }}
+
+      - name: Build and sign
+        run: scripts/build-app.sh
+
+      - name: Say what was signed
+        run: codesign --display --verbose=2 shell/.build/GPT-VoiceCoding.app
