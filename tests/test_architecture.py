@@ -31,6 +31,15 @@ AUDIO_MODULE = ADAPTERS / "call" / "realtime" / "webrtc.py"
 #: The distributions that file exists to confine.
 AUDIO_LIBRARIES = frozenset({"aiortc", "av", "sounddevice"})
 
+#: Where the Companion Channel's HTTP client is allowed to be, and nowhere else.
+#: The same confinement as the audio stack, for the opposite reason: this
+#: repository takes no Telegram dependency and hand-rolls the little it needs, so
+#: no dependency list can catch the wire spreading. One file can be read.
+TELEGRAM_WIRE_MODULE = ADAPTERS / "companion_channel" / "telegram" / "api.py"
+
+#: The Companion Channel subpackage, whose other modules must stay wireless.
+COMPANION_CHANNEL = ADAPTERS / "companion_channel"
+
 # Top-level distribution names that carry a wire, terminal or transport protocol.
 # Adding to this list is cheap; removing from it needs a new ADR.
 PROTOCOL_LIBRARIES = frozenset(
@@ -213,3 +222,48 @@ def test_the_audio_stack_lives_in_exactly_one_file() -> None:
 def test_the_audio_module_is_where_it_says_it_is() -> None:
     """A guard that silently stops guarding is worse than no guard."""
     assert AUDIO_MODULE.is_file(), f"{AUDIO_MODULE} is not there, so nothing is confined"
+
+
+def test_the_telegram_wire_lives_in_exactly_one_file() -> None:
+    """One module speaks HTTP; the rest of the channel is ordinary Python.
+
+    The Telegram *libraries* are already forbidden everywhere by
+    `PROTOCOL_LIBRARIES`, and this repository would not use one anyway. What
+    that leaves is the wire arriving hand-rolled, from the standard library —
+    exactly how the Codex adapter's WebSocket client is built — so the rule that
+    matters here is where `urllib` and `http` may appear.
+    """
+    offences = [
+        f"{path.relative_to(PACKAGE)} imports {module}"
+        for path in _sources(COMPANION_CHANNEL)
+        if path != TELEGRAM_WIRE_MODULE
+        for module in _imported_modules(path.read_text(encoding="utf-8"))
+        if module.split(".")[0] in WIRE_MODULES | {"urllib"}
+    ]
+    named = "; ".join(offences)
+    assert not offences, f"the Telegram wire belongs in {TELEGRAM_WIRE_MODULE.name} alone: {named}"
+
+
+def test_the_telegram_wire_module_is_where_it_says_it_is() -> None:
+    """A guard that silently stops guarding is worse than no guard."""
+    assert TELEGRAM_WIRE_MODULE.is_file(), f"{TELEGRAM_WIRE_MODULE} is not there"
+
+
+def test_the_channel_starts_exactly_one_thread_and_only_in_the_adapter() -> None:
+    """The reader's thread is the adapter's own, and stays that way.
+
+    It exists for a measured reason — a poll parked on `asyncio.to_thread` holds
+    `asyncio.run` open past the engine that let go of it — and machinery kept
+    for a measured reason spreads if nothing watches. The wire may not start
+    threads, and neither may the settings or the null implementation.
+    """
+    allowed = COMPANION_CHANNEL / "telegram" / "adapter.py"
+    offences = [
+        f"{path.relative_to(PACKAGE)} imports {module}"
+        for path in _sources(COMPANION_CHANNEL)
+        if path != allowed
+        for module in _imported_modules(path.read_text(encoding="utf-8"))
+        if module.split(".")[0] == "threading"
+    ]
+    named = "; ".join(offences)
+    assert not offences, f"the channel's one thread belongs in {allowed.name} alone: {named}"

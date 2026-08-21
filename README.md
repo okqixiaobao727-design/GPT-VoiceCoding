@@ -5,10 +5,11 @@ speaks agent progress to you, and carries your spoken instructions back to the
 agents.
 
 > **Status: early build.** Bridge Core, the control plane, the engine's
-> composition root, the Codex Agent adapter and the bridge-owned Live Call are
-> built and tested; the Companion Channel, the Session Launcher, the Claude
-> adapter and the menu-bar shell are not, so nothing yet reaches you when no
-> call is up and nothing yet launches a session. If you are
+> composition root, the Codex Agent adapter, the bridge-owned Live Call, the
+> Companion Channel, the Claude adapter's Answer and Notice Relays and the
+> menu-bar shell are built and tested; the Session Launcher, the Claude
+> adapter's Approval Relay and the signed app bundle are not, so nothing yet
+> launches a session for you. If you are
 > looking for working software, the first-generation implementation lives at
 > [GPT-VoiceCoding-legacy](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy).
 
