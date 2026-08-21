@@ -55,10 +55,52 @@ chat_id   = "000000000"
 # Where the bridge's own threads run. A location, so it defaults to ~.
 # workspace = "~/code"
 
+# --- The external binaries, stated because this is a bundle ------------------
+#
+# An .app opened from Finder does not get your shell's PATH. macOS gives it
+# launchd's, which is /usr/bin:/bin:/usr/sbin:/sbin — no Homebrew, no npm
+# prefix, nothing you installed. Left unstated, these are looked up on PATH at
+# spawn time, which is right for a `pip install` run from a terminal and wrong
+# here. `which claude`, `which codex`, `which tmux` in your own shell and paste
+# the answers.
+#
+# You will know if you get it wrong: `bridgectl verify` fails naming the binary,
+# and the engine refuses to start rather than serving a seam it cannot use.
+
+[adapters.settings.session_launcher]
+claude_binary = "/opt/homebrew/bin/claude"
+codex_binary = "/opt/homebrew/bin/codex"
+# Only the tmux adapter reads this one.
+# tmux_binary = "/opt/homebrew/bin/tmux"
+
+# The dotted seam name has to be quoted, or TOML reads it as two nested tables.
+[adapters.settings."agent.codex"]
+executable = "/opt/homebrew/bin/codex"
+
 [policy]
 # Optional; these are the locked defaults.
 # relay_ceiling_seconds   = 600
 # approval_budget_seconds = 600
+
+[log]
+# REQUIRED, all three. The engine owns its log and rotates it by rename
+# (ADR 0004), and these three numbers have no default in code on purpose: they
+# are what a 68 MB outage measured, and a compiled-in fallback would quietly
+# reinstate a value the measurement proved matters. The values below are a
+# sensible starting point, not a recommendation you are excused from reading.
+#
+# `max_bytes` binds EVERY generation, so the disk this can occupy is
+# max_bytes x (retained_files + 1) — 32 MiB as written.
+max_bytes = 8388608
+retained_files = 3
+# Names starting with any of these are removed from the environment once, by
+# every process that spawns others. `Malloc` is here because `MallocStackLogging`
+# — inherited from whichever shell ran an installer, set by nobody — produced
+# 98.1% of that outage, one line of stderr per spawned process.
+stripped_environment_prefixes = ["Malloc"]
+# The log's path is a location rather than a decision, so it defaults beside the
+# state file:
+# path = "~/Library/Application Support/GPT-VoiceCoding/engine/engine.log"
 
 [delegate]
 # Required: the Delegated Turn's model is the cost lever, and a default here

@@ -298,6 +298,11 @@ workspace = "~/code"                # where the bridge's own threads run; defaul
 relay_ceiling_seconds   = 600
 approval_budget_seconds = 600
 
+[log]                               # required: three numbers with no default
+max_bytes                     = 8388608
+retained_files                = 3
+stripped_environment_prefixes = ["Malloc"]
+
 [delegate]
 model = "the-model-you-chose"       # required: the cost lever has no default
 cli   = "/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/bridgectl"
@@ -369,8 +374,11 @@ to prevent. Running without a Companion Channel is legitimate, but the null
 implementation ships with that adapter (#10) and is not built yet, so today it is
 also a refusal that says so.
 
-Keys this file does not carry yet belong to the tickets that own them: the log's
-four numbers are ADR 0004's, and packaging keys arrive with the bundle.
+`[log]`'s three numbers are **required, with no default in code**: they are what
+ADR 0004's outage measured, and a compiled-in fallback would quietly reinstate a
+value the measurement proved matters. The log's *path* is a location rather than
+a decision, so it defaults beside the state file. `max_bytes` binds every
+generation, so the disk one log can occupy is `max_bytes × (retained_files + 1)`.
 
 ## Running headless
 

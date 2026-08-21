@@ -19,6 +19,8 @@ from pathlib import Path
 import pytest
 from app_bundle import inputs, lock, mach_o, signing
 
+from gpt_voicecoding import config
+
 #: What every binary in a current arm64 tree actually starts with.
 MACH_O = b"\xcf\xfa\xed\xfe"
 
@@ -285,6 +287,26 @@ class TestTheThingsThatMustAgree:
         assert identity.identifier == "com.gptvoicecoding.GPT-VoiceCoding"
         assert identity.app_directory_name == "GPT-VoiceCoding.app"
         assert identity.executable == inputs.SHELL_PRODUCT
+
+    def test_the_example_config_is_one_the_engine_would_accept(self, tmp_path: Path) -> None:
+        """The shipped example has to be a *working* file, not an illustration.
+
+        It is the first thing a new user copies into place, so a key it omits is
+        an engine that refuses to start on their first run with a message about
+        a section they were never shown. `[log]`'s three numbers have no default
+        in code (ADR 0004) and this example did omit them, which is how this test
+        came to exist.
+
+        The adapter references are resolved for real; only the external binaries
+        are stand-ins, and nothing at this layer looks at those.
+        """
+        example = (inputs.REPO_ROOT / "app_bundle" / inputs.CONFIG_EXAMPLE).read_text()
+        placed = tmp_path / "config.toml"
+        placed.write_text(example)
+        read = config.load(placed)
+        assert read.delegated_turn_model
+        assert read.log.max_bytes > 0
+        assert set(read.adapters.as_mapping()) >= {"call", "companion_channel", "session_launcher"}
 
     def test_the_example_config_points_at_the_cli_the_bundle_really_lays_out(self) -> None:
         """`[delegate] cli` has to be true, or the instructions naming it are not.

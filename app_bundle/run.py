@@ -154,12 +154,18 @@ def relocate_cli(plan: BuildPlan) -> None:
 def precompile(plan: BuildPlan) -> None:
     """Write every `.pyc` now, so the interpreter never wants to write one later.
 
-    Nothing may write into the bundle at runtime. Of the two ways to hold that —
-    running with bytecode writing off, or pre-compiling — only this one is
-    packaging's own job: the other would mean editing the shell's argv to serve a
-    packaging constraint. `unchecked-hash` means the bytecode is used without a
-    timestamp comparison, so a bundle whose mtimes moved in transit still starts
-    without recompiling.
+    Nothing may write into the bundle at runtime, and there are two ways to hold
+    that. The shell already takes one: `ProcessLauncher` sets
+    `PYTHONDONTWRITEBYTECODE` when it spawns the *bundled* interpreter. This is
+    the other, and it is not redundant — that variable covers only the engine the
+    shell spawns, and the bundle is also run headless from a terminal and through
+    the relocated `bridgectl`, neither of which the shell is anywhere near.
+
+    `unchecked-hash` means the bytecode is used without a timestamp comparison,
+    so a bundle whose mtimes moved in transit still starts without recompiling —
+    which also happens to be the difference between the two escapes: with
+    bytecode writing off and nothing pre-compiled, every start recompiles from
+    source into memory.
     """
     python = plan.engine_root / "bin" / "python3"
     run(
