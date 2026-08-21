@@ -22,15 +22,23 @@ the engine's own log, because stderr *is* the log from that point on. Nothing is
 lost either way; the two failures are simply readable in different places, and
 the exit code says the same thing in both.
 
-**Every failure of the start is a refusal, whatever type it arrives as.** That
-sentence used to be true only for `OSError`, and every shipped adapter raises
-something else — so an engine that could not reach the far side of a seam exited
-1 with a traceback rather than 2 with a reason. Found from the app bundle, where
-it is worst: post-adoption stderr is the log, so the menu-bar shell's stderr
-panel is empty and the shell restarts on every exit, turning a first-run
-misconfiguration into a silent crash loop. The refusal now carries the whole
-traceback into the log and prints one sentence, because a `TypeError` inside an
-adapter's `connect` is a bug and the traceback is the only thing that explains it.
+**Every phase before the engine serves — reading the configuration, assembling,
+starting — refuses with one sentence and exit 2, on any exception. Only a failure
+*while serving* may look like a crash.** That is the contract, and it is stated
+as a rule rather than as three cases because it was twice repaired one case at a
+time: first only `ConfigError` was a refusal, then only `OSError` around the
+serve, and each time some other type — and every shipped adapter raises its own —
+fell through to the interpreter as exit 1 and a traceback.
+
+Found from the app bundle, where that is at its worst: post-adoption stderr *is*
+the log, so the menu-bar shell's stderr panel is empty and the shell restarts on
+every exit, turning a first-run misconfiguration into a silent crash loop. The
+most likely first run of all hit it — a Companion Channel whose credential
+variable is not set refuses at *assembly*, which was the last uncovered phase.
+
+Nothing is swallowed: the whole traceback goes to the diagnostics of whichever
+phase raised it, and the last line is a sentence. A `TypeError` inside somebody's
+`connect` is a bug, and that traceback is the only thing that explains it.
 
 **The environment is cleaned once, here, before anything is spawned.** Every
 adapter child inherits what this process holds, so ADR 0004's stripped prefixes
@@ -61,7 +69,6 @@ from gpt_voicecoding.control_plane.server import AlreadyServing
 from gpt_voicecoding.engine.composition import (
     DEFAULT_TICK_SECONDS,
     Engine,
-    EngineAssemblyError,
 )
 from gpt_voicecoding.engine.logfile import own_the_log, strip_environment
 
@@ -157,8 +164,14 @@ def main(
 
     try:
         engine = Engine.assemble(config)
-    except EngineAssemblyError as refusal:
-        print(f"the engine cannot start: {refusal}", file=sys.stderr)
+    except Exception as refusal:
+        # Every phase before serving refuses the same way. `EngineAssemblyError`
+        # was the only type caught here, and `built` re-raises only `TypeError`
+        # as one — so an adapter factory raising its own settings error escaped,
+        # which is the *first* thing a new install hits: the Telegram spoke
+        # raises exactly that when the variable `token_env` names is not set.
+        _log.error("the engine could not be assembled", exc_info=refusal)
+        print(f"the engine cannot start: {_start_refusal_detail(refusal, config)}", file=sys.stderr)
         return EXIT_REFUSED
 
     try:

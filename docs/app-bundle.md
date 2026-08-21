@@ -93,15 +93,27 @@ and two real coding agents. Run it **once, in order, from a bundled build**, on 
 machine that is not the one that built it if you can — moving the `.app` is half
 of what is being tested.
 
-**0. Configure it, and read the failure first.** Copy
+**0. Configure it, and read *both* failures first.** Copy
 `Contents/Resources/config.example.toml` into
-`~/Library/Application Support/GPT-VoiceCoding/engine/config.toml` and *before*
-filling it in properly, open the app with it deliberately broken — a missing
-`[delegate] model`, say. What should happen: the engine exits 2, the whole
-refusal is in `engine.log` beside the config, and the shell's Retry panel is
-**empty**, because after the engine adopts its log its stderr *is* the log
-(ADR 0004). That empty panel is a known v0 rough edge and this step exists so you
-meet it once, on purpose, rather than the first time something is actually wrong.
+`~/Library/Application Support/GPT-VoiceCoding/engine/config.toml`, and before
+filling it in properly, break it twice on purpose. The two breakages behave
+differently, and knowing which is which is the whole point of the step.
+
+*First, a configuration mistake* — comment out `[delegate] model`. The engine
+refuses **before it adopts its log**, so the sentence goes to stderr, the shell's
+Retry panel **shows it**, and no `engine.log` is created at all. This is the
+pleasant case.
+
+*Then, a missing credential* — put the model back, and start it with the variable
+named by `token_env` unset. The engine refuses **after adoption**, so its stderr
+*is* the log (ADR 0004): the terminal says nothing, the Retry panel is **empty**,
+and the reason — with a full traceback above it — is in `engine.log` beside the
+configuration.
+
+That empty panel is a known v0 rough edge. This step exists so you meet it once
+on purpose, and it uses the missing-credential case deliberately: it is the most
+likely thing to be wrong on anybody's real first run, so you are rehearsing the
+failure you would actually have met.
 
 **1. The microphone.** `python3 scripts/microphone_grant_proof.py --reset`, and
 follow it. The prompt must name the app.

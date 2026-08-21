@@ -189,6 +189,36 @@ class TestWhichSideOfAdoptionARefusalLandsOn:
         # is what a shell-restarted engine leaves behind to be read.
         assert (home / "engine.log").exists()
 
+    def test_an_adapter_that_refuses_its_settings_is_a_refusal_and_not_a_crash(
+        self, home: Path, configured: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The other half of the same bug, in the phase before `connect`.
+
+        `built` in the composition root re-raises only `TypeError` as an
+        `EngineAssemblyError`, so an adapter factory raising its own settings
+        error — which is what every settings-carrying adapter does — escaped
+        `main` entirely and became exit 1 with a traceback.
+
+        This is the *most likely first-run failure there is*: the Telegram spoke
+        raises exactly this when the variable named by `token_env` is not set,
+        and a missing credential is what a new install hits before anything else.
+        """
+        configured.write_text(
+            configured.read_text().replace("fakes:FakeCall", "fakes:unbuildable_call"),
+            encoding="utf-8",
+        )
+
+        code = main(
+            ["--config", str(configured)],
+            check_seconds=None,
+            redirect_standard_streams=False,
+        )
+
+        printed = capsys.readouterr()
+        assert code == EXIT_REFUSED
+        assert "the engine cannot start" in printed.err
+        assert "$NOTHING_SETS_THIS" in printed.err
+
     def test_an_adapter_whose_far_side_is_absent_is_a_refusal_and_not_a_crash(
         self, home: Path, configured: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

@@ -230,6 +230,20 @@ class RefusingCall(FakeCall):
         return None
 
 
+class AdapterSettingsRefused(Exception):
+    """What a settings-carrying adapter raises on a table it cannot accept.
+
+    Its own type, like every shipped adapter's — the Telegram spoke raises
+    `SettingsError` when the variable named by `token_env` is not set, which is
+    the most likely thing to go wrong on anybody's first run.
+    """
+
+
+def unbuildable_call(**_: object) -> FakeCall:
+    """A factory that refuses, the way an adapter refuses a settings table."""
+    raise AdapterSettingsRefused("the bot token is read from $NOTHING_SETS_THIS")
+
+
 class FakeCompanionChannel:
     """A Companion Channel that records pushes and can be told to fail."""
 
