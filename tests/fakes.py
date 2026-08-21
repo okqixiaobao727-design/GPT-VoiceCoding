@@ -20,7 +20,9 @@ adapter's issue.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
@@ -157,14 +159,20 @@ class FakeCall:
         self.sink = sink
         self.spoken: list[str] = []
         self.delegated: list[tuple[str, str]] = []
+        #: The house rules every call was opened on, in order. Bridge Core is
+        #: the only source of these, so a test can prove they came from it.
+        self.opened_on: list[str] = []
+        #: The same, for the threads Delegated Turns run on.
+        self.delegated_on: list[str] = []
         self._snapshot = CallSnapshot(state=CallState.DOWN)
         #: How many calls this adapter actually brought up. A policy test asserts
         #: on it to prove the one-call invariant stopped a second one.
         self.calls_started = 0
 
-    async def ensure_call(self) -> CallSnapshot:
+    async def ensure_call(self, instructions: str) -> CallSnapshot:
         if self._snapshot.is_up:
             return self._snapshot
+        self.opened_on.append(instructions)
         if not self.reachable:
             self._snapshot = CallSnapshot(state=CallState.CONNECTING)
             return self._snapshot
@@ -191,8 +199,11 @@ class FakeCall:
             request_id=request_id, outcome=Delivery.DELIVERED, reason="spoken into the call"
         )
 
-    async def delegate(self, text: str, *, model: str, request_id: RequestId) -> DelegatedReply:
+    async def delegate(
+        self, text: str, *, model: str, instructions: str, request_id: RequestId
+    ) -> DelegatedReply:
         self.delegated.append((text, model))
+        self.delegated_on.append(instructions)
         return DelegatedReply(text=self.delegated_text, model=model)
 
     async def verify(self) -> VerifyResult:
@@ -290,3 +301,26 @@ class FakeSessionLauncher:
         return self.verify_result or VerifyResult(
             outcome=VerifyOutcome.PASS, loaded="tests.fakes.FakeSessionLauncher"
         )
+
+
+#: What a test passes where Bridge Core would pass generated house rules. Any
+#: non-empty string will do: what the Call seam promises about instructions is
+#: that they arrive from the hub at the call site, not what they say.
+HOUSE_RULES = "the voice thread's house rules"
+
+
+def instruction_context(
+    *,
+    command: Path = Path("/usr/bin/true"),
+    socket_path: Path = Path("/tmp/gpt-voicecoding-tests/control.sock"),
+) -> InstructionContext:
+    """A generation context for a hub under test.
+
+    Both fields are only required to be absolute, so nothing has to exist on
+    disk. A hub built without one generates no instructions and therefore opens
+    no call, which is correct and is its own test — it is just not what most of
+    these tests are about.
+    """
+    return InstructionContext(
+        cli=ControlPlaneCli(command=command, version="0", socket_path=socket_path)
+    )

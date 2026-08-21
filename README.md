@@ -4,9 +4,11 @@ Voice-controlling terminal coding agents through a realtime voice call: the syst
 speaks agent progress to you, and carries your spoken instructions back to the
 agents.
 
-> **Status: early build.** Bridge Core, the control plane and the engine's
-> composition root are built and tested; no real adapter is, so the engine can
-> only be assembled over fakes and nothing yet speaks or launches. If you are
+> **Status: early build.** Bridge Core, the control plane, the engine's
+> composition root, the Codex Agent adapter and the bridge-owned Live Call are
+> built and tested; the Companion Channel, the Session Launcher, the Claude
+> adapter and the menu-bar shell are not, so nothing yet reaches you when no
+> call is up and nothing yet launches a session. If you are
 > looking for working software, the first-generation implementation lives at
 > [GPT-VoiceCoding-legacy](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy).
 
@@ -40,7 +42,9 @@ shell/              The Swift menu-bar shell (see ADR 0005).
 ```
 
 The engine runs standalone, without the menu-bar shell:
-`python -m gpt_voicecoding.engine --config <file>`. See
+`python -m gpt_voicecoding.engine --config <file>`. The Live Call's audio path is
+an optional extra — `pip install 'gpt-voicecoding[voice]'` — because everything
+else runs without a compiled media stack. See
 [`docs/control-plane.md`](docs/control-plane.md) for the interface, the command
 set and the configuration file.
 

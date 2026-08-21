@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel
+from fakes import HOUSE_RULES, FakeAgent, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import CLOSING_NOTICES, ApprovalPipeline
 from gpt_voicecoding.core.escalation import EscalationPipeline
@@ -74,6 +74,7 @@ class Harness:
             interlock=CallInterlock(self.call),
             adjudicator=SwitchAdjudicator(self.switches),
             relays=self.relays,
+            voice_instructions=HOUSE_RULES,
             clock=lambda: self.now,
         )
         self.pipeline = ApprovalPipeline(

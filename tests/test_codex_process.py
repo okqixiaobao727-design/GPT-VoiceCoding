@@ -33,6 +33,7 @@ from codex_fake import FakeAppServer
 from gpt_voicecoding.adapters.codex_app_server import process
 from gpt_voicecoding.adapters.codex_app_server.process import (
     CLIENT_NAME,
+    REALTIME_FEATURE,
     AppServerError,
     OwnedAppServer,
     attach,
@@ -58,6 +59,26 @@ async def main() -> None:
     server.answers("initialize", {{"codexHome": "/somewhere"}})
     await server.start()
     await asyncio.Event().wait()
+
+asyncio.run(main())
+"""
+
+#: The same, except it keeps talking. Two components share the engine's own
+#: app-server, so what matters here is that both of them hear it.
+CHATTY = """\
+import asyncio, sys
+sys.path.insert(0, {tests!r})
+from pathlib import Path
+from codex_fake import FakeAppServer
+
+async def main() -> None:
+    listen = [a for a in sys.argv if a.startswith("unix://")][0]
+    server = FakeAppServer(Path(listen[len("unix://"):]))
+    server.answers("initialize", {{}})
+    await server.start()
+    while True:
+        await asyncio.sleep(0.02)
+        await server.notify_all("thread/status/changed", {{"threadId": "t-1"}})
 
 asyncio.run(main())
 """
@@ -196,6 +217,101 @@ class TestOwningOne:
         started, pid = asyncio.run(scenario())
         assert started
         assert not running(pid), "the app-server outlived the engine that owned it"
+
+    def test_every_listener_hears_it(self, tmp_path: Path, socket_path: Path) -> None:
+        """One connection, one handler — but two components ride this process.
+
+        The Agent seam's adapter owns the app-server and the Call seam's adapter
+        rides it, so a fan-out that let only the owner listen would mean the
+        Call adapter could never see a realtime notification at all.
+        """
+        runner = tmp_path / "chatty.py"
+        runner.write_text(CHATTY.format(tests=str(Path(__file__).parent)))
+
+        async def scenario() -> tuple[list[object], list[object]]:
+            owned = OwnedAppServer(
+                settings=quick(
+                    executable=stand_in(tmp_path, body=f'exec {sys.executable} "{runner}" "$@"')
+                ),
+                socket_path=socket_path,
+            )
+            first: list[object] = []
+            second: list[object] = []
+            owned.listen(first.append)
+            try:
+                await owned.start(on_notification=second.append)
+                await _until(lambda: bool(first) and bool(second))
+            finally:
+                await owned.aclose()
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        assert first and second, "a shared app-server that only one component hears"
+
+    def test_a_listener_that_raises_does_not_silence_the_others(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        runner = tmp_path / "chatty.py"
+        runner.write_text(CHATTY.format(tests=str(Path(__file__).parent)))
+
+        async def scenario() -> list[object]:
+            owned = OwnedAppServer(
+                settings=quick(
+                    executable=stand_in(tmp_path, body=f'exec {sys.executable} "{runner}" "$@"')
+                ),
+                socket_path=socket_path,
+            )
+
+            def objects(_message: object) -> None:
+                raise RuntimeError("this listener is broken")
+
+            heard: list[object] = []
+            owned.listen(objects)
+            owned.listen(heard.append)
+            try:
+                await owned.start()
+                await _until(lambda: bool(heard))
+            finally:
+                await owned.aclose()
+            return heard
+
+        assert asyncio.run(scenario())
+
+    def test_it_enables_the_realtime_feature(self, tmp_path: Path, socket_path: Path) -> None:
+        """`experimentalApi` at initialize is not enough; the family must be on.
+
+        The two are different things and the difference cost a real smoke run.
+        Verified against codex 0.148.0 directly: `experimentalFeature/list`
+        reports `realtime_conversation` as `enabled: false` without this flag and
+        `enabled: true` with it. Without it `thread/realtime/start` is accepted
+        and then refused with "thread ... does not support realtime
+        conversation" — a per-thread-sounding message for a per-process cause,
+        which is exactly the kind of thing nobody diagnoses twice cheaply.
+        """
+        argv = tmp_path / "argv.txt"
+        runner = tmp_path / "recorded.py"
+        runner.write_text(STAND_IN.format(tests=str(Path(__file__).parent)))
+        recording = f'printf "%s\n" "$@" > "{argv}"\nexec {sys.executable} "{runner}" "$@"'
+
+        async def scenario() -> None:
+            owned = OwnedAppServer(
+                settings=quick(executable=stand_in(tmp_path, body=recording)),
+                socket_path=socket_path,
+            )
+            try:
+                await owned.start()
+            finally:
+                await owned.aclose()
+
+        asyncio.run(scenario())
+
+        assert argv.read_text().split() == [
+            "app-server",
+            "--enable",
+            REALTIME_FEATURE,
+            "--listen",
+            f"unix://{socket_path}",
+        ]
 
     def test_starting_twice_returns_the_same_connection(
         self, tmp_path: Path, socket_path: Path

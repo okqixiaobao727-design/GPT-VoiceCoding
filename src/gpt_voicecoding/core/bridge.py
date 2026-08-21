@@ -174,6 +174,10 @@ class BridgeCore:
         #: engine it reaches. None until a root supplies them; a hub assembled
         #: for a test has no CLI to name and does not pretend to.
         self._instructions = generate(instruction_context) if instruction_context else None
+        #: The voice thread's house rules, as the one string a call starts with.
+        #: Empty when this hub generated none, and the interlock refuses to open
+        #: a call on an empty one rather than this being checked at each caller.
+        self._voice_instructions = self._instructions.voice.text if self._instructions else ""
         #: Durations are measured with `clock`; anything written to disk is
         #: stamped with `stamp`. A Session's `registered_at` is read back by the
         #: next engine, and a monotonic reading would come back as the future.
@@ -187,6 +191,7 @@ class BridgeCore:
             interlock=self.interlock,
             adjudicator=self.adjudicator,
             relays=state.relays,
+            voice_instructions=self._voice_instructions,
             clock=clock,
         )
         self.relays = RelayPipeline(
@@ -265,7 +270,9 @@ class BridgeCore:
         """
         if self.interlock.owns_call():
             return await self.interlock.end_call()
-        snapshot = await self.interlock.open_call()
+        # Ending is always allowed; whether opening is, is the interlock's to
+        # say — in both directions, and for both of its reasons.
+        snapshot = await self.interlock.open_call(self._voice_instructions)
         if snapshot.is_up:
             await self.escalation.sweep()
         return snapshot

@@ -16,12 +16,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel
+import pytest
+
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
     BridgeCore,
 )
+from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.router import Classification, TextGrammar
@@ -63,6 +66,7 @@ class Hub:
         window: ReplyWindow = ReplyWindow.CLOSED,
         control: object = None,
         delegate: object = None,
+        instructions: bool = True,
     ) -> None:
         self.now = 1_000.0
         switches = Switchboard()
@@ -96,6 +100,7 @@ class Hub:
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]
             delegate=delegate,  # type: ignore[arg-type]
+            instruction_context=instruction_context() if instructions else None,
         )
 
     def emit(self, *events: object) -> int:
@@ -323,6 +328,26 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.toggle().state is CallState.DOWN
         assert hub.core.interlock.owns_call() is False
 
+    def test_a_hub_that_generated_no_house_rules_opens_no_call(self) -> None:
+        """The refusal comes from the interlock, which is the one door.
+
+        The hub does not carry its own copy of this check, so what a caller sees
+        here is the same refusal, worded once, that the escalation pipeline sees.
+        """
+        hub = Hub(instructions=False)
+
+        with pytest.raises(VoiceInstructionsMissing):
+            hub.toggle()
+
+        assert hub.call.calls_started == 0
+
+    def test_ending_a_call_never_needs_house_rules(self) -> None:
+        """Opening is refusable; ending is not. A call that is up must be endable."""
+        hub = Hub(instructions=False)
+        hub.core.interlock.note_started("call-1")
+
+        assert hub.toggle().state is CallState.DOWN
+
     def test_the_live_toggle_works_with_every_switch_off(self) -> None:
         """It is a control-plane action: the user touching the call, not the system."""
         hub = Hub(duty=False, voice=False, message=False)
@@ -446,9 +471,9 @@ class TestSwitchAdjudicationEndToEnd:
         hub.call.reachable = False
         original = hub.call.ensure_call
 
-        async def go_off_duty_while_connecting() -> object:
+        async def go_off_duty_while_connecting(instructions: str) -> object:
             hub.state.switches.flip(SwitchName.DUTY, False)
-            return await original()
+            return await original(instructions)
 
         hub.call.ensure_call = go_off_duty_while_connecting  # type: ignore[method-assign]
 

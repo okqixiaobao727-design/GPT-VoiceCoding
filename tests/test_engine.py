@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeCall, FakeCompanionChannel, FakeSessionLauncher
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.server import AlreadyServing
@@ -44,6 +44,31 @@ def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
     and a test's own module is as legitimate a source as a shipped adapter.
     """
     return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
+
+
+class RidingCall(FakeCall):
+    """A Call adapter that rides an app-server some other spoke owns."""
+
+    def __init__(self, **held: object) -> None:
+        super().__init__(**held)  # type: ignore[arg-type]
+        self.riding: object = None
+
+    def use_app_server(self, server: object) -> None:
+        self.riding = server
+
+
+class ServerOwningAgent(FakeAgent):
+    """An Agent adapter that owns one, as the Codex adapter really does."""
+
+    app_server = "the one app-server this engine spawns"
+
+
+def call_that_rides(*, sink: object = None) -> RidingCall:
+    return RidingCall(sink=sink)
+
+
+def agent_that_owns_one(*, sink: object = None) -> ServerOwningAgent:
+    return ServerOwningAgent(sink=sink)  # type: ignore[arg-type]
 
 
 CONFIG = """
@@ -321,6 +346,24 @@ class TestEventsReachTheHub:
 
         assert sent and "duty" in sent[0]
 
+    def test_a_delegated_turn_carries_the_instructions_the_hub_generated(self, home: Path) -> None:
+        """Bridge Core generates them; the root passes them at the call site."""
+        engine = assembled(home)
+
+        async def scenario() -> list[str]:
+            await engine.start()
+            try:
+                engine.core.events.emit(InboundText(text="> summarise the diff"))
+                await asyncio.sleep(0.05)
+                return list(engine.adapters.call.delegated_on)
+            finally:
+                await engine.aclose()
+
+        carried = asyncio.run(scenario())
+
+        assert engine.core.instructions is not None
+        assert carried == [engine.core.instructions.delegated.text]
+
     def test_a_delegated_turn_uses_the_model_the_user_configured(self, home: Path) -> None:
         """The cost lever comes from the file, never from code."""
         engine = assembled(home)
@@ -337,6 +380,42 @@ class TestEventsReachTheHub:
         delegated = asyncio.run(scenario())
 
         assert delegated == [("summarise the diff", "the-model-the-user-chose")]
+
+
+class TestSharingTheOneAppServer:
+    """One `codex app-server` per engine, and the root is what introduces them."""
+
+    RIDING = CONFIG.replace(
+        'call = "fakes:FakeCall"', 'call = "test_engine:call_that_rides"'
+    ).replace('codex = "fakes:FakeAgent"', 'codex = "test_engine:agent_that_owns_one"')
+
+    def test_the_call_adapter_is_handed_the_one_the_agent_adapter_owns(self, home: Path) -> None:
+        engine = assembled(home, self.RIDING)
+
+        assert engine.adapters.call.riding is ServerOwningAgent.app_server
+
+    def test_it_is_wired_before_anything_is_asked_to_open(self, home: Path) -> None:
+        """Assembly does it, so `start` can never reach an adapter still missing one."""
+        engine = assembled(home, self.RIDING)
+
+        assert engine.adapters.call.riding is not None, "wired only at start would be too late"
+
+    def test_a_call_adapter_with_no_provider_refuses_to_assemble(self, home: Path) -> None:
+        """Named by seam, not degraded silently: the voice surface could never come up."""
+        orphaned = self.RIDING.replace(
+            'codex = "test_engine:agent_that_owns_one"', 'codex = "fakes:FakeAgent"'
+        )
+
+        with pytest.raises(EngineAssemblyError) as refusal:
+            assembled(home, orphaned)
+
+        assert "[adapters.agents] codex" in str(refusal.value)
+
+    def test_a_call_adapter_that_wants_none_is_left_alone(self, home: Path) -> None:
+        """A fake or null Call adapter needs to know nothing about any of this."""
+        engine = assembled(home)
+
+        assert not hasattr(engine.adapters.call, "riding")
 
 
 class TestTheTick:
