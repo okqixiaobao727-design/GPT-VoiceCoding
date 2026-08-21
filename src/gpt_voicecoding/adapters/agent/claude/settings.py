@@ -18,6 +18,10 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from gpt_voicecoding.adapters.agent.claude.peer import DEFAULT_PEER_SOCKET_DIRECTORY
+from gpt_voicecoding.adapters.agent.claude.registry import DEFAULT_REGISTRY_DIRECTORY
+from gpt_voicecoding.adapters.agent.claude.transcript import DEFAULT_PROJECTS_DIRECTORY
+
 #: A short runtime root, for the reason `privacy.py` gives a length limit at
 #: all: a channel socket under a long application-support path cannot be bound.
 DEFAULT_SOCKET_DIRECTORY = Path("/tmp")
@@ -43,6 +47,31 @@ DEFAULT_MAX_MESSAGE_BYTES = 1 << 20
 #: The longest the user's words themselves may be, inside that line.
 DEFAULT_MAX_TEXT_BYTES = 64 << 10
 
+#: How long a Notice Relay waits, holding the caller, for its transcript readback
+#: or a receipt. Generous on purpose and bounded on purpose: the record that
+#: proves delivery is written only once the target's running turn ends, so this
+#: is a turn's length rather than a wire's — and an unbounded wait would turn
+#: "we cannot tell yet" into "we never answer".
+DEFAULT_READBACK_TIMEOUT_SECONDS = 90.0
+
+#: How long the readback keeps going *after* that wait is spent, in the
+#: background, so a proof that arrives late is still raised upward. This is what
+#: stops Bridge Core re-sending a notice that provably arrived.
+DEFAULT_LATE_READBACK_TIMEOUT_SECONDS = 600.0
+
+#: How often the transcript is re-read while waiting. Twice a second: the tail is
+#: a seek-and-read on one already-located file, and the thing being waited for
+#: takes a whole turn to appear, so anything faster is cost without an answer.
+DEFAULT_READBACK_POLL_SECONDS = 0.5
+
+#: How often each registered Session's registry record is re-read to see whether
+#: its Reply Window has moved. One second, and the number is a judgement about
+#: what is on the other end of it: what waits on this signal is a queued Relay
+#: being flushed, against turns that run for minutes, so a second of latency is
+#: imperceptible — while the file itself is rewritten sub-second, so polling
+#: faster would multiply reads without seeing anything sooner.
+DEFAULT_REPLY_WINDOW_POLL_SECONDS = 1.0
+
 
 class SettingsError(Exception):
     """The settings table names something this adapter does not have."""
@@ -58,12 +87,27 @@ class ClaudeSettings:
     late_ack_timeout_seconds: float = DEFAULT_LATE_ACK_TIMEOUT_SECONDS
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
     max_text_bytes: int = DEFAULT_MAX_TEXT_BYTES
+    #: Where Claude Code keeps the three things the Notice Relay reads: the
+    #: Session registry, the transcripts, and every Session's peer socket. All
+    #: three are locations, so all three default — and none of them is ours to
+    #: write to.
+    registry_directory: Path = DEFAULT_REGISTRY_DIRECTORY
+    projects_directory: Path = DEFAULT_PROJECTS_DIRECTORY
+    peer_socket_directory: Path = DEFAULT_PEER_SOCKET_DIRECTORY
+    readback_timeout_seconds: float = DEFAULT_READBACK_TIMEOUT_SECONDS
+    late_readback_timeout_seconds: float = DEFAULT_LATE_READBACK_TIMEOUT_SECONDS
+    readback_poll_seconds: float = DEFAULT_READBACK_POLL_SECONDS
+    reply_window_poll_seconds: float = DEFAULT_REPLY_WINDOW_POLL_SECONDS
 
     def __post_init__(self) -> None:
         for name in (
             "request_timeout_seconds",
             "ack_timeout_seconds",
             "late_ack_timeout_seconds",
+            "readback_timeout_seconds",
+            "late_readback_timeout_seconds",
+            "readback_poll_seconds",
+            "reply_window_poll_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise SettingsError(f"{name} must be a positive number of seconds")
@@ -93,7 +137,7 @@ class ClaudeSettings:
 
 def _typed(key: str, value: Any) -> Any:
     """Turn one TOML value into what the field holds, or refuse in the operator's words."""
-    if key == "socket_directory":
+    if key.endswith("_directory"):
         if not isinstance(value, str) or not value.strip():
             raise SettingsError(f"{key} must be a directory path")
         return Path(value.strip()).expanduser()

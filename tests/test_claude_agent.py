@@ -23,10 +23,7 @@ import pytest
 
 from claude_fake import FakeChannel
 from gpt_voicecoding.adapters.agent.claude import ClaudeAgentAdapter, claude_agent
-from gpt_voicecoding.adapters.agent.claude.adapter import (
-    APPROVAL_UNAVAILABLE,
-    NOTICE_UNAVAILABLE,
-)
+from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNAVAILABLE
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     CHANNEL_KIND_BY_VERB,
     channel_kind_for,
@@ -338,27 +335,47 @@ class TestTheRoutesThisBuildReallyHas:
         assert receipt.outcome is Delivery.FAILED
         assert received == [], "a route this adapter lacks must put nothing on the wire"
 
-    def test_the_notice_and_approval_relays_refuse_by_name(self, socket_path: Path) -> None:
-        """Both ride other routes. Saying so beats mis-sending them down this one."""
+    def test_the_approval_relay_refuses_by_name(self, socket_path: Path) -> None:
+        """It rides the PermissionRequest hook. Saying so beats mis-sending it here."""
+
+        async def scenario():
+            async with FakeChannel(socket_path) as channel:
+                adapter = reaching(socket_path, Sink())
+                try:
+                    verdict = await adapter.approval_relay(
+                        ApprovalRequest(approval_id="a-1", target=TARGET, tool_name="Bash"),
+                        ApprovalVerdict.ALLOW,
+                        request_id=rid("r-2"),
+                    )
+                    return verdict, channel.received
+                finally:
+                    await adapter.aclose()
+
+        verdict, received = asyncio.run(scenario())
+        assert verdict.outcome is Delivery.FAILED and verdict.reason == APPROVAL_UNAVAILABLE
+        assert received == []
+
+    def test_a_notice_relay_never_touches_the_channel(self, socket_path: Path) -> None:
+        """It rides the peer socket. The two wires must not leak into each other.
+
+        The target here is in no registry, so the Notice Relay fails before the
+        wire — which is exactly the point: whatever it does, it does somewhere
+        else. `test_claude_notice.py` covers what it does on its own route.
+        """
 
         async def scenario():
             async with FakeChannel(socket_path) as channel:
                 adapter = reaching(socket_path, Sink())
                 try:
                     notice = await adapter.notice_relay(TARGET, "it stopped", request_id=rid())
-                    verdict = await adapter.approval_relay(
-                        ApprovalRequest(approval_id="a-1", target=TARGET, tool_name="Bash"),
-                        ApprovalVerdict.ALLOW,
-                        request_id=rid("r-2"),
-                    )
-                    return notice, verdict, channel.received
+                    return notice, channel.received
                 finally:
                     await adapter.aclose()
 
-        notice, verdict, received = asyncio.run(scenario())
-        assert notice.outcome is Delivery.FAILED and notice.reason == NOTICE_UNAVAILABLE
-        assert verdict.outcome is Delivery.FAILED and verdict.reason == APPROVAL_UNAVAILABLE
-        assert received == []
+        notice, received = asyncio.run(scenario())
+        assert notice.outcome is Delivery.FAILED
+        assert notice.reason, "a failure must always say why"
+        assert received == [], "the Notice Relay must put nothing on the channel"
 
 
 class TestFailingBeforeTheWordsLeave:
