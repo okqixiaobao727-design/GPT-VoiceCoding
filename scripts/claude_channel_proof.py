@@ -67,6 +67,8 @@ from gpt_voicecoding.adapters.agent.claude.privacy import (  # noqa: E402
     prepare_private_directory,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings  # noqa: E402
+from gpt_voicecoding.seams.agent import RelayReceipt  # noqa: E402
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt  # noqa: E402
 from gpt_voicecoding.seams.identity import (  # noqa: E402
     AgentKind,
     SessionTarget,
@@ -81,9 +83,16 @@ PINNED_CLAUDE_VERSION = "2.1.235"
 
 #: What the Relay says. Short, and it asks for a visible answer, so the proof is
 #: readable in the operator's own window rather than only in a receipt here.
+#:
+#: It must never tell the session to "do nothing else", and the first live run is
+#: why that is written down: this text said exactly that, the session obeyed it,
+#: replied in plain words and skipped the tool call — so a channel that had
+#: worked perfectly graded UNKNOWN. The receipt *is* a tool call, so a Relay that
+#: forbids tool calls forbids its own proof.
 RELAY_TEXT = (
     "This message came from the GPT-VoiceCoding bridge through your Session Channel. "
-    "Please reply with the single word ACKNOWLEDGED and do nothing else."
+    "Acknowledge it in the way this channel's instructions ask you to, and then reply "
+    "with the single word ACKNOWLEDGED."
 )
 
 
@@ -185,6 +194,34 @@ def _report_claude_version() -> None:
         )
 
 
+class Receipts:
+    """The event sink, kept so a late acknowledgement can still be heard.
+
+    Without this the script closes the adapter the moment the bounded wait is
+    spent, which throws away the very mechanism that separates "never
+    acknowledged" from "acknowledged a moment later" — and grades the second one
+    as though it were the first.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[RelayReceipt] = []
+
+    def emit(self, event: object) -> None:
+        if isinstance(event, RelayReceipt):
+            self.events.append(event)
+
+    async def delivered(self, request_id: str, *, seconds: float) -> DeliveryReceipt | None:
+        """Wait out the late window for a receipt that upgrades this attempt."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while loop.time() < deadline:
+            for event in self.events:
+                if event.receipt.request_id == request_id and event.receipt.is_delivered:
+                    return event.receipt
+            await asyncio.sleep(0.5)
+        return None
+
+
 async def _await_socket(path: Path, *, seconds: float) -> bool:
     """Wait, bounded, for the channel to bind. Its absence is the honest symptom."""
     loop = asyncio.get_running_loop()
@@ -198,30 +235,43 @@ async def _await_socket(path: Path, *, seconds: float) -> bool:
 
 async def run(arguments: argparse.Namespace) -> int:
     settings = ClaudeSettings()
-    home = Path(tempfile.mkdtemp(prefix="vc-claude-proof-", dir="/tmp"))
-    socket_path = home / "channel.sock"
-    prepare_private_directory(home)
-    plugin_directory = (
-        Path(arguments.plugin_dir).expanduser() if arguments.plugin_dir else home / "plugin"
-    )
-    _report_claude_version()
-    _refuse_to_replace_anything(sys.executable, plugin_directory)
-    write_plugin(plugin_directory, sys.executable)
-    print(f"plugin rendered at: {plugin_directory}")
-    print(f"channel socket:     {socket_path}")
-    print(_instructions(plugin_directory, socket_path, settings))
-    print(f"waiting up to {arguments.wait:.0f}s for the channel to bind ...", flush=True)
+    home: Path | None = None
 
-    bound = await _await_socket(socket_path, seconds=arguments.wait)
-    if not bound:
-        print(
-            "\nthe channel never bound its socket. Claude Code did not start this "
-            "server — the usual reason is that managed settings do not name this "
-            "plugin in allowedChannelPlugins, or channelsEnabled is not true.",
-            file=sys.stderr,
+    if arguments.socket:
+        # A channel a previous run already brought up, on a session still
+        # sitting there. Nothing is installed and nothing is rendered: this
+        # path exists so a second Relay costs one model turn instead of a whole
+        # install-and-launch round.
+        socket_path = Path(arguments.socket).expanduser()
+        _report_claude_version()
+        print(f"channel socket:     {socket_path} (given, not created)")
+        if not socket_path.exists():
+            print("\nthat socket is not there. The session that bound it is gone.", file=sys.stderr)
+            return 1
+    else:
+        home = Path(tempfile.mkdtemp(prefix="vc-claude-proof-", dir="/tmp"))
+        socket_path = home / "channel.sock"
+        prepare_private_directory(home)
+        plugin_directory = (
+            Path(arguments.plugin_dir).expanduser() if arguments.plugin_dir else home / "plugin"
         )
-        return 1
-    print("channel socket: bound")
+        _report_claude_version()
+        _refuse_to_replace_anything(sys.executable, plugin_directory)
+        write_plugin(plugin_directory, sys.executable)
+        print(f"plugin rendered at: {plugin_directory}")
+        print(f"channel socket:     {socket_path}")
+        print(_instructions(plugin_directory, socket_path, settings))
+        print(f"waiting up to {arguments.wait:.0f}s for the channel to bind ...", flush=True)
+
+        if not await _await_socket(socket_path, seconds=arguments.wait):
+            print(
+                "\nthe channel never bound its socket. Claude Code did not start this "
+                "server — the usual reason is that managed settings do not name this "
+                "plugin in allowedChannelPlugins, or channelsEnabled is not true.",
+                file=sys.stderr,
+            )
+            return 1
+        print("channel socket: bound")
 
     target = SessionTarget(
         agent=AgentKind.CLAUDE,
@@ -231,7 +281,8 @@ async def run(arguments: argparse.Namespace) -> int:
         # addresses the Session by.
         pid=arguments.pid or os.getpid(),
     )
-    adapter = ClaudeAgentAdapter(settings=settings)
+    receipts = Receipts()
+    adapter = ClaudeAgentAdapter(sink=receipts, settings=settings)
     adapter.register_session(target, socket_path)
     try:
         result = await adapter.verify()
@@ -242,8 +293,22 @@ async def run(arguments: argparse.Namespace) -> int:
             return 0
 
         print("\ncarrying one Answer Relay in ...", flush=True)
-        receipt = await adapter.answer_relay(target, RELAY_TEXT, request_id=new_request_id())
+        request_id = new_request_id()
+        receipt = await adapter.answer_relay(target, RELAY_TEXT, request_id=request_id)
         print(f"receipt: {receipt.outcome}{(' — ' + receipt.reason) if receipt.reason else ''}")
+
+        if receipt.outcome is Delivery.UNKNOWN:
+            # The adapter is still listening on that connection. Waiting the
+            # window out is the difference between "never acknowledged" and
+            # "acknowledged a moment after the budget", and reporting the second
+            # as the first is what a hurried proof would do.
+            budget = settings.late_ack_timeout_seconds
+            print(f"waiting up to {budget:.0f}s more for a late acknowledgement ...", flush=True)
+            late = await receipts.delivered(str(request_id), seconds=budget)
+            if late is not None:
+                receipt = late
+                print(f"late receipt: {late.outcome}")
+
         if not receipt.is_delivered:
             print(
                 "\nnot proven delivered. Watch the session's own window: an unread "
@@ -256,7 +321,9 @@ async def run(arguments: argparse.Namespace) -> int:
         return 0
     finally:
         await adapter.aclose()
-        if not arguments.keep:
+        if home is None:
+            pass  # the socket belongs to an earlier run, and is not ours to remove
+        elif not arguments.keep:
             shutil.rmtree(home, ignore_errors=True)
         else:
             print(f"\nleft in place: {home}")
@@ -274,6 +341,11 @@ def main() -> int:
     parser.add_argument("--session-id", default=None, help="the Session's id, if you know it")
     parser.add_argument("--pid", type=int, default=None, help="the Session's pid, if you know it")
     parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
+    parser.add_argument(
+        "--socket",
+        default=None,
+        help="relay into a channel an earlier run already brought up, installing nothing",
+    )
     return asyncio.run(run(parser.parse_args()))
 
 
