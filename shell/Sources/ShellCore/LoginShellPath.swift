@@ -16,6 +16,25 @@ import Foundation
 /// their profile — so this reads the original instead, at the one point where
 /// launchd truncated it, and everything downstream inherits the truth for free.
 ///
+/// **Which startup file, though, is the whole difficulty.** The first version of
+/// this asked with `-lc` and was wrong on the reference machine: zsh sources
+/// `~/.zshrc` only when the shell is *interactive*, and `~/.zshrc` is where a zsh
+/// user's `PATH` actually is — it is where `nvm`'s own installer writes itself,
+/// and where `brew shellenv` is usually put. A login-but-not-interactive shell
+/// reads `.zprofile` and stops, so it hands back a `PATH` the user has never
+/// seen, and the engine starts without the coding agent it exists to drive. The
+/// ledger was real; `-lc` was reading the wrong page of it.
+///
+/// So the shell is asked interactively, and the answer is **delimited by
+/// sentinels** the shell itself prints around the value. Interactive is what
+/// makes a prompt framework — powerlevel10k's instant prompt is the loud one —
+/// write to stdout on the way past, and without a delimiter that chatter is
+/// indistinguishable from the answer. With one, everything outside the sentinels
+/// is noise by construction and the value between them is the `PATH` verbatim.
+/// This is the shape VS Code's shell integration has used for years to read an
+/// environment out of somebody's real profile; it is settled prior art rather
+/// than a local invention.
+///
 /// **It fails open, always.** No shell, a shell that hangs, a non-zero exit, an
 /// answer that is not a path — every one of them leaves the inherited
 /// environment exactly as it was. This may make a spawn better; it may never
@@ -38,10 +57,42 @@ public enum LoginShellPath {
     /// `waitUntilExit`, so this is the resolution of the one written here.
     static let terminationPollInterval: useconds_t = 10_000
 
+    /// What marks the answer off from whatever else an interactive profile
+    /// decided to print. Long and unlovely on purpose: it has to be something no
+    /// prompt framework would emit by accident, because anything it collides
+    /// with would be read as a `PATH`.
+    static let sentinel = "<<<GVC-PATH>>>"
+
     /// `printf` rather than `echo`, which appends a newline that then has to be
     /// trimmed, and `%s` rather than `%q`, because this is a value and not a
-    /// command line.
-    static let script = #"printf %s "$PATH""#
+    /// command line. The sentinels are literal in single quotes so no shell
+    /// expands them, and the value stays in `"$PATH"` so no shell splits it.
+    static let script =
+        #"printf '\#(sentinel)%s\#(sentinel)' "$PATH""#
+
+    /// The `PATH` from between the sentinels, or nothing at all.
+    ///
+    /// Nothing at all is the right answer for a shell that printed chatter and
+    /// never reached the `printf`: it exits 0 having said something that may
+    /// well look path-shaped, and taking that would be making a spawn worse.
+    ///
+    /// **Exactly two, or nothing.** Reading the first two occurrences would, for
+    /// output that contains three, take the gap between somebody else's sentinel
+    /// and ours — a fragment of a `PATH`, which is path-shaped enough to be
+    /// accepted and is a *worse* environment than the one we already had. A
+    /// count that is not two means something other than the `printf` wrote the
+    /// marker, and then no part of the output can be trusted to be the answer.
+    static func delimited(in output: String) -> String? {
+        var bounds: [Range<String.Index>] = []
+        var searched = output.startIndex..<output.endIndex
+        while let found = output.range(of: sentinel, range: searched) {
+            bounds.append(found)
+            if bounds.count > 2 { return nil }
+            searched = found.upperBound..<output.endIndex
+        }
+        guard bounds.count == 2 else { return nil }
+        return String(output[bounds[0].upperBound..<bounds[1].lowerBound])
+    }
 
     /// What runs the shell. A parameter so the failure modes can be tested
     /// without needing a machine that has each of them.
@@ -76,6 +127,11 @@ public enum LoginShellPath {
             log("\(shell) did not give a usable PATH; keeping the one we were given")
             return environment
         }
+        // Said on the way past, not only on the way down. The `-lc` defect this
+        // replaced produced a PATH that was *usable and wrong*, so no fallback
+        // line fired and nothing was written anywhere — the only observable that
+        // would have caught it is the one that says which PATH was taken.
+        log("PATH from login shell \(shell): \(resolved)")
         var built = environment
         built["PATH"] = resolved
         return built
@@ -88,11 +144,25 @@ public enum LoginShellPath {
     /// path list, and does not try to be right about which directories should
     /// exist. A `PATH` naming somewhere that is not there is the user's, and
     /// theirs to have.
+    ///
+    /// A newline disqualifies the answer **wherever it sits**, so it is looked
+    /// for before anything is trimmed away. Trimming first and asking after
+    /// would accept `"\n/opt/bin"` — a value that is not what the shell said it
+    /// was, arriving from output nobody can account for. Spaces and tabs are
+    /// still trimmed, because a `printf` cannot produce them here and a `Reader`
+    /// under test may.
+    ///
+    /// "Newline" means `CharacterSet.newlines` and not `\n` alone. A bare `\r`
+    /// is what a profile written on, or for, Windows leaves behind, and it is a
+    /// line break to every terminal that will ever render this value — testing
+    /// for the one shape a Unix `printf` happens to emit would be checking the
+    /// implementation we control instead of the input we do not.
     static func usable(_ answer: String) -> String? {
-        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard answer.rangeOfCharacter(from: .newlines) == nil, !answer.contains("\0") else {
+            return nil
+        }
+        let trimmed = answer.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
         guard !trimmed.isEmpty,
-            !trimmed.contains("\0"),
-            !trimmed.contains("\n"),
             trimmed.split(separator: ":").contains(where: { $0.hasPrefix("/") })
         else { return nil }
         return trimmed
@@ -101,15 +171,17 @@ public enum LoginShellPath {
     /// Run the login shell and take its answer, or nothing at all.
     ///
     /// `-l` is what makes the profile run; without it this reads the same
-    /// truncated `PATH` we already have. stdin is `/dev/null` and stderr is
-    /// discarded, so a profile that prompts cannot block us and a profile that
-    /// complains cannot be mistaken for the answer.
+    /// truncated `PATH` we already have. `-i` is what makes zsh read `~/.zshrc`,
+    /// which is the page of the ledger the `PATH` is usually on — and what makes
+    /// the sentinels necessary, since an interactive profile may print. stdin is
+    /// `/dev/null` and stderr is discarded, so a profile that prompts cannot
+    /// block us and a profile that complains cannot be mistaken for the answer.
     public static let readFromLoginShell: Reader = { shell, timeout in
         guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
-        process.arguments = ["-lc", script]
+        process.arguments = ["-lic", script]
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
@@ -130,7 +202,8 @@ public enum LoginShellPath {
         }
         process.waitUntilExit()
         guard process.terminationStatus == 0, process.terminationReason == .exit else { return nil }
-        return String(data: collected.data, encoding: .utf8)
+        guard let said = String(data: collected.data, encoding: .utf8) else { return nil }
+        return delimited(in: said)
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The engine as a **direct child** of this process.
 ///
@@ -10,7 +11,36 @@ import Foundation
 /// Bundle containment, not this spawn mechanism, is what earns the microphone
 /// grant — but parenthood is what keeps spawn, health and restart in one place.
 public struct ProcessLauncher: EngineLaunching {
-    public init() {
+    /// Where this launcher's own sentences go.
+    ///
+    /// **Not** the engine's log and not ``StderrRing``. ADR 0004 gives the
+    /// engine's log to the engine, and the ring carries the engine's own words —
+    /// the shell writing its sentences into either would be the surface
+    /// inventing speech on the engine's behalf. Choosing a child's environment
+    /// is the shell's own act, so it is reported through the platform's
+    /// diagnostic channel, where `log show` and Console.app can find it without
+    /// the shell keeping a ledger of its own.
+    private let log: @Sendable (String) -> Void
+
+    /// The unified log, under the bundle's own identifier.
+    ///
+    /// The subsystem is read from the bundle rather than spelled out: ADR 0005
+    /// makes `Info.plist` the one place that identifier lives, and a copy here
+    /// would be a second one to keep in step. Outside a bundle — headless, or a
+    /// test — there is no identifier to read, and saying so is more honest than
+    /// borrowing the app's.
+    public static let unifiedLog: @Sendable (String) -> Void = { line in
+        let logger = Logger(
+            subsystem: Bundle.main.bundleIdentifier ?? "GPTVoiceCodingShell.unbundled",
+            category: "launch")
+        // `public` because this is one machine's own `PATH` in its own local
+        // log. Default redaction would replace it with `<private>`, which is the
+        // same silence this line exists to end.
+        logger.notice("\(line, privacy: .public)")
+    }
+
+    public init(log: @escaping @Sendable (String) -> Void = ProcessLauncher.unifiedLog) {
+        self.log = log
         // The child's stderr is a pipe this process reads and may stop reading.
         BrokenPipes.ignore()
     }
@@ -30,7 +60,8 @@ public struct ProcessLauncher: EngineLaunching {
         // every spawn rather than cached: it is cheap, and a cached copy of
         // somebody's profile is the staleness this exists to avoid. It fails
         // open, so a spawn is never worse for having asked.
-        var environment = LoginShellPath.applied(to: ProcessInfo.processInfo.environment)
+        var environment = LoginShellPath.applied(
+            to: ProcessInfo.processInfo.environment, log: log)
 
         if command.source == .bundled {
             // Nothing may write into the bundle at runtime, and a `.pyc` beside a

@@ -45,6 +45,33 @@ import Testing
         #expect(outcome.pid > 0)
     }
 
+    @Test func everySpawnSaysWhichPathItChoseAndWhereItCameFrom() async {
+        // The wiring, not the closure. `LoginShellPath` already proved it calls
+        // whatever logger it is handed; what went unproven — and untrue — is
+        // that anything ever handed it one, so both of its fallback sentences
+        // were discarded in production for the whole of d850e8f's life.
+        //
+        // A silent fallback is how a feature stops working without anybody
+        // noticing, and this ticket is the proof: `-lc` returned a PATH that was
+        // usable and wrong, so no fallback line would have fired anyway. Only
+        // saying which PATH was *taken* makes that observable.
+        let said = Sentences()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
+        let collected = Collector()
+
+        _ = try! ProcessLauncher(log: { said.add($0) }).launch(
+            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        // Exactly one, because a line per spawn is a diagnostic and two would be
+        // the beginning of a log nobody reads.
+        #expect(said.lines.count == 1)
+        // Whichever branch this machine takes, the line names the shell it asked
+        // and never claims a PATH it did not adopt.
+        #expect(said.lines.first?.contains(LoginShellPath.loginShell() ?? "/bin/sh") == true)
+    }
+
     @Test func askingItToStopStopsIt() async {
         let collected = Collector()
         let command = EngineCommand(
@@ -58,6 +85,16 @@ import Testing
         let code = await collected.exitCode()
         #expect(code == -SIGTERM)
     }
+}
+
+/// Gathers the launcher's own diagnostic lines, which is a different stream
+/// from the child's stderr and must not be confused with it.
+private final class Sentences: @unchecked Sendable {
+    private let lock = NSLock()
+    private var said: [String] = []
+
+    func add(_ line: String) { lock.withLock { said.append(line) } }
+    var lines: [String] { lock.withLock { said } }
 }
 
 /// Gathers what a real child said and how it ended.

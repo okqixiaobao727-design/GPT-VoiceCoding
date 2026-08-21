@@ -35,6 +35,11 @@ import Testing
         "   \n ",  // said whitespace
         "warning: your profile is broken",  // a profile complaining, not an answer
         "/opt/homebrew/bin\n/usr/bin",  // two lines: not a PATH
+        "\n/opt/homebrew/bin",  // a newline is a newline wherever it sits …
+        "/opt/homebrew/bin\n",  // … including at the end
+        "/opt/homebrew/bin\r",  // a bare CR is a line break too, not just LF
+        "/opt/homebrew\r\n/bin",  // and so is the pair, in the middle
+        "/opt/homebrew\u{2028}/bin",  // Unicode has its own, and they still count
         "relative:paths:only",  // nothing absolute in it
     ])
     func anAnswerThatIsNotAPathChangesNothing(_ answer: String) {
@@ -82,11 +87,7 @@ import Testing
         // The bound is what stops one person's `.zprofile` from holding the
         // engine's supervisor open — and the supervisor is what restarts the
         // engine, so a spawn that never returns is the whole shell wedged.
-        let hanging = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("hanging-shell-\(UUID().uuidString)")
-        try "#!/bin/sh\nsleep 30\n".write(to: hanging, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: hanging.path)
+        let hanging = try fakeShell("sleep 30")
         defer { try? FileManager.default.removeItem(at: hanging) }
 
         let started = Date()
@@ -97,17 +98,69 @@ import Testing
         #expect(elapsed < 3.0)
     }
 
+    @Test func itTakesThePathOutFromBetweenTheSentinelsAndLeavesTheNoise() throws {
+        // An interactive shell is what reads `.zshrc`, and `.zshrc` is where a
+        // zsh user's `PATH` actually is — but interactive is also what lets a
+        // prompt framework write to stdout on the way past. The sentinels are
+        // what make those two facts compatible.
+        let noisy = try fakeShell(
+            #"printf 'p10k instant prompt\n'; printf '%s' "$MARK/opt/homebrew/bin:/usr/bin$MARK"; printf 'welcome back\n'"#
+        )
+        defer { try? FileManager.default.removeItem(at: noisy) }
+
+        let answer = LoginShellPath.readFromLoginShell(noisy.path, LoginShellPath.timeout)
+
+        #expect(answer == "/opt/homebrew/bin:/usr/bin")
+        #expect(LoginShellPath.usable(answer ?? "") == "/opt/homebrew/bin:/usr/bin")
+    }
+
+    @Test func aSentinelInTheNoiseIsNotAnAnswerEither() throws {
+        // Taking the first two occurrences would read the gap between the
+        // chatter's sentinel and the real one — path-shaped enough to pass
+        // `usable`, and a truncated PATH is a worse spawn, which this may never
+        // produce. Three occurrences is a collision, and a collision is a
+        // fallback.
+        let colliding = try fakeShell(
+            #"printf '%s /opt/junk' "$MARK"; printf '%s' "$MARK/opt/homebrew/bin:/usr/bin$MARK""#
+        )
+        defer { try? FileManager.default.removeItem(at: colliding) }
+
+        #expect(LoginShellPath.readFromLoginShell(colliding.path, LoginShellPath.timeout) == nil)
+    }
+
+    @Test func noiseWithoutSentinelsIsNotAnAnswer() throws {
+        // A shell that exits 0 having printed something path-shaped, but never
+        // reached the `printf`, has not answered. Taking its chatter would be
+        // making a spawn worse, which this is not allowed to do.
+        let mute = try fakeShell(#"printf 'p10k instant prompt\n/usr/bin:/bin\n'"#)
+        defer { try? FileManager.default.removeItem(at: mute) }
+
+        #expect(LoginShellPath.readFromLoginShell(mute.path, LoginShellPath.timeout) == nil)
+    }
+
     @Test func aShellThatFailsGivesNothingEvenIfItPrinted() throws {
         // Exit status is checked as well as the text, because a profile can
         // print something path-shaped on its way to failing.
-        let failing = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("failing-shell-\(UUID().uuidString)")
-        try "#!/bin/sh\nprintf /usr/bin:/bin\nexit 1\n".write(
-            to: failing, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: failing.path)
+        let failing = try fakeShell(#"printf '%s/usr/bin:/bin%s' "$MARK" "$MARK"; exit 1"#)
         defer { try? FileManager.default.removeItem(at: failing) }
 
         #expect(LoginShellPath.readFromLoginShell(failing.path, LoginShellPath.timeout) == nil)
+    }
+
+    /// A throwaway executable standing in for somebody's login shell: it runs
+    /// `body` and nothing else, with `MARK` bound to the sentinel so no test
+    /// spells the marker out and then drifts from it.
+    ///
+    /// The arguments the reader passes — `-lic` and the script — are ignored,
+    /// which is the point: these cases are about what a shell *says*, and a real
+    /// one cannot be made to say them on demand.
+    private func fakeShell(_ body: String) throws -> URL {
+        let script = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fake-shell-\(UUID().uuidString)")
+        try "#!/bin/sh\nMARK='\(LoginShellPath.sentinel)'\n\(body)\n".write(
+            to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script
     }
 }

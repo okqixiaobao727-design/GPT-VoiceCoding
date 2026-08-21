@@ -72,6 +72,7 @@ produces a bundle that verifies clean and fails at the one moment it matters.
 | `com.apple.security.device.audio-input` on the bundled interpreter only | Entitlements go on executables, and `python3.12` is the process that opens the device. Without the sandbox or the hardened runtime it is **inert** — belt and braces, deliberately, so the bundle is already the right shape later. It is not what earns the grant. |
 | Bytecode pre-compiled at build time | Nothing may write into the bundle at runtime. The shell already sets `PYTHONDONTWRITEBYTECODE` for the bundled interpreter it spawns; this covers the two cases it cannot see — the engine run headless from a terminal, and the relocated `bridgectl` — and it also means a start does not recompile from source into memory. |
 | `bridgectl` is a two-line wrapper, not pip's console script | `pip` writes an **absolute** shebang. The interpreter relocates; its scripts do not. The engine's own check on `[delegate] cli` is "is a runnable file", which a dead shebang passes — so the failure would surface as `bad interpreter` inside a generated instruction. |
+| The user's `PATH` is read from an **interactive** login shell, delimited by sentinels | launchd hands a Finder-launched `.app` `/usr/bin:/bin:/usr/sbin:/sbin`, and the engine and every Session it launches inherit it. The fix reads the user's own shell — but `-lc` was the wrong question: zsh sources `~/.zshrc` only when interactive, and `~/.zshrc` is where `nvm`'s installer and `brew shellenv` actually write. `-i` reaches that page of the ledger; the sentinels are what make an interactive shell's chatter (powerlevel10k's instant prompt) separable from the answer. Same shape VS Code's shell integration uses. `.zprofile` is a steadier home for a `PATH`, but a product that only works for users who already knew that is broken for the majority. |
 | `config.example.toml` is shipped, never installed | The configuration is a file the user owns and the engine only reads, and it names adapters by import reference, so it runs with the privileges of whoever wrote it. An installer that authored it would be claiming something that is not the installer's. |
 
 ## Regenerating the lock
@@ -118,10 +119,14 @@ failure you would actually have met.
 **1. The microphone.** `python3 scripts/microphone_grant_proof.py --reset`, and
 follow it. The prompt must name the app.
 
-**2. One bot, one engine.** If the first-generation bridge still runs here, stop
-it or point this engine at a different bot — see the cutover note below. The
-`send` half of step 8 will pass either way; only inbound goes quiet, so this leg
-proves less than it appears to if you skip this.
+**2. One bot, one engine.** Check that nothing else is consuming `getUpdates` for
+the bot this engine is configured for; if something is, stop it or use a
+different bot — see the cutover note below. The `send` half of step 8 will pass
+either way; only inbound goes quiet, so this leg proves less than it appears to
+if you skip this. On the reference machine there is no contender: the
+first-generation bridge's `companionChannel` is empty and it never spoke to
+Telegram at all. The constraint is Telegram's and still real; that one bridge is
+simply not what would violate it.
 
 **3. Launch a Session.** From the menu bar, and again headless with
 `bridgectl launch`. Both must reach a real agent in a real workspace — this is
@@ -188,9 +193,14 @@ build. Charter decision 9, accepted; it waits for notarization.
 
 ## Cutover: one bot, one engine
 
-Telegram permits exactly **one `getUpdates` consumer per bot**. If the
-first-generation bridge is still running on the same machine, do not point the
-new engine's Companion Channel at the bot it holds: the two steal each other's
-inbound messages, `verify` still passes because `getMe` and `getChat` are
-unaffected, and only inbound goes quiet. Stop the old bridge first, or use a
-distinct bot until it is retired.
+Telegram permits exactly **one `getUpdates` consumer per bot**. Do not point the
+new engine's Companion Channel at a bot something else is already polling: the
+two steal each other's inbound messages, `verify` still passes because `getMe`
+and `getChat` are unaffected, and only inbound goes quiet. Stop the other
+consumer first, or use a distinct bot.
+
+The first-generation bridge was named here as the likely contender, and on this
+machine it is not one — its `companionChannel` is configured with an empty
+`module` and no credentials, so it has no Telegram channel to hold a bot with.
+Anything else polling the same bot — a second engine, a script, another machine —
+still would.
