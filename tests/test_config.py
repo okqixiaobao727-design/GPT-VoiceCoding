@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from gpt_voicecoding.config import (
+    NULL_COMPANION_CHANNEL,
     ConfigError,
     EngineConfig,
     default_log_path,
@@ -230,8 +231,13 @@ class TestWhatItRefuses:
 
         assert seam in str(refusal.value)
 
-    def test_an_unconfigured_channel_says_the_null_one_is_coming(self, tmp_path: Path) -> None:
-        """Legitimate to run without a channel — but that adapter is not built yet."""
+    def test_an_unconfigured_channel_names_the_null_one_to_write(self, tmp_path: Path) -> None:
+        """Legitimate to run without text reach — and it is said out loud, not left blank.
+
+        The refusal carries the exact reference an operator can paste, which is
+        only useful for as long as it is the real one; `test_companion_channel`
+        holds the spelling to the adapter that answers to it.
+        """
         text = "\n".join(
             line for line in COMPLETE.splitlines() if not line.startswith("companion_channel")
         )
@@ -239,7 +245,7 @@ class TestWhatItRefuses:
         with pytest.raises(ConfigError) as refusal:
             load(written(tmp_path, text))
 
-        assert "null" in str(refusal.value).lower()
+        assert NULL_COMPANION_CHANNEL in str(refusal.value)
 
     def test_no_agent_at_all(self, tmp_path: Path) -> None:
         text = COMPLETE.replace('codex = "tests.fakes:FakeAgent"', "")

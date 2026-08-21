@@ -69,6 +69,13 @@ LOG_FILE_NAME = "engine.log"
 #: Every seam the composition root must fill before the engine may serve.
 REQUIRED_SEAMS = ("call", "companion_channel", "session_launcher")
 
+#: The adapter an engine with no text reach names for itself. Written out as a
+#: string rather than imported: this module reads configuration, and importing an
+#: adapter is the composition root's privilege alone (ADR 0001). The spelling is
+#: held to the real one by a test, so the sentence below can never send an
+#: operator to a reference that does not exist.
+NULL_COMPANION_CHANNEL = "gpt_voicecoding.adapters.companion_channel:null_channel"
+
 
 class ConfigError(Exception):
     """The configuration cannot be read, or does not say enough to start."""
@@ -283,9 +290,11 @@ def _nothing_behind(seam: str, where: str) -> str:
     if seam == "companion_channel":
         return (
             f"nothing is configured behind the companion_channel seam{where}. Running "
-            "without one is legitimate, but the null implementation ships with the "
-            "Companion Channel adapter and is not built yet, so this engine refuses to "
-            "start rather than pretend it can reach you"
+            "without text reach is legitimate, and it is said out loud rather than left "
+            "blank: set companion_channel = "
+            f'"{NULL_COMPANION_CHANNEL}"'
+            ". An engine that deliberately has no channel and one that lost its channel "
+            "must not look alike"
         )
     return (
         f"nothing is configured behind the {seam} seam{where}: an engine that starts with "
