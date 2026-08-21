@@ -57,12 +57,12 @@ chat_id   = "000000000"
 
 # --- The external binaries, stated because this is a bundle ------------------
 #
-# An .app opened from Finder does not get your shell's PATH. macOS gives it
-# launchd's, which is /usr/bin:/bin:/usr/sbin:/sbin — no Homebrew, no npm
-# prefix, nothing you installed. Left unstated, these are looked up on PATH at
-# spawn time, which is right for a `pip install` run from a terminal and wrong
-# here. `which claude`, `which codex`, `which tmux` in your own shell and paste
-# the answers.
+# The menu-bar shell reads your login shell's PATH and hands it to the engine,
+# so in the ordinary case these are found. State them anyway if your setup is
+# not ordinary — the resolution fails open, so a profile that errors or hangs
+# leaves the engine with launchd's PATH (/usr/bin:/bin:/usr/sbin:/sbin) and
+# nothing you installed on it. `which claude`, `which codex`, `which tmux` in
+# your own shell and paste the answers.
 #
 # You will know if you get it wrong: `bridgectl verify` fails naming the binary,
 # and the engine refuses to start rather than serving a seam it cannot use.

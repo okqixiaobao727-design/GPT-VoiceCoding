@@ -23,13 +23,21 @@ public struct ProcessLauncher: EngineLaunching {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command.executable)
         process.arguments = command.arguments
+
+        // The user's own PATH, read from their login shell — because launchd
+        // gives a Finder-launched app `/usr/bin:/bin:/usr/sbin:/sbin`, the engine
+        // inherits that, and so does every Session the engine launches. Read
+        // every spawn rather than cached: it is cheap, and a cached copy of
+        // somebody's profile is the staleness this exists to avoid. It fails
+        // open, so a spawn is never worse for having asked.
+        var environment = LoginShellPath.applied(to: ProcessInfo.processInfo.environment)
+
         if command.source == .bundled {
             // Nothing may write into the bundle at runtime, and a `.pyc` beside a
             // signed file is a modification of a signed bundle.
-            var environment = ProcessInfo.processInfo.environment
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            process.environment = environment
         }
+        process.environment = environment
 
         // Only the engine's *pre-adoption* words arrive here: once it owns its
         // log (ADR 0004) its stderr is that file. Which is exactly the window

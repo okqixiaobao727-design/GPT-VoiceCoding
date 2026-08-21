@@ -112,6 +112,16 @@ parenthood rather than a seam concern:
 - Exit 2 with something already listening on the socket is not a crash: a second
   engine refuses without touching the first one's socket. That state says so and
   offers Retry rather than spawning against a live engine.
+- It gives the engine the user's **own `PATH`**, read from their login shell at
+  every spawn. macOS gives a Finder-launched app launchd's
+  `/usr/bin:/bin:/usr/sbin:/sbin`, the engine inherits it, and so does every
+  Session the engine launches — so without this a coding agent started from the
+  menu bar runs without the tools it exists to use. The user's shell startup
+  files are where that `PATH` is already written down; asking them to copy it
+  into `config.toml` would be a second copy that goes stale. It **fails open**:
+  no shell, a profile that hangs, a non-zero exit or an answer that is not a
+  path all leave the inherited environment exactly as it was. Nothing but `PATH`
+  is taken.
 
 Everything else it shows or flips is a control-plane action, including the Live
 Toggle — Bridge Core decides whether that starts or ends a call, and no call
