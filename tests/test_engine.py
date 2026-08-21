@@ -70,6 +70,7 @@ def call_that_rides(*, sink: object = None) -> RidingCall:
 def agent_that_owns_one(*, sink: object = None) -> ServerOwningAgent:
     return ServerOwningAgent(sink=sink)  # type: ignore[arg-type]
 
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -345,9 +346,7 @@ class TestEventsReachTheHub:
 
         assert sent and "duty" in sent[0]
 
-    def test_a_delegated_turn_carries_the_instructions_the_hub_generated(
-        self, home: Path
-    ) -> None:
+    def test_a_delegated_turn_carries_the_instructions_the_hub_generated(self, home: Path) -> None:
         """Bridge Core generates them; the root passes them at the call site."""
         engine = assembled(home)
 
@@ -390,9 +389,7 @@ class TestSharingTheOneAppServer:
         'call = "fakes:FakeCall"', 'call = "test_engine:call_that_rides"'
     ).replace('codex = "fakes:FakeAgent"', 'codex = "test_engine:agent_that_owns_one"')
 
-    def test_the_call_adapter_is_handed_the_one_the_agent_adapter_owns(
-        self, home: Path
-    ) -> None:
+    def test_the_call_adapter_is_handed_the_one_the_agent_adapter_owns(self, home: Path) -> None:
         engine = assembled(home, self.RIDING)
 
         assert engine.adapters.call.riding is ServerOwningAgent.app_server

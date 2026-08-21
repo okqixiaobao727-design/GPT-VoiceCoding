@@ -213,9 +213,7 @@ class TestWithNoHouseRulesToOpenOn:
 
         outcome = harness.escalate(notice())
 
-        assert [attempt.route for attempt in outcome.attempts] == [
-            NoticeRoute.OPEN_CALL_AND_SPEAK
-        ]
+        assert [attempt.route for attempt in outcome.attempts] == [NoticeRoute.OPEN_CALL_AND_SPEAK]
         assert outcome.attempts[0].outcome is Delivery.FAILED
         assert str(VoiceInstructionsMissing()) == outcome.attempts[0].reason
 
