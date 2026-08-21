@@ -5,6 +5,10 @@ Claude Session's window, so `Session.reply_window` stayed at its fail-closed
 default and every Relay queued forever. The tests are about the two ways that
 could be got wrong — claiming a window is open when it has not been observed, and
 reporting so much that a transition means nothing.
+
+The same sweep is also the only observer of a Claude Session's *death* (#20), and
+that half is tested for the way it could be got worst-wrong: reporting a death
+that has not happened. So most of those cases assert an absence.
 """
 
 from __future__ import annotations
@@ -12,16 +16,34 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
+from gpt_voicecoding.adapters.agent.claude import window as window_module
+from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL, SessionRecord
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
-from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher, window_for
-from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
+from gpt_voicecoding.adapters.agent.claude.window import (
+    PID_RECYCLED,
+    PROCESS_GONE,
+    ReplyWindowWatcher,
+    death_for,
+    window_for,
+)
+from gpt_voicecoding.core.sessions import SessionState
+from gpt_voicecoding.seams.agent import (
+    AgentEvent,
+    ReplyWindow,
+    ReplyWindowChanged,
+    SessionEnded,
+)
+from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+from hub import Hub
 
 SESSION = "430b0def-38ef-4783-8d57-d800710d83bd"
 LIVE_PID = os.getpid()
@@ -38,6 +60,30 @@ class Sink:
     @property
     def windows(self) -> list[ReplyWindow]:
         return [event.window for event in self.events]
+
+
+@dataclass
+class AllEvents:
+    """Everything the watcher raises, for the cases that are about death.
+
+    Deliberately not a widening of `Sink`. `Sink` collects windows and nothing
+    else, so a `SessionEnded` leaking into a window case breaks it loudly — and
+    that is exactly the regression the death rule could introduce, so the sentinel
+    the older cases already are has to keep its edge.
+    """
+
+    events: list[AgentEvent] = field(default_factory=list)
+
+    def emit(self, event: AgentEvent) -> None:
+        self.events.append(event)
+
+    @property
+    def windows(self) -> list[ReplyWindow]:
+        return [event.window for event in self.events if isinstance(event, ReplyWindowChanged)]
+
+    @property
+    def deaths(self) -> list[SessionEnded]:
+        return [event for event in self.events if isinstance(event, SessionEnded)]
 
 
 def registry(tmp_path: Path) -> Path:
@@ -65,7 +111,7 @@ def say(tmp_path: Path, status: str, *, pid: int = LIVE_PID, session_id: str = S
     )
 
 
-def watching(tmp_path: Path, sink: Sink) -> ReplyWindowWatcher:
+def watching(tmp_path: Path, sink: Sink | AllEvents) -> ReplyWindowWatcher:
     """A watcher over that stand-in registry, polling fast enough for a test to see it."""
     return ReplyWindowWatcher(
         settings=ClaudeSettings(
@@ -243,3 +289,270 @@ class TestPolling:
 
         asyncio.run(scenario())
         assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN]
+
+
+class Child:
+    """A real process this test owns, so its death is a fact rather than a stub.
+
+    Nothing about death detection can be proved against `os.getpid()`, which is
+    alive by definition — so the tests that need a corpse make one.
+    """
+
+    def __init__(self) -> None:
+        self._process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.pid = self._process.pid
+
+    def kill(self) -> None:
+        """End it and reap it, so the pid is gone rather than left as a zombie."""
+        self._process.kill()
+        self._process.wait()
+
+
+@pytest.fixture
+def child() -> Iterator[Child]:
+    process = Child()
+    try:
+        yield process
+    finally:
+        process.kill()
+
+
+def dead_pid() -> int:
+    """A pid whose process has certainly exited and been reaped."""
+    process = Child()
+    process.kill()
+    return process.pid
+
+
+def target_for(pid: int, *, session_id: str = SESSION) -> SessionTarget:
+    return SessionTarget(agent=AgentKind.CLAUDE, session_id=session_id, pid=pid)
+
+
+def a_record(*, pid: int, session_id: str) -> SessionRecord:
+    """One parsed record, built directly — these cases are about the rule, not the file."""
+    return SessionRecord(
+        pid=pid,
+        session_id=session_id,
+        cwd=Path("/a/workspace"),
+        version="2.1.238",
+        peer_protocol=PEER_PROTOCOL,
+        socket_path=Path(f"/tmp/cc-socks/{pid}.sock"),
+        status="idle",
+    )
+
+
+class TestWhatCountsAsPositiveEvidenceOfDeath:
+    """`death_for` alone: the rule, with no filesystem and no watcher around it."""
+
+    def test_a_process_that_is_gone_is_death(self) -> None:
+        assert death_for(TARGET, None, alive=False) == PROCESS_GONE
+
+    def test_a_process_that_is_gone_is_death_even_with_a_record_still_on_disk(self) -> None:
+        """Liveness is the authority; Claude Code not cleaning up does not resurrect it."""
+        record = a_record(pid=LIVE_PID, session_id=SESSION)
+
+        assert death_for(TARGET, record, alive=False) == PROCESS_GONE
+
+    def test_a_record_naming_another_session_on_a_live_pid_is_death(self) -> None:
+        record = a_record(pid=LIVE_PID, session_id="somebody-else")
+
+        assert death_for(TARGET, record, alive=True) == PID_RECYCLED.format(pid=LIVE_PID)
+
+    def test_the_two_kinds_of_evidence_are_told_apart(self) -> None:
+        """The acceptance criterion: a reader can tell which fact fired."""
+        gone = death_for(TARGET, None, alive=False)
+        recycled = death_for(TARGET, a_record(pid=LIVE_PID, session_id="else"), alive=True)
+
+        assert gone != recycled
+
+    def test_no_record_at_all_on_a_live_process_is_not_death(self) -> None:
+        """The registry is another program's file; a missing one is an ordinary state."""
+        assert death_for(TARGET, None, alive=True) is None
+
+    def test_this_sessions_own_record_on_a_live_process_is_not_death(self) -> None:
+        record = a_record(pid=LIVE_PID, session_id=SESSION)
+
+        assert death_for(TARGET, record, alive=True) is None
+
+
+class TestReportingDeath:
+    def test_a_process_that_exited_is_reported_ended_on_the_next_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        target = target_for(dead_pid())
+        watcher.watch(target)
+
+        watcher.poll_once()
+
+        assert sink.deaths == [SessionEnded(target=target, detail=PROCESS_GONE)]
+
+    def test_a_record_left_behind_by_a_dead_process_does_not_hide_the_death(
+        self, tmp_path: Path
+    ) -> None:
+        """Claude Code does not always clean up; liveness is the authority, not the file."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        pid = dead_pid()
+        say(tmp_path, "idle", pid=pid)
+        target = target_for(pid)
+        watcher.watch(target)
+
+        watcher.poll_once()
+
+        assert [event.detail for event in sink.deaths] == [PROCESS_GONE]
+
+    def test_a_recycled_pid_is_reported_ended(self, tmp_path: Path, child: Child) -> None:
+        """A readable record naming a different session id: that pid is somebody else's now."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "idle", pid=child.pid, session_id="somebody-else")
+        target = target_for(child.pid)
+        watcher.watch(target)
+
+        watcher.poll_once()
+
+        assert sink.deaths == [
+            SessionEnded(target=target, detail=PID_RECYCLED.format(pid=child.pid))
+        ]
+
+    def test_a_deleted_record_on_a_live_process_is_not_a_death(self, tmp_path: Path) -> None:
+        """The one case a false death would be most tempting, and most destructive."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "idle")
+        watcher.watch(TARGET)
+
+        (registry(tmp_path) / f"{LIVE_PID}.json").unlink()
+        watcher.poll_once()
+
+        assert sink.deaths == []
+        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert watcher.watching == (TARGET,)
+
+    def test_a_torn_record_on_a_live_process_is_not_a_death(self, tmp_path: Path) -> None:
+        """Records are rewritten live, so a half-written one is ordinary, not fatal."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "idle")
+        watcher.watch(TARGET)
+
+        (registry(tmp_path) / f"{LIVE_PID}.json").write_text('{"pid": 42, "sessi', encoding="utf-8")
+        watcher.poll_once()
+
+        assert sink.deaths == []
+        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert watcher.watching == (TARGET,)
+
+    def test_death_is_reported_once_and_drops_the_target(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        target = target_for(dead_pid())
+        watcher.watch(target)
+
+        watcher.poll_once()
+        before = list(sink.events)
+        watcher.poll_once()
+        watcher.poll_once()
+
+        assert len(sink.deaths) == 1
+        assert sink.events == before
+        assert watcher.watching == ()
+
+    def test_death_is_never_reported_at_registration(self, tmp_path: Path) -> None:
+        """Bridge Core has not registered the Session yet, so a death raised here is lost."""
+        sink = AllEvents()
+        target = target_for(dead_pid())
+
+        watching(tmp_path, sink).watch(target)
+
+        assert sink.deaths == []
+        assert sink.windows == [ReplyWindow.CLOSED]
+
+    def test_death_is_not_paired_with_a_window_report(self, tmp_path: Path) -> None:
+        """Ending a Session closes its window in core state; saying both says it twice."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        process = Child()
+        say(tmp_path, "idle", pid=process.pid)
+        target = target_for(process.pid)
+        watcher.watch(target)
+        assert sink.windows == [ReplyWindow.OPEN]
+
+        process.kill()
+        watcher.poll_once()
+
+        assert sink.events[1:] == [SessionEnded(target=target, detail=PROCESS_GONE)]
+
+    def test_a_target_forgotten_before_it_dies_is_never_reported(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        process = Child()
+        say(tmp_path, "idle", pid=process.pid)
+        target = target_for(process.pid)
+        watcher.watch(target)
+        watcher.forget(target)
+
+        process.kill()
+        watcher.poll_once()
+
+        assert sink.deaths == []
+        assert watcher.watching == ()
+
+    def test_a_sweep_that_raises_leaves_the_watch_standing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unchanged from before death detection: one bad sweep must not end the watch."""
+        sink = AllEvents()
+        raised: list[int] = []
+
+        def probe(pid: int) -> bool:
+            if not raised:
+                raised.append(pid)
+                raise RuntimeError("the liveness probe fell over")
+            return True
+
+        async def scenario() -> tuple[SessionTarget, ...]:
+            watcher = watching(tmp_path, sink)
+            say(tmp_path, "busy")
+            watcher.watch(TARGET)
+            monkeypatch.setattr(window_module, "pid_is_live", probe)
+            await watcher.start()
+            try:
+                say(tmp_path, "idle")
+                for _ in range(100):
+                    await asyncio.sleep(0.02)
+                    if ReplyWindow.OPEN in sink.windows:
+                        break
+                return watcher.watching
+            finally:
+                await watcher.aclose()
+
+        assert asyncio.run(scenario()) == (TARGET,)
+        assert raised == [LIVE_PID]  # the sweep really did fall over, once
+        assert sink.deaths == []
+        assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN]
+
+
+class TestDeathReachesBridgeCoreEndToEnd:
+    """The consumer half was already built and tested; this proves the producer lands."""
+
+    def test_a_dead_session_is_marked_ended_and_its_waiting_relays_are_answered(
+        self, tmp_path: Path
+    ) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        target = target_for(dead_pid())
+        hub = Hub(sessions=((target, "port the log"),))
+        watcher.watch(target)
+        hub.emit(InboundText(text="ship it"))
+        assert len(hub.state.relays.pending()) == 1
+
+        watcher.poll_once()
+        hub.emit(*sink.events)
+
+        assert hub.state.sessions.all()[0].state is SessionState.ENDED
+        assert hub.state.relays.pending() == ()
+        assert hub.agent.calls == []
+        assert any("never reached the session" in spoken for spoken in hub.call.spoken)
