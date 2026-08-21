@@ -189,6 +189,64 @@ class TestWhichSideOfAdoptionARefusalLandsOn:
         # is what a shell-restarted engine leaves behind to be read.
         assert (home / "engine.log").exists()
 
+    def test_an_adapter_whose_far_side_is_absent_is_a_refusal_and_not_a_crash(
+        self, home: Path, configured: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The docstring's promise: the exit code says the same thing either way.
+
+        It did not. Only `OSError` was caught around the serve, so an adapter
+        raising its own exception type — which every shipped one does; the Codex
+        app-server says `no 'codex' on PATH` — left the engine exiting **1** with
+        a traceback instead of **2** with a sentence.
+
+        Found from the app bundle, where it is at its worst: after adoption
+        stderr *is* the log, so the menu-bar shell's stderr panel gets nothing,
+        and the shell restarts on every exit. A first-run misconfiguration
+        presented as a silent crash loop.
+        """
+        configured.write_text(
+            configured.read_text().replace("fakes:FakeCall", "fakes:RefusingCall"),
+            encoding="utf-8",
+        )
+
+        code = main(
+            ["--config", str(configured)],
+            check_seconds=None,
+            redirect_standard_streams=False,
+        )
+
+        printed = capsys.readouterr()
+        assert code == EXIT_REFUSED
+        assert "the engine cannot start" in printed.err
+        # The adapter's own words, not a category. "Something went wrong" is the
+        # least actionable sentence a refusal can carry.
+        assert "the far side of this seam is not there" in printed.err
+
+    def test_a_refusal_keeps_the_traceback_the_only_diagnostic_a_bug_would_have(
+        self, home: Path, configured: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A sentence for the human, the whole traceback for the log.
+
+        A `TypeError` inside an adapter's `connect` is a bug, not a refusal, and
+        collapsing it to one line would throw away the only thing that could
+        explain it. Both, on purpose: the last line is a sentence and the log
+        keeps everything above it.
+        """
+        configured.write_text(
+            configured.read_text().replace("fakes:FakeCall", "fakes:RefusingCall"),
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.ERROR):
+            main(["--config", str(configured)], check_seconds=None, redirect_standard_streams=False)
+
+        recorded = [record for record in caplog.records if record.exc_info]
+        assert recorded, "the refusal carried no traceback into the log"
+        assert "UnreachableFarSide" in "".join(
+            logging.Formatter().formatException(record.exc_info)  # type: ignore[arg-type]
+            for record in recorded
+        )
+
 
 class TestARealEngineOwningARealLog:
     """The whole of ADR 0004's Done-when, in one process that is actually served."""

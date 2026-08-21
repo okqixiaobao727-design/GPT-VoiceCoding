@@ -22,6 +22,16 @@ the engine's own log, because stderr *is* the log from that point on. Nothing is
 lost either way; the two failures are simply readable in different places, and
 the exit code says the same thing in both.
 
+**Every failure of the start is a refusal, whatever type it arrives as.** That
+sentence used to be true only for `OSError`, and every shipped adapter raises
+something else — so an engine that could not reach the far side of a seam exited
+1 with a traceback rather than 2 with a reason. Found from the app bundle, where
+it is worst: post-adoption stderr is the log, so the menu-bar shell's stderr
+panel is empty and the shell restarts on every exit, turning a first-run
+misconfiguration into a silent crash loop. The refusal now carries the whole
+traceback into the log and prints one sentence, because a `TypeError` inside an
+adapter's `connect` is a bug and the traceback is the only thing that explains it.
+
 **The environment is cleaned once, here, before anything is spawned.** Every
 adapter child inherits what this process holds, so ADR 0004's stripped prefixes
 are applied at the one point all of them descend from rather than at each spawn
@@ -153,13 +163,46 @@ def main(
 
     try:
         asyncio.run(_serve(engine))
+    except StartRefused as refused:
+        # The whole traceback goes to the log, and the last line is a sentence.
+        # Both, on purpose: an adapter's own refusal reads as one line, and a
+        # `TypeError` inside somebody's `connect` is a bug whose only diagnostic
+        # is the traceback — collapsing it would throw that away.
+        _log.error("the engine could not start", exc_info=refused.cause)
+        print(f"the engine cannot start: {_said(refused.cause, config)}", file=sys.stderr)
+        return EXIT_REFUSED
     except (AlreadyServing, SocketPathTooLong, OSError) as refusal:
-        # OSError covers both the socket and an adapter whose far side is not
-        # there: a `connect` that raises is a start that did not happen, and the
-        # engine has already closed whatever it opened before saying so.
+        # Reached only while serving; a start that raises one of these arrives
+        # above, wrapped.
         print(f"the engine cannot serve on {config.socket_path}: {refusal}", file=sys.stderr)
         return EXIT_REFUSED
     return EXIT_OK
+
+
+def _said(cause: BaseException, config: EngineConfig) -> str:
+    """One sentence for a start that did not happen, in the failure's own words.
+
+    The socket is named when the socket is the problem, because "already in use"
+    without the path is a sentence with nowhere to go.
+    """
+    if isinstance(cause, AlreadyServing | SocketPathTooLong | OSError):
+        return f"nothing can serve on {config.socket_path}: {cause}"
+    return str(cause) or type(cause).__name__
+
+
+class StartRefused(Exception):
+    """The engine never came up. Carries what actually stopped it.
+
+    A start failure and a serving failure are different sentences and were, until
+    this existed, told apart only by exception *type* — so an adapter that raised
+    anything but an `OSError` fell through to the interpreter and became an exit
+    code of 1 with a traceback, in a runner that promises 2 with a reason. The
+    shipped adapters all raise their own types.
+    """
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
 
 
 async def _serve(engine: Engine) -> None:
@@ -169,7 +212,14 @@ async def _serve(engine: Engine) -> None:
     for received in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(received, stopping.set)
 
-    await engine.start()
+    try:
+        await engine.start()
+    except Exception as refusal:
+        # `start` has already closed whatever it opened, so there is nothing
+        # here to clean up — only something to name. `CancelledError` is not an
+        # `Exception` and is left to propagate, because a cancelled start is a
+        # shutdown, not a refusal.
+        raise StartRefused(refusal) from refusal
     try:
         await stopping.wait()
     finally:

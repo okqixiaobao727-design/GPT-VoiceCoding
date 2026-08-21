@@ -210,6 +210,26 @@ class FakeCall:
         return self.verify_result
 
 
+class UnreachableFarSide(Exception):
+    """What an adapter raises when the thing behind it is not there.
+
+    Deliberately **not** an `OSError`: the shipped adapters raise their own
+    exception types — `AppServerError` when `codex` is not on `PATH`, for one —
+    and a runner that only caught `OSError` turned those into an exit code of 1
+    and a traceback instead of the refusal it promises.
+    """
+
+
+class RefusingCall(FakeCall):
+    """A Call adapter whose `connect` fails the way a real one does."""
+
+    async def connect(self) -> None:
+        raise UnreachableFarSide("the far side of this seam is not there")
+
+    async def aclose(self) -> None:
+        return None
+
+
 class FakeCompanionChannel:
     """A Companion Channel that records pushes and can be told to fail."""
 
