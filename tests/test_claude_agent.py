@@ -23,7 +23,7 @@ import pytest
 
 from claude_fake import FakeChannel
 from gpt_voicecoding.adapters.agent.claude import ClaudeAgentAdapter, claude_agent
-from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNAVAILABLE
+from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNROUTED
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     CHANNEL_KIND_BY_VERB,
     channel_kind_for,
@@ -335,8 +335,16 @@ class TestTheRoutesThisBuildReallyHas:
         assert receipt.outcome is Delivery.FAILED
         assert received == [], "a route this adapter lacks must put nothing on the wire"
 
-    def test_the_approval_relay_refuses_by_name(self, socket_path: Path) -> None:
-        """It rides the PermissionRequest hook. Saying so beats mis-sending it here."""
+    def test_the_approval_relay_refuses_by_name_when_no_hook_route_exists(
+        self, socket_path: Path
+    ) -> None:
+        """It rides the PermissionRequest hook, which this Session's launch never opened.
+
+        A registered Session is not automatically an answerable one: the hook
+        arrives only for a launch that carried both the hook plugin and the
+        approval socket's address, so the refusal names those rather than
+        reporting an empty race.
+        """
 
         async def scenario():
             async with FakeChannel(socket_path) as channel:
@@ -352,8 +360,8 @@ class TestTheRoutesThisBuildReallyHas:
                     await adapter.aclose()
 
         verdict, received = asyncio.run(scenario())
-        assert verdict.outcome is Delivery.FAILED and verdict.reason == APPROVAL_UNAVAILABLE
-        assert received == []
+        assert verdict.outcome is Delivery.FAILED and verdict.reason == APPROVAL_UNROUTED
+        assert received == [], "a verdict never travels over the channel wire"
 
     def test_a_notice_relay_never_touches_the_channel(self, socket_path: Path) -> None:
         """It rides the peer socket. The two wires must not leak into each other.

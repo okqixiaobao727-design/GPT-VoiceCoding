@@ -8,6 +8,7 @@
 | [0004](0004-the-engine-owns-its-log.md) | The engine owns its log, so rotation can rename rather than truncate |
 | [0005](0005-the-engine-lives-inside-the-app-bundle.md) | The engine lives inside the app bundle, because that is what earns the microphone grant |
 | [0006](0006-the-claude-channel-server-is-python-and-stdlib-only.md) | The Claude Session Channel server is Python, and speaks MCP with the standard library alone |
+| [0007](0007-the-approval-hook-is-a-session-scoped-plugin.md) | The Claude Approval Relay's hook is registered as a session-scoped plugin |
 
 ## Provenance
 
