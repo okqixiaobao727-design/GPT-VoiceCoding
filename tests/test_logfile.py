@@ -44,6 +44,14 @@ from gpt_voicecoding.engine.logfile import (
 CAP = 100
 RETAINED = 3
 
+#: The bound the module's other waits already use: a tick that never comes fails
+#: the test rather than hanging it.
+WATCH_DEADLINE = 5
+
+#: A subprocess whose watcher never brought the live log back within the cap.
+#: Distinct so the parent can name what a non-zero exit meant.
+WATCHER_NEVER_TRIMMED = 17
+
 
 def rotate(path: Path, *, max_bytes: int = CAP, retained_files: int = RETAINED) -> bool:
     return rotate_by_rename(path, max_bytes=max_bytes, retained_files=retained_files)
@@ -405,9 +413,46 @@ class TestTheWriterThatCannotAskForRotation:
                 "    sys.stderr.write('x' * 10 + '\\n')\n"
                 "    sys.stderr.flush()\n"
                 "    time.sleep(0.005)\n"
+                # The clock is this writer's only trigger, so between the write
+                # that crosses the cap and the tick that notices it the live file
+                # is legitimately over — measuring at an arbitrary instant inside
+                # that window asserts something the design never promised. Wait
+                # for the tick here rather than in the parent: `watch()` runs on a
+                # daemon thread that dies with this process, so a deadline loop
+                # after the child exits would wait for a tick that cannot arrive.
+                #
+                # One observation decides both the loop and the exit, so the test
+                # cannot pass by waiting on one reading and asserting another.
+                # Rotation renames before it reopens, so the live path is briefly
+                # absent mid-rollover — that is a rotation in flight rather than a
+                # bound that held, and it keeps the loop going instead of raising
+                # and exiting with a status that says nothing.
+                #
+                # The deadline bounds the *waiting*, so a watcher that never trims
+                # fails rather than hangs; it is not a promise about tick latency.
+                # A reading within the cap ends the loop whatever the clock says,
+                # because the bound under test held — failing a slow machine for
+                # satisfying it is the flake this case was rewritten to remove.
+                "log = Path(sys.argv[1])\n"
+                f"deadline = time.monotonic() + {WATCH_DEADLINE}\n"
+                "while True:\n"
+                "    try:\n"
+                f"        within = log.stat().st_size <= {CAP}\n"
+                "    except FileNotFoundError:\n"
+                "        within = False\n"
+                "    if within or time.monotonic() >= deadline:\n"
+                "        break\n"
+                "    time.sleep(0.02)\n"
+                "if not within:\n"
+                f"    sys.exit({WATCHER_NEVER_TRIMMED})\n"
             ),
         )
 
+        # The child's stderr is the log under test, so nothing it prints on the
+        # way out reaches the runner — the status is the whole message.
+        assert result.returncode != WATCHER_NEVER_TRIMMED, (
+            f"the watcher never trimmed the live file within {WATCH_DEADLINE}s"
+        )
         assert result.returncode == 0, result.stderr
         # 1100 bytes were written against a 100-byte cap. Without a trigger the
         # whole 1100 sits in the live file and no generation exists at all.
