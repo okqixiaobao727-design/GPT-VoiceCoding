@@ -111,17 +111,27 @@ adapter needs no special case here — a human can see the dialog and answer it.
 
 That cost was reopened as a product question during this build, and the answer
 came back unchanged — so this paragraph stands as written rather than by default.
-The convenience route was ruled out by measurement rather than by preference: a
-per-invocation trust override **does not exist** on 0.149.0. `-c
+The convenience route was ruled out by measurement rather than by preference: `-c
 projects."<path>".trust_level` reaches the trust gate from neither the TUI nor the
 app-server, in neither path spelling; and, decisively, setting an *already
-trusted* directory to `untrusted` the same way produces no dialog either. Codex
-reads trust from the persisted configuration file, not from the merged
-configuration, so pre-trusting would mean this engine writing a file another
-program owns. A sanctioned route for voice-first launching into an unseen
-workspace is [issue
-#18](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/18), and it
-is not this decision's to take.
+trusted* directory to `untrusted` the same way produces no dialog either.
+
+A later probe, recorded on [issue
+#18](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/18), narrowed
+what those experiments actually measure. This paragraph first read them as "a
+per-invocation trust override does not exist" and "codex reads trust from the
+persisted configuration file, not from the merged configuration". The accurate
+statement is *file versus override*: codex resolves trust from persisted
+configuration **layers** — the base user config and any file named by `--profile`
+— and ignores `-c`. A `--profile` layer does reach the gate, held down by an
+inverted control: the same flag and the same engine-owned file, differing only in
+whether the workspace is listed, shows the dialog or does not. That is no route
+for *this* launcher — `codex app-server` has no `--profile`, and a remote TUI
+resolves trust by asking the app-server rather than from its own layers — but it
+makes pre-trusting a question of **which** file gets written rather than an
+impossibility. Every route that fits this topology writes a file another program
+owns, which is why the sanctioned route is issue #18's to take and not this
+decision's.
 
 **This does not apply to Claude Code.** Measured on 2.1.238 by the same method — a
 real tty, an unfamiliar directory, no keystrokes sent — a Claude Session starts
