@@ -149,6 +149,31 @@ ADR 0005 already established the negative control — an interpreter outside any
 `.app` collapses to the bare binary path — so that half is deliberately not
 re-run: it is a property of macOS, not of this bundle.
 
+## Known v0 limitations
+
+Deliberate, and written down so they are not rediscovered as bugs.
+
+**A refusal after log adoption is invisible in the shell.** The engine exits 2
+and says why, but by then its stderr *is* its log (ADR 0004), so the menu-bar
+shell's Retry panel — which shows only the engine's *pre-adoption* words — is
+empty. The answer is `engine.log`, beside the configuration. Step 0 of the
+acceptance exists so this is met once on purpose.
+
+**Nothing ends an engine it did not start.** Kill the shell abnormally and the
+engine is orphaned, and there is no supported way to stop it but `kill` on the
+process. Two reasons, both load-bearing rather than incidental: `bridgectl` is a
+*control-plane surface* — status and switches — and giving it a stop verb would
+make the control plane a lifecycle owner, which is not what it is; and a
+relaunched shell holds no handle on a process it did not spawn, so its Quit
+stops its own child and it has none, having refused to start one against the
+live socket. `SIGTERM` is what the engine's own signal handling is for: loops
+cancelled, socket removed, no debris. If field evidence ever shows the orphan
+case is common enough to hurt, that is a reopening with evidence, not a
+convenience feature.
+
+**An update may re-prompt for the microphone.** Ad-hoc signatures change per
+build. Charter decision 9, accepted; it waits for notarization.
+
 ## Cutover: one bot, one engine
 
 Telegram permits exactly **one `getUpdates` consumer per bot**. If the
