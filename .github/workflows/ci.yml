@@ -37,3 +37,28 @@ jobs:
 
       - name: Test
         run: pytest
+
+  shell:
+    # The menu-bar shell, checked in its own job so a Swift failure reads as a
+    # Swift failure. "The shell builds" is #11's own acceptance, and this is
+    # where that sentence is proved — leaving it to the packaging ticket would
+    # mean main could break the shell and the packaging ticket would be the one
+    # to find out.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build --package-path shell
+
+      # swift-testing is an explicit test-only dependency, because a checkout
+      # with only the Command Line Tools has neither it nor XCTest in the
+      # toolchain. `--disable-xctest` is what makes that the harness that runs.
+      - name: Test
+        run: swift test --package-path shell --disable-xctest
+
+      - name: Format
+        run: |
+          cd shell
+          swift format lint --recursive --strict Sources Tests Package.swift
