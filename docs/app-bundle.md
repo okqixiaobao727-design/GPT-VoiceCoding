@@ -85,6 +85,57 @@ because a lock resolved by some other Python is a lock for some other set of
 wheels. It writes `app_bundle/locks/<triple>.lock`. Read the diff: it is the list
 of binaries the next build will sign.
 
+## The v0 acceptance
+
+Everything above is machine-checked on every PR. What follows is not, and cannot
+be: it needs a microphone, a person to click a TCC prompt, a real Telegram bot
+and two real coding agents. Run it **once, in order, from a bundled build**, on a
+machine that is not the one that built it if you can — moving the `.app` is half
+of what is being tested.
+
+**0. Configure it, and read the failure first.** Copy
+`Contents/Resources/config.example.toml` into
+`~/Library/Application Support/GPT-VoiceCoding/engine/config.toml` and *before*
+filling it in properly, open the app with it deliberately broken — a missing
+`[delegate] model`, say. What should happen: the engine exits 2, the whole
+refusal is in `engine.log` beside the config, and the shell's Retry panel is
+**empty**, because after the engine adopts its log its stderr *is* the log
+(ADR 0004). That empty panel is a known v0 rough edge and this step exists so you
+meet it once, on purpose, rather than the first time something is actually wrong.
+
+**1. The microphone.** `python3 scripts/microphone_grant_proof.py --reset`, and
+follow it. The prompt must name the app.
+
+**2. One bot, one engine.** If the first-generation bridge still runs here, stop
+it or point this engine at a different bot — see the cutover note below. The
+`send` half of step 8 will pass either way; only inbound goes quiet, so this leg
+proves less than it appears to if you skip this.
+
+**3. Launch a Session.** From the menu bar, and again headless with
+`bridgectl launch`. Both must reach a real agent in a real workspace — this is
+also the step that proves the `PATH` the shell hands the engine is your own and
+not launchd's.
+
+**4. Let it stop.** Wait for the Session to finish a turn.
+
+**5. The Stop Notice.** With a Live Call up, it must be spoken into the call.
+
+**6. Answer Relay.** Speak an instruction; it must arrive in the Session as your
+own words.
+
+**7. Approval Relay.** Get the Session to ask for a permission it needs, and
+answer it by voice. One verdict, one request.
+
+**8. The Companion Channel.** End the call. A notice must reach Telegram, and a
+reply typed there must come back as inbound text.
+
+**9. The switches.** Duty off: nothing is spoken and nothing is pushed, but
+events are still recorded and the control plane still answers. Voice off,
+Message on: text-only operation. Then back.
+
+**10. Headless.** Every one of the above must be reachable through `bridgectl`
+from a terminal, against the same running engine.
+
 ## Before a release: the microphone
 
 The one part a machine cannot finish. macOS shows the TCC prompt to a person.
