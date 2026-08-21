@@ -48,6 +48,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
+from gpt_voicecoding.adapters.agent.claude.bootstrap import bootstrap_value
 from gpt_voicecoding.adapters.agent.claude.notice import NoticeRelay
 from gpt_voicecoding.adapters.agent.claude.peer import ReceiptListener
 from gpt_voicecoding.adapters.agent.claude.protocol import (
@@ -268,6 +269,25 @@ class ClaudeAgentAdapter:
         question about this engine's identity, not about its current state.
         """
         return self._approvals.path
+
+    def launch_bootstrap(self, channel_socket_path: Path) -> str:
+        """What one launch must set the bootstrap variable to for this engine.
+
+        The Session Launcher owns the child environment but not the contents of
+        this value: the byte budgets inside it are this adapter's settings, and
+        the approval address is this adapter's socket. So the launcher says where
+        the channel should listen — that path is per-launch and only it can mint
+        one — and asks here for everything else.
+
+        Answered before anything is bound, for the same reason
+        `approval_socket_path` is: a launch has to carry the address into the
+        Session that will dial it, so the address must exist first.
+        """
+        return bootstrap_value(
+            channel_socket_path,
+            self._settings,
+            approval_socket_path=self.approval_socket_path(),
+        )
 
     def _registered_as(self, session_id: str) -> SessionTarget | None:
         """The authority check behind the approval socket, in this adapter's own terms.
