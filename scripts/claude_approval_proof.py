@@ -18,10 +18,12 @@ asked for. The command you need is printed for you and none of it is run.
 
 **Use a throwaway session, and ask it to do something you do not mind happening.**
 An `allow` here is a real allow: the session runs the command. The suggestion
-below is `echo`, wrapped so no existing allow-rule pre-approves it — which is
-also the gotcha this whole route carries, because the hook never fires for a call
-a rule already allowed, and the first probe of this mechanism ever run failed for
-exactly that reason.
+below touches one file in `/tmp`, and it is a write rather than a print because
+that is the gotcha this whole route carries: the hook never fires for a call that
+was let through without a dialog. `echo` is let through — by Claude Code's own
+reading of what is harmless, not by any rule you could look up — and both the
+research that established this route and this script's own first live run lost a
+probe to exactly that.
 
 What a pass looks like, in the operator's own window: the permission dialog
 appears, this script prints the dialog it was told about, the script answers, and
@@ -77,10 +79,18 @@ from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request
 
 #: A command chosen to be harmless and, more importantly, *not* pre-approved.
 #: The hook only ever sees what would have stalled, so a proof that asks for
-#: something an existing rule allows proves nothing and looks like a broken hook.
+#: something already allowed proves nothing and looks exactly like a broken hook.
+#:
+#: **It is a write, and that is the whole point.** `echo` was the obvious choice
+#: and it is the wrong one twice over: the research that established this route
+#: recorded its first probe failing on exactly that, and this script's first live
+#: run repeated the mistake — `echo` was let through with no dialog and no hook,
+#: by Claude Code's own classification of harmless commands rather than by any
+#: rule a user could look up. A command that touches the filesystem is what
+#: reliably stops for a human.
 SUGGESTED_PROMPT = (
     "Run this exact shell command and show me its output: "
-    "echo gpt-voicecoding-approval-proof-$(date +%s)"
+    "touch /tmp/gpt-voicecoding-approval-proof && ls -l /tmp/gpt-voicecoding-approval-proof"
 )
 
 
