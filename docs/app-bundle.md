@@ -94,6 +94,11 @@ and two real coding agents. Run it **once, in order, from a bundled build**, on 
 machine that is not the one that built it if you can — moving the `.app` is half
 of what is being tested.
 
+Before step 0, do the two cutover checks below: retire any first-generation
+codex skill, and make sure nothing else is polling this engine's bot. Both are
+preconditions rather than steps — get either wrong and the run produces results
+that cannot be attributed to this engine at all.
+
 **0. Configure it, and read *both* failures first.** Copy
 `Contents/Resources/config.example.toml` into
 `~/Library/Application Support/GPT-VoiceCoding/engine/config.toml`, and before
@@ -190,6 +195,51 @@ convenience feature.
 
 **An update may re-prompt for the microphone.** Ad-hoc signatures change per
 build. Charter decision 9, accepted; it waits for notarization.
+
+**A first-generation codex skill silently hijacks the voice thread.** Anyone
+upgrading from the first generation has one, and this engine has no way to
+refuse it — see the cutover note. Left in place it does not break anything
+visibly; it just makes the Live Call drive a control plane that is not here, and
+explain itself perfectly while doing so. Retiring the skill is a step in the
+cutover rather than a fix in the code, because the file belongs to the user and
+so does the decision to keep it.
+
+**A workspace with no Session running in it cannot be named by voice.** The
+voice thread resolves a workspace from what the control plane returns, and the
+only absolute paths the control plane knows are those of Sessions it already
+holds. So the first launch into a cold workspace needs the absolute path spoken
+in full. Deferred rather than fixed: a project catalogue is a mechanism, and v0's
+closing gate is not where one gets added.
+
+## Cutover: retire the first generation's codex skill
+
+**Before the acceptance, and before any real use, check
+`~/.codex/skills/` for a first-generation skill and move it out.** On the
+reference machine it was `~/.codex/skills/gpt-voicecoding/`, six files, and it
+took three launches to notice.
+
+The Live Call's voice thread runs on a codex app-server, and codex loads skills
+from the user's own directory. A skill written for the first-generation bridge
+describes a *different* control plane: another binary
+(`…/GPT-VoiceCoding/runtime/bridgectl`), verbs this engine does not have
+(`launch --list`, `launch --destinations`), and a concept it has no equivalent
+for — a catalogue of "shortcuts" mapping a spoken project name to a directory.
+The engine cannot prevent this: the skill is the user's file and codex loads it
+before any of this engine's own instructions are in play.
+
+**The hijack is silent, which is what makes it expensive.** The model does not
+malfunction — it follows the wrong procedure correctly, and its explanations
+sound reasonable, because they *are* reasonable under the rules it was given. On
+the reference machine it read a retired skill's step 1, called `launch --list`,
+got an argparse usage error, and then declined to improvise because that skill's
+own rule says a failed launch must not be retried. Every sentence it said was
+true of the system it thought it was driving.
+
+The test is the rollout: find the call's rollout under `~/.codex/sessions/`
+(its filename carries the Live Call id `bridgectl status` prints) and look for
+the first generation's `bridgectl` path or `launch --list`. Either one means the
+voice thread is not being driven by this engine's instructions, and nothing it
+does can be attributed to this engine until the skill is gone.
 
 ## Cutover: one bot, one engine
 
