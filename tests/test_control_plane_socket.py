@@ -51,19 +51,32 @@ def socket_dir() -> Iterator[Path]:
         shutil.rmtree(base, ignore_errors=True)
 
 
-class StubPlane:
-    """Answers every action with the action it was asked, slowly on request."""
+class Held:
+    """One action stopped inside the plane until the test lets it go.
 
-    def __init__(self, *, delay_for: Action | None = None) -> None:
-        self.delay_for = delay_for
+    A sleep would only make the slow handler *probably* slower than the quick
+    one; this makes it certainly unfinished, so nothing rests on a margin that
+    a busy machine can eat.
+    """
+
+    def __init__(self, action: Action) -> None:
+        self.action = action
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+
+class StubPlane:
+    """Answers every action with the action it was asked, holding one on request."""
+
+    def __init__(self, *, held: Held | None = None) -> None:
+        self.held = held
         self.handled: list[Action] = []
-        self.answered_at: dict[Action, float] = {}
 
     async def handle(self, request: Request) -> Reply:
-        if request.action is self.delay_for:
-            await asyncio.sleep(0.2)
+        if self.held is not None and request.action is self.held.action:
+            self.held.reached.set()
+            await self.held.release.wait()
         self.handled.append(request.action)
-        self.answered_at[request.action] = asyncio.get_running_loop().time()
         return Reply.answered(request.action, {"echo": dict(request.payload)})
 
 
@@ -266,7 +279,8 @@ class TestOneBadLineCostsOneRequest:
 
 class TestTwoSurfacesAtOnce:
     def test_concurrent_clients_each_get_their_own_reply(self, socket_dir: Path) -> None:
-        plane = StubPlane(delay_for=Action.LAUNCH)
+        held = Held(Action.LAUNCH)
+        plane = StubPlane(held=held)
 
         async def scenario() -> tuple[Reply, Reply]:
             server = await serving(socket_dir, plane)
@@ -274,19 +288,32 @@ class TestTwoSurfacesAtOnce:
                 slow = asyncio.ensure_future(
                     ask(Request(action=Action.LAUNCH), path=server.path, timeout=5)
                 )
-                await asyncio.sleep(0.02)
+                # Wait for the slow handler to be in flight — but never past the
+                # slow request itself, or a LAUNCH that failed before it ever
+                # reached the plane would hang the suite instead of failing it.
+                reaching = asyncio.ensure_future(held.reached.wait())
+                await asyncio.wait([reaching, slow], return_when=asyncio.FIRST_COMPLETED)
+                reaching.cancel()
+                if slow.done():
+                    await slow  # it never arrived; let it say why
                 quick = await ask(Request(action=Action.STATUS), path=server.path, timeout=5)
+                # The quick one did not wait behind the slow one: one surface
+                # cannot wedge another, which is what a single-threaded accept
+                # loop would do. The slow handler is demonstrably still in
+                # flight, because nothing has released it yet.
+                assert not slow.done()
+                assert plane.handled == [Action.STATUS]
+                held.release.set()
                 return await slow, quick
             finally:
+                held.release.set()
                 await server.aclose()
 
         slow, quick = asyncio.run(scenario())
 
         assert slow.action is Action.LAUNCH
         assert quick.action is Action.STATUS
-        # The quick one did not wait behind the slow one: one surface cannot
-        # wedge another, which is what a single-threaded accept loop would do.
-        assert plane.answered_at[Action.STATUS] < plane.answered_at[Action.LAUNCH]
+        assert plane.handled == [Action.STATUS, Action.LAUNCH]
 
     def test_every_reply_names_the_action_it_answers(self, socket_dir: Path) -> None:
         """A surface that guessed which reply was its own is a surface that races."""
