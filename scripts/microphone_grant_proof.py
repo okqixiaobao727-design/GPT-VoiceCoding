@@ -135,8 +135,20 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     say(
-        "5. Quit it properly, launch it again, start another Live Call",
-        "  bridgectl or the menu's Quit, then open the app again.\n"
+        "5. End the orphan by hand, then start over",
+        "  kill $(pgrep -f gpt_voicecoding.engine)   # SIGTERM: it stops in order\n\n"
+        "  By hand because nothing in v0 can do it for you, and that is not an\n"
+        "  oversight to route around: `bridgectl` is a control-plane surface and\n"
+        "  has no verb that ends the engine, and the relaunched shell holds no\n"
+        "  handle on a process it did not spawn — its Quit stops its own child\n"
+        "  and there is no child, because it refused to start one against the\n"
+        "  live socket. SIGTERM is what the engine's own signal handling is for:\n"
+        "  loops cancelled, socket removed, no debris for the next start.",
+    )
+
+    say(
+        "6. Launch it again, start another Live Call",
+        "  Now there is no engine running, so this is a genuine second run.\n"
         "  There must be NO second prompt. A grant that has to be given twice\n"
         "  attached to a launch rather than to the bundle.",
     )
