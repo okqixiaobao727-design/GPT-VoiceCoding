@@ -14,11 +14,26 @@ the single-ownership rule the Codex adapter issue fixes.
 
 **A Session's own.** A Codex TUI is a thin client of an app-server
 (`codex --remote unix://PATH`), so whoever owns that process owns the life of the
-user's visible session. The engine therefore **never** owns one: the launch
-wrapper spawns it in the user's own terminal and tells the engine where its
-socket is, and this engine attaches as one more client. That is what keeps an
-engine restart from taking every open Codex session down with it, and it is why
-`attach` here spawns nothing at all.
+user's session. Either way, **nothing here spawns one**: `attach` becomes one more
+client of a process somebody else started, and that is the whole of this module's
+relationship to it.
+
+Who that somebody is depends on whether the Session is visible, and ADR 0008
+settles it along the same line as visibility itself:
+
+- **A visible Session's app-server belongs to the tmux server**, which the tmux
+  launcher starts it under. The engine never owns it, and an engine restart does
+  not take down a session a human is using — the original reason for this rule,
+  preserved exactly where it applies.
+- **A headless Session's app-server is the engine's own child** and dies with it.
+  That Session runs on a pseudo-terminal the engine holds, so an engine that goes
+  takes the TUI with it regardless; an app-server left serving a client that no
+  longer exists, and that nobody could have reached, is not something to keep
+  alive.
+
+This module said "the engine **never** owns one" before the launcher existed. That
+was true of every path there was at the time, and it is now true of the visible
+path only. It is corrected here rather than left to become quietly false.
 
 Attaching is possible because of a fact established by probing codex 0.148.0
 directly: one app-server accepts many concurrent clients, `thread/resume` against

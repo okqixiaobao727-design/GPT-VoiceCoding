@@ -136,10 +136,14 @@ async def main(relay: bool) -> int:
             socket_path, version="proof", settings=settings, on_notification=heard
         )
         print("\n   Open a terminal that is NOT inside tmux, and run:\n")
-        print(f"       cd {workspace} && codex --remote unix://{socket_path}\n")
-        print("   Then type anything into it — a Session with no history cannot be")
-        print("   resumed, so it has to do one thing before it can be observed.")
-        print("   (`!echo hello` runs a shell command and costs nothing.)\n")
+        print(f"       codex --remote unix://{socket_path} -C {workspace}\n")
+        print("   It should announce itself within seconds without you typing")
+        print("   anything. Measured on codex 0.149.0: a TUI emits thread/started")
+        print("   during its own startup. This script used to say a Session had to")
+        print("   do one thing before it could be observed; that stopped being")
+        print("   true, and the Session Launcher's confirmation depends on it.")
+        print("   (If it stalls, the likeliest cause is the directory-trust")
+        print("   dialog, shown once per workspace codex has not seen before.)\n")
 
         thread_id = (
             await wait_for(lambda: started[:1], WAIT_FOR_A_HUMAN_SECONDS, "a Codex Session")
