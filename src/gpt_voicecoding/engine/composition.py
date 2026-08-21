@@ -159,6 +159,7 @@ class Engine:
         events = EventQueue()
         adapters = _adapters(config, events, factory_of)
         _share_the_app_server(adapters)
+        _introduce_the_launcher(adapters)
 
         state = BridgeState(
             switches=Switchboard(),
@@ -388,6 +389,37 @@ def _share_the_app_server(adapters: Adapters) -> None:
             "[adapters.agents] codex, or configure a Call adapter that needs none"
         )
     consumer(provider)
+
+
+def _introduce_the_launcher(adapters: Adapters) -> None:
+    """Tell the Session Launcher which Agent adapters a launch has to serve.
+
+    A launch carries things only an Agent spoke can name. The Claude one is the
+    clearest: a launched Session's `PermissionRequest` hook has to be told where
+    this engine parks dialogs, and its Session Channel has to be told which byte
+    budgets this engine was configured with — both of which live in that
+    adapter's settings and its own derived socket path, not in the launcher's.
+    The Codex one is smaller and the same shape: a launched Session's app-server
+    address is something only the launch knows, and only that adapter needs.
+
+    Introducing them is this root's job for the reason `_share_the_app_server`
+    states — the only place allowed to know two adapters at once is here.
+
+    **A launcher that wants no introduction is left alone**, so a fake or a null
+    implementation needs to know nothing about any of this. And a launcher that
+    wants one but finds no such Agent adapter is *not* stopped here: the
+    consequence is per-agent rather than fatal — an engine configured for Codex
+    only should start — and the launcher itself refuses that agent's launches by
+    name, which is the truthful place for that refusal.
+    """
+    launcher = adapters.launcher
+    for agent, introduce in (
+        (AgentKind.CLAUDE, getattr(launcher, "use_claude", None)),
+        (AgentKind.CODEX, getattr(launcher, "use_codex", None)),
+    ):
+        adapter = adapters.agents.get(agent)
+        if introduce is not None and adapter is not None:
+            introduce(adapter)
 
 
 def _instruction_context(config: EngineConfig) -> InstructionContext:

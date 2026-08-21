@@ -71,6 +71,31 @@ def agent_that_owns_one(*, sink: object = None) -> ServerOwningAgent:
     return ServerOwningAgent(sink=sink)  # type: ignore[arg-type]
 
 
+class IntroducedLauncher(FakeSessionLauncher):
+    """A Launcher that asks to be introduced to the Agent adapters, as both real ones do.
+
+    A launch carries things only an Agent spoke can name — where this engine
+    parks permission dialogs, which byte budgets its Session Channel was
+    configured with — so the real launchers take those adapters and the root is
+    what hands them over.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.met_claude: object = None
+        self.met_codex: object = None
+
+    def use_claude(self, adapter: object) -> None:
+        self.met_claude = adapter
+
+    def use_codex(self, adapter: object) -> None:
+        self.met_codex = adapter
+
+
+def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLauncher:
+    return IntroducedLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
+
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -399,6 +424,44 @@ class TestSharingTheOneAppServer:
         engine = assembled(home, self.RIDING)
 
         assert engine.adapters.call.riding is not None, "wired only at start would be too late"
+
+    def test_a_launcher_is_introduced_to_the_agent_adapters_it_launches_for(
+        self, home: Path
+    ) -> None:
+        """The launcher meets the spokes before anything opens, not at launch time."""
+        introduced = CONFIG.replace(
+            'session_launcher = "test_engine:one_session_launcher"',
+            'session_launcher = "test_engine:launcher_that_wants_introducing"',
+        )
+
+        engine = assembled(home, introduced)
+
+        assert engine.adapters.launcher.met_codex is engine.adapters.agents[AgentKind.CODEX]
+
+    def test_a_launcher_is_not_introduced_to_an_agent_this_engine_has_none_of(
+        self, home: Path
+    ) -> None:
+        """Per-agent rather than fatal.
+
+        An engine configured for Codex only is a legitimate engine, and it must
+        start. The launcher refuses a Claude launch by name when one is asked
+        for, which is where that refusal belongs — the assembly is not the place
+        to decide that half a configuration is no configuration.
+        """
+        introduced = CONFIG.replace(
+            'session_launcher = "test_engine:one_session_launcher"',
+            'session_launcher = "test_engine:launcher_that_wants_introducing"',
+        )
+
+        engine = assembled(home, introduced)
+
+        assert engine.adapters.launcher.met_claude is None
+
+    def test_a_launcher_that_wants_no_introduction_is_left_alone(self, home: Path) -> None:
+        """A fake or null launcher needs to know nothing about any of this."""
+        engine = assembled(home)
+
+        assert not hasattr(engine.adapters.launcher, "use_codex")
 
     def test_a_call_adapter_with_no_provider_refuses_to_assemble(self, home: Path) -> None:
         """Named by seam, not degraded silently: the voice surface could never come up."""
