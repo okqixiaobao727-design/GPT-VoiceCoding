@@ -64,9 +64,7 @@ def settings_for(home: Path, **overrides: object) -> ClaudeSettings:
         peer_socket_directory=home / "socks",
         request_timeout_seconds=2.0,
         readback_timeout_seconds=float(overrides.pop("readback_timeout_seconds", 2.0)),
-        late_readback_timeout_seconds=float(
-            overrides.pop("late_readback_timeout_seconds", 2.0)
-        ),
+        late_readback_timeout_seconds=float(overrides.pop("late_readback_timeout_seconds", 2.0)),
         readback_poll_seconds=0.02,
         **overrides,  # type: ignore[arg-type]
     )
@@ -191,9 +189,9 @@ class FakeSession:
         path = reply_address.removeprefix("uds:")
         _, writer = await asyncio.open_unix_connection(path)
         writer.write(
-            json.dumps(
-                {"type": "control", "action": "peer_message_status", **fields}
-            ).encode("utf-8")
+            json.dumps({"type": "control", "action": "peer_message_status", **fields}).encode(
+                "utf-8"
+            )
             + b"\n"
         )
         await writer.drain()
@@ -546,9 +544,7 @@ class TestAddressingAFork:
 
             async with FakeSession(home, pid=wanted_pid).answers(answer) as session:
                 try:
-                    receipt = await relay.send(
-                        target(wanted_pid), "it stopped", request_id=rid()
-                    )
+                    receipt = await relay.send(target(wanted_pid), "it stopped", request_id=rid())
                     return receipt, session.received
                 finally:
                     await relay.aclose()

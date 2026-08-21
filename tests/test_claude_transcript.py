@@ -106,7 +106,7 @@ def test_a_half_written_line_is_not_a_record_and_is_read_once_it_is_whole(
     assert list(tail.records()) == [{"whole": 1}]
 
     with path.open("a", encoding="utf-8") as handle:
-        handle.write('2}\n')
+        handle.write("2}\n")
     assert list(tail.records()) == [{"partial": 2}]
 
 

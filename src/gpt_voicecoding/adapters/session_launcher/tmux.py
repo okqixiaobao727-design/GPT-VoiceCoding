@@ -239,9 +239,7 @@ class _TmuxAppServer:
         self._window: str | None = None
 
     async def start(self, argv: Sequence[str], *, env: Mapping[str, str], cwd: Path) -> None:
-        self._window = await self._tmux.open_window(
-            self._name, pane_command(argv, env), cwd=cwd
-        )
+        self._window = await self._tmux.open_window(self._name, pane_command(argv, env), cwd=cwd)
 
     async def close(self) -> tuple[ChildOutcome, ...]:
         """Kill the window, and report truthfully — this adapter really owns it.
@@ -341,9 +339,7 @@ class TmuxLauncher:
                 _window_name(request), pane_command(plan.argv, plan.env), cwd=plan.cwd
             )
             ancestor = await tmux.pane_pid(window)
-            target = await preparation.confirm(
-                ancestor=ancestor, still_running=None
-            )
+            target = await preparation.confirm(ancestor=ancestor, still_running=None)
         except (PreparationError, TmuxError) as refused:
             screen = await tmux.screen(window) if window else ""
             await self._abandon(tmux, window, preparation)

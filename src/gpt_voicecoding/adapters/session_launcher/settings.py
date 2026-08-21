@@ -119,8 +119,9 @@ def _resolved(stated: Path | None, name: str, key: str) -> Path:
     """A stated path checked, or a discovered one, or a refusal naming both."""
     if stated is not None:
         if not stated.is_file():
-            raise SettingsError(f"[adapters.settings.session_launcher] {key} names {stated}, "
-                                "which is not there")
+            raise SettingsError(
+                f"[adapters.settings.session_launcher] {key} names {stated}, which is not there"
+            )
         return stated.resolve()
     found = shutil.which(name)
     if found is None:

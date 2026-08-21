@@ -212,9 +212,7 @@ class CodexPreparation:
         if isinstance(thread, dict):
             self._started.append(thread)
 
-    async def _await_thread(
-        self, still_running: Callable[[], bool] | None
-    ) -> Mapping[str, Any]:
+    async def _await_thread(self, still_running: Callable[[], bool] | None) -> Mapping[str, Any]:
         """Wait, bounded, for exactly one thread — and refuse if two appear.
 
         Two is a refusal for the same reason claiming a Claude record is: this

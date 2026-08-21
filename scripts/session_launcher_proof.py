@@ -104,9 +104,7 @@ async def run(arguments: argparse.Namespace) -> int:
     launcher.use_codex(codex)
 
     core = BridgeCore(
-        state=BridgeState(
-            switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue()
-        ),
+        state=BridgeState(switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue()),
         call=None,
         channel=None,
         agents={AgentKind.CLAUDE: claude, AgentKind.CODEX: codex},

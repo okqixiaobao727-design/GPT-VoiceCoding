@@ -232,8 +232,7 @@ class TelegramCompanionChannel:
                     request_id=request_id,
                     outcome=Delivery.UNKNOWN,
                     reason=(
-                        f"{landed} of {len(parts)} parts reached the chat, then "
-                        f"{refused.detail}"
+                        f"{landed} of {len(parts)} parts reached the chat, then {refused.detail}"
                     ),
                 )
             landed += 1

@@ -160,9 +160,7 @@ class ClaudePreparation:
         except ClaimError as unclaimable:
             raise PreparationError(str(unclaimable)) from None
 
-        target = SessionTarget(
-            agent=AgentKind.CLAUDE, session_id=record.session_id, pid=record.pid
-        )
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id=record.session_id, pid=record.pid)
         # The channel's address is the one thing the Agent adapter cannot
         # discover: Claude Code spawns that server from an environment variable
         # this launch generated, so only this launch knows where it listens.

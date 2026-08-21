@@ -35,9 +35,7 @@ from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 #: What a push into an unconfigured channel is told. One sentence, because it is
 #: read by a person looking at a delivery record and wondering where their words
 #: went.
-NOT_CONFIGURED = (
-    "no companion channel is configured behind this seam, so nothing was sent anywhere"
-)
+NOT_CONFIGURED = "no companion channel is configured behind this seam, so nothing was sent anywhere"
 
 #: The generic public adapter an operator would name instead. Stated here so the
 #: null implementation's own answer carries the way out of it.

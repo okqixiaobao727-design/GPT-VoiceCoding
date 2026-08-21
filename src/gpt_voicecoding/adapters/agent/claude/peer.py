@@ -172,8 +172,7 @@ async def send_frame(socket_path: Path, frame: dict[str, Any], *, timeout_second
     payload = json.dumps(frame, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(payload) + 1 > PEER_FRAME_CAP_BYTES:
         raise PeerError(
-            f"the frame is {len(payload)} bytes and the receiver caps one at "
-            f"{PEER_FRAME_CAP_BYTES}"
+            f"the frame is {len(payload)} bytes and the receiver caps one at {PEER_FRAME_CAP_BYTES}"
         )
     try:
         verify_bindable_length(socket_path)

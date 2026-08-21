@@ -87,9 +87,7 @@ async def _proving(channel, sink: Collecting, parsed, table: dict[str, str]) -> 
     failures += 0 if result.outcome.value == "pass" else 1
 
     print("verify — a deliberately wrong token must fail, and say which layer")
-    wrong = telegram_channel(
-        settings=table, environ={parsed.token_env: WRONG_TOKEN}
-    )
+    wrong = telegram_channel(settings=table, environ={parsed.token_env: WRONG_TOKEN})
     refused = await wrong.verify()
     print(f"  {refused.outcome}: {refused.detail}")
     if refused.outcome.value != "fail" or FailureLayer.CREDENTIALS not in refused.detail:

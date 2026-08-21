@@ -100,9 +100,7 @@ def readback_in(record: dict[str, Any], request_id: str) -> Readback | None:
 
     attachment = record.get("attachment")
     if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
-        return _agreement(
-            attachment.get("source_uuid"), _origin_msg_id(attachment), request_id
-        )
+        return _agreement(attachment.get("source_uuid"), _origin_msg_id(attachment), request_id)
     return None
 
 

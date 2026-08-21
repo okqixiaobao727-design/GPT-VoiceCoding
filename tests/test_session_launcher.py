@@ -959,9 +959,7 @@ class TestTheTmuxLauncher:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         tmux = FakeTmux(available=False)
-        launcher = self._launcher(
-            tmp_path, tmux, binary=tmp_path / "claude", registry=registry
-        )
+        launcher = self._launcher(tmp_path, tmux, binary=tmp_path / "claude", registry=registry)
 
         outcome = asyncio.run(launcher.launch(a_request(workspace)))
 
@@ -1008,9 +1006,7 @@ class TestTheTmuxLauncher:
         assert "default" in command
         assert "--plugin-dir" in command
 
-    def test_a_launch_that_never_registers_fails_and_kills_its_window(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_launch_that_never_registers_fails_and_kills_its_window(self, tmp_path: Path) -> None:
         """Nothing is left running after a launch that did not happen."""
         registry = tmp_path / "registry"
         registry.mkdir()
@@ -1078,7 +1074,7 @@ class TestClosingATmuxSession:
     def test_a_tmux_that_cannot_be_asked_fails_rather_than_presuming_the_session_gone(
         self, tmp_path: Path
     ) -> None:
-        """"Cannot tell" is not "already closed".
+        """ "Cannot tell" is not "already closed".
 
         A liveness query that fails is a question with no answer. Reading it as
         "the Session exited" is fail-open twice over: the close reports a success
@@ -1172,9 +1168,7 @@ class TestOneLaunchPerIdentity:
 
         async def run():
             request = a_request(workspace)
-            first, second = await asyncio.gather(
-                launcher.launch(request), launcher.launch(request)
-            )
+            first, second = await asyncio.gather(launcher.launch(request), launcher.launch(request))
             started = len(list(registry.glob("*.json")))
             await launcher.aclose()
             return first, second, started

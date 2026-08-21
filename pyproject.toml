@@ -22,7 +22,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+# `ruff` is pinned exactly, and `pytest` is not, because only one of them decides
+# what the source is allowed to look like. The formatter changes its mind between
+# releases — 0.16 rejoins lines 0.6 split — so an open range makes `ruff format
+# --check` a check against whichever version CI happened to resolve that morning,
+# and main goes red without a commit having touched it. An exact pin makes a ruff
+# upgrade a deliberate act that carries its own reformat, never an ambient one.
+dev = ["pytest>=8", "ruff==0.16.4"]
 # The bridge-owned Live Call's audio path. An extra rather than a dependency:
 # every one of these carries a compiled media stack, and the engine's control
 # plane, its Relays and its whole test suite run without them. They are imported

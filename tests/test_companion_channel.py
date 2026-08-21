@@ -263,9 +263,7 @@ class TestWhatTheAdapterMayBeTold:
     def test_the_factory_refuses_to_build_a_channel_it_cannot_authenticate(self) -> None:
         """A missing variable never heals on its own, so it stops the start."""
         with pytest.raises(SettingsError):
-            telegram_channel(
-                settings={"token_env": TOKEN_VARIABLE, "chat_id": CHAT}, environ={}
-            )
+            telegram_channel(settings={"token_env": TOKEN_VARIABLE, "chat_id": CHAT}, environ={})
 
     def test_a_built_channel_fills_both_the_seam_and_the_connection(self) -> None:
         built = telegram_channel(
@@ -505,9 +503,7 @@ class TestListening:
         async def listening() -> None:
             listener = channel(api, sink=sink)
             await listener.connect()
-            await until(
-                lambda: len(api.method_calls("getUpdates")) >= 3, what="the reader retried"
-            )
+            await until(lambda: len(api.method_calls("getUpdates")) >= 3, what="the reader retried")
             api.deliver(message("still here"))
             await until(lambda: sink.events, what="the text arrived after the blip")
             await listener.aclose()

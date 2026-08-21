@@ -243,9 +243,7 @@ def probe_echoes(transcript: Path, request_id: str) -> None:
 async def relay_once(settings: ClaudeSettings, record: SessionRecord) -> int:
     """One real Notice Relay into one real session, and everything it proved."""
     request_id = RequestId(str(uuid.uuid4()))
-    target = SessionTarget(
-        agent=AgentKind.CLAUDE, session_id=record.session_id, pid=record.pid
-    )
+    target = SessionTarget(agent=AgentKind.CLAUDE, session_id=record.session_id, pid=record.pid)
     raised: list[RelayReceipt] = []
     listener = ReceiptListener(settings.peer_socket_directory)
     relay = NoticeRelay(settings=settings, listener=listener, emit=raised.append)
