@@ -29,6 +29,15 @@ public enum LoginShellPath {
     /// a problem of its own, and the engine is waiting on it.
     public static let timeout: TimeInterval = 2.0
 
+    /// How long a shell that ignored `SIGTERM` gets before `SIGKILL`. Short,
+    /// because a shell that will take the hint takes it immediately and one that
+    /// will not is not going to change its mind.
+    static let terminationGrace: TimeInterval = 0.2
+
+    /// How finely that grace period is checked. `Process` offers no bounded
+    /// `waitUntilExit`, so this is the resolution of the one written here.
+    static let terminationPollInterval: useconds_t = 10_000
+
     /// `printf` rather than `echo`, which appends a newline that then has to be
     /// trimmed, and `%s` rather than `%q`, because this is a value and not a
     /// command line.
@@ -114,7 +123,7 @@ public enum LoginShellPath {
             // it. `terminate` first, because a shell given the chance usually
             // takes it; `SIGKILL` is what makes the bound real.
             process.terminate()
-            if !process.waitUntil(deadline: .now() + 0.2) {
+            if !process.waitUntil(deadline: .now() + terminationGrace) {
                 kill(process.processIdentifier, SIGKILL)
             }
             return nil
@@ -157,7 +166,7 @@ extension Process {
     /// hold the caller for ever.
     fileprivate func waitUntil(deadline: DispatchTime) -> Bool {
         while isRunning && DispatchTime.now() < deadline {
-            usleep(10_000)
+            usleep(LoginShellPath.terminationPollInterval)
         }
         return !isRunning
     }

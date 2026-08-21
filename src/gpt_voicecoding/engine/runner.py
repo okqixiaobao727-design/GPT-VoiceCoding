@@ -169,7 +169,10 @@ def main(
         # `TypeError` inside somebody's `connect` is a bug whose only diagnostic
         # is the traceback — collapsing it would throw that away.
         _log.error("the engine could not start", exc_info=refused.cause)
-        print(f"the engine cannot start: {_said(refused.cause, config)}", file=sys.stderr)
+        print(
+            f"the engine cannot start: {_start_refusal_detail(refused.cause, config)}",
+            file=sys.stderr,
+        )
         return EXIT_REFUSED
     except (AlreadyServing, SocketPathTooLong, OSError) as refusal:
         # Reached only while serving; a start that raises one of these arrives
@@ -179,7 +182,7 @@ def main(
     return EXIT_OK
 
 
-def _said(cause: BaseException, config: EngineConfig) -> str:
+def _start_refusal_detail(cause: BaseException, config: EngineConfig) -> str:
     """One sentence for a start that did not happen, in the failure's own words.
 
     The socket is named when the socket is the problem, because "already in use"

@@ -120,7 +120,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     say(
-        "4. Quit it, launch it again, start another Live Call",
+        "4. Kill the shell, and watch the engine outlive it",
+        "  kill -9 $(pgrep -f MacOS/GPTVoiceCodingShell | head -1)\n"
+        "  pgrep -f gpt_voicecoding.engine        # still there, now under launchd\n\n"
+        "  Quitting from the menu is NOT this test: a clean quit stops the engine\n"
+        "  on the way out, by design. Only an abnormal death orphans it, and that\n"
+        "  is the case the probe checked — the grant belongs to the bundle, so it\n"
+        "  survives the process that spawned the engine going away. Ask the\n"
+        "  orphan to speak (bridgectl live) and it must still reach the\n"
+        "  microphone with no prompt.\n\n"
+        "  Then launch the app again: it must NOT spawn a second engine against\n"
+        "  the live socket. Exit 2 with something already listening is not a\n"
+        "  crash — the shell says so and offers Retry.",
+    )
+
+    say(
+        "5. Quit it properly, launch it again, start another Live Call",
+        "  bridgectl or the menu's Quit, then open the app again.\n"
         "  There must be NO second prompt. A grant that has to be given twice\n"
         "  attached to a launch rather than to the bundle.",
     )
