@@ -16,12 +16,20 @@ therefore kept, for a second and longer budget, purely so a late receipt can be
 raised upward and the hub can drop what it was holding. Only DELIVERED is ever
 raised that way; a late anything-else is logged and changes nothing.
 
-**One verb of three.** This package is the shared Claude adapter, and this issue
-lays it down with the Answer Relay in it. The Notice Relay rides the peer socket
-and the Approval Relay rides the `PermissionRequest` hook — different routes,
-not different framings of this one — so both answer here with a classified
-refusal naming what is missing, rather than pretending the channel can carry
-them.
+**Two verbs of three, over two different wires.** This package is the shared
+Claude adapter. The Answer Relay rides the MCP Session Channel, described above.
+The Notice Relay rides the **peer socket** — a separate route with a separate
+proof, delegated to `notice.py`, and separate because the peer socket wraps every
+message in a hard-coded "not typed by your user" preamble that is correct for
+system-authored words and a lie about the user's own. The Approval Relay rides
+the `PermissionRequest` hook and is not here yet, so it answers with a classified
+refusal naming what is missing rather than pretending either wire can carry it.
+
+**The Reply Window is reported from the registry**, by `window.py`. Without it
+nothing ever tells Bridge Core that a Claude Session is ready for a user turn, so
+every Relay queues against a window that is fail-closed and never observed to
+open. That is the mechanism working correctly and a Session nothing can reach;
+watching the registry is what makes the two stop being the same thing.
 """
 
 from __future__ import annotations
@@ -31,6 +39,8 @@ import logging
 from contextlib import suppress
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent.claude.notice import NoticeRelay
+from gpt_voicecoding.adapters.agent.claude.peer import ReceiptListener
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     ACKNOWLEDGED,
     CHANNEL_ERROR,
@@ -41,11 +51,13 @@ from gpt_voicecoding.adapters.agent.claude.protocol import (
     channel_kind_for,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
+from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 from gpt_voicecoding.adapters.agent.claude.wire import (
     ChannelConnection,
     ChannelError,
 )
 from gpt_voicecoding.seams.agent import (
+    AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
     RelayReceipt,
@@ -61,10 +73,6 @@ _log = logging.getLogger(__name__)
 #: What a Relay that has no route here is told. Named by issue, because "not
 #: implemented" without a way to find out when is a dead end for whoever reads
 #: the log.
-NOTICE_UNAVAILABLE = (
-    "this build carries the Answer Relay only; the Notice Relay rides the Claude peer "
-    "socket and arrives with issue #13"
-)
 APPROVAL_UNAVAILABLE = (
     "this build carries the Answer Relay only; the Approval Relay rides the "
     "PermissionRequest hook and arrives with issue #14"
@@ -87,19 +95,38 @@ class ClaudeAgentAdapter:
         self._channels: dict[SessionTarget, Path] = {}
         #: Late-receipt listeners in flight, so none outlives this adapter.
         self._listening: set[asyncio.Task[None]] = set()
+        #: The one long-lived resource this adapter owns: a socket in Claude
+        #: Code's own `cc-socks` directory, where peer receipts are delivered.
+        self._receipts = ReceiptListener(self._settings.peer_socket_directory)
+        self._notices = NoticeRelay(
+            settings=self._settings, listener=self._receipts, emit=self._emit
+        )
+        self._windows = ReplyWindowWatcher(settings=self._settings, emit=self._emit)
 
     # -- lifecycle --------------------------------------------------------
 
     async def connect(self) -> None:
-        """Nothing to open: every channel belongs to a Session, not to this engine."""
+        """Start watching Reply Windows. Channels still belong to Sessions, not to us.
+
+        The receipt listener is deliberately *not* bound here. It lives in a
+        directory Claude Code owns, and binding a socket there on the strength of
+        "this engine started" would leave one sitting in a shared namespace for
+        every run that never sends a Notice Relay. It is bound on first use and
+        removed on `aclose`.
+        """
+        await self._windows.start()
 
     async def aclose(self) -> None:
-        """Stop listening for late receipts. The Sessions are left running.
+        """Stop everything this adapter started, and take its socket back out.
 
         A channel is a process Claude Code owns. Closing this adapter lets go of
-        connections to it and nothing more — there is nothing here to reap.
+        connections to it and nothing more — there is nothing there to reap. The
+        receipt listener is the exception, and the reason this method has more to
+        do than the Answer Relay left it: that socket is ours, it sits in a
+        directory shared with every Session on the machine, and leaving it behind
+        would litter that namespace with dead inodes.
 
-        **Each cancelled listener is waited for, not merely cancelled.** A
+        **Each cancelled task is waited for, not merely cancelled.** A
         cancellation is a request, delivered the next time the task runs, so
         cancelling and returning would make `aclose` mean "asked them to stop"
         while a listener was still holding a connection to a Session's own
@@ -113,6 +140,9 @@ class ClaudeAgentAdapter:
             with suppress(asyncio.CancelledError):
                 await task
         self._listening.clear()
+        await self._notices.aclose()
+        await self._windows.aclose()
+        await self._receipts.aclose()
         self._channels.clear()
 
     # -- the Session roster this adapter can reach ------------------------
@@ -127,10 +157,15 @@ class ClaudeAgentAdapter:
         if target.agent is not AgentKind.CLAUDE:
             raise ValueError(f"{target.agent} sessions are not this adapter's to reach")
         self._channels[target] = socket_path
+        # Registering is also what starts reporting this Session's Reply Window,
+        # which is what makes it reachable at all: until a window is observed,
+        # Bridge Core holds every Relay against the fail-closed default.
+        self._windows.watch(target)
 
     def forget_session(self, target: SessionTarget) -> None:
         """Stop holding a route to one Session. The Session itself is untouched."""
         self._channels.pop(target, None)
+        self._windows.forget(target)
 
     def reachable(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter holds a channel address for."""
@@ -160,8 +195,17 @@ class ClaudeAgentAdapter:
     async def notice_relay(
         self, target: SessionTarget, text: str, *, request_id: RequestId
     ) -> DeliveryReceipt:
-        """Not this route's to carry. Refused by name rather than mis-sent."""
-        return _failed(request_id, NOTICE_UNAVAILABLE)
+        """Carry words the system itself originates, over the peer socket.
+
+        A different wire from the Answer Relay, and deliberately so: the peer
+        socket frames everything it carries as a message from another session and
+        never as the user's own — right for a Notice, wrong for a user's words —
+        so nothing about the channel route applies here beyond the four states
+        both must classify into.
+        """
+        if target.agent is not AgentKind.CLAUDE:
+            return _failed(request_id, f"{target.agent} sessions are not this adapter's to reach")
+        return await self._notices.send(target, text, request_id=request_id)
 
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
@@ -326,7 +370,7 @@ class ClaudeAgentAdapter:
             max_message_bytes=self._settings.max_message_bytes,
         )
 
-    def _emit(self, event: RelayReceipt) -> None:
+    def _emit(self, event: AgentEvent) -> None:
         if self._sink is not None:
             self._sink.emit(event)
 
