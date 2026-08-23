@@ -204,12 +204,16 @@ explain itself perfectly while doing so. Retiring the skill is a step in the
 cutover rather than a fix in the code, because the file belongs to the user and
 so does the decision to keep it.
 
-**A workspace with no Session running in it cannot be named by voice.** The
-voice thread resolves a workspace from what the control plane returns, and the
-only absolute paths the control plane knows are those of Sessions it already
-holds. So the first launch into a cold workspace needs the absolute path spoken
-in full. Deferred rather than fixed: a project catalogue is a mechanism, and v0's
-closing gate is not where one gets added.
+**Only configured projects can be launched by voice.** #25 added the project
+catalogue this entry once deferred: `[[launch.projects]]` in `config.toml` maps
+a canonical name and explicit spoken aliases to an absolute workspace, so a cold
+workspace *is* now launchable by name — the launch verb takes a project
+reference and a task, resolves them through the catalogue, and applies the
+configured default agent unless one is named. What remains a limitation is the
+catalogue's edge: a workspace with no `[[launch.projects]]` entry cannot be
+launched at all — the control-plane launch action refuses raw `workspace` and
+`label` fields, and a spoken path resolves to nothing. Adding the entry to
+`config.toml` is the supported route, not speaking the path.
 
 ## Cutover: retire the first generation's codex skill
 

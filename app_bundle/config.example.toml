@@ -26,6 +26,18 @@
 # socket_path = "/tmp/gpt-voicecoding-501/control.sock"
 # state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"
 
+[launch]
+# Required. The agent a launch request uses when it names none, and the projects
+# a spoken launch may resolve. Lookup data only: no permission modes, no shell
+# flags. A project not listed here cannot be launched by voice — add it here
+# rather than speaking its path.
+default_agent = "claude"
+
+[[launch.projects]]
+name = "GPT-VoiceCoding"
+workspace = "/Users/you/Documents/coding/GPT-VoiceCoding"
+spoken_aliases = ["Voice Coding", "GPT Live"]
+
 [adapters]
 # Each is `module:attribute`, imported by the composition root and nothing else.
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
