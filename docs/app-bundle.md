@@ -138,6 +138,11 @@ simply not what would violate it.
 also the step that proves the `PATH` the shell hands the engine is your own and
 not launchd's.
 
+A cold launch can take the better part of a minute, which is longer than the
+control-plane client waits — expect `bridgectl launch` to report a timeout here
+and read the limitation below before you retry, because retrying the wrong way
+starts a second agent.
+
 **4. Let it stop.** Wait for the Session to finish a turn.
 
 **5. The Stop Notice.** With a Live Call up, it must be spoken into the call.
@@ -195,6 +200,21 @@ convenience feature.
 
 **An update may re-prompt for the microphone.** Ad-hoc signatures change per
 build. Charter decision 9, accepted; it waits for notarization.
+
+**A cold `bridgectl launch` outlives the client's deadline, and says so as
+though it failed.** Starting an agent from nothing takes far longer than the ten
+seconds the control-plane client waits, so the CLI prints `the engine at … did
+not answer within 10s` and exits 2 — for a launch that is proceeding normally
+and completes moments later. The engine is not wedged and the Session is not
+lost; only the answer was late. Confirm with `bridgectl status`, which will show
+the Session once it registers.
+
+**Retry with the *same* `--request-id`, never a fresh one.** A launch is held as
+a transaction keyed by its request id, so re-issuing the identical command joins
+the launch already in flight and returns the Session it produced. A fresh id
+describes a *different* launch, and the engine will honour it — starting a
+second agent in the same workspace. The identity is the safety mechanism, which
+is why the flag is required rather than generated for you.
 
 **A first-generation codex skill silently hijacks the voice thread.** Anyone
 upgrading from the first generation has one, and this engine has no way to
