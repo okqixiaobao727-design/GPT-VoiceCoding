@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from gpt_voicecoding.core.approvals import ApprovalOutcome, PendingApproval
 from gpt_voicecoding.core.bridge import Status
@@ -32,7 +33,7 @@ from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.verification import SeamVerification
 from gpt_voicecoding.seams.agent import ApprovalVerdict, RelayRoute
 from gpt_voicecoding.seams.call import CallSnapshot
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionLabel, SessionTarget
 from gpt_voicecoding.seams.session_launcher import CloseOutcome, LaunchOutcome
 
 
@@ -60,6 +61,16 @@ def read_text(payload: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidPayload(f"{key!r} must be a non-empty string")
     return value.strip()
+
+
+def read_request_id(payload: Mapping[str, Any], key: str = "request_id") -> RequestId:
+    """The sender-minted identity of one request, carried unchanged."""
+    value = read_text(payload, key)
+    try:
+        UUID(value)
+    except ValueError:
+        raise InvalidPayload(f"{key!r} must be a UUID") from None
+    return RequestId(value)
 
 
 def read_flag(payload: Mapping[str, Any], key: str) -> bool:

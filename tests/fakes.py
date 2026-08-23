@@ -248,11 +248,13 @@ class FakeSessionLauncher:
 
     def __post_init__(self) -> None:
         self.launched: dict[RequestId, LaunchOutcome] = {}
+        self.requests: list[LaunchRequest] = []
         self.opened: set[SessionTarget] = set()
         self.closed: set[SessionTarget] = set()
         self.environments: list[dict[str, str]] = []
 
     async def launch(self, request: LaunchRequest) -> LaunchOutcome:
+        self.requests.append(request)
         if not self.available:
             return LaunchOutcome(
                 request_id=request.request_id,

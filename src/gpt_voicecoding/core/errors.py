@@ -134,6 +134,16 @@ class SeamUnavailableError(BridgeCoreError):
         self.seam = seam
 
 
+class ConflictingLaunchError(BridgeCoreError):
+    """One launch identity was reused for a different resolved launch intent."""
+
+    def __init__(self, request_id: RequestId) -> None:
+        super().__init__(
+            f"launch request identity {request_id!r} is already bound to a different intent"
+        )
+        self.request_id = request_id
+
+
 class SecondCallRefused(BridgeCoreError):
     """Something asked to open a voice surface while the system already owns one.
 

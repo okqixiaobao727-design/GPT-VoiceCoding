@@ -25,7 +25,7 @@ from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry, SessionState
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
 from gpt_voicecoding.seams.session_launcher import CloseStatus, LaunchStatus
 
 WORKSPACE = Path("/tmp/workspace")
@@ -35,7 +35,14 @@ CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 def launched(core: BridgeCore) -> object:
     """One launch of the one agent these tests use."""
-    return asyncio.run(core.launch_session(agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL))
+    return asyncio.run(
+        core.launch_session(
+            request_id=new_request_id(),
+            agent=AgentKind.CODEX,
+            workspace=WORKSPACE,
+            label=LABEL,
+        )
+    )
 
 
 def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
@@ -97,7 +104,11 @@ class TestLaunching:
 
         asyncio.run(
             core.launch_session(
-                agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL, env={"GPT_VC": "1"}
+                request_id=new_request_id(),
+                agent=AgentKind.CODEX,
+                workspace=WORKSPACE,
+                label=LABEL,
+                env={"GPT_VC": "1"},
             )
         )
 

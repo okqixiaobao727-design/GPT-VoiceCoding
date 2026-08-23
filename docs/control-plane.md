@@ -53,14 +53,14 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 1, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 2, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 1, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 2, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
-`action` is `null` when the line never named a usable one. `protocol` is `1`;
+`action` is `null` when the line never named a usable one. `protocol` is `2`;
 a field being **absent** means an engine too old to have been asked, which is
 distinct from a field being empty ([ADR 0003](adr/0003-the-engine-reports-what-it-loaded.md)).
 
@@ -150,11 +150,15 @@ never by a switch.
 Payload:
 
 ```json
-{"agent": "codex", "workspace": "/path/to/work",
+{"request_id": "21d73168-b1f0-4b18-977d-fba0d1f2cc13",
+ "agent": "codex", "workspace": "/path/to/work",
  "label": {"project": "gpt-voicecoding", "task": "build the control plane"},
  "env": {"NAME": "value"}}
 ```
 
+`request_id` is the sender-minted UUID for this distinct launch intent. A retry
+carries the same UUID; an intentional second Session carries a new one. Reusing
+one UUID with a different agent, workspace, label or environment is refused.
 `env` is optional and is exactly the variables to set on the child. Data:
 
 ```json
@@ -165,7 +169,9 @@ Payload:
 **A Launcher that tried and failed answers `ok: true`.** That is news the caller
 asked for, carrying the real error in `detail`; a protocol refusal would say the
 request was unusable, which is a different thing. Only a `launched` outcome
-registers a Session.
+registers a Session. Sequential or concurrent repeats under one UUID return the
+first complete outcome and neither launch nor register a second Session. This
+in-process guarantee does not survive an engine restart.
 
 ### `close`
 
@@ -258,7 +264,7 @@ status
 switch <name> on|off
 sessions
 live
-launch <agent> <workspace> <project · task>
+launch --request-id <UUID> <agent> <workspace> <project · task>
 close <agent>:<session id>[:<pid>]
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
 approve <approval id> allow|deny|ask

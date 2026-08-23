@@ -34,6 +34,7 @@ injected handlers with honest defaults rather than being invented here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, Pe
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
+    ConflictingLaunchError,
     SeamUnavailableError,
     StaleSessionError,
     UnknownRelayError,
@@ -92,6 +94,7 @@ from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundTex
 from gpt_voicecoding.seams.events import Event
 from gpt_voicecoding.seams.identity import (
     AgentKind,
+    RequestId,
     SessionLabel,
     SessionTarget,
     new_request_id,
@@ -138,6 +141,14 @@ class Status:
     pending_approvals: tuple[PendingApproval, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _LaunchTransaction:
+    """One resolved launch intent and the complete in-process transaction carrying it."""
+
+    request: LaunchRequest
+    task: asyncio.Task[LaunchOutcome]
+
+
 class BridgeCore:
     """The hub: one truth, five pipelines, and the loop that feeds them."""
 
@@ -182,6 +193,7 @@ class BridgeCore:
         #: stamped with `stamp`. A Session's `registered_at` is read back by the
         #: next engine, and a monotonic reading would come back as the future.
         self._stamp = stamp
+        self._launches: dict[RequestId, _LaunchTransaction] = {}
 
         self.interlock = CallInterlock(call)
         self.adjudicator = SwitchAdjudicator(state.switches)
@@ -295,6 +307,7 @@ class BridgeCore:
     async def launch_session(
         self,
         *,
+        request_id: RequestId,
         agent: AgentKind,
         workspace: Path,
         label: SessionLabel,
@@ -312,37 +325,62 @@ class BridgeCore:
         authoritative, and a failed launch that wrote a row would be the system
         inventing a Session to Relay into.
         """
-        launcher = self._require_launcher()
-        outcome = await launcher.launch(
-            LaunchRequest(
-                request_id=new_request_id(),
-                agent=agent,
-                workspace=workspace,
-                label=label,
-                env=env or {},
-            )
+        request = LaunchRequest(
+            request_id=request_id,
+            agent=agent,
+            workspace=workspace,
+            label=label,
+            env=env or {},
         )
+        transaction = self._launches.get(request_id)
+        if transaction is not None and transaction.request != request:
+            raise ConflictingLaunchError(request_id)
+        if transaction is None:
+            launcher = self._require_launcher()
+            transaction = _LaunchTransaction(
+                request=request,
+                task=asyncio.create_task(
+                    self._launch_and_register(launcher, request),
+                    name=f"launch-{request_id}",
+                ),
+            )
+            self._launches[request_id] = transaction
+
+        if transaction.task.done():
+            outcome = transaction.task.result()
+        else:
+            outcome = await asyncio.shield(transaction.task)
         if outcome.status is not LaunchStatus.LAUNCHED:
             _log.info("launch refused: %r", outcome.detail)
+        else:
+            assert outcome.target is not None  # the seam refuses a LAUNCHED without one
+            _log.info(
+                "launched Session agent=%s session_id=%s pid=%s workspace=%s",
+                outcome.target.agent,
+                outcome.target.session_id,
+                outcome.target.pid,
+                workspace,
+            )
+        return outcome
+
+    async def _launch_and_register(
+        self, launcher: SessionLauncher, request: LaunchRequest
+    ) -> LaunchOutcome:
+        """Run the adapter effect and Core registration as one shared transaction."""
+        outcome = await launcher.launch(request)
+        if outcome.status is not LaunchStatus.LAUNCHED:
             return outcome
 
         assert outcome.target is not None  # the seam refuses a LAUNCHED without one
         self._state.sessions.register(
             Session(
                 target=outcome.target,
-                label=label,
-                workspace=workspace,
+                label=request.label,
+                workspace=request.workspace,
                 registered_at=self._stamp(),
             )
         )
         self._state.persist()
-        _log.info(
-            "launched Session agent=%s session_id=%s pid=%s workspace=%s",
-            outcome.target.agent,
-            outcome.target.session_id,
-            outcome.target.pid,
-            workspace,
-        )
         return outcome
 
     async def close_session(self, target: SessionTarget) -> CloseOutcome:

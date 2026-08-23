@@ -23,10 +23,42 @@ import pytest
 from fakes import FakeSessionLauncher
 from gpt_voicecoding.cli import main
 from gpt_voicecoding.config import load
+from gpt_voicecoding.control_plane.commands import CommandError, build_request
 from gpt_voicecoding.engine.composition import Engine
+from gpt_voicecoding.seams.control_plane import Action
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
+LAUNCH_REQUEST_ID = "21d73168-b1f0-4b18-977d-fba0d1f2cc13"
+
+
+class TestTheLaunchCommand:
+    def test_the_named_request_identity_enters_the_control_plane_payload(self) -> None:
+        request = build_request(
+            "launch",
+            [
+                "--request-id",
+                LAUNCH_REQUEST_ID,
+                "codex",
+                "/tmp/workspace",
+                "a project · a task",
+            ],
+        )
+
+        assert request.action is Action.LAUNCH
+        assert dict(request.payload) == {
+            "request_id": LAUNCH_REQUEST_ID,
+            "agent": "codex",
+            "workspace": "/tmp/workspace",
+            "label": {"project": "a project", "task": "a task"},
+        }
+
+    def test_a_positional_request_identity_is_not_a_second_interface(self) -> None:
+        with pytest.raises(CommandError):
+            build_request(
+                "launch",
+                [LAUNCH_REQUEST_ID, "codex", "/tmp/workspace", "a project · a task"],
+            )
 
 
 def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
@@ -154,7 +186,20 @@ class TestTheWholeSessionCommandSet:
         assert main([*config, "sessions"]) == 0
         assert "sessions: none" in capsys.readouterr().out
 
-        assert main([*config, "launch", "codex", str(workspace), "a project · a task"]) == 0
+        assert (
+            main(
+                [
+                    *config,
+                    "launch",
+                    "--request-id",
+                    LAUNCH_REQUEST_ID,
+                    "codex",
+                    str(workspace),
+                    "a project · a task",
+                ]
+            )
+            == 0
+        )
         assert "launched codex:abc" in capsys.readouterr().out
 
         assert main([*config, "sessions"]) == 0
@@ -170,6 +215,31 @@ class TestTheWholeSessionCommandSet:
 
         assert main([*config, "close", "codex:abc"]) == 0
         assert "already closed" in capsys.readouterr().out
+
+    def test_repeating_one_launch_command_returns_the_first_result_and_one_session(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        command = [
+            "--config",
+            str(engine_at),
+            "launch",
+            "--request-id",
+            LAUNCH_REQUEST_ID,
+            "codex",
+            str(engine_at.parent),
+            "a project · a task",
+        ]
+
+        assert main(command) == 0
+        first = capsys.readouterr().out
+        assert main(command) == 0
+        second = capsys.readouterr().out
+        assert first == second
+
+        assert main(["--config", str(engine_at), "sessions"]) == 0
+        roster = capsys.readouterr().out
+        assert roster.count("a project · a task") == 1
+        assert roster.count("codex:abc") == 1
 
     def test_a_session_that_was_never_launched_cannot_be_closed(
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]

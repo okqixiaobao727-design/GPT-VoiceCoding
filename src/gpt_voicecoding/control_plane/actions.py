@@ -134,6 +134,7 @@ class ControlPlane:
 
     async def _launch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         outcome = await self._core.launch_session(
+            request_id=payloads.read_request_id(payload),
             agent=payloads.read_agent(payload),
             workspace=payloads.read_workspace(payload),
             label=payloads.read_label(payload),

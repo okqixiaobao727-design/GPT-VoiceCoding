@@ -8,10 +8,11 @@ Three locked rules are enforced here by shape rather than by discipline:
 - **Claude Sessions are addressed by pid.** `--resume` forks a second process
   under the same session id, so a Claude target without a pid is ambiguous and
   is refused at construction.
-- **`request_id` is one sender-minted UUID**, minted by Bridge Core and reused
-  across every route: Claude sends it as both `uuid` and `msg_id`, Codex as
-  `clientUserMessageId`. It stays a plain string precisely so every route can
-  carry it unchanged. Adapters map it; they never mint one.
+- **`request_id` is one sender-minted UUID**, reused across every delivery of
+  the same intent: Claude sends it as both `uuid` and `msg_id`, Codex as
+  `clientUserMessageId`, and launch callers carry it through the control plane.
+  It stays a plain string precisely so every route can carry it unchanged.
+  Bridge Core and adapters map or bind it; they never replace it.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import NewType
 
-#: The correlation id for one delivery attempt, minted once by Bridge Core.
+#: The correlation id for one request intent, minted once by its sender.
 RequestId = NewType("RequestId", str)
 
 #: What separates the two halves of a Session Label when it is rendered.
@@ -29,7 +30,7 @@ LABEL_SEPARATOR = " · "
 
 
 def new_request_id() -> RequestId:
-    """Mint the one id an attempt carries across every route it touches."""
+    """Mint the one id a sender carries across every delivery of an intent."""
     return RequestId(str(uuid.uuid4()))
 
 

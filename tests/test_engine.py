@@ -34,7 +34,7 @@ from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
 from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest, LaunchStatus
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -425,6 +425,7 @@ class TestEventsReachTheHub:
                     Request(
                         action=Action.LAUNCH,
                         payload={
+                            "request_id": new_request_id(),
                             "agent": "claude",
                             "workspace": str(home),
                             "label": {"project": "p", "task": "t"},
@@ -459,6 +460,7 @@ class TestEventsReachTheHub:
                     Request(
                         action=Action.LAUNCH,
                         payload={
+                            "request_id": new_request_id(),
                             "agent": "codex",
                             "workspace": str(home),
                             "label": {"project": "p", "task": "t"},

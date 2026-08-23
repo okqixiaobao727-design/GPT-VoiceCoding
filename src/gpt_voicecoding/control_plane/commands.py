@@ -31,7 +31,7 @@ USAGE: dict[Action, str] = {
     Action.SWITCH: "switch <name> on|off",
     Action.SESSIONS: "sessions",
     Action.LIVE: "live",
-    Action.LAUNCH: "launch <agent> <workspace> <project · task>",
+    Action.LAUNCH: "launch --request-id <UUID> <agent> <workspace> <project · task>",
     Action.CLOSE: "close <agent>:<session id>[:<pid>]",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
     Action.APPROVE: "approve <approval id> allow|deny|ask",
@@ -68,10 +68,7 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
             name, state = _exactly(action, arguments, 2)
             return {"name": name, "on": _state(state)}
         case Action.LAUNCH:
-            if len(arguments) < 3:
-                raise CommandError(f"say it as: {USAGE[action]}")
-            agent, workspace, *rest = arguments
-            return {"agent": agent, "workspace": workspace, "label": _label(" ".join(rest))}
+            return _launch(arguments)
         case Action.CLOSE:
             (address,) = _exactly(action, arguments, 1)
             return {"target": parse_address(address)}
@@ -93,6 +90,19 @@ def _relay(arguments: list[str]) -> dict[str, object]:
         raise CommandError(f"say it as: {USAGE[Action.RELAY]}")
     address, *words = remaining
     return {"target": parse_address(address), "text": " ".join(words), "route": route}
+
+
+def _launch(arguments: list[str]) -> dict[str, object]:
+    """Read the one named control field before the unchanged business arguments."""
+    if len(arguments) < 5 or arguments[0] != "--request-id":
+        raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
+    _, request_id, agent, workspace, *label = arguments
+    return {
+        "request_id": request_id,
+        "agent": agent,
+        "workspace": workspace,
+        "label": _label(" ".join(label)),
+    }
 
 
 def _exactly(action: Action, arguments: list[str], count: int) -> list[str]:
