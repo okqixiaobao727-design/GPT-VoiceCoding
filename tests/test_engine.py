@@ -111,19 +111,31 @@ def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLaunche
 class ClaudeRegisteringLauncher(FakeSessionLauncher):
     """A launch that registers its channel before it reports success, as Claude does.
 
-    **The yield after registering is the faithful part, not a nicety (#27).** The
-    real `ClaudeSessionPreparation.confirm` registers the channel and then keeps
-    awaiting — claiming a registry record, tearing down its preparation — before
-    Bridge Core ever gets to write the Session into its roster. Every one of
-    those awaits is a slice the dispatch loop can take, which is exactly how a
-    report raised at registration reaches the hub *before* the hub knows the
-    Session and is dropped as unknown.
+    **The task boundary is the faithful part, not a nicety (#27).** Every real
+    launch runs inside one: `LaunchRegistry.once` spawns the launching work with
+    `asyncio.ensure_future` and awaits it through `asyncio.shield`
+    (`session_launcher/lifecycle.py:55-59`), so the coroutine that resumes when a
+    launch finishes is *not* the one that ran it. It is woken by `call_soon`, on
+    a later turn of the loop, with `shield` adding a second hop on top.
 
-    Without the yield this fake registers and returns in one uninterrupted step,
-    so the dispatch loop never runs in the gap and the event waits harmlessly in
-    the queue until the roster row exists. That is production's ordering defect
-    papered over by the fake's own timing, and it is why this helper passed a
-    Session's window through for as long as the defect was live.
+    That gap is where the defect lives. `register_session` puts the report on the
+    queue with `put_nowait`, which makes the dispatch loop — parked on
+    `queue.get()` — runnable immediately; the loop then services it while the
+    launch is handing its outcome back, which is *before* Bridge Core writes the
+    roster row. So the report arrives for a Session the hub does not yet hold and
+    is dropped as unknown.
+
+    Note where the gap is **not**: `ClaudeSessionPreparation.confirm` really does
+    register and return with nothing awaited after it, and reading only that call
+    stack suggests the loop can never interleave. It can, because `_launching` is
+    spawned rather than called. Reproducing the boundary rather than sleeping
+    past it is what keeps this helper honest about which mechanism it stands for.
+
+    Without it this fake registered and returned in one uninterrupted step, the
+    dispatch loop never ran in the gap, and the event waited harmlessly in the
+    queue until the roster row existed — production's ordering defect papered
+    over by the fake's own timing, which is why this helper passed a Session's
+    window through for as long as the defect was live.
     """
 
     def __post_init__(self) -> None:
@@ -134,6 +146,12 @@ class ClaudeRegisteringLauncher(FakeSessionLauncher):
         self.claude = adapter
 
     async def launch(self, request: LaunchRequest) -> LaunchOutcome:
+        # Spawned and shielded exactly as `LaunchRegistry.once` does it, so the
+        # scheduling boundary under test is production's own and not this
+        # helper's invention.
+        return await asyncio.shield(asyncio.ensure_future(self._launching(request)))
+
+    async def _launching(self, request: LaunchRequest) -> LaunchOutcome:
         outcome = await super().launch(request)
         if outcome.status is LaunchStatus.LAUNCHED:
             assert outcome.target is not None
@@ -142,10 +160,6 @@ class ClaudeRegisteringLauncher(FakeSessionLauncher):
                 outcome.target,
                 Path(tempfile.gettempdir()) / f"gvc-test-{outcome.target.pid}.sock",
             )
-            # Long enough that the dispatch loop certainly takes a slice, rather
-            # than a bare `sleep(0)` that leaves the reproduction resting on how
-            # many yields one queue hand-off happens to need.
-            await asyncio.sleep(0.01)
         return outcome
 
 
