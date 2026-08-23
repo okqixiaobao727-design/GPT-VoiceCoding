@@ -214,6 +214,28 @@ class CodexAgentAdapter:
             socket_path,
         )
 
+    def reply_window(self, target: SessionTarget) -> ReplyWindow:
+        """Where this Session's Reply Window stands right now, from what has been observed.
+
+        The seam's level query (#27). Nothing is probed: a thread's status
+        arrives as a notification, so the freshest answer available is the one
+        `_note_status` last wrote down, and asking the app-server here would make
+        a synchronous verb wait on a wire.
+
+        Both of the ways this can have nothing to report are already CLOSED, and
+        deliberately so. A target this adapter does not watch is not one it can
+        claim anything about; and a watched thread that has not yet reported a
+        status carries `WatchedThread.reply_window`'s own fail-closed default,
+        which is exactly the right answer — a window nobody has observed is not
+        one anything may claim is open. In that second case the level is
+        *provisional rather than wrong*: `observed` is still False, so the first
+        status to arrive is emitted as a `ReplyWindowChanged` and corrects it.
+        """
+        watched = self._threads.get(target)
+        if watched is None:
+            return ReplyWindow.CLOSED
+        return watched.reply_window
+
     async def forget_session(self, target: SessionTarget) -> None:
         """Stop watching one Session. The Session itself is left running."""
         watched = self._threads.pop(target, None)

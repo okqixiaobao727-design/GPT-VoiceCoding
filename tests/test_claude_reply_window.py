@@ -122,65 +122,91 @@ def watching(tmp_path: Path, sink: Sink | AllEvents) -> ReplyWindowWatcher:
 
 
 class TestWhatOneStatusMeans:
+    """What one registry status means, asked of the level query that answers the seam.
+
+    These read through `level` rather than through an emitted event. The level is
+    what a status *is*, and `level` is the verb the Agent seam's `reply_window`
+    answers with, so asking it directly tests the meaning at the place the meaning
+    is now published. They asked `watch` before, and read the report it used to
+    emit — a report #27 removed, because registration runs before Bridge Core
+    holds the Session and every one of those reports was dropped.
+    """
+
     def test_only_idle_is_an_open_window(self, tmp_path: Path) -> None:
-        sink = Sink()
-        watcher = watching(tmp_path, sink)
         say(tmp_path, "idle")
 
-        watcher.watch(TARGET)
-
-        assert sink.windows == [ReplyWindow.OPEN]
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.OPEN
 
     @pytest.mark.parametrize("status", ["busy", "waiting"])
     def test_busy_and_waiting_are_both_closed(self, tmp_path: Path, status: str) -> None:
         """`waiting` is a permission dialog, and a dialog blocks every Relay there is."""
-        sink = Sink()
-        watcher = watching(tmp_path, sink)
         say(tmp_path, status)
 
-        watcher.watch(TARGET)
-
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
     def test_a_status_this_build_has_never_seen_is_closed(self, tmp_path: Path) -> None:
         """A whitelist, so a new state cannot arrive claiming readiness by default."""
-        sink = Sink()
-        watcher = watching(tmp_path, sink)
         say(tmp_path, "meditating")
 
-        watcher.watch(TARGET)
-
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
     def test_no_record_at_all_is_closed(self, tmp_path: Path) -> None:
-        sink = Sink()
-
-        watching(tmp_path, sink).watch(TARGET)
-
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
     def test_a_record_for_another_session_on_that_pid_is_closed(self, tmp_path: Path) -> None:
         """A recycled pid says nothing about the Session that used to hold it."""
-        sink = Sink()
         say(tmp_path, "idle", session_id="somebody-else")
 
-        watching(tmp_path, sink).watch(TARGET)
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
-        assert sink.windows == [ReplyWindow.CLOSED]
+    def test_asking_for_a_level_neither_reports_nor_starts_watching(
+        self, tmp_path: Path
+    ) -> None:
+        """A pure query: Bridge Core asks it of Sessions the sweep already owns."""
+        sink = Sink()
+        say(tmp_path, "idle")
+        watcher = watching(tmp_path, sink)
+
+        watcher.level(TARGET)
+
+        assert sink.events == []
+        assert watcher.watching == ()
 
     def test_a_missing_record_is_closed_without_a_record_object(self) -> None:
         assert window_for(None) is ReplyWindow.CLOSED
 
 
 class TestWhatGetsReported:
-    def test_registering_reports_the_level_immediately(self, tmp_path: Path) -> None:
-        """Otherwise an already-idle Session waits for a transition that may never come."""
+    def test_registering_seeds_the_level_and_reports_nothing(self, tmp_path: Path) -> None:
+        """Registration is silent, and #27 is why it has to be.
+
+        This asserted the opposite until #27: registration emitted the current
+        level, on the argument that an already-idle Session would otherwise wait
+        for a transition that might never come. The need was real and the
+        mechanism never once met it — registration runs before Bridge Core holds
+        the Session, so **every report this test ever asserted was dropped by the
+        hub as belonging to a Session nobody knew**, and because the watcher had
+        recorded it as sent the sweep could never repeat it.
+
+        The level is now pulled by Bridge Core through the seam's `reply_window`
+        the instant its roster holds the Session, so registration only has to
+        leave the sweep a baseline to compare against. Staying silent is also
+        what keeps "a Reply Window changed on an unknown Session" out of the log
+        of every healthy launch, where it would cost that line the evidential
+        weight it earned in #21.
+        """
         sink = Sink()
         say(tmp_path, "idle")
 
-        watching(tmp_path, sink).watch(TARGET)
+        watcher = watching(tmp_path, sink)
+        watcher.watch(TARGET)
 
-        assert sink.events == [ReplyWindowChanged(target=TARGET, window=ReplyWindow.OPEN)]
+        assert sink.events == []
+        assert watcher.watching == (TARGET,)
+        # Seeded at the level it actually observed, not at a default: a sweep
+        # that found the same `idle` again must have nothing to report.
+        watcher.poll_once()
+        assert sink.events == []
 
     def test_only_transitions_are_reported_after_that(self, tmp_path: Path) -> None:
         sink = Sink()
@@ -196,9 +222,10 @@ class TestWhatGetsReported:
         say(tmp_path, "waiting")
         watcher.poll_once()
 
-        assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
 
-    def test_watching_the_same_session_twice_reports_it_once(self, tmp_path: Path) -> None:
+    def test_watching_the_same_session_twice_holds_it_once(self, tmp_path: Path) -> None:
+        """Idempotent. Read off the watched set now that registration is silent."""
         sink = Sink()
         watcher = watching(tmp_path, sink)
         say(tmp_path, "idle")
@@ -206,7 +233,8 @@ class TestWhatGetsReported:
         watcher.watch(TARGET)
         watcher.watch(TARGET)
 
-        assert len(sink.events) == 1
+        assert watcher.watching == (TARGET,)
+        assert sink.events == []
 
     def test_a_forgotten_session_stops_being_reported(self, tmp_path: Path) -> None:
         sink = Sink()
@@ -219,7 +247,7 @@ class TestWhatGetsReported:
         watcher.poll_once()
 
         assert watcher.watching == ()
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert sink.windows == []
 
     def test_a_session_that_vanishes_is_reported_closed(self, tmp_path: Path) -> None:
         """A Session that has gone cannot take a user turn, and must not look like it can."""
@@ -231,7 +259,7 @@ class TestWhatGetsReported:
         (registry(tmp_path) / f"{LIVE_PID}.json").unlink()
         watcher.poll_once()
 
-        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert sink.windows == [ReplyWindow.CLOSED]
 
 
 class TestPolling:
@@ -253,7 +281,7 @@ class TestPolling:
                 await watcher.aclose()
 
         asyncio.run(scenario())
-        assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN]
+        assert sink.windows == [ReplyWindow.OPEN]
 
     def test_closing_stops_the_polling(self, tmp_path: Path) -> None:
         sink = Sink()
@@ -270,7 +298,7 @@ class TestPolling:
             return watcher.watching
 
         assert asyncio.run(scenario()) == ()
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert sink.windows == []
 
     def test_starting_twice_does_not_double_the_reads(self, tmp_path: Path) -> None:
         sink = Sink()
@@ -288,7 +316,7 @@ class TestPolling:
                 await watcher.aclose()
 
         asyncio.run(scenario())
-        assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN]
+        assert sink.windows == [ReplyWindow.OPEN]
 
 
 class Child:
@@ -428,7 +456,7 @@ class TestReportingDeath:
         watcher.poll_once()
 
         assert sink.deaths == []
-        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert sink.windows == [ReplyWindow.CLOSED]
         assert watcher.watching == (TARGET,)
 
     def test_a_torn_record_on_a_live_process_is_not_a_death(self, tmp_path: Path) -> None:
@@ -442,7 +470,7 @@ class TestReportingDeath:
         watcher.poll_once()
 
         assert sink.deaths == []
-        assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert sink.windows == [ReplyWindow.CLOSED]
         assert watcher.watching == (TARGET,)
 
     def test_death_is_reported_once_and_drops_the_target(self, tmp_path: Path) -> None:
@@ -461,14 +489,22 @@ class TestReportingDeath:
         assert watcher.watching == ()
 
     def test_death_is_never_reported_at_registration(self, tmp_path: Path) -> None:
-        """Bridge Core has not registered the Session yet, so a death raised here is lost."""
+        """Bridge Core has not registered the Session yet, so a death raised here is lost.
+
+        Since #27 this holds for a stronger reason than it was written for:
+        registration now emits *nothing at all*, so the ordering that would have
+        lost a death cannot lose one, because none is raised there to lose. The
+        assertion is kept and widened to the whole event stream — what has to stay
+        true is that no observation escapes registration, not merely that deaths
+        do not.
+        """
         sink = AllEvents()
         target = target_for(dead_pid())
 
         watching(tmp_path, sink).watch(target)
 
         assert sink.deaths == []
-        assert sink.windows == [ReplyWindow.CLOSED]
+        assert sink.events == []
 
     def test_death_is_not_paired_with_a_window_report(self, tmp_path: Path) -> None:
         """Ending a Session closes its window in core state; saying both says it twice."""
@@ -478,12 +514,12 @@ class TestReportingDeath:
         say(tmp_path, "idle", pid=process.pid)
         target = target_for(process.pid)
         watcher.watch(target)
-        assert sink.windows == [ReplyWindow.OPEN]
+        assert sink.events == []  # registration is silent since #27
 
         process.kill()
         watcher.poll_once()
 
-        assert sink.events[1:] == [SessionEnded(target=target, detail=PROCESS_GONE)]
+        assert sink.events == [SessionEnded(target=target, detail=PROCESS_GONE)]
 
     def test_a_target_forgotten_before_it_dies_is_never_reported(self, tmp_path: Path) -> None:
         sink = AllEvents()
@@ -532,7 +568,7 @@ class TestReportingDeath:
         assert asyncio.run(scenario()) == (TARGET,)
         assert raised == [LIVE_PID]  # the sweep really did fall over, once
         assert sink.deaths == []
-        assert sink.windows == [ReplyWindow.CLOSED, ReplyWindow.OPEN]
+        assert sink.windows == [ReplyWindow.OPEN]
 
 
 class TestDeathReachesBridgeCoreEndToEnd:
