@@ -68,7 +68,14 @@ class TestLaunching:
         launched(core)
 
         assert [record.getMessage() for record in caplog.records] == [
-            "launched Session agent=codex session_id=abc pid=None workspace=/tmp/workspace"
+            # The level the hub pulled the instant its roster held the Session
+            # (#27), stated as a fact rather than as a change: this is not a
+            # `ReplyWindowChanged`, and must not read like one. It is what made
+            # #27 undiagnosable from the log — the starting window was the one
+            # thing a launch never wrote down.
+            "established Reply Window at registration agent=codex "
+            "session_id=abc pid=None window=closed",
+            "launched Session agent=codex session_id=abc pid=None workspace=/tmp/workspace",
         ]
 
     def test_a_refused_launch_records_the_refusal_words(self, caplog) -> None:

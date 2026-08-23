@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import os
 import shutil
 from collections.abc import Iterator
@@ -22,12 +23,17 @@ from typing import Any
 import pytest
 
 from claude_fake import FakeChannel
-from gpt_voicecoding.adapters.agent.claude import ClaudeAgentAdapter, claude_agent
+from gpt_voicecoding.adapters.agent.claude import (
+    PROVEN_AGAINST_VERSION,
+    ClaudeAgentAdapter,
+    claude_agent,
+)
 from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNROUTED
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     CHANNEL_KIND_BY_VERB,
     channel_kind_for,
 )
+from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings, SettingsError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relay_queue import RelayQueue
@@ -47,7 +53,31 @@ from gpt_voicecoding.seams.verify import VerifyOutcome
 SESSION = "0b7cf6f2-0f3c-4f5e-9d1f-8a2b3c4d5e6f"
 TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=4321)
 
+#: A target whose pid really is alive, which the Reply Window watcher insists on
+#: before it will read a record as belonging to this Session. `TARGET`'s pid is a
+#: literal and cannot serve, so the level tests build their own.
+LIVE_TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=os.getpid())
+
 _names = itertools.count()
+
+
+def write_record(registry_directory: Path, *, status: str) -> None:
+    """The registry record Claude Code publishes, and the watcher reads the level from."""
+    registry_directory.mkdir(parents=True, exist_ok=True)
+    (registry_directory / f"{LIVE_TARGET.pid}.json").write_text(
+        json.dumps(
+            {
+                "pid": LIVE_TARGET.pid,
+                "sessionId": SESSION,
+                "cwd": str(registry_directory),
+                "version": PROVEN_AGAINST_VERSION,
+                "peerProtocol": PEER_PROTOCOL,
+                "messagingSocketPath": str(registry_directory / "claude.sock"),
+                "status": status,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class Sink:
@@ -117,6 +147,70 @@ class TestRegisteringSessions:
             "registered Session channel "
             f"agent=claude session_id={SESSION} pid=4321 socket={socket_path}"
         ]
+
+    def test_registering_raises_nothing_upward(self, socket_path: Path) -> None:
+        """Silent since #27 — the seam's `reply_window` carries the starting level.
+
+        Registration runs before Bridge Core holds the Session, so anything
+        raised here is dropped as belonging to a Session nobody knows. The window
+        report that used to come out of it was lost on every launch this way.
+        """
+        sink = Sink()
+
+        ClaudeAgentAdapter(sink=sink, settings=quick()).register_session(TARGET, socket_path)
+
+        assert sink.events == []
+
+
+class TestTheLevelItIsAskedFor:
+    """The Agent seam's `reply_window` — how a Session's starting level reaches the hub (#27).
+
+    What a registry status *means* is settled in `test_claude_reply_window.py`
+    against the watcher's own `level`. What is new here, and only observable at
+    the adapter, is the channel gate: this adapter answers for the Sessions it
+    can reach, and CLOSED for everything else.
+    """
+
+    def _adapter(self, tmp_path: Path, *, status: str = "idle") -> ClaudeAgentAdapter:
+        write_record(tmp_path, status=status)
+        return ClaudeAgentAdapter(sink=Sink(), settings=quick(registry_directory=tmp_path))
+
+    def test_a_session_this_adapter_holds_no_channel_for_is_closed(self, tmp_path: Path) -> None:
+        """Reading someone's record is not the same as being able to reach them.
+
+        The record says `idle` and the honest answer is still CLOSED: a Reply
+        Window is a claim about reachability, and this adapter has no way in to
+        this Session. Fail closed, exactly as the rest of the seam does.
+        """
+        assert self._adapter(tmp_path).reply_window(LIVE_TARGET) is ReplyWindow.CLOSED
+
+    def test_a_registered_session_that_is_idle_is_open(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """The already-idle-at-registration case, answered without waiting for a sweep."""
+        adapter = self._adapter(tmp_path)
+        adapter.register_session(LIVE_TARGET, socket_path)
+
+        assert adapter.reply_window(LIVE_TARGET) is ReplyWindow.OPEN
+
+    def test_a_registered_session_that_is_busy_is_closed(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        adapter = self._adapter(tmp_path, status="busy")
+        adapter.register_session(LIVE_TARGET, socket_path)
+
+        assert adapter.reply_window(LIVE_TARGET) is ReplyWindow.CLOSED
+
+    def test_a_forgotten_session_goes_back_to_closed(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """The record still says `idle`; this adapter no longer has any way in."""
+        adapter = self._adapter(tmp_path)
+        adapter.register_session(LIVE_TARGET, socket_path)
+
+        adapter.forget_session(LIVE_TARGET)
+
+        assert adapter.reply_window(LIVE_TARGET) is ReplyWindow.CLOSED
 
 
 class TestCarryingTheUsersWords:

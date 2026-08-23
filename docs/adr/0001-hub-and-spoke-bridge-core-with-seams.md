@@ -74,9 +74,10 @@ those files, or the disk becomes a second truth.
   transcript, call started / ended / dropped. The one-call invariant lives *above*
   this seam.
 - **Agent**: `answer_relay(session, text)` · `notice_relay(session, text)` ·
-  `approval_relay(session, request, verdict)`. Events up: Session stopped,
-  awaiting approval, delivery receipts (delivered / held / expired). Reply-Window
-  queueing is Bridge Core policy — adapters deliver, never queue.
+  `approval_relay(session, request, verdict)` · `reply_window(session)`. Events
+  up: Session stopped, awaiting approval, Reply Window changed, delivery
+  receipts (delivered / held / expired). Reply-Window queueing is Bridge Core
+  policy — adapters deliver, never queue.
 - **Session Launcher**: `launch` a Session into a workspace and report the
   launch outcome; `close` a Session and report what closed. Pane semantics
   never cross this seam.
@@ -95,6 +96,24 @@ truthful per-child outcomes only where the adapter actually owns child
 destinations. Closing was never missing from the product — the reference
 implementation had a `close` action, wrongly gated behind the Duty Switch — it
 was missing from this list, which is what an adapter implements against.
+
+`reply_window` was added to the Agent seam on 2026-08-24, under [#27](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/27),
+which is the adjudication this list's closed set requires: a seam's verbs extend
+only through a ruling with a use case behind it, and that is the ruling.
+
+The use case is that **an event cannot bootstrap a level.** An adapter is
+registered before Bridge Core holds the Session, so a `ReplyWindowChanged`
+raised at registration is dropped as belonging to a Session nobody knows — and
+having been recorded by the adapter as reported, it is never repeated. A Session
+that was already idle when it was launched therefore stayed at the fail-closed
+default forever, unreachable while perfectly healthy. So the level is *asked
+for*, once, the instant the roster holds the Session, and only its changes are
+reported. The verb is synchronous alone with `supported_routes`, because an
+await would reopen the very gap it exists to close.
+
+This is the same seam as #26 seen from the other side. Registration is the one
+point where a Session's reachability is settled: restore refuses to claim what it
+cannot establish, and launch establishes what it can.
 
 ## Consequences
 

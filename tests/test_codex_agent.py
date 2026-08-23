@@ -630,6 +630,88 @@ class TestApprovalRouting:
         assert "guardian_subagent" in receipt.reason
 
 
+class TestTheLevelItIsAskedFor:
+    """The Agent seam's `reply_window`, which is how a Session's starting level lands (#27).
+
+    Codex has the same registration ordering Claude does, and the same
+    consequence. `register_session` awaits `_subscribe`, whose `thread/resume`
+    echo carries the thread's status, so `_note_status` fires and latches
+    `observed` before Bridge Core holds the Session — putting that first report
+    exactly where it gets dropped as unknown. Bridge Core therefore asks instead
+    of listening, and what it must be told is whatever this adapter has actually
+    observed.
+    """
+
+    def _asked(self, socket_path: Path, *, status: str) -> tuple[ReplyWindow, ReplyWindow]:
+        """The level the seam is told, alongside the level the adapter holds."""
+
+        async def scenario() -> tuple[ReplyWindow, ReplyWindow]:
+            async with Codex(socket_path).script(status=status) as server:
+                adapter = await watching(server, Sink())
+                try:
+                    return adapter.reply_window(TARGET), adapter._threads[TARGET].reply_window
+                finally:
+                    await adapter.aclose()
+
+        return asyncio.run(scenario())
+
+    def test_an_idle_thread_answers_open_with_what_it_observed(self, socket_path: Path) -> None:
+        """The case the drop costs: a Session idle at registration, told to nobody."""
+        asked, held = self._asked(socket_path, status="idle")
+
+        assert asked is ReplyWindow.OPEN
+        assert asked is held
+
+    def test_an_active_thread_answers_closed_with_what_it_observed(
+        self, socket_path: Path
+    ) -> None:
+        asked, held = self._asked(socket_path, status="active")
+
+        assert asked is ReplyWindow.CLOSED
+        assert asked is held
+
+    def test_a_thread_that_has_reported_no_status_answers_closed(
+        self, socket_path: Path
+    ) -> None:
+        """Fail closed, and provisionally so.
+
+        A status kind this build does not recognise leaves `observed` False, so
+        nothing has been observed at all. CLOSED is the only honest answer — a
+        window nobody has seen is not one anything may claim is open — and it is
+        provisional rather than wrong, because the first status that does arrive
+        is emitted as a transition and corrects it.
+        """
+
+        async def scenario() -> tuple[ReplyWindow, bool]:
+            async with Codex(socket_path).script(status="meditating") as server:
+                adapter = await watching(server, Sink())
+                try:
+                    return adapter.reply_window(TARGET), adapter._threads[TARGET].observed
+                finally:
+                    await adapter.aclose()
+
+        asked, observed = asyncio.run(scenario())
+
+        assert asked is ReplyWindow.CLOSED
+        assert observed is False
+
+    def test_a_session_this_adapter_does_not_watch_answers_closed(
+        self, socket_path: Path
+    ) -> None:
+        """Not reachable is not the same as not busy, and neither is an open window."""
+
+        async def scenario() -> ReplyWindow:
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, Sink())
+                try:
+                    stranger = SessionTarget(agent=AgentKind.CODEX, session_id="somebody-else")
+                    return adapter.reply_window(stranger)
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()) is ReplyWindow.CLOSED
+
+
 class TestWhatItRaisesUpward:
     def test_a_turn_ending_closes_the_loop_as_a_stop_and_an_open_window(
         self, socket_path: Path
