@@ -196,7 +196,7 @@ def _roster_lines(sessions: object) -> list[str]:
     if not sessions:
         return ["sessions: none"]
     return ["sessions:"] + [
-        f"  {session['label']} — {format_address(session['target'])} "
+        f"  {session['label']} — {format_address(session['target'])} — {session['workspace']} "
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions
     ]

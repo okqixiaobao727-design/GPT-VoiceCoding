@@ -149,16 +149,18 @@ class TestTheWholeSessionCommandSet:
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         config = ["--config", str(engine_at)]
+        workspace = engine_at.parent
 
         assert main([*config, "sessions"]) == 0
         assert "sessions: none" in capsys.readouterr().out
 
-        assert main([*config, "launch", "codex", "/tmp", "a project · a task"]) == 0
+        assert main([*config, "launch", "codex", str(workspace), "a project · a task"]) == 0
         assert "launched codex:abc" in capsys.readouterr().out
 
         assert main([*config, "sessions"]) == 0
         roster = capsys.readouterr().out
         assert "a project · a task" in roster and "codex:abc" in roster
+        assert str(workspace) in roster
 
         assert main([*config, "relay", "codex:abc", "carry", "on"]) == 0
         assert "deliver" in capsys.readouterr().out
