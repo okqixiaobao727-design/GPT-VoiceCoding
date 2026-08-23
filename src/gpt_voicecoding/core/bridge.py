@@ -164,7 +164,7 @@ class BridgeCore:
         self._channel = channel
         self._agents = dict(agents)
         self._launcher = launcher
-        self._events = events or EventQueue()
+        self._events = events if events is not None else EventQueue()
         self._policy = policy or CorePolicy()
         self._control = control
         self._delegate = delegate
@@ -506,6 +506,7 @@ class BridgeCore:
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
+        self._state.persist()
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
 
