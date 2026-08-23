@@ -323,6 +323,7 @@ class BridgeCore:
             )
         )
         if outcome.status is not LaunchStatus.LAUNCHED:
+            _log.info("launch refused: %r", outcome.detail)
             return outcome
 
         assert outcome.target is not None  # the seam refuses a LAUNCHED without one
@@ -335,6 +336,13 @@ class BridgeCore:
             )
         )
         self._state.persist()
+        _log.info(
+            "launched Session agent=%s session_id=%s pid=%s workspace=%s",
+            outcome.target.agent,
+            outcome.target.session_id,
+            outcome.target.pid,
+            workspace,
+        )
         return outcome
 
     async def close_session(self, target: SessionTarget) -> CloseOutcome:

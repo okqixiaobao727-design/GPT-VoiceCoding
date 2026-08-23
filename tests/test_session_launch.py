@@ -50,6 +50,26 @@ def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
 
 
 class TestLaunching:
+    def test_a_launched_session_records_its_target_and_workspace(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        core = hub(FakeSessionLauncher(targets=[CODEX]))
+
+        launched(core)
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "launched Session agent=codex session_id=abc pid=None workspace=/tmp/workspace"
+        ]
+
+    def test_a_refused_launch_records_the_refusal_words(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        core = hub(FakeSessionLauncher(targets=[]))
+
+        launched(core)
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "launch refused: 'this fake launcher has no target left to hand out'"
+        ]
+
     def test_a_launched_session_is_registered_by_the_hub(self) -> None:
         core = hub(FakeSessionLauncher(targets=[CODEX]))
 

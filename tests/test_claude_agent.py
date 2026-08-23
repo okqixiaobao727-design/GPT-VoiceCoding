@@ -106,6 +106,19 @@ async def _until_closed(channel: FakeChannel) -> None:
         await asyncio.sleep(0.01)
 
 
+class TestRegisteringSessions:
+    def test_a_registered_session_channel_is_recorded(self, socket_path: Path, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.adapters.agent.claude.adapter")
+        adapter = ClaudeAgentAdapter(sink=Sink(), settings=quick())
+
+        adapter.register_session(TARGET, socket_path)
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "registered Session channel "
+            f"agent=claude session_id={SESSION} pid=4321 socket={socket_path}"
+        ]
+
+
 class TestCarryingTheUsersWords:
     def test_a_relay_is_delivered_only_once_the_session_acknowledges_it(
         self, socket_path: Path

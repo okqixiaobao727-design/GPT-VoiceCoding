@@ -206,6 +206,13 @@ class CodexAgentAdapter:
             self._threads.pop(target, None)
             await connection.aclose()
             raise
+        _log.info(
+            "registered Session channel agent=%s session_id=%s pid=%s socket=%s",
+            target.agent,
+            target.session_id,
+            target.pid,
+            socket_path,
+        )
 
     async def forget_session(self, target: SessionTarget) -> None:
         """Stop watching one Session. The Session itself is left running."""
