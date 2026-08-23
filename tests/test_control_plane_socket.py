@@ -395,6 +395,16 @@ class TestAPathThatCannotBeBound:
             asyncio.run(ControlPlaneServer(plane=StubPlane(), path=too_long).start())
 
 
+def _engine_budget() -> float:
+    """The longest the engine may spend deciding one launch. Summed in one place,
+    so a wait added to the launch path is added to the derivation with it."""
+    return (
+        APP_SERVER_TIMEOUT_SECONDS  # the app-server binding its socket
+        + DEFAULT_REQUEST_TIMEOUT_SECONDS  # the `initialise` handshake
+        + CONFIRM_TIMEOUT_SECONDS  # the Session saying who it is
+    )
+
+
 class TestTheLaunchDeadlineIsDerived:
     """The launch deadline is not a taste; it is read off the engine's own budget.
 
@@ -411,23 +421,13 @@ class TestTheLaunchDeadlineIsDerived:
     """
 
     def test_it_outlives_every_bound_the_engine_can_spend_on_one_launch(self) -> None:
-        engine_budget = (
-            APP_SERVER_TIMEOUT_SECONDS  # the app-server binding its socket
-            + DEFAULT_REQUEST_TIMEOUT_SECONDS  # the `initialise` handshake
-            + CONFIRM_TIMEOUT_SECONDS  # the Session saying who it is
-        )
-
-        assert LAUNCH_TIMEOUT_SECONDS > engine_budget, (
+        assert LAUNCH_TIMEOUT_SECONDS > _engine_budget(), (
             "the surface would give up while the engine is still entitled to be working"
         )
 
     def test_it_leaves_room_for_the_spawn_the_bounds_do_not_cover(self) -> None:
         """The bounded waits are not the whole launch: processes still have to start."""
-        engine_budget = (
-            APP_SERVER_TIMEOUT_SECONDS + DEFAULT_REQUEST_TIMEOUT_SECONDS + CONFIRM_TIMEOUT_SECONDS
-        )
-
-        assert LAUNCH_TIMEOUT_SECONDS - engine_budget >= 20.0
+        assert LAUNCH_TIMEOUT_SECONDS - _engine_budget() >= 20.0
 
     def test_a_launch_waits_longer_than_anything_else_does(self) -> None:
         assert timeout_for(Action.LAUNCH) == LAUNCH_TIMEOUT_SECONDS

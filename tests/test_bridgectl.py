@@ -398,6 +398,23 @@ class TestNoEngineAtAll:
         assert "--socket" in error
 
 
+def _launching(config: Path, *, timeout: str | None = None) -> list[str]:
+    """One launch command line, so each test below carries only its own point."""
+    deadline = ["--timeout", timeout] if timeout is not None else []
+    return [
+        "--config",
+        str(config),
+        *deadline,
+        "launch",
+        "--request-id",
+        LAUNCH_REQUEST_ID,
+        "--project",
+        "a project",
+        "--task",
+        "say hello",
+    ]
+
+
 class TestALaunchThatOutrunsTheDeadline:
     """A launch that is still in flight is not a launch that failed (#28).
 
@@ -411,21 +428,7 @@ class TestALaunchThatOutrunsTheDeadline:
     def test_the_operator_is_told_the_launch_may_still_be_running(
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "--timeout",
-                "0.3",
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
+        code = main(_launching(slow_engine_at, timeout="0.3"))
 
         assert code == 2
         error = capsys.readouterr().err
@@ -436,21 +439,7 @@ class TestALaunchThatOutrunsTheDeadline:
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Quoted back, so the recovery is copyable rather than merely described."""
-        main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "--timeout",
-                "0.3",
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
+        main(_launching(slow_engine_at, timeout="0.3"))
 
         error = capsys.readouterr().err
         assert LAUNCH_REQUEST_ID in error
@@ -460,21 +449,7 @@ class TestALaunchThatOutrunsTheDeadline:
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """The wrong guess is named, because naming only the right move invites it."""
-        main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "--timeout",
-                "0.3",
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
+        main(_launching(slow_engine_at, timeout="0.3"))
 
         assert "second agent" in capsys.readouterr().err
 
@@ -531,21 +506,7 @@ class TestTheDeadlineTheOperatorAsked:
     ) -> None:
         """Proved by the sentence naming the operator's number, not the default's:
         had the 150s launch deadline applied, this test would still be waiting."""
-        code = main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "--timeout",
-                "0.3",
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
+        code = main(_launching(slow_engine_at, timeout="0.3"))
 
         assert code == 2
         assert "did not answer within 0.3s" in capsys.readouterr().err
@@ -557,19 +518,7 @@ class TestASlowLaunchIsNotAFailure:
     def test_a_launch_slower_than_an_ordinary_action_still_reports_success(
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
+        code = main(_launching(slow_engine_at))
 
         assert code == 0
         assert "launched codex:abc" in capsys.readouterr().out
