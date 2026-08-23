@@ -20,13 +20,20 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeSessionLauncher
+from fakes import FakeCall, FakeSessionLauncher
 from gpt_voicecoding.cli import main
 from gpt_voicecoding.config import load
+from gpt_voicecoding.control_plane.client import (
+    DEFAULT_TIMEOUT_SECONDS,
+    LAUNCH_TIMEOUT_SECONDS,
+    EngineUnreachable,
+)
 from gpt_voicecoding.control_plane.commands import CommandError, build_request
 from gpt_voicecoding.engine.composition import Engine
-from gpt_voicecoding.seams.control_plane import Action
+from gpt_voicecoding.seams.call import CallSnapshot
+from gpt_voicecoding.seams.control_plane import Action, Reply
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 LAUNCH_REQUEST_ID = "21d73168-b1f0-4b18-977d-fba0d1f2cc13"
@@ -89,6 +96,36 @@ def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
     return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
 
+#: Longer than any deadline these tests hand the surface, and short enough that
+#: the engine's own shutdown does not wait on it. It stands in for the real
+#: thing #28 was found on: a cold launch that outruns the client's patience.
+SLOWER_THAN_ANY_DEADLINE_SECONDS = 3.0
+
+
+class SlowSessionLauncher(FakeSessionLauncher):
+    """A Launcher that is still working when the surface has given up waiting."""
+
+    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
+        await asyncio.sleep(SLOWER_THAN_ANY_DEADLINE_SECONDS)
+        return await super().launch(request)
+
+
+class SlowCall(FakeCall):
+    """A Call adapter that is slow, so a *non*-launch action can time out too."""
+
+    async def ensure_call(self, instructions: str) -> CallSnapshot:
+        await asyncio.sleep(SLOWER_THAN_ANY_DEADLINE_SECONDS)
+        return await super().ensure_call(instructions)
+
+
+def slow_session_launcher(*, sink: object = None) -> SlowSessionLauncher:
+    return SlowSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
+
+
+def slow_call(*, sink: object = None, **rest: object) -> SlowCall:
+    return SlowCall(sink=sink)  # type: ignore[arg-type]
+
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -131,6 +168,21 @@ def home() -> Iterator[Path]:
         shutil.rmtree(base, ignore_errors=True)
 
 
+#: The same engine, wired to adapters that outlast the surface's patience.
+SLOW_CONFIG = CONFIG.replace(
+    'call = "fakes:FakeCall"', 'call = "test_bridgectl:slow_call"'
+).replace(
+    'session_launcher = "test_bridgectl:one_session_launcher"',
+    'session_launcher = "test_bridgectl:slow_session_launcher"',
+)
+
+
+@pytest.fixture
+def slow_engine_at(home: Path) -> Iterator[Path]:
+    """An engine that answers, but not before the surface has stopped listening."""
+    yield from _engine_serving(home, SLOW_CONFIG)
+
+
 @pytest.fixture
 def engine_at(home: Path) -> Iterator[Path]:
     """One engine, running in its own loop on another thread, and its config path.
@@ -138,9 +190,14 @@ def engine_at(home: Path) -> Iterator[Path]:
     `bridgectl` runs its own `asyncio.run`, exactly as the console script does,
     so the engine it talks to cannot share this thread's loop.
     """
+    yield from _engine_serving(home, CONFIG)
+
+
+def _engine_serving(home: Path, config: str) -> Iterator[Path]:
+    """One assembled engine, served on its own thread, and torn down after."""
     config_path = home / "config.toml"
     config_path.write_text(
-        CONFIG.format(
+        config.format(
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
@@ -339,3 +396,150 @@ class TestNoEngineAtAll:
         error = capsys.readouterr().err
         assert str(home / "absent.toml") in error
         assert "--socket" in error
+
+
+def _launching(config: Path, *, timeout: str | None = None) -> list[str]:
+    """One launch command line, so each test below carries only its own point."""
+    deadline = ["--timeout", timeout] if timeout is not None else []
+    return [
+        "--config",
+        str(config),
+        *deadline,
+        "launch",
+        "--request-id",
+        LAUNCH_REQUEST_ID,
+        "--project",
+        "a project",
+        "--task",
+        "say hello",
+    ]
+
+
+class TestALaunchThatOutrunsTheDeadline:
+    """A launch that is still in flight is not a launch that failed (#28).
+
+    The engine holds an in-flight launch under its request id and joins a repeat
+    to it, so re-issuing the *identical* command is the safe recovery. That is
+    worth nothing if the operator cannot learn it at the moment it is needed,
+    and the obvious guess — retry with a fresh id — is precisely the one that
+    starts a second agent in the same workspace.
+    """
+
+    def test_the_operator_is_told_the_launch_may_still_be_running(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(_launching(slow_engine_at, timeout="0.3"))
+
+        assert code == 2
+        error = capsys.readouterr().err
+        # Not "it failed": the launch's fate is genuinely unknown to this surface.
+        assert "may still be in flight" in error
+
+    def test_the_recovery_names_the_operator_s_own_request_id(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Quoted back, so the recovery is copyable rather than merely described."""
+        main(_launching(slow_engine_at, timeout="0.3"))
+
+        error = capsys.readouterr().err
+        assert LAUNCH_REQUEST_ID in error
+        assert "--request-id" in error
+
+    def test_it_warns_that_a_fresh_request_id_would_start_a_second_agent(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The wrong guess is named, because naming only the right move invites it."""
+        main(_launching(slow_engine_at, timeout="0.3"))
+
+        assert "second agent" in capsys.readouterr().err
+
+    def test_an_action_that_is_not_a_launch_keeps_the_plain_sentence(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """There is no in-flight launch to join, so there is nothing to advise."""
+        code = main(
+            [
+                "--config",
+                str(slow_engine_at),
+                "--timeout",
+                "0.3",
+                "live",
+            ]
+        )
+
+        assert code == 2
+        error = capsys.readouterr().err
+        assert "did not answer within 0.3s" in error
+        assert "request-id" not in error
+
+    def test_no_engine_at_all_is_never_told_a_launch_may_be_in_flight(
+        self, home: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Nothing was ever reached, so nothing is running — advising a rejoin would
+        be the same untruth this ticket exists to remove, pointed the other way."""
+        code = main(
+            [
+                "--socket",
+                str(home / "absent.sock"),
+                "launch",
+                "--request-id",
+                LAUNCH_REQUEST_ID,
+                "--project",
+                "a project",
+                "--task",
+                "say hello",
+            ]
+        )
+
+        assert code == 2
+        error = capsys.readouterr().err
+        assert str(home / "absent.sock") in error
+        assert "may still be in flight" not in error
+        assert "second agent" not in error
+
+
+class TestTheDeadlineTheOperatorAsked:
+    """`--timeout` is the operator's, and it outranks the per-action default."""
+
+    def test_an_explicit_timeout_overrides_the_launch_default(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Proved by the sentence naming the operator's number, not the default's:
+        had the 150s launch deadline applied, this test would still be waiting."""
+        code = main(_launching(slow_engine_at, timeout="0.3"))
+
+        assert code == 2
+        assert "did not answer within 0.3s" in capsys.readouterr().err
+
+
+class TestASlowLaunchIsNotAFailure:
+    """The first thing #28 asks for: a launch that is merely slow still succeeds."""
+
+    def test_a_launch_slower_than_an_ordinary_action_still_reports_success(
+        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(_launching(slow_engine_at))
+
+        assert code == 0
+        assert "launched codex:abc" in capsys.readouterr().out
+
+    def test_a_launch_is_given_the_derived_deadline_and_other_actions_are_not(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The number reaches the wire. Asserted here rather than by spending it:
+        a test that actually waited out the launch deadline would take 150s."""
+        waited: list[float] = []
+
+        async def record(request: object, *, path: Path, timeout: float) -> Reply:
+            waited.append(timeout)
+            # Refused rather than answered: this test is about the deadline that
+            # reached the wire, and rendering a reply is another test's business.
+            raise EngineUnreachable("this engine is a stand-in")
+
+        monkeypatch.setattr("gpt_voicecoding.cli.bridgectl.ask", record)
+        socket = ["--socket", str(home / "control.sock")]
+        launch = ["launch", "--request-id", LAUNCH_REQUEST_ID, "--project", "p", "--task", "t"]
+        main([*socket, *launch])
+        main([*socket, "status"])
+
+        assert waited == [LAUNCH_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]

@@ -24,7 +24,18 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.control_plane.client import EngineUnreachable, ask
+# Imported to pin the launch deadline against the engine's own budget, and for
+# no other reason: nothing in `control_plane` reaches into `adapters` at runtime.
+from gpt_voicecoding.adapters.codex_app_server.settings import DEFAULT_REQUEST_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.session_launcher.codex import APP_SERVER_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.session_launcher.plan import CONFIRM_TIMEOUT_SECONDS
+from gpt_voicecoding.control_plane.client import (
+    DEFAULT_TIMEOUT_SECONDS,
+    LAUNCH_TIMEOUT_SECONDS,
+    EngineUnreachable,
+    ask,
+    timeout_for,
+)
 from gpt_voicecoding.control_plane.ownership import SocketPathTooLong
 from gpt_voicecoding.control_plane.server import AlreadyServing, ControlPlaneServer
 from gpt_voicecoding.seams.control_plane import (
@@ -382,3 +393,73 @@ class TestAPathThatCannotBeBound:
 
         with pytest.raises(SocketPathTooLong):
             asyncio.run(ControlPlaneServer(plane=StubPlane(), path=too_long).start())
+
+
+def _engine_budget() -> float:
+    """The longest the engine may spend deciding one launch. Summed in one place,
+    so a wait added to the launch path is added to the derivation with it."""
+    return (
+        APP_SERVER_TIMEOUT_SECONDS  # the app-server binding its socket
+        + DEFAULT_REQUEST_TIMEOUT_SECONDS  # the `initialise` handshake
+        + CONFIRM_TIMEOUT_SECONDS  # the Session saying who it is
+    )
+
+
+class TestTheLaunchDeadlineIsDerived:
+    """The launch deadline is not a taste; it is read off the engine's own budget.
+
+    A launch that outran the surface's deadline was reported as a failure while
+    it was in fact succeeding (#28). The fix is only sound while the surface
+    waits longer than the engine can possibly take to decide, so that a
+    client-side timeout means "the engine hung" and never "the launch was slow".
+
+    These tests defend against the way that soundness is silently lost: someone
+    raises one of the engine-side constants, the derivation stops holding, and
+    nothing fails. If one of these trips, **re-derive the deadline — do not
+    loosen the assertion.** The engine-side constants are imported here and
+    never at runtime: `control_plane` does not reach into `adapters`.
+    """
+
+    def test_it_outlives_every_bound_the_engine_can_spend_on_one_launch(self) -> None:
+        assert LAUNCH_TIMEOUT_SECONDS > _engine_budget(), (
+            "the surface would give up while the engine is still entitled to be working"
+        )
+
+    def test_it_leaves_room_for_the_spawn_the_bounds_do_not_cover(self) -> None:
+        """The bounded waits are not the whole launch: processes still have to start."""
+        assert LAUNCH_TIMEOUT_SECONDS - _engine_budget() >= 20.0
+
+    def test_a_launch_waits_longer_than_anything_else_does(self) -> None:
+        assert timeout_for(Action.LAUNCH) == LAUNCH_TIMEOUT_SECONDS
+        for action in Action:
+            if action is not Action.LAUNCH:
+                assert timeout_for(action) == DEFAULT_TIMEOUT_SECONDS
+
+    def test_a_client_that_names_no_deadline_still_gets_the_launch_one(
+        self, socket_dir: Path
+    ) -> None:
+        """The trap #28 was: a launch held to an ordinary action's patience.
+
+        `ask` reads the deadline off the action when it is not told one, so a
+        caller cannot reintroduce that bug by simply not thinking about it.
+        """
+        recorded: list[float] = []
+        real = asyncio.timeout
+
+        def watch(seconds: float) -> object:
+            recorded.append(seconds)
+            return real(seconds)
+
+        async def scenario() -> None:
+            server = await serving(socket_dir, StubPlane())
+            try:
+                with pytest.MonkeyPatch.context() as patched:
+                    patched.setattr(asyncio, "timeout", watch)
+                    for action in (Action.LAUNCH, Action.STATUS):
+                        await ask(Request(action=action), path=server.path)
+            finally:
+                await server.aclose()
+
+        asyncio.run(scenario())
+
+        assert recorded == [LAUNCH_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
