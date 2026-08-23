@@ -25,9 +25,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from gpt_voicecoding.config import ConfigError, default_config_path, load
-from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, EngineUnreachable, ask
+from gpt_voicecoding.control_plane.client import (
+    EngineSilent,
+    EngineUnreachable,
+    ask,
+    timeout_for,
+)
 from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
-from gpt_voicecoding.seams.control_plane import Action
+from gpt_voicecoding.seams.control_plane import Action, Request
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -45,8 +50,14 @@ def parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--socket", type=Path, default=None, help="the engine's socket, instead of reading config"
     )
+    # No default here: which deadline applies depends on the action, which is not
+    # known until the command line has been parsed. `None` means "not asked for",
+    # so an operator's own number still outranks whatever the action would pick.
     parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="seconds to wait"
+        "--timeout",
+        type=float,
+        default=None,
+        help="seconds to wait, instead of the deadline this action carries",
     )
     parser.add_argument("command", help="one of the commands listed below")
     parser.add_argument("arguments", nargs=argparse.REMAINDER, help="whatever it takes")
@@ -69,8 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{refusal}. Point at a running engine with --socket.", file=sys.stderr)
         return EXIT_UNREACHABLE
 
+    timeout = arguments.timeout if arguments.timeout is not None else timeout_for(request.action)
     try:
-        reply = asyncio.run(ask(request, path=socket_path, timeout=arguments.timeout))
+        reply = asyncio.run(ask(request, path=socket_path, timeout=timeout))
+    except EngineSilent as unanswered:
+        print(_still_in_flight(unanswered, request), file=sys.stderr)
+        return EXIT_UNREACHABLE
     except EngineUnreachable as down:
         print(str(down), file=sys.stderr)
         return EXIT_UNREACHABLE
@@ -81,6 +96,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     print(rendered, file=sys.stderr)
     return EXIT_REFUSED
+
+
+def _still_in_flight(unanswered: EngineSilent, request: Request) -> str:
+    """Say what a silent deadline actually means, and for a launch, what to do.
+
+    The engine said nothing, so there is no engine speech to relay and none is
+    invented here: the deadline is this surface's own, and so is the report of
+    it. What is added for a launch is a fact about the hub's behaviour — a
+    launch is held under its request id and a repeat of the identical request
+    joins it rather than starting a second one — so the safe recovery is the
+    one an operator is least likely to guess. The wrong guess is named too,
+    because telling someone only the right move still leaves the plausible
+    wrong one looking free.
+    """
+    if request.action is not Action.LAUNCH:
+        return str(unanswered)
+    request_id = request.payload.get("request_id")
+    return (
+        f"{unanswered}; the launch may still be in flight. Re-issue this exact "
+        f"command with the same --request-id {request_id} to join it and hear how "
+        "it ended — a fresh --request-id would start a second agent in the same "
+        "workspace."
+    )
 
 
 def _socket_path(arguments: argparse.Namespace) -> Path:
