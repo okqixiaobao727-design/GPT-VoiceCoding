@@ -86,6 +86,7 @@ class TestRoundTrip:
         assert after.switches.is_set("stop_notice") is False
 
     def test_the_session_registry_survives_a_restart(self, tmp_path: Path) -> None:
+        """The roster itself survives — every row, with everything it described."""
         path = default_state_path(tmp_path)
         session = a_session()
 
@@ -97,11 +98,11 @@ class TestRoundTrip:
         after = a_bridge(path)
         after.restore()
 
-        restored = after.sessions.resolve(session.target)
+        (restored,) = after.sessions.all()
+        assert restored.target == session.target
         assert restored.label == session.label
         assert restored.workspace == session.workspace
-        assert restored.reply_window is ReplyWindow.OPEN
-        assert restored.state is SessionState.LIVE
+        assert restored.registered_at == session.registered_at
 
     def test_the_relay_queue_is_not_durable(self, tmp_path: Path) -> None:
         """Words whose moment has passed must not be re-delivered after a restart."""
@@ -255,3 +256,113 @@ class TestOnlyCoreTouchesIt:
         )
         store.save(state)
         assert store.load() == state
+
+
+class TestARestoredSessionIsOneTheEngineCanHonour:
+    """A restored row may not claim a capability the restart took away (#26).
+
+    `register_session` is the sole place a Session's channel and its Reply Window
+    watch are established, and the channel's address arrives from the launch that
+    minted it. A restart loses both, so a row that came back LIVE — "whether this
+    Session can still be Relayed into" — would be claiming, in the enum's own
+    terms, exactly what it no longer has.
+    """
+
+    def test_a_live_row_comes_back_ended(self, tmp_path: Path) -> None:
+        path = default_state_path(tmp_path)
+        session = a_session()
+
+        before = a_bridge(path)
+        before.sessions.register(session)
+        before.sessions.set_reply_window(session.target, ReplyWindow.OPEN)
+        before.persist()
+
+        after = a_bridge(path)
+        after.restore()
+
+        (restored,) = after.sessions.all()
+        assert restored.state is SessionState.ENDED
+
+    def test_its_reply_window_closes_with_it(self, tmp_path: Path) -> None:
+        """An ended Session's window is closed, and a restored one is no exception."""
+        path = default_state_path(tmp_path)
+        session = a_session()
+
+        before = a_bridge(path)
+        before.sessions.register(session)
+        before.sessions.set_reply_window(session.target, ReplyWindow.OPEN)
+        before.persist()
+
+        after = a_bridge(path)
+        after.restore()
+
+        (restored,) = after.sessions.all()
+        assert restored.reply_window is ReplyWindow.CLOSED
+
+    def test_no_restored_session_is_live_so_none_can_outlive_its_process(
+        self, tmp_path: Path
+    ) -> None:
+        """#26's immortality, asked of the roster every surface actually reads."""
+        path = default_state_path(tmp_path)
+
+        before = a_bridge(path)
+        before.sessions.register(a_session("abc", 100))
+        before.sessions.register(a_session("def", 200))
+        before.persist()
+
+        after = a_bridge(path)
+        after.restore()
+
+        assert after.sessions.live() == ()
+
+    def test_nothing_is_dropped_so_the_roster_keeps_its_history(self, tmp_path: Path) -> None:
+        """Ending a row is the fix; forgetting it would be a second, quieter lie."""
+        path = default_state_path(tmp_path)
+        live, ended = a_session("abc", 100), a_session("def", 200)
+
+        before = a_bridge(path)
+        before.sessions.register(live)
+        before.sessions.register(ended)
+        before.sessions.mark_ended(ended.target)
+        before.persist()
+
+        after = a_bridge(path)
+        after.restore()
+
+        assert [held.target for held in after.sessions.all()] == [live.target, ended.target]
+
+    def test_a_row_that_was_already_ended_restores_unchanged(self, tmp_path: Path) -> None:
+        path = default_state_path(tmp_path)
+        session = a_session()
+
+        before = a_bridge(path)
+        before.sessions.register(session)
+        before.sessions.mark_ended(session.target)
+        before.persist()
+
+        after = a_bridge(path)
+        after.restore()
+
+        (restored,) = after.sessions.all()
+        assert restored.state is SessionState.ENDED
+        assert restored.reply_window is ReplyWindow.CLOSED
+
+    def test_it_survives_repeated_restarts_without_changing_again(self, tmp_path: Path) -> None:
+        """Idempotent: the second restart finds nothing left to end."""
+        path = default_state_path(tmp_path)
+        session = a_session()
+
+        before = a_bridge(path)
+        before.sessions.register(session)
+        before.persist()
+
+        first = a_bridge(path)
+        first.restore()
+        first.persist()
+        once = json.loads(path.read_text(encoding="utf-8"))["sessions"]
+
+        second = a_bridge(path)
+        second.restore()
+        second.persist()
+
+        assert json.loads(path.read_text(encoding="utf-8"))["sessions"] == once
