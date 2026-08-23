@@ -28,6 +28,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     RelayRoute,
+    ReplyWindow,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
 from gpt_voicecoding.seams.control_plane import Action
@@ -87,6 +88,12 @@ class FakeAgent:
         )
         self.sink = sink
         self.calls: list[RelayCall] = []
+        #: What this fake answers `reply_window` with, per target. Anything not
+        #: named here is CLOSED.
+        self.windows: dict[SessionTarget, ReplyWindow] = {}
+        #: Every target the hub asked about, in order, so a test can prove the
+        #: level was pulled at all rather than infer it from the result.
+        self.asked_windows: list[SessionTarget] = []
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         return self._routes
@@ -132,6 +139,16 @@ class FakeAgent:
             )
         )
         return self._receipt(request_id)
+
+    def reply_window(self, target: SessionTarget) -> ReplyWindow:
+        """Whatever a test told this fake to answer. CLOSED unless it was told.
+
+        Fail-closed by default so a hub asking this fake at registration lands on
+        the same starting level it had before the seam gained the verb, and no
+        test inherits an open window it never asked for.
+        """
+        self.asked_windows.append(target)
+        return self.windows.get(target, ReplyWindow.CLOSED)
 
     async def verify(self) -> VerifyResult:
         return self.verify_result
