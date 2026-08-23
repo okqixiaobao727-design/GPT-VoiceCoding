@@ -22,6 +22,7 @@ second.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -36,6 +37,18 @@ from gpt_voicecoding.core.errors import (
 )
 from gpt_voicecoding.seams.agent import ReplyWindow
 from gpt_voicecoding.seams.identity import SessionLabel, SessionTarget
+
+_log = logging.getLogger(__name__)
+
+#: Why a Session that was LIVE when the engine stopped comes back ENDED. Said in
+#: the log rather than kept on the row: the reason is a fact about this restart,
+#: not a property of the Session, and persisting it would make the durable subset
+#: carry an explanation nothing reads back.
+RESTORED_SESSION_ENDED = (
+    "the engine restarted, and a Session's channel address is minted by the launch that "
+    "started it, so nothing can re-establish the route or the Reply Window watch this "
+    "Session would need to be Relayed into"
+)
 
 
 class SessionState(StrEnum):
@@ -162,10 +175,47 @@ class SessionRegistry:
         return tuple(self._sessions.values())
 
     def restore(self, sessions: tuple[Session, ...]) -> None:
-        """Adopt a persisted roster, replacing whatever is held."""
+        """Adopt a persisted roster, replacing whatever is held — and end what was live.
+
+        **A restored Session is ENDED, and that is this method's whole subtlety.**
+        A row is adopted with everything the file said about it except its state:
+        anything the stopped engine held as LIVE comes back finished, with the
+        reason stated once in the log.
+
+        LIVE is not a description of a process; it is this enum's claim that the
+        Session *can still be Relayed into*. Nothing on the restore path can make
+        that true. A Session's channel and its Reply Window watch are established
+        in exactly one place — the Agent adapter's `register_session` — and its
+        address is minted by the launch that started it, so a restart loses the
+        address with the process that knew it. Restoring LIVE would therefore
+        claim, in the enum's own terms, precisely the capability the restart took
+        away (#26).
+
+        Both of that lie's consequences are closed by ending the row. A LIVE
+        Session nothing watches can never be reported dead, because the only
+        observer of a Claude Session's death sweeps the population `register_
+        session` built — so before this, a `live` row outlived its process by
+        days and survived every subsequent restart. And a LIVE Session with no
+        channel is one Bridge Core queues the user's own words against, holding
+        them at the fail-closed default window forever.
+
+        Ending is done through `mark_ended` rather than by building a finished
+        row here, so there stays exactly one way a Session ends and its window
+        closes with it. Nothing is dropped: an ended row is still the roster's
+        record that this Session existed, which a surface may still read.
+        """
         self._sessions = {}
         for session in sessions:
             self.register(session)
+            if session.state is SessionState.LIVE:
+                self.mark_ended(session.target)
+                _log.info(
+                    "restored Session ended agent=%s session_id=%s pid=%s: %s",
+                    session.target.agent,
+                    session.target.session_id,
+                    session.target.pid,
+                    RESTORED_SESSION_ENDED,
+                )
 
     def _by_session_id(self, target: SessionTarget) -> list[Session]:
         return [

@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -31,6 +32,7 @@ from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
+from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
@@ -107,7 +109,34 @@ def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLaunche
 
 
 class ClaudeRegisteringLauncher(FakeSessionLauncher):
-    """A launch that registers its channel before it reports success, as Claude does."""
+    """A launch that registers its channel before it reports success, as Claude does.
+
+    **The task boundary is the faithful part, not a nicety (#27).** Every real
+    launch runs inside one: `LaunchRegistry.once` spawns the launching work with
+    `asyncio.ensure_future` and awaits it through `asyncio.shield`
+    (`session_launcher/lifecycle.py:55-59`), so the coroutine that resumes when a
+    launch finishes is *not* the one that ran it. It is woken by `call_soon`, on
+    a later turn of the loop, with `shield` adding a second hop on top.
+
+    That gap is where the defect lives. `register_session` puts the report on the
+    queue with `put_nowait`, which makes the dispatch loop — parked on
+    `queue.get()` — runnable immediately; the loop then services it while the
+    launch is handing its outcome back, which is *before* Bridge Core writes the
+    roster row. So the report arrives for a Session the hub does not yet hold and
+    is dropped as unknown.
+
+    Note where the gap is **not**: `ClaudeSessionPreparation.confirm` really does
+    register and return with nothing awaited after it, and reading only that call
+    stack suggests the loop can never interleave. It can, because `_launching` is
+    spawned rather than called. Reproducing the boundary rather than sleeping
+    past it is what keeps this helper honest about which mechanism it stands for.
+
+    Without it this fake registered and returned in one uninterrupted step, the
+    dispatch loop never ran in the gap, and the event waited harmlessly in the
+    queue until the roster row existed — production's ordering defect papered
+    over by the fake's own timing, which is why this helper passed a Session's
+    window through for as long as the defect was live.
+    """
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -117,6 +146,12 @@ class ClaudeRegisteringLauncher(FakeSessionLauncher):
         self.claude = adapter
 
     async def launch(self, request: LaunchRequest) -> LaunchOutcome:
+        # Spawned and shielded exactly as `LaunchRegistry.once` does it, so the
+        # scheduling boundary under test is production's own and not this
+        # helper's invention.
+        return await asyncio.shield(asyncio.ensure_future(self._launching(request)))
+
+    async def _launching(self, request: LaunchRequest) -> LaunchOutcome:
         outcome = await super().launch(request)
         if outcome.status is LaunchStatus.LAUNCHED:
             assert outcome.target is not None
@@ -192,8 +227,14 @@ def assembled(home: Path, text: str = CONFIG) -> Engine:
     return Engine.assemble(load(configured(home, text)))
 
 
-def with_idle_claude(home: Path) -> str:
-    """Use the real Claude spoke and the launch order that introduces a Session to it."""
+def with_idle_claude(home: Path, *, poll_seconds: float = 0.02) -> str:
+    """Use the real Claude spoke and the launch order that introduces a Session to it.
+
+    `poll_seconds` is normally fast enough for a test to watch a sweep work. Set
+    it long enough to outlive the test and the sweep provably cannot have run,
+    which is how #27's requirement — reachable *without* waiting for a
+    subsequent window transition — is asserted rather than assumed.
+    """
     return (
         CONFIG.replace(
             'session_launcher = "test_engine:one_session_launcher"',
@@ -213,7 +254,7 @@ def with_idle_claude(home: Path) -> str:
                     f'socket_directory = "{home / "sockets"}"',
                     f'projects_directory = "{home / "projects"}"',
                     f'peer_socket_directory = "{home / "peers"}"',
-                    "reply_window_poll_seconds = 0.02",
+                    f"reply_window_poll_seconds = {poll_seconds}",
                     "",
                     "[delegate]",
                 )
@@ -222,8 +263,14 @@ def with_idle_claude(home: Path) -> str:
     )
 
 
-def write_idle_claude_record(home: Path) -> None:
-    """Write the registry level the real Claude Reply-Window watcher reads."""
+def write_idle_claude_record(home: Path, *, status: str = "idle") -> None:
+    """Write the registry level the real Claude Reply-Window watcher reads.
+
+    `status` exists so a test can stand the already-idle case next to the
+    busy-at-registration control (#27). The control matters because it is the
+    case that passed even with the defect present — the dropped report happened
+    to carry CLOSED, which is what Bridge Core defaults to anyway.
+    """
     sessions = home / "sessions"
     sessions.mkdir()
     (sessions / f"{CLAUDE.pid}.json").write_text(
@@ -235,7 +282,41 @@ def write_idle_claude_record(home: Path) -> None:
                 "version": PROVEN_AGAINST_VERSION,
                 "peerProtocol": PEER_PROTOCOL,
                 "messagingSocketPath": str(home / "claude.sock"),
-                "status": "idle",
+                "status": status,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def a_dead_pid() -> int:
+    """A pid that really is gone: one this process started and has already reaped."""
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    return child.pid
+
+
+def write_state_holding_a_live_session(home: Path, *, pid: int) -> None:
+    """The shape #26 captured: a state file whose Session says `live`."""
+    (home / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "switches": {"duty": True, "message": False, "voice": True},
+                "sessions": [
+                    {
+                        "target": {
+                            "agent": "claude",
+                            "session_id": CLAUDE.session_id,
+                            "pid": pid,
+                        },
+                        "label": {"project": "GPT-VoiceCoding", "task": "acceptance step 3"},
+                        "workspace": str(home),
+                        "registered_at": 1787302123.276521,
+                        "state": "live",
+                        "reply_window": "closed",
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -454,11 +535,243 @@ class TestTruthAcrossARestart:
         assert asyncio.run(read()).data["switches"]["duty"] is True
 
 
+class TestARestoredSessionIsOneTheEngineCanHonour:
+    """#26, through the production wiring: assemble, restore, and ask the engine.
+
+    `state.restore()` repopulates Bridge Core's roster only. Nothing on that path
+    calls the Agent adapter's `register_session()`, which is the sole place a
+    Session's channel *and* its Reply Window watch are established — and the
+    channel's address arrives from the launch that minted it, so it cannot come
+    back. A row that returned LIVE would claim a reachability the engine has no
+    way to honour, and — being unwatched — could never be reported dead either.
+
+    Both of the ticket's consequences are exercised here against the real Claude
+    spoke and the real state file: the Session whose process is gone, and the
+    Session whose process is perfectly healthy.
+    """
+
+    def a_launched_session(self, home: Path) -> str:
+        """Launch one real Claude Session, stop the engine, and leave state behind."""
+        write_idle_claude_record(home)
+        text = with_idle_claude(home)
+        engine = assembled(home, text)
+
+        async def scenario() -> Reply:
+            return await running(
+                engine,
+                lambda: ask(
+                    Request(
+                        action=Action.LAUNCH,
+                        payload={
+                            "request_id": new_request_id(),
+                            "agent": "claude",
+                            "project": "GPT Live",
+                            "task": "t",
+                        },
+                    ),
+                    path=engine.socket_path,
+                ),
+            )
+
+        assert asyncio.run(scenario()).ok
+        return text
+
+    def test_a_live_session_is_what_the_stopped_engine_really_wrote_down(
+        self, home: Path
+    ) -> None:
+        """The premise of the rest: a Session that was live is persisted as live."""
+        self.a_launched_session(home)
+
+        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
+
+        assert [row["state"] for row in persisted["sessions"]] == ["live"]
+
+    def test_a_restored_session_whose_process_is_alive_is_not_left_claiming_to_be_live(
+        self, home: Path
+    ) -> None:
+        """Consequence 2, isolated: the agent never died — the restart is the whole cause.
+
+        `CLAUDE.pid` is this test process, so the Session is genuinely healthy
+        across the restart. It still may not come back LIVE, because the engine
+        holds no channel to it and Bridge Core would queue the user's own words
+        against a Reply Window nothing observes.
+        """
+        text = self.a_launched_session(home)
+        restarted = assembled(home, text)
+
+        async def read() -> Reply:
+            return await running(
+                restarted,
+                lambda: ask(Request(action=Action.SESSIONS), path=restarted.socket_path),
+            )
+
+        sessions = asyncio.run(read()).data["sessions"]
+
+        assert [session["state"] for session in sessions] == ["ended"]
+        assert [session["reply_window"] for session in sessions] == ["closed"]
+
+    def test_the_roster_says_only_what_the_adapter_can_back_up(self, home: Path) -> None:
+        """The point of the fix: core state and the adapter's real reach agree."""
+        text = self.a_launched_session(home)
+        restarted = assembled(home, text)
+        claude = restarted.adapters.agents[AgentKind.CLAUDE]
+
+        assert restarted.core.status().sessions[0].state is SessionState.ENDED
+        assert claude.reachable() == ()  # type: ignore[attr-defined]
+
+    def test_a_restored_session_whose_process_is_dead_does_not_live_forever(
+        self, home: Path
+    ) -> None:
+        """Consequence 1, from the captured shape: an unwatched row survived every restart.
+
+        Nothing but the Reply Window sweep ever reports a Claude Session's death,
+        and the sweep only ever visits Sessions `register_session()` entered into
+        it. A restored row was in nobody's population, so `live` outlived the
+        process by days. Ending it on the restore path is what stops that.
+        """
+        write_state_holding_a_live_session(home, pid=a_dead_pid())
+        text = with_idle_claude(home)
+
+        async def read(engine: Engine) -> Reply:
+            return await running(
+                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+            )
+
+        first = asyncio.run(read(assembled(home, text))).data["sessions"]
+        second = asyncio.run(read(assembled(home, text))).data["sessions"]
+
+        assert [session["state"] for session in first] == ["ended"]
+        assert [session["state"] for session in second] == ["ended"]
+
+    def test_repeated_restarts_do_not_rewrite_a_row_that_is_already_ended(
+        self, home: Path
+    ) -> None:
+        """Idempotent: an ended Session is never ended a second time."""
+        write_state_holding_a_live_session(home, pid=a_dead_pid())
+        text = with_idle_claude(home)
+        state = home / "state.json"
+
+        async def read(engine: Engine) -> Reply:
+            return await running(
+                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+            )
+
+        asyncio.run(read(assembled(home, text)))
+        once = state.read_text(encoding="utf-8")
+        asyncio.run(read(assembled(home, text)))
+
+        assert state.read_text(encoding="utf-8") == once
+
+
+class TestTheStartingReplyWindow:
+    """A Session's *first* Reply Window, established when the roster learns of it (#27).
+
+    Every test here runs the assembled engine over the real Claude spoke and the
+    real launch/registration order — the adapter registered before Bridge Core
+    holds the Session, which is the ordering that made the starting level
+    undeliverable as an event.
+
+    They run with the sweep parked beyond the life of the test, so nothing here
+    can pass on the back of a later transition. What is asserted is what the
+    launch itself established.
+    """
+
+    #: Longer than any test here lives, so a passing assertion cannot be the
+    #: sweep having quietly fixed things up a poll interval later.
+    NO_SWEEP = 3600.0
+
+    async def _launch(self, engine: Engine) -> Reply:
+        return await ask(
+            Request(
+                action=Action.LAUNCH,
+                payload={
+                    "request_id": new_request_id(),
+                    "agent": "claude",
+                    "project": "GPT Live",
+                    "task": "t",
+                },
+            ),
+            path=engine.socket_path,
+        )
+
+    def _launched_window(self, home: Path, *, status: str) -> Reply:
+        write_idle_claude_record(home, status=status)
+        engine = assembled(home, with_idle_claude(home, poll_seconds=self.NO_SWEEP))
+
+        async def scenario() -> Reply:
+            await engine.start()
+            try:
+                assert (await self._launch(engine)).ok
+                return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+            finally:
+                await engine.aclose()
+
+        return asyncio.run(scenario())
+
+    def test_a_session_already_idle_at_registration_is_reachable_at_once(
+        self, home: Path
+    ) -> None:
+        """#27's defect, at the case that exposes it.
+
+        The Session is idle *before* its launch confirms, which is the ordinary
+        case — a Session is usually registered the moment it comes up. Its
+        starting window was announced by the adapter at registration and dropped,
+        because Bridge Core did not hold the Session yet, and the announcement
+        was never repeated because the watcher had recorded it as sent. The
+        Session sat CLOSED, unreachable while perfectly healthy.
+
+        With the sweep parked for an hour, an OPEN here can only have come from
+        the level Bridge Core pulled the instant its roster held the Session.
+        """
+        sessions = self._launched_window(home, status="idle").data["sessions"]
+
+        assert sessions[0]["reply_window"] == "open"
+        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
+        assert persisted["sessions"][0]["reply_window"] == "open"
+
+    def test_a_session_still_busy_at_registration_starts_closed(self, home: Path) -> None:
+        """The control — and the reason the acceptance run's checkpoint proved nothing.
+
+        A Session busy at registration is the case that passed *even with the
+        defect present*: the report that got dropped carried CLOSED, which is
+        what Bridge Core fails closed to anyway. So this asserts the fix did not
+        buy reachability by starting Sessions open, and on its own it would be
+        no evidence at all — it earns its place only standing next to the idle
+        case above.
+        """
+        sessions = self._launched_window(home, status="busy").data["sessions"]
+
+        assert sessions[0]["reply_window"] == "closed"
+
+    def test_a_healthy_launch_never_reports_a_window_on_an_unknown_session(
+        self, home: Path, caplog
+    ) -> None:
+        """Keeps one log line load-bearing.
+
+        "a Reply Window changed on an unknown Session" was decisive evidence in
+        #21 and again in #27. Before the fix it was printed by *every* launch,
+        healthy or not, which is precisely what a line has to stop doing to mean
+        anything. Registration is silent now, so this asserts the line is absent
+        from a launch that went perfectly — and that the level was established by
+        the pull instead, stated as a fact rather than as a change.
+        """
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+
+        self._launched_window(home, status="idle")
+
+        logged = [record.getMessage() for record in caplog.records]
+        assert not [line for line in logged if "unknown Session" in line], logged
+        assert [line for line in logged if line.startswith("established Reply Window")] == [
+            f"established Reply Window at registration agent={CLAUDE.agent} "
+            f"session_id={CLAUDE.session_id} pid={CLAUDE.pid} window=open"
+        ]
+
+
 class TestEventsReachTheHub:
     def test_an_idle_claude_session_opens_its_reply_window_in_core_state(
         self, home: Path
     ) -> None:
-        """The adapter reports during launch; the assembled hub must receive that report."""
+        """The hub establishes the level at registration; the sweep keeps it current."""
         write_idle_claude_record(home)
         engine = assembled(home, with_idle_claude(home))
 

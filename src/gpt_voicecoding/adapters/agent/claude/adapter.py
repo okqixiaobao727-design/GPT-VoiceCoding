@@ -72,6 +72,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     RelayReceipt,
     RelayRoute,
+    ReplyWindow,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -212,6 +213,22 @@ class ClaudeAgentAdapter:
     def reachable(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter holds a channel address for."""
         return tuple(self._channels)
+
+    def reply_window(self, target: SessionTarget) -> ReplyWindow:
+        """Where this Session's Reply Window stands right now, read from the registry.
+
+        The seam's level query, and how a Session's *starting* window reaches
+        Bridge Core at all: registration cannot announce it, because it runs
+        before Bridge Core holds the Session (#27), so Bridge Core asks instead.
+
+        A Session this adapter holds no channel for is CLOSED, whatever its
+        registry record happens to say. The window is a claim about reachability,
+        and reading someone else's record is not the same as being able to reach
+        them — the same fail-closed rule the whole seam runs on.
+        """
+        if target not in self._channels:
+            return ReplyWindow.CLOSED
+        return self._windows.level(target)
 
     # -- the seam ---------------------------------------------------------
 

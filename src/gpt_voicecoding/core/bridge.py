@@ -392,8 +392,57 @@ class BridgeCore:
                 registered_at=self._stamp(),
             )
         )
+        self._establish_reply_window(outcome.target)
         self._state.persist()
         return outcome
+
+    def _establish_reply_window(self, target: SessionTarget) -> None:
+        """Ask the adapter where this Session's window stands, now that the roster holds it.
+
+        **The one line that must not move (#27).** A Session's starting level
+        cannot arrive as an event: the adapter is registered before this method
+        runs, so anything it raised at registration was dropped as belonging to a
+        Session Bridge Core did not yet hold — and having been recorded by the
+        adapter as reported, it was never repeated. A Session that was already
+        idle when it was launched stayed at the fail-closed default forever,
+        unreachable while perfectly healthy. Asking here cannot be dropped,
+        because the row was written one statement above.
+
+        **Synchronous on purpose.** The seam's `reply_window` takes no await, so
+        nothing can run between the roster write and the answer being applied —
+        the gap this exists to close is not reopened by closing it.
+
+        **A level query may never fail a launch.** An adapter that raises, or one
+        this hub does not hold at all, leaves the Session at CLOSED and the launch
+        succeeds. A Session listed as conservatively closed is corrected by its
+        next transition; a Session that was never launched because a question
+        about it raised is not recoverable at all.
+
+        An OPEN established here deliberately does *not* run the queued-Relay
+        flush `_reply_window_changed` runs. This Session did not exist a
+        statement ago, so nothing can be queued against it, and there is no
+        transition to act on — the level is being established, not changed.
+        Every later opening is an event and takes that path as before.
+        """
+        adapter = self._agents.get(target.agent)
+        if adapter is None:
+            return
+        try:
+            window = adapter.reply_window(target)
+            self._state.sessions.set_reply_window(target, window)
+        except Exception:
+            # Broad, and the whole establishment is inside it: "may never fail a
+            # launch" has to cover applying the answer as well as asking for it,
+            # or the promise holds for one statement and not the next.
+            _log.exception("establishing a launched Session's Reply Window raised; it stays closed")
+            return
+        _log.info(
+            "established Reply Window at registration agent=%s session_id=%s pid=%s window=%s",
+            target.agent,
+            target.session_id,
+            target.pid,
+            window,
+        )
 
     async def close_session(self, target: SessionTarget) -> CloseOutcome:
         """Close exactly one Session, by exact identity, and record that it ended.

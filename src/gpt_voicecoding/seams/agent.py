@@ -1,7 +1,15 @@
 """The Agent seam — carrying words into a Session, and hearing back from it.
 
-Verbs Bridge Core calls: `answer_relay`, `notice_relay`, `approval_relay`, and
-`verify` (ADR 0003 — liveness is a verb on every pluggable seam).
+Verbs Bridge Core calls: `answer_relay`, `notice_relay`, `approval_relay`,
+`reply_window` and `verify` (ADR 0003 — liveness is a verb on every pluggable
+seam).
+
+**The Reply Window is a level, so it is both asked for and reported.** `reply_
+window` answers where it stands right now and is asked exactly once, when Bridge
+Core enters a Session in its roster; `ReplyWindowChanged` reports every
+transition after that. The split is not redundancy — an event cannot bootstrap a
+level, because registration happens before Bridge Core holds the Session and a
+report raised there is dropped as belonging to a Session nobody knows (#27).
 
 Events raised upward: Session stopped, Session ended, Session awaiting approval,
 Reply Window changed, and delivery receipts that arrive asynchronously.
@@ -136,6 +144,43 @@ class AgentAdapter(Protocol):
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Which routes this adapter really has. Static, and honest about gaps."""
+        ...
+
+    def reply_window(self, target: SessionTarget) -> ReplyWindow:
+        """Where one Session's Reply Window stands right now, asked rather than awaited.
+
+        The level, pulled; `ReplyWindowChanged` remains the transition, pushed.
+        Bridge Core calls this once, the instant it enters a Session in its
+        roster, so the Session starts from an observed level instead of from the
+        fail-closed default — and calls nothing here again.
+
+        **A pull exists because the push cannot bootstrap a level (#27).** An
+        adapter is registered before Bridge Core holds the Session, so a report
+        emitted at registration is dropped as belonging to a Session nobody knows
+        — and it is a report the adapter has already recorded as sent, so no
+        later transition repeats it. A Session that was already idle when it was
+        registered therefore stayed at CLOSED forever, unreachable while
+        perfectly healthy. Asking closes that hole by construction rather than by
+        timing: the roster provably holds the Session one line before the
+        question is asked.
+
+        **Deliberately synchronous**, alone among this seam's verbs except
+        `supported_routes`. An await here would reintroduce the very gap the pull
+        exists to close, by letting the dispatch loop run between the roster
+        write and the answer being applied. Both real adapters can answer without
+        one — Claude from the registry record it already reads, Codex from the
+        status it has already observed — so the seam asks for no more than they
+        need.
+
+        **Fail closed, and never fail the caller.** An adapter that does not hold
+        this target answers CLOSED, because "I cannot reach this Session" is not
+        an observation that its window is open. Bridge Core treats a raise the
+        same way and completes the launch regardless: a Session that is listed
+        but conservatively closed is recoverable on the next transition, while a
+        launch failed over a level query is not.
+
+        Extending this seam's verb set was adjudicated for this use case.
+        """
         ...
 
     async def answer_relay(

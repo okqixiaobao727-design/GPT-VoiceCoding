@@ -26,9 +26,19 @@ cannot be read. The whole vocabulary of this seam rests on never claiming
 readiness that has not been observed, and a status string this build has never
 seen is not an observation of readiness.
 
-Transitions are what get emitted, plus one report at registration so Bridge Core
-learns the current level immediately rather than sitting at the default until the
-Session happens to change state.
+**Transitions are what get emitted, and nothing else.** Registration seeds the
+baseline this watcher compares against and stays silent; Bridge Core learns the
+starting level by *asking* — the Agent seam's `reply_window`, answered here by
+`level` — at the moment it enters the Session in its roster.
+
+That split is #27's. Registration announced the starting level once, and the
+announcement was always dropped: an adapter is registered before Bridge Core
+holds the Session, so the report arrived for a Session nobody knew, while having
+been recorded here as sent — which left the sweep, whose whole rule is to emit
+only on a change, unable to repeat it. A Session that was already idle when it
+was registered therefore sat at Bridge Core's fail-closed CLOSED for the rest of
+its life. A level has to be *pulled* to be bootstrapped; only its changes can be
+pushed.
 
 **This sweep is also the only observer of a Claude Session's death** (#20).
 Nothing else on the Claude side ever raises `SessionEnded`, while Bridge Core's
@@ -56,9 +66,10 @@ only when a record happened to parse. A dead Session whose record Claude Code
 deleted, and one whose record it left behind, are both deaths, and neither is
 observable from the record alone.
 
-Death is reported **once**, from the sweep and never from registration's
-immediate report — raising it there would race Bridge Core's own registration of
-the Session, whose handler drops an event for a Session it does not yet know — and
+Death is reported **once**, from the sweep and never from registration — raising
+it there would lose it to Bridge Core's own registration of the Session, whose
+handler drops an event for a Session it does not yet know, which is the same
+ordering that took the Reply Window's starting level above — and
 it is **not** paired with a `ReplyWindowChanged(CLOSED)`, because ending a Session
 already closes its window in core state and emitting both would report one fact
 twice in two vocabularies. After it fires, the target stops being watched.
@@ -158,26 +169,49 @@ class ReplyWindowWatcher:
         self._reported: dict[SessionTarget, ReplyWindow] = {}
         self._polling: asyncio.Task[None] | None = None
 
+    def level(self, target: SessionTarget) -> ReplyWindow:
+        """Where one Session's window stands right now, read fresh and reported to nobody.
+
+        The answer to the Agent seam's `reply_window`, and the only way a
+        Session's *first* level reaches Bridge Core. Pure query: it emits
+        nothing, records nothing, and does not make `target` watched.
+        """
+        record, alive = self._observe(target)
+        return window_for(_record_for_live_target(target, record, alive=alive))
+
     def watch(self, target: SessionTarget) -> None:
-        """Start watching one Session, reporting where its window stands right now.
+        """Start watching one Session, from where its window stands right now.
 
-        The immediate report is not an optimisation. Bridge Core starts every
-        Session at CLOSED, so without it a Session that is already idle — the
-        common case, since a Session is usually registered the moment it comes up
-        — would stay unreachable until it next changed state.
+        **Seeded, not announced — and the difference is #27.** This records the
+        current level so the sweep has a baseline to compare against, and emits
+        nothing at all.
 
-        Death is deliberately not reported from here even when the evidence is
-        already in. Bridge Core registers the Session itself, and a `SessionEnded`
-        for a Session it does not yet know is dropped with a log line — so a death
-        raised at registration is a death silently lost. A target that is already
-        dead reports CLOSED now and is reported ended on the first sweep.
+        It used to emit, on the argument that Bridge Core starts every Session at
+        CLOSED and an already-idle Session would otherwise stay unreachable until
+        it next changed state. The need was real; the mechanism could not meet
+        it. Registration runs *before* Bridge Core holds the Session, so that
+        report was dropped as belonging to a Session nobody knew — and because it
+        had already been recorded here as sent, the sweep's `if self._reported.
+        get(target) != window` could never repeat it. The report written to
+        prevent a stuck-CLOSED Session was discarded every time, and the Session
+        it was written for stayed CLOSED for the rest of its life.
+
+        Bridge Core now *asks* — `level` above, called the instant the roster
+        holds the Session — so the need is met by a question that cannot be
+        dropped rather than by an announcement that always was. Emitting here as
+        well would put a Reply Window changed on an unknown Session line in the
+        log of every healthy launch, which would cost that line the evidential
+        weight it earned in #21.
+
+        Death is deliberately not reported from here either, and for the same
+        underlying reason: a `SessionEnded` for a Session Bridge Core does not yet
+        know is dropped with a log line, so a death raised at registration is a
+        death silently lost. A target that is already dead seeds CLOSED now and is
+        reported ended on the first sweep.
         """
         if target in self._reported:
             return
-        record, alive = self._observe(target)
-        window = window_for(_record_for_live_target(target, record, alive=alive))
-        self._reported[target] = window
-        self._emit(ReplyWindowChanged(target=target, window=window))
+        self._reported[target] = self.level(target)
 
     def forget(self, target: SessionTarget) -> None:
         """Stop watching one Session. Its own process is untouched."""
