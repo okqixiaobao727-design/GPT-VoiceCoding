@@ -1,10 +1,9 @@
-"""What generation is told, and the one thing it refuses to invent.
+"""What generation is told, and the things it refuses to invent.
 
-Two facts vary between one installation and the next: where the control-plane
-CLI actually is, and which engine it is talking to. Both are knowable only by
-the composition root — it is what was launched, and what read the configuration
-— so they arrive here rather than being discovered here. Bridge Core reads no
-file and probes no filesystem.
+The CLI location, the engine it reaches and the parser's current launch form are
+knowable outside instruction generation. The composition root therefore hands
+them in rather than letting prose remember or rediscover them. Bridge Core reads
+no file and probes no filesystem.
 
 The refusal matters more than the plumbing. A generated instruction that names
 a CLI which is not there is an invented detail, and inventing detail is the
@@ -58,3 +57,13 @@ class InstructionContext:
     """Everything generation is parameterised by. Handed in, never discovered."""
 
     cli: ControlPlaneCli
+    launch_usage: str
+
+    def __post_init__(self) -> None:
+        if not self.launch_usage.strip():
+            raise InstructionError("generated instructions need the parser's launch usage")
+
+    @property
+    def launch_invocation(self) -> str:
+        """The real CLI invocation followed by the parser-owned launch form."""
+        return f"{self.cli.invocation} {self.launch_usage.strip()}"

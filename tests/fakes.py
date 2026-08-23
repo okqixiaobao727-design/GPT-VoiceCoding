@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -29,6 +30,7 @@ from gpt_voicecoding.seams.agent import (
     RelayRoute,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
+from gpt_voicecoding.seams.control_plane import Action
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
@@ -324,5 +326,6 @@ def instruction_context(
     these tests are about.
     """
     return InstructionContext(
-        cli=ControlPlaneCli(command=command, version="0", socket_path=socket_path)
+        cli=ControlPlaneCli(command=command, version="0", socket_path=socket_path),
+        launch_usage=USAGE[Action.LAUNCH],
     )

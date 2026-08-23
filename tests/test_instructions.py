@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.core.instructions import (
     ACTION_GIST,
     MAX_VOICE_INSTRUCTION_BYTES,
@@ -41,7 +42,7 @@ CLI = ControlPlaneCli(
     version="1.4.2",
     socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
 )
-CONTEXT = InstructionContext(cli=CLI)
+CONTEXT = InstructionContext(cli=CLI, launch_usage=USAGE[Action.LAUNCH])
 
 
 @pytest.fixture(scope="module")
@@ -54,10 +55,10 @@ class TestCatalogue:
         ids = [rule.id for rule in RULES]
         assert len(ids) == len(set(ids))
 
-    def test_every_rule_names_the_lines_it_came_from(self) -> None:
-        """Provenance survives the split of a combined row into one id per audience."""
+    def test_every_rule_names_where_it_came_from(self) -> None:
+        """Provenance survives migration and later product decisions."""
         for rule in RULES:
-            assert rule.source.startswith("skill/"), rule.id
+            assert rule.source.startswith(("skill/", "issue/")), rule.id
 
     def test_a_rule_carried_by_code_names_where(self) -> None:
         for rule in RULES:
@@ -92,6 +93,20 @@ class TestCatalogue:
         rule = catalogue_module.BY_ID["adapter.launcher.tmux-destinations-are-tmux-only"]
         assert rule.audience is Audience.ADAPTER
 
+    def test_issue_25_launch_rules_name_their_actual_source(self) -> None:
+        assert (
+            catalogue_module.BY_ID[
+                "voice.start.complete-request-launches-directly"
+            ].source
+            == "issue/25"
+        )
+        assert (
+            catalogue_module.BY_ID[
+                "delegated.start.complete-request-launches-directly"
+            ].source
+            == "issue/25"
+        )
+
 
 class TestTheTableLandedWhole:
     """Exhaustiveness over the disposition tables, not just over what got written.
@@ -117,6 +132,8 @@ class TestTheTableLandedWhole:
     def test_every_line_of_every_migrated_file_is_accounted_for(self) -> None:
         claimed: dict[str, set[int]] = {name: set() for name in self.MIGRATED}
         for rule in RULES:
+            if not rule.source.startswith("skill/"):
+                continue
             name, _, lines = rule.source.partition(":")
             assert name in claimed, rule.source
             first, _, last = lines.partition("-")
@@ -271,7 +288,8 @@ class TestTheDelegatedSetNamesTheRealCli:
                     command=Path("/opt/homebrew/bin/bridgectl"),
                     version="9.9.9",
                     socket_path=Path("/tmp/other.sock"),
-                )
+                ),
+                launch_usage=USAGE[Action.LAUNCH],
             )
         )
         assert "/opt/homebrew/bin/bridgectl" in elsewhere.text
@@ -285,7 +303,8 @@ class TestTheDelegatedSetNamesTheRealCli:
                     command=Path("/Application Support/GPT-VoiceCoding/bridgectl"),
                     version="1.0",
                     socket_path=Path("/tmp/s.sock"),
-                )
+                ),
+                launch_usage=USAGE[Action.LAUNCH],
             )
         )
         assert "'/Application Support/GPT-VoiceCoding/bridgectl'" in spaced.text
@@ -293,6 +312,12 @@ class TestTheDelegatedSetNamesTheRealCli:
     def test_the_voice_set_names_it_too(self, instructions) -> None:
         """The voice thread reaches the engine through the same one door."""
         assert str(CLI.command) in instructions.voice.text
+
+    def test_complete_launch_uses_the_parsers_exact_syntax(self, instructions) -> None:
+        launch = f"{CLI.invocation} {USAGE[Action.LAUNCH]}"
+
+        assert launch in instructions.voice.text
+        assert launch in instructions.delegated.text
 
     def test_a_cli_that_is_not_where_it_really_is_gets_refused(self) -> None:
         """A bare name resolves against a PATH the generated thread may not share."""
@@ -306,6 +331,10 @@ class TestTheDelegatedSetNamesTheRealCli:
             ControlPlaneCli(
                 command=Path("/x/bridgectl"), version="  ", socket_path=Path("/tmp/s.sock")
             )
+
+    def test_a_context_without_the_parsers_launch_usage_is_refused(self) -> None:
+        with pytest.raises(InstructionError, match="launch usage"):
+            InstructionContext(cli=CLI, launch_usage="  ")
 
 
 class TestTheActionSetIsGeneratedFromTheClosedSet:

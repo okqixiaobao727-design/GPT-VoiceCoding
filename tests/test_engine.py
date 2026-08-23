@@ -29,6 +29,7 @@ from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION, Claude
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
+from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
@@ -251,6 +252,13 @@ async def running(engine: Engine, work) -> object:
 
 
 class TestAssembly:
+    def test_generated_instructions_receive_the_launch_parsers_usage(self, home: Path) -> None:
+        instructions = assembled(home).core.instructions
+
+        assert instructions is not None
+        assert USAGE[Action.LAUNCH] in instructions.voice.text
+        assert USAGE[Action.LAUNCH] in instructions.delegated.text
+
     def test_launch_configuration_reaches_bridge_core(self, home: Path) -> None:
         engine = assembled(home)
         request = Request(

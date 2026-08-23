@@ -17,10 +17,10 @@ Assembled here and nowhere else:
 - the Delegated Turn handler, carrying the model from configuration — the cost
   lever is a user-facing setting and nothing here may default it;
 - the generation context for Bridge Core's two instruction sets: where the
-  control-plane CLI really is on this machine, and which engine it reaches.
-  Only this root can know either, and it states them rather than guessing —
-  configuration first, then the console script beside this interpreter, and a
-  refusal when neither is really there;
+  control-plane CLI really is on this machine, which engine it reaches, and the
+  parser-owned launch form. This root states those facts rather than letting
+  generated prose guess them — configuration first, then the console script
+  beside this interpreter, and a refusal when neither is really there;
 - the two loops the engine needs to be alive: one that drains events into the
   hub's dispatch, and one that advances the hub's two ceilings on a timer.
 
@@ -48,7 +48,7 @@ from typing import Any
 from gpt_voicecoding import __version__
 from gpt_voicecoding.config import EngineConfig
 from gpt_voicecoding.control_plane.actions import ControlPlane
-from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
+from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
 from gpt_voicecoding.control_plane.server import ControlPlaneServer
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.events import EventQueue
@@ -425,7 +425,7 @@ def _introduce_the_launcher(adapters: Adapters) -> None:
 
 
 def _instruction_context(config: EngineConfig) -> InstructionContext:
-    """Where the control-plane CLI is, so the generated instructions can name it.
+    """The real control-plane CLI and parser form generated instructions may name.
 
     Stated, then derived, then refused. Configuration wins because the bundle
     moves the binary and is the only thing that knows where to; otherwise the
@@ -457,7 +457,8 @@ def _instruction_context(config: EngineConfig) -> InstructionContext:
             command=command,
             version=__version__,
             socket_path=config.socket_path,
-        )
+        ),
+        launch_usage=USAGE[Action.LAUNCH],
     )
 
 
