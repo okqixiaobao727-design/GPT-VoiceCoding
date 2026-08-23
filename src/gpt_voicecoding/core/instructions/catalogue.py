@@ -627,12 +627,22 @@ def _rules() -> tuple[Rule, ...]:
         # --- skill/starting.md ---------------------------------------------
         Rule(
             id="voice.start.needs-an-explicit-agent-and-workspace",
+            audience=Audience.DROPPED,
+            source="skill/starting.md:1-24",
+            gist=(
+                "The old requirement to hear an explicit agent and absolute workspace. "
+                "The configured default agent and project catalogue replace both."
+            ),
+        ),
+        Rule(
+            id="voice.start.complete-request-launches-directly",
             audience=Audience.VOICE,
             source="skill/starting.md:1-24",
             gist=(
-                "Which agent and which workspace both come from what the user actually "
-                "said. A near miss in transcription is a question, not a guess, and "
-                "nothing is opened while either is unsettled."
+                "A project reference and task are a complete launch request. Use the "
+                "configured default agent unless the user named one, and issue exactly one "
+                "launch action without help, roster or status preflight and without a "
+                "confirmation round. Ask only when project resolution is not unique."
             ),
         ),
         Rule(
@@ -658,8 +668,8 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.DELEGATED,
             source="skill/starting.md:42-54",
             gist=(
-                "The workspace a launch names is one the user named, resolved from what the "
-                "control plane returned — never invented to make a launch possible."
+                "Carry the user's project reference and task to the launch action. Bridge "
+                "Core resolves the workspace; the Delegated Turn never invents one."
             ),
         ),
         Rule(
@@ -690,6 +700,15 @@ def _rules() -> tuple[Rule, ...]:
             gist=(
                 "One spoken request is one launch, carrying one request identity, and its "
                 "outcome is waited for rather than assumed."
+            ),
+        ),
+        Rule(
+            id="delegated.start.complete-request-launches-directly",
+            audience=Audience.DELEGATED,
+            source="skill/starting.md:70-96",
+            gist=(
+                "A complete project-and-task request is exactly one launch action. Do not "
+                "read help, sessions or status first and do not ask for confirmation."
             ),
         ),
         Rule(

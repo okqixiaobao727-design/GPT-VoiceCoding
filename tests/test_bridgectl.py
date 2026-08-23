@@ -33,24 +33,47 @@ LAUNCH_REQUEST_ID = "21d73168-b1f0-4b18-977d-fba0d1f2cc13"
 
 
 class TestTheLaunchCommand:
-    def test_the_named_request_identity_enters_the_control_plane_payload(self) -> None:
+    def test_project_and_task_enter_the_launch_payload_without_an_agent(self) -> None:
         request = build_request(
             "launch",
             [
                 "--request-id",
                 LAUNCH_REQUEST_ID,
-                "codex",
-                "/tmp/workspace",
-                "a project · a task",
+                "--project",
+                "GPT Live",
+                "--task",
+                "build",
+                "the control plane",
             ],
         )
 
         assert request.action is Action.LAUNCH
         assert dict(request.payload) == {
             "request_id": LAUNCH_REQUEST_ID,
+            "project": "GPT Live",
+            "task": "build the control plane",
+        }
+
+    def test_an_explicit_agent_enters_the_launch_payload(self) -> None:
+        request = build_request(
+            "launch",
+            [
+                "--request-id",
+                LAUNCH_REQUEST_ID,
+                "--project",
+                "GPT Live",
+                "--agent",
+                "codex",
+                "--task",
+                "build the control plane",
+            ],
+        )
+
+        assert dict(request.payload) == {
+            "request_id": LAUNCH_REQUEST_ID,
+            "project": "GPT Live",
+            "task": "build the control plane",
             "agent": "codex",
-            "workspace": "/tmp/workspace",
-            "label": {"project": "a project", "task": "a task"},
         }
 
     def test_a_positional_request_identity_is_not_a_second_interface(self) -> None:
@@ -78,6 +101,14 @@ session_launcher = "test_bridgectl:one_session_launcher"
 
 [adapters.agents]
 codex = "fakes:FakeAgent"
+
+[launch]
+default_agent = "codex"
+
+[[launch.projects]]
+name = "a project"
+workspace = "{workspace}"
+spoken_aliases = ["spoken project"]
 
 [delegate]
 model = "the-model-the-user-chose"
@@ -113,6 +144,7 @@ def engine_at(home: Path) -> Iterator[Path]:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
+            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -181,8 +213,6 @@ class TestTheWholeSessionCommandSet:
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         config = ["--config", str(engine_at)]
-        workspace = engine_at.parent
-
         assert main([*config, "sessions"]) == 0
         assert "sessions: none" in capsys.readouterr().out
 
@@ -193,9 +223,12 @@ class TestTheWholeSessionCommandSet:
                     "launch",
                     "--request-id",
                     LAUNCH_REQUEST_ID,
+                    "--project",
+                    "spoken project",
+                    "--agent",
                     "codex",
-                    str(workspace),
-                    "a project · a task",
+                    "--task",
+                    "a task",
                 ]
             )
             == 0
@@ -205,7 +238,7 @@ class TestTheWholeSessionCommandSet:
         assert main([*config, "sessions"]) == 0
         roster = capsys.readouterr().out
         assert "a project · a task" in roster and "codex:abc" in roster
-        assert str(workspace) in roster
+        assert str(engine_at.parent) in roster
 
         assert main([*config, "relay", "codex:abc", "carry", "on"]) == 0
         assert "deliver" in capsys.readouterr().out
@@ -225,9 +258,12 @@ class TestTheWholeSessionCommandSet:
             "launch",
             "--request-id",
             LAUNCH_REQUEST_ID,
+            "--project",
+            "spoken project",
+            "--agent",
             "codex",
-            str(engine_at.parent),
-            "a project · a task",
+            "--task",
+            "a task",
         ]
 
         assert main(command) == 0

@@ -38,7 +38,6 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
@@ -46,6 +45,7 @@ from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
     ConflictingLaunchError,
+    InvalidLaunchLabelError,
     SeamUnavailableError,
     StaleSessionError,
     UnknownRelayError,
@@ -55,6 +55,7 @@ from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.policy import CorePolicy
+from gpt_voicecoding.core.projects import Project, ProjectCatalogue
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
@@ -160,6 +161,8 @@ class BridgeCore:
         channel: CompanionChannel,
         agents: Mapping[AgentKind, AgentAdapter],
         launcher: SessionLauncher | None = None,
+        default_agent: AgentKind | None = None,
+        projects: tuple[Project, ...] = (),
         events: EventQueue | None = None,
         policy: CorePolicy | None = None,
         grammar: TextGrammar | None = None,
@@ -175,6 +178,8 @@ class BridgeCore:
         self._channel = channel
         self._agents = dict(agents)
         self._launcher = launcher
+        self._default_agent = default_agent
+        self._projects = ProjectCatalogue(projects) if projects else None
         self._events = events if events is not None else EventQueue()
         self._policy = policy or CorePolicy()
         self._control = control
@@ -308,10 +313,9 @@ class BridgeCore:
         self,
         *,
         request_id: RequestId,
-        agent: AgentKind,
-        workspace: Path,
-        label: SessionLabel,
-        env: Mapping[str, str] | None = None,
+        project: str,
+        task: str,
+        agent: AgentKind | None = None,
     ) -> LaunchOutcome:
         """Bring one Session into existence, and record the one that arrived.
 
@@ -325,12 +329,20 @@ class BridgeCore:
         authoritative, and a failed launch that wrote a row would be the system
         inventing a Session to Relay into.
         """
+        if self._projects is None or self._default_agent is None:
+            raise BridgeCoreError("this Bridge Core has no launch configuration")
+        configured = self._projects.resolve(project)
+        selected_agent = agent or self._default_agent
+        try:
+            label = SessionLabel(project=configured.name, task=task)
+        except ValueError as refusal:
+            raise InvalidLaunchLabelError(str(refusal)) from None
         request = LaunchRequest(
             request_id=request_id,
-            agent=agent,
-            workspace=workspace,
+            agent=selected_agent,
+            workspace=configured.workspace,
             label=label,
-            env=env or {},
+            env={},
         )
         transaction = self._launches.get(request_id)
         if transaction is not None and transaction.request != request:
@@ -359,7 +371,7 @@ class BridgeCore:
                 outcome.target.agent,
                 outcome.target.session_id,
                 outcome.target.pid,
-                workspace,
+                request.workspace,
             )
         return outcome
 

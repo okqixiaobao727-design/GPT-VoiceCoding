@@ -128,6 +128,22 @@ class TestTheTableLandedWhole:
 
 
 class TestCoverage:
+    def test_natural_launch_is_carried_without_the_superseded_preflight_rule(
+        self, instructions
+    ) -> None:
+        assert (
+            instructions.carrier_of("voice.start.complete-request-launches-directly")
+            is Audience.VOICE
+        )
+        assert (
+            instructions.carrier_of("delegated.start.complete-request-launches-directly")
+            is Audience.DELEGATED
+        )
+        assert (
+            instructions.carrier_of("voice.start.needs-an-explicit-agent-and-workspace")
+            is None
+        )
+
     def test_each_retained_rule_lands_in_exactly_its_own_set(self, instructions) -> None:
         for rule in RULES:
             if rule.audience is Audience.DROPPED:

@@ -144,6 +144,14 @@ session_launcher = "test_engine:one_session_launcher"
 [adapters.agents]
 codex = "fakes:FakeAgent"
 
+[launch]
+default_agent = "codex"
+
+[[launch.projects]]
+name = "GPT-VoiceCoding"
+workspace = "{workspace}"
+spoken_aliases = ["GPT Live"]
+
 [delegate]
 model = "the-model-the-user-chose"
 
@@ -172,6 +180,7 @@ def configured(home: Path, text: str = CONFIG) -> Path:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
+            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -193,6 +202,7 @@ def with_idle_claude(home: Path) -> str:
             'codex = "fakes:FakeAgent"',
             'claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"',
         )
+        .replace('default_agent = "codex"', 'default_agent = "claude"')
         .replace(
             "[delegate]",
             "\n".join(
@@ -241,6 +251,32 @@ async def running(engine: Engine, work) -> object:
 
 
 class TestAssembly:
+    def test_launch_configuration_reaches_bridge_core(self, home: Path) -> None:
+        engine = assembled(home)
+        request = Request(
+            action=Action.LAUNCH,
+            payload={
+                "request_id": new_request_id(),
+                "project": "GPT Live",
+                "task": "prove configuration composition",
+            },
+        )
+
+        async def scenario() -> Reply:
+            return await running(engine, lambda: ask(request, path=engine.socket_path))
+
+        reply = asyncio.run(scenario())
+
+        assert reply.ok
+        launcher = engine.adapters.launcher
+        assert isinstance(launcher, FakeSessionLauncher)
+        assert len(launcher.requests) == 1
+        launched = launcher.requests[0]
+        assert launched.agent is AgentKind.CODEX
+        assert launched.workspace == home
+        assert launched.label.project == "GPT-VoiceCoding"
+        assert launched.label.task == "prove configuration composition"
+
     def test_the_engine_serves_the_control_plane_it_was_configured_with(self, home: Path) -> None:
         engine = assembled(home)
 
@@ -427,8 +463,8 @@ class TestEventsReachTheHub:
                         payload={
                             "request_id": new_request_id(),
                             "agent": "claude",
-                            "workspace": str(home),
-                            "label": {"project": "p", "task": "t"},
+                            "project": "GPT Live",
+                            "task": "t",
                         },
                     ),
                     path=engine.socket_path,
@@ -462,8 +498,8 @@ class TestEventsReachTheHub:
                         payload={
                             "request_id": new_request_id(),
                             "agent": "codex",
-                            "workspace": str(home),
-                            "label": {"project": "p", "task": "t"},
+                            "project": "GPT Live",
+                            "task": "t",
                         },
                     ),
                     path=engine.socket_path,

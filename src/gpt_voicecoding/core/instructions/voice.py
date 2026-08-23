@@ -223,12 +223,14 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
             title="Starting a session",
             blocks=(
                 Block(
-                    covers=("voice.start.needs-an-explicit-agent-and-workspace",),
+                    covers=("voice.start.complete-request-launches-directly",),
                     text=(
-                        "Two things are settled from what the user actually said: which "
-                        "coding agent, and which workspace. Transcription mishears both, so a "
-                        "near miss is a question, not a guess — one follow-up costs far less "
-                        "than one wrong window. While either is unsettled, nothing starts."
+                        "A project reference and task are a complete request to start one "
+                        "session. Use the configured default agent unless the user explicitly "
+                        "named Claude or Codex, then make exactly one launch action immediately. "
+                        "Do not read help, sessions or status first, and do not add a confirmation "
+                        "round. Ask only when the project reference is unknown or non-unique; "
+                        "while it is unsettled, nothing starts."
                     ),
                 ),
                 Block(

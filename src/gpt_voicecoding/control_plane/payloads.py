@@ -21,7 +21,6 @@ and the switch it would flip on is the master.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -33,7 +32,7 @@ from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.verification import SeamVerification
 from gpt_voicecoding.seams.agent import ApprovalVerdict, RelayRoute
 from gpt_voicecoding.seams.call import CallSnapshot
-from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
 from gpt_voicecoding.seams.session_launcher import CloseOutcome, LaunchOutcome
 
 
@@ -61,6 +60,13 @@ def read_text(payload: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise InvalidPayload(f"{key!r} must be a non-empty string")
     return value.strip()
+
+
+def reject_unknown(payload: Mapping[str, Any], allowed: frozenset[str]) -> None:
+    """Refuse fields outside one action's closed interface instead of ignoring them."""
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise InvalidPayload("unknown payload field(s): " + ", ".join(unknown))
 
 
 def read_request_id(payload: Mapping[str, Any], key: str = "request_id") -> RequestId:
@@ -108,30 +114,11 @@ def read_agent(payload: Mapping[str, Any], key: str = "agent") -> AgentKind:
         ) from None
 
 
-def read_label(payload: Mapping[str, Any], key: str = "label") -> SessionLabel:
-    raw = payload.get(key)
-    if not isinstance(raw, dict):
-        raise InvalidPayload(f"{key!r} must carry a project half and a task half")
-    try:
-        return SessionLabel(project=read_text(raw, "project"), task=read_text(raw, "task"))
-    except ValueError as refusal:
-        raise InvalidPayload(str(refusal)) from None
-
-
-def read_workspace(payload: Mapping[str, Any], key: str = "workspace") -> Path:
-    return Path(read_text(payload, key))
-
-
-def read_environment(payload: Mapping[str, Any], key: str = "env") -> dict[str, str]:
-    """Exactly the variables to set on the child, and no others."""
-    raw = payload.get(key, {})
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict) or not all(
-        isinstance(name, str) and isinstance(value, str) for name, value in raw.items()
-    ):
-        raise InvalidPayload(f"{key!r} must map variable names to string values")
-    return dict(raw)
+def read_optional_agent(payload: Mapping[str, Any], key: str = "agent") -> AgentKind | None:
+    """An omitted agent selects Bridge Core's configured global default."""
+    if key not in payload:
+        return None
+    return read_agent(payload, key)
 
 
 def read_route(payload: Mapping[str, Any], key: str = "route") -> RelayRoute:

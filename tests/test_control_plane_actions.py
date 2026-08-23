@@ -28,6 +28,7 @@ from fakes import (
 )
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.core.bridge import BridgeCore
+from gpt_voicecoding.core.projects import Project
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
@@ -50,11 +51,21 @@ from gpt_voicecoding.seams.identity import (
 from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest
 
 WORKSPACE = Path("/tmp/workspace")
-LABEL = SessionLabel(project="gpt-voicecoding", task="build the control plane")
+SECOND_WORKSPACE = Path("/tmp/another-workspace")
+LABEL = SessionLabel(project="GPT-VoiceCoding", task="build the control plane")
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
+CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="claude-abc", pid=1234)
 SECOND_CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="def")
 CODEX_ADDRESS = {"agent": "codex", "session_id": "abc", "pid": None}
 LAUNCH_REQUEST_ID = RequestId("21d73168-b1f0-4b18-977d-fba0d1f2cc13")
+PROJECTS = (
+    Project(
+        name="GPT-VoiceCoding",
+        workspace=WORKSPACE,
+        spoken_aliases=("Voice Coding", "GPT Live", "GPT Voice Coding"),
+    ),
+    Project(name="Other Project", workspace=SECOND_WORKSPACE),
+)
 
 
 class HoldingLauncher(FakeSessionLauncher):
@@ -75,7 +86,11 @@ class Surface:
     """One assembled engine-side control plane, and the knobs a test needs."""
 
     def __init__(
-        self, *, duty: bool = True, launcher: bool | FakeSessionLauncher = True
+        self,
+        *,
+        duty: bool = True,
+        launcher: bool | FakeSessionLauncher = True,
+        projects: tuple[Project, ...] = PROJECTS,
     ) -> None:
         self.agent = FakeAgent()
         self.call = FakeCall()
@@ -94,8 +109,10 @@ class Surface:
             state=state,
             call=self.call,
             channel=self.channel,
-            agents={AgentKind.CODEX: self.agent},
+            agents={AgentKind.CLAUDE: self.agent, AgentKind.CODEX: self.agent},
             launcher=self.launcher,
+            default_agent=AgentKind.CLAUDE,
+            projects=projects,
             inventory=(SeamLoad(seam="call", configured="a.call"),),
             instruction_context=instruction_context(),
         )
@@ -109,8 +126,8 @@ class Surface:
             Action.LAUNCH,
             request_id=request_id or new_request_id(),
             agent="codex",
-            workspace=str(WORKSPACE),
-            label={"project": LABEL.project, "task": LABEL.task},
+            project=LABEL.project,
+            task=LABEL.task,
         )
 
     def open_window(self) -> None:
@@ -234,9 +251,8 @@ class TestRefusalsKeepTheirIdentity:
 
         reply = surface.ask(
             Action.LAUNCH,
-            agent="codex",
-            workspace=str(WORKSPACE),
-            label={"project": LABEL.project, "task": LABEL.task},
+            project=LABEL.project,
+            task=LABEL.task,
         )
 
         assert reply.error is not None
@@ -252,13 +268,60 @@ class TestRefusalsKeepTheirIdentity:
             Action.LAUNCH,
             request_id="not-a-uuid",
             agent="codex",
-            workspace=str(WORKSPACE),
-            label={"project": LABEL.project, "task": LABEL.task},
+            project=LABEL.project,
+            task=LABEL.task,
         )
 
         assert reply.error is not None
         assert reply.error.code is ErrorCode.INVALID_PAYLOAD
         assert "UUID" in reply.error.message
+        assert surface.launcher is not None
+        assert surface.launcher.requests == []
+
+    @pytest.mark.parametrize(
+        ("legacy_key", "legacy_value"),
+        [
+            pytest.param("workspace", str(WORKSPACE), id="workspace"),
+            pytest.param(
+                "label",
+                {"project": LABEL.project, "task": LABEL.task},
+                id="label",
+            ),
+            pytest.param("env", {"LAUNCH_SETTING": "value"}, id="environment"),
+        ],
+    )
+    def test_legacy_launch_fields_are_not_a_second_interface(
+        self, legacy_key: str, legacy_value: object
+    ) -> None:
+        surface = Surface()
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project=LABEL.project,
+            task=LABEL.task,
+            **{legacy_key: legacy_value},
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.INVALID_PAYLOAD
+        assert legacy_key in reply.error.message
+        assert surface.launcher is not None
+        assert surface.launcher.requests == []
+
+    def test_task_text_that_cannot_form_a_session_label_is_refused(self) -> None:
+        surface = Surface()
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project=LABEL.project,
+            task="first half · second half",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "task" in reply.error.message
         assert surface.launcher is not None
         assert surface.launcher.requests == []
 
@@ -285,6 +348,172 @@ class TestRefusalsKeepTheirIdentity:
 
 
 class TestLaunchingAndClosing:
+    def test_a_spoken_project_alias_launches_once_with_the_default_agent(self) -> None:
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(launcher=launcher)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="GPT Live",
+            task="build the control plane",
+        )
+
+        assert reply.ok
+        assert len(launcher.requests) == 1
+        request = launcher.requests[0]
+        assert request.agent is AgentKind.CLAUDE
+        assert request.workspace == WORKSPACE
+        assert request.label == SessionLabel(
+            project="GPT-VoiceCoding", task="build the control plane"
+        )
+        assert dict(request.env) == {}
+
+    def test_an_explicit_agent_overrides_the_configured_default(self) -> None:
+        launcher = FakeSessionLauncher(targets=[CODEX])
+        surface = Surface(launcher=launcher)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="GPT Live",
+            task="build the control plane",
+            agent="codex",
+        )
+
+        assert reply.ok
+        assert launcher.requests[0].agent is AgentKind.CODEX
+
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            pytest.param("GPT-VoiceCoding", id="canonical"),
+            pytest.param("gPt voice coding", id="case-and-space"),
+            pytest.param("GPT--Voice  Coding", id="repeated-hyphen-and-space"),
+            pytest.param("GPT\t-\N{NO-BREAK SPACE}Voice---Coding", id="unicode-whitespace"),
+            pytest.param("GPTVoiceCoding", id="joined-words"),
+            pytest.param("gpt_voice-coding", id="mixed-punctuation"),
+            pytest.param(
+                "ＧＰＴ—Ｖｏｉｃｅ　Ｃｏｄｉｎｇ",
+                id="unicode-width-and-punctuation",
+            ),
+        ],
+    )
+    def test_project_lookup_ignores_typographic_differences(self, reference: str) -> None:
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(launcher=launcher)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project=reference,
+            task="build the control plane",
+        )
+
+        assert reply.ok
+        assert launcher.requests[0].label.project == "GPT-VoiceCoding"
+
+    def test_a_configured_workspace_with_spaces_reaches_the_launcher_unchanged(self) -> None:
+        workspace = Path("/tmp/project volume/GPT-VoiceCoding")
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(
+            launcher=launcher,
+            projects=(Project(name="GPT-VoiceCoding", workspace=workspace),),
+        )
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="GPT Voice Coding",
+            task="build the control plane",
+        )
+
+        assert reply.ok
+        assert launcher.requests[0].workspace == workspace
+
+    def test_project_lookup_does_not_guess_a_misspelling(self) -> None:
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(launcher=launcher)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="GPT Voice Codng",
+            task="build the control plane",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert launcher.requests == []
+
+    def test_punctuation_alone_cannot_be_a_project_lookup_key(self) -> None:
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(
+            launcher=launcher,
+            projects=(
+                Project(
+                    name="GPT-VoiceCoding",
+                    workspace=WORKSPACE,
+                    spoken_aliases=("---",),
+                ),
+            ),
+        )
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="___",
+            task="build the control plane",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert launcher.requests == []
+
+    def test_an_unknown_project_is_refused_with_the_configured_names(self) -> None:
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(launcher=launcher)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="Not Configured",
+            task="build the control plane",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "GPT-VoiceCoding" in reply.error.message
+        assert "Other Project" in reply.error.message
+        assert launcher.requests == []
+
+    def test_a_project_reference_shared_by_two_projects_is_refused(self) -> None:
+        projects = (
+            Project(
+                name="First Project", workspace=WORKSPACE, spoken_aliases=("Shared-Project",)
+            ),
+            Project(
+                name="Second Project",
+                workspace=SECOND_WORKSPACE,
+                spoken_aliases=("Shared_Project",),
+            ),
+        )
+        launcher = FakeSessionLauncher(targets=[CLAUDE])
+        surface = Surface(launcher=launcher, projects=projects)
+
+        reply = surface.ask(
+            Action.LAUNCH,
+            request_id=LAUNCH_REQUEST_ID,
+            project="shared project",
+            task="build the control plane",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "First Project" in reply.error.message
+        assert "Second Project" in reply.error.message
+        assert launcher.requests == []
+
     def test_a_repeated_launch_intent_returns_one_document_and_registers_once(self) -> None:
         surface = Surface()
 
@@ -303,16 +532,8 @@ class TestLaunchingAndClosing:
         "changes",
         [
             pytest.param({"agent": "claude"}, id="agent"),
-            pytest.param({"workspace": "/tmp/another-workspace"}, id="workspace"),
-            pytest.param(
-                {"label": {"project": "another-project", "task": LABEL.task}},
-                id="label-project",
-            ),
-            pytest.param(
-                {"label": {"project": LABEL.project, "task": "a different task"}},
-                id="label-task",
-            ),
-            pytest.param({"env": {"LAUNCH_SETTING": "different"}}, id="environment"),
+            pytest.param({"project": "Other Project"}, id="project"),
+            pytest.param({"task": "a different task"}, id="task"),
         ],
     )
     def test_reusing_a_launch_identity_for_a_different_intent_is_refused(
@@ -323,8 +544,8 @@ class TestLaunchingAndClosing:
         payload: dict[str, object] = {
             "request_id": LAUNCH_REQUEST_ID,
             "agent": "codex",
-            "workspace": str(WORKSPACE),
-            "label": {"project": LABEL.project, "task": LABEL.task},
+            "project": LABEL.project,
+            "task": LABEL.task,
         }
         payload.update(changes)
 
@@ -345,8 +566,8 @@ class TestLaunchingAndClosing:
             payload={
                 "request_id": LAUNCH_REQUEST_ID,
                 "agent": "codex",
-                "workspace": str(WORKSPACE),
-                "label": {"project": LABEL.project, "task": LABEL.task},
+                "project": LABEL.project,
+                "task": LABEL.task,
             },
         )
 
@@ -374,8 +595,8 @@ class TestLaunchingAndClosing:
             payload={
                 "request_id": LAUNCH_REQUEST_ID,
                 "agent": "codex",
-                "workspace": str(WORKSPACE),
-                "label": {"project": LABEL.project, "task": LABEL.task},
+                "project": LABEL.project,
+                "task": LABEL.task,
             },
         )
 

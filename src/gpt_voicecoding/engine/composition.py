@@ -199,6 +199,8 @@ class Engine:
             channel=adapters.channel,
             agents=adapters.agents,
             launcher=adapters.launcher,
+            default_agent=config.launch.default_agent,
+            projects=config.launch.projects,
             events=events,
             policy=config.policy,
             # The grammar's command words are the action set itself, so the

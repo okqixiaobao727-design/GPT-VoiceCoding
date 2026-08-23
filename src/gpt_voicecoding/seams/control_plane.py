@@ -33,7 +33,7 @@ from typing import Any
 
 #: Bumped when the shapes below change incompatibly. Carried on every reply so a
 #: surface can tell an engine that disagrees from one too old to have been asked.
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 #: The longest line either side will read. Generous for a roster, small enough
 #: that a peer cannot make the engine hold an unbounded buffer.

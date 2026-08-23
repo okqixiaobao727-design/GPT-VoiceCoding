@@ -68,8 +68,8 @@ class TestARequestOnTheWire:
 
 
 class TestAReplyOnTheWire:
-    def test_the_required_launch_identity_is_protocol_two(self) -> None:
-        assert PROTOCOL_VERSION == 2
+    def test_the_natural_launch_payload_is_protocol_three(self) -> None:
+        assert PROTOCOL_VERSION == 3
 
     def test_an_answer_carries_the_action_it_answers_and_the_protocol_version(self) -> None:
         document = Reply.answered(Action.STATUS, {"call_id": None}).as_document()

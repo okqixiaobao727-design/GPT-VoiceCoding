@@ -36,7 +36,7 @@ ACTION_GIST: dict[Action, str] = {
     Action.SWITCH: "flip one switch on or off",
     Action.SESSIONS: "the session roster on its own",
     Action.LIVE: "the Live Toggle — end the call that is up, or start one when none is",
-    Action.LAUNCH: "bring exactly one session into existence in a workspace",
+    Action.LAUNCH: "bring exactly one session into a configured project for a stated task",
     Action.CLOSE: "close exactly one session, by its exact identity",
     Action.RELAY: "carry the user's own words into one exact session",
     Action.APPROVE: "carry the user's verdict on one pending permission request",
@@ -197,19 +197,24 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                 Block(
                     covers=("delegated.start.resolves-without-guessing",),
                     text=(
-                        "A launch names the workspace the user named, resolved from what the "
-                        "control plane returned. If it cannot be resolved from what they "
-                        "actually said, ask — a workspace invented to make a launch possible "
-                        "is a session opened in the wrong place."
+                        "A launch carries the project reference and task the user named. Bridge "
+                        "Core resolves the absolute workspace and canonical project name. If the "
+                        "project cannot be resolved uniquely, ask — never invent a workspace to "
+                        "make a launch possible."
                     ),
                 ),
                 Block(
-                    covers=("delegated.start.launches-once-and-waits",),
+                    covers=(
+                        "delegated.start.launches-once-and-waits",
+                        "delegated.start.complete-request-launches-directly",
+                    ),
                     text=(
-                        "One request is one launch. Carry one request identity for it, wait "
-                        "for the outcome rather than assuming it, and if you need to ask "
-                        "again, ask under the same identity — the engine answers with the "
-                        "first outcome instead of opening a second session."
+                        "A complete project-and-task request is one launch action immediately: "
+                        "do not read help, sessions or status first, and do not add a confirmation "
+                        "round. Carry one request identity, wait for the outcome rather than "
+                        "assuming it, and if transport needs the same request again, reuse that "
+                        "identity — the engine returns the first outcome instead of opening a "
+                        "second session."
                     ),
                 ),
                 Block(

@@ -21,6 +21,7 @@ import pytest
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.errors import SeamUnavailableError, UnknownSessionError
+from gpt_voicecoding.core.projects import Project
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry, SessionState
 from gpt_voicecoding.core.state import BridgeState
@@ -30,6 +31,7 @@ from gpt_voicecoding.seams.session_launcher import CloseStatus, LaunchStatus
 
 WORKSPACE = Path("/tmp/workspace")
 LABEL = SessionLabel(project="gpt-voicecoding", task="build the control plane")
+PROJECTS = (Project(name=LABEL.project, workspace=WORKSPACE),)
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 
@@ -39,8 +41,8 @@ def launched(core: BridgeCore) -> object:
         core.launch_session(
             request_id=new_request_id(),
             agent=AgentKind.CODEX,
-            workspace=WORKSPACE,
-            label=LABEL,
+            project=LABEL.project,
+            task=LABEL.task,
         )
     )
 
@@ -53,6 +55,8 @@ def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
         channel=FakeCompanionChannel(),
         agents={AgentKind.CODEX: FakeAgent()},
         launcher=launcher,
+        default_agent=AgentKind.CODEX,
+        projects=PROJECTS,
     )
 
 
@@ -98,22 +102,6 @@ class TestLaunching:
         assert outcome.detail
         assert core.status().sessions == ()
 
-    def test_the_launcher_is_told_exactly_which_environment_to_set(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CODEX])
-        core = hub(launcher)
-
-        asyncio.run(
-            core.launch_session(
-                request_id=new_request_id(),
-                agent=AgentKind.CODEX,
-                workspace=WORKSPACE,
-                label=LABEL,
-                env={"GPT_VC": "1"},
-            )
-        )
-
-        assert launcher.environments == [{"GPT_VC": "1"}]
-
     def test_an_engine_with_no_launcher_refuses_rather_than_pretending(self) -> None:
         core = hub(None)
 
@@ -137,6 +125,8 @@ class TestLaunching:
             channel=FakeCompanionChannel(),
             agents={AgentKind.CODEX: FakeAgent()},
             launcher=FakeSessionLauncher(targets=[CODEX]),
+            default_agent=AgentKind.CODEX,
+            projects=PROJECTS,
         )
 
         launched(core)
