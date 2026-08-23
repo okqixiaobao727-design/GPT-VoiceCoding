@@ -17,10 +17,9 @@ nothing here sends a turn.
 What it does, in order:
 
 1. builds the launcher named on the command line;
-2. launches one Session into a throwaway workspace, through **Bridge Core**, so
-   what is proved is the registry ending up correct rather than the adapter
-   returning a nice object;
-3. prints the identity Core registered, and — for the headless adapter — what the
+2. sends the same sender-minted launch request twice, through **Bridge Core**,
+   and proves both calls return the same outcome while Core registers one Session;
+3. prints that one identity, and — for the headless adapter — what the
    Session actually put on its own terminal;
 4. closes it, and prints the outcome including any per-child destinations.
 
@@ -58,7 +57,11 @@ from gpt_voicecoding.core.relay_queue import RelayQueue  # noqa: E402
 from gpt_voicecoding.core.sessions import SessionRegistry  # noqa: E402
 from gpt_voicecoding.core.state import BridgeState  # noqa: E402
 from gpt_voicecoding.core.switches import Switchboard  # noqa: E402
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel  # noqa: E402
+from gpt_voicecoding.seams.identity import (  # noqa: E402
+    AgentKind,
+    SessionLabel,
+    new_request_id,
+)
 
 #: Long enough for a TUI to start and register on a cold cache.
 LOOK_AT_IT_SECONDS = 20.0
@@ -121,18 +124,35 @@ async def run(arguments: argparse.Namespace) -> int:
 
     try:
         await claude.connect()
-        outcome = await core.launch_session(
-            agent=agent,
-            workspace=workspace,
-            label=SessionLabel(project="gpt-voicecoding", task="session launcher proof"),
-        )
-        print(f"\n   outcome: {outcome.status}")
+        request_id = new_request_id()
+        label = SessionLabel(project="gpt-voicecoding", task="session launcher proof")
+        outcomes = [
+            await core.launch_session(
+                request_id=request_id,
+                agent=agent,
+                workspace=workspace,
+                label=label,
+            )
+            for _ in range(2)
+        ]
+        outcome, repeated = outcomes
+        print(f"\n   request_id: {request_id}")
+        print(f"   first outcome: {outcome.status}")
+        print(f"   repeated outcome: {repeated.status}")
+        if repeated != outcome:
+            print("   duplicate request returned a different outcome")
+            return 1
         if outcome.target is None:
             print(f"   detail:\n{outcome.detail}")
             return 1
 
-        say("2. what Bridge Core registered")
-        for held in core.status().sessions:
+        sessions = core.status().sessions
+        if len(sessions) != 1:
+            print(f"   duplicate request registered {len(sessions)} Sessions; expected one")
+            return 1
+
+        say("2. the one Session Bridge Core registered")
+        for held in sessions:
             print(f"   {held.target}   state={held.state}   workspace={held.workspace}")
             print(f"   label: {held.label}")
 

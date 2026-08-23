@@ -166,6 +166,25 @@ def rid(text: str = "r-1") -> RequestId:
     return RequestId(text)
 
 
+class TestRegisteringSessions:
+    def test_a_registered_session_channel_is_recorded(self, socket_path: Path, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.adapters.agent.codex.adapter")
+
+        async def scenario() -> Path:
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, Sink())
+                try:
+                    return server.path
+                finally:
+                    await adapter.aclose()
+
+        registered_path = asyncio.run(scenario())
+        assert [record.getMessage() for record in caplog.records] == [
+            "registered Session channel "
+            f"agent=codex session_id={THREAD} pid=None socket={registered_path}"
+        ]
+
+
 class TestCarryingTheUsersWords:
     def test_a_relay_is_delivered_only_once_the_thread_shows_the_words(
         self, socket_path: Path

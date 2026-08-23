@@ -75,7 +75,7 @@ class Rule:
 
     id: str
     audience: Audience
-    #: The old file and lines it was migrated from — provenance, not content.
+    #: The skill lines or later issue the obligation came from — provenance, not content.
     source: str
     #: What the rule requires, in one sentence. A brief for the generator, not
     #: the text it must emit.
@@ -87,7 +87,7 @@ class Rule:
         if not self.id.strip():
             raise ValueError("a rule without an id cannot be covered or audited")
         if not self.source.strip():
-            raise ValueError(f"{self.id} must name the lines it was migrated from")
+            raise ValueError(f"{self.id} must name its source")
         if not self.gist.strip():
             raise ValueError(f"{self.id} must say what it requires")
         if self.audience.is_code and not self.enforced_by.strip():
@@ -627,12 +627,22 @@ def _rules() -> tuple[Rule, ...]:
         # --- skill/starting.md ---------------------------------------------
         Rule(
             id="voice.start.needs-an-explicit-agent-and-workspace",
-            audience=Audience.VOICE,
+            audience=Audience.DROPPED,
             source="skill/starting.md:1-24",
             gist=(
-                "Which agent and which workspace both come from what the user actually "
-                "said. A near miss in transcription is a question, not a guess, and "
-                "nothing is opened while either is unsettled."
+                "The old requirement to hear an explicit agent and absolute workspace. "
+                "The configured default agent and project catalogue replace both."
+            ),
+        ),
+        Rule(
+            id="voice.start.complete-request-launches-directly",
+            audience=Audience.VOICE,
+            source="issue/25",
+            gist=(
+                "A project reference and task are a complete launch request. Use the "
+                "configured default agent unless the user named one, and issue exactly one "
+                "launch action without help, roster or status preflight and without a "
+                "confirmation round. Ask only when project resolution is not unique."
             ),
         ),
         Rule(
@@ -658,8 +668,8 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.DELEGATED,
             source="skill/starting.md:42-54",
             gist=(
-                "The workspace a launch names is one the user named, resolved from what the "
-                "control plane returned — never invented to make a launch possible."
+                "Carry the user's project reference and task to the launch action. Bridge "
+                "Core resolves the workspace; the Delegated Turn never invents one."
             ),
         ),
         Rule(
@@ -693,6 +703,15 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
+            id="delegated.start.complete-request-launches-directly",
+            audience=Audience.DELEGATED,
+            source="issue/25",
+            gist=(
+                "A complete project-and-task request is exactly one launch action. Do not "
+                "read help, sessions or status first and do not ask for confirmation."
+            ),
+        ),
+        Rule(
             id="core.start.owns-the-launch-outcome",
             audience=Audience.CORE,
             source="skill/starting.md:70-96",
@@ -719,7 +738,7 @@ def _rules() -> tuple[Rule, ...]:
             gist=(
                 "Report only what actually happened. A new Session has started and has not "
                 "named itself yet — say both, in that order, and describe it by the user's "
-                "own workspace and task until a label exists."
+                "own project reference and task until a label exists."
             ),
         ),
         Rule(

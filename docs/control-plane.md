@@ -53,14 +53,14 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 1, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 3, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 1, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 3, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
-`action` is `null` when the line never named a usable one. `protocol` is `1`;
+`action` is `null` when the line never named a usable one. `protocol` is `3`;
 a field being **absent** means an engine too old to have been asked, which is
 distinct from a field being empty ([ADR 0003](adr/0003-the-engine-reports-what-it-loaded.md)).
 
@@ -150,12 +150,20 @@ never by a switch.
 Payload:
 
 ```json
-{"agent": "codex", "workspace": "/path/to/work",
- "label": {"project": "gpt-voicecoding", "task": "build the control plane"},
- "env": {"NAME": "value"}}
+{"request_id": "21d73168-b1f0-4b18-977d-fba0d1f2cc13",
+ "project": "GPT Live", "task": "build the control plane", "agent": "codex"}
 ```
 
-`env` is optional and is exactly the variables to set on the child. Data:
+`request_id` is the sender-minted UUID for this distinct launch intent. A retry
+carries the same UUID; an intentional second Session carries a new one. Reusing
+one UUID with a different resolved agent, workspace or Session Label is refused.
+`agent` is optional; when absent, Bridge Core uses `[launch] default_agent`.
+Bridge Core resolves `project` against the configured project catalogue, uses
+the entry's canonical name for the Session Label, and passes its absolute
+workspace to the Session Launcher. The former `workspace`, `label` and `env`
+control-plane fields are not a compatibility interface and are refused. The
+Launcher seam still receives its unchanged typed request, including its internal
+environment mapping. Data:
 
 ```json
 {"request_id": "…", "status": "launched" | "failed" | "unavailable",
@@ -165,7 +173,15 @@ Payload:
 **A Launcher that tried and failed answers `ok: true`.** That is news the caller
 asked for, carrying the real error in `detail`; a protocol refusal would say the
 request was unusable, which is a different thing. Only a `launched` outcome
-registers a Session.
+registers a Session. Sequential or concurrent repeats under one UUID return the
+first complete outcome and neither launch nor register a second Session. This
+in-process guarantee does not survive an engine restart.
+
+An unknown or non-unique project is a `refused` response carrying Bridge Core's
+own explanation and canonical candidate names. There is no second wire error
+code: surfaces need the truthful reason, but have no different action to branch
+to. Nothing launches until the reference resolves to exactly one configured
+project.
 
 ### `close`
 
@@ -258,7 +274,7 @@ status
 switch <name> on|off
 sessions
 live
-launch <agent> <workspace> <project · task>
+launch --request-id <UUID> --project <project> [--agent claude|codex] --task <words...>
 close <agent>:<session id>[:<pid>]
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
 approve <approval id> allow|deny|ask
@@ -273,6 +289,11 @@ the same session id.
 when there was no engine to ask. Collapsing the last two would tell a user their
 switch does not exist when nothing is running.
 
+`--task` consumes every remaining word. Project names containing spaces are one
+quoted argument; callers never quote an absolute workspace or compose a Session
+Label. Omitting `--agent` selects the configured global default. The old
+positional agent/workspace/label form is not accepted beside this one.
+
 ## Configuration
 
 One TOML file, read once, by the composition root and nothing else.
@@ -281,6 +302,14 @@ One TOML file, read once, by the composition root and nothing else.
 [engine]
 socket_path = "/tmp/gpt-voicecoding-501/control.sock"   # optional
 state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"  # optional
+
+[launch]
+default_agent = "claude"
+
+[[launch.projects]]
+name = "GPT-VoiceCoding"
+workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"
+spoken_aliases = ["Voice Coding", "GPT Live"]
 
 [adapters]
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
@@ -307,6 +336,31 @@ stripped_environment_prefixes = ["Malloc"]
 model = "the-model-you-chose"       # required: the cost lever has no default
 cli   = "/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/bridgectl"
 ```
+
+`[launch] default_agent` is the global agent used when a launch request names no
+agent. Each `[[launch.projects]]` entry carries one canonical `name`, one absolute
+`workspace`, and optional `spoken_aliases` used only for spoken project lookup.
+The launch table, its default agent and at least one project are required. The
+default may be `claude` or `codex`, and must name an agent adapter this engine is
+configured to load. A workspace must be absolute when configuration is read;
+whether it currently exists is checked by the Launcher when a launch is asked
+for, so an offline volume does not prevent the engine itself from starting.
+
+Project lookup first applies Unicode compatibility normalisation and ignores
+case, then removes whitespace and punctuation to compare only letters and
+numbers. Thus `GPT-VoiceCoding`, `gpt voice coding`, `GPTVoiceCoding` and
+`gpt_voice-coding` match without duplicating configuration. It does not guess a
+misspelling or choose by similarity. Repeated equivalent names inside one
+project still resolve to that one project. A key shared by different projects
+is retained as an honest runtime ambiguity, while a wholly duplicated project
+entry is invalid configuration. Spoken aliases carry no agent, model,
+permission mode, shell command or shell argument; shell aliases remain
+independent and are never read or migrated.
+
+Resolution lives in `core/projects.py`, an internal deep module of Bridge Core.
+It adds no seam, adapter, state copy or private test surface: observable project
+resolution remains tested through Control Plane -> Bridge Core -> fake Session
+Launcher.
 
 Each adapter reference is `module:attribute`, resolved by the composition root —
 the only thing in the system that imports an adapter. A factory is called as

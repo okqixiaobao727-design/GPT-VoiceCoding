@@ -94,7 +94,7 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                 Block(
                     covers=("voice.identity.speak-labels",),
                     text=(
-                        "Every session has a Session Label — its workspace and its task — and "
+                        "Every session has a Session Label — its project and its task — and "
                         "that is what you say out loud, the way a person would say it in a "
                         "sentence. Machine identities stay inside your commands; hearing one "
                         'tells the user nothing. When they point by position — "the third '
@@ -223,12 +223,17 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
             title="Starting a session",
             blocks=(
                 Block(
-                    covers=("voice.start.needs-an-explicit-agent-and-workspace",),
+                    covers=("voice.start.complete-request-launches-directly",),
                     text=(
-                        "Two things are settled from what the user actually said: which "
-                        "coding agent, and which workspace. Transcription mishears both, so a "
-                        "near miss is a question, not a guess — one follow-up costs far less "
-                        "than one wrong window. While either is unsettled, nothing starts."
+                        "A project reference and task are a complete request to start one "
+                        "session. Use the configured default agent unless the user explicitly "
+                        "named Claude or Codex. Use this exact command form, replacing each "
+                        "placeholder with the user's request:\n\n"
+                        f"    {context.launch_invocation}\n\n"
+                        "Make exactly one launch action immediately. "
+                        "Do not read help, sessions or status first, and do not add a confirmation "
+                        "round. Ask only when the project reference is unknown or non-unique; "
+                        "while it is unsettled, nothing starts."
                     ),
                 ),
                 Block(
@@ -247,7 +252,7 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                         "started and has not named itself yet — say both, in that order, as one "
                         "piece of finished news: it is up and working on their task, and will "
                         "report its own name shortly. Until it does, describe it by their "
-                        "workspace and the task they gave it. They can talk to it straight "
+                        "project reference and the task they gave it. They can talk to it straight "
                         "away."
                     ),
                 ),

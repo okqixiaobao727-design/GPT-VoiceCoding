@@ -21,21 +21,30 @@ import pytest
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.errors import SeamUnavailableError, UnknownSessionError
+from gpt_voicecoding.core.projects import Project
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry, SessionState
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
 from gpt_voicecoding.seams.session_launcher import CloseStatus, LaunchStatus
 
 WORKSPACE = Path("/tmp/workspace")
 LABEL = SessionLabel(project="gpt-voicecoding", task="build the control plane")
+PROJECTS = (Project(name=LABEL.project, workspace=WORKSPACE),)
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 
 def launched(core: BridgeCore) -> object:
     """One launch of the one agent these tests use."""
-    return asyncio.run(core.launch_session(agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL))
+    return asyncio.run(
+        core.launch_session(
+            request_id=new_request_id(),
+            agent=AgentKind.CODEX,
+            project=LABEL.project,
+            task=LABEL.task,
+        )
+    )
 
 
 def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
@@ -46,10 +55,32 @@ def hub(launcher: FakeSessionLauncher | None = None) -> BridgeCore:
         channel=FakeCompanionChannel(),
         agents={AgentKind.CODEX: FakeAgent()},
         launcher=launcher,
+        default_agent=AgentKind.CODEX,
+        projects=PROJECTS,
     )
 
 
 class TestLaunching:
+    def test_a_launched_session_records_its_target_and_workspace(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        core = hub(FakeSessionLauncher(targets=[CODEX]))
+
+        launched(core)
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "launched Session agent=codex session_id=abc pid=None workspace=/tmp/workspace"
+        ]
+
+    def test_a_refused_launch_records_the_refusal_words(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        core = hub(FakeSessionLauncher(targets=[]))
+
+        launched(core)
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "launch refused: 'this fake launcher has no target left to hand out'"
+        ]
+
     def test_a_launched_session_is_registered_by_the_hub(self) -> None:
         core = hub(FakeSessionLauncher(targets=[CODEX]))
 
@@ -70,18 +101,6 @@ class TestLaunching:
         assert outcome.status is LaunchStatus.FAILED
         assert outcome.detail
         assert core.status().sessions == ()
-
-    def test_the_launcher_is_told_exactly_which_environment_to_set(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CODEX])
-        core = hub(launcher)
-
-        asyncio.run(
-            core.launch_session(
-                agent=AgentKind.CODEX, workspace=WORKSPACE, label=LABEL, env={"GPT_VC": "1"}
-            )
-        )
-
-        assert launcher.environments == [{"GPT_VC": "1"}]
 
     def test_an_engine_with_no_launcher_refuses_rather_than_pretending(self) -> None:
         core = hub(None)
@@ -106,6 +125,8 @@ class TestLaunching:
             channel=FakeCompanionChannel(),
             agents={AgentKind.CODEX: FakeAgent()},
             launcher=FakeSessionLauncher(targets=[CODEX]),
+            default_agent=AgentKind.CODEX,
+            projects=PROJECTS,
         )
 
         launched(core)

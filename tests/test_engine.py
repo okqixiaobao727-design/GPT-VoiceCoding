@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -24,16 +25,25 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
+from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION, ClaudeAgentAdapter
+from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
+from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
+from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest, LaunchStatus
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
+CLAUDE = SessionTarget(
+    agent=AgentKind.CLAUDE,
+    session_id="430b0def-38ef-4783-8d57-d800710d83bd",
+    pid=os.getpid(),
+)
 
 
 def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
@@ -96,6 +106,32 @@ def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLaunche
     return IntroducedLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
 
+class ClaudeRegisteringLauncher(FakeSessionLauncher):
+    """A launch that registers its channel before it reports success, as Claude does."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.claude: ClaudeAgentAdapter | None = None
+
+    def use_claude(self, adapter: ClaudeAgentAdapter) -> None:
+        self.claude = adapter
+
+    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
+        outcome = await super().launch(request)
+        if outcome.status is LaunchStatus.LAUNCHED:
+            assert outcome.target is not None
+            assert self.claude is not None
+            self.claude.register_session(
+                outcome.target,
+                Path(tempfile.gettempdir()) / f"gvc-test-{outcome.target.pid}.sock",
+            )
+        return outcome
+
+
+def claude_registering_launcher(*, sink: object = None) -> ClaudeRegisteringLauncher:
+    return ClaudeRegisteringLauncher(targets=[CLAUDE], sink=sink)  # type: ignore[arg-type]
+
+
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -108,6 +144,14 @@ session_launcher = "test_engine:one_session_launcher"
 
 [adapters.agents]
 codex = "fakes:FakeAgent"
+
+[launch]
+default_agent = "codex"
+
+[[launch.projects]]
+name = "GPT-VoiceCoding"
+workspace = "{workspace}"
+spoken_aliases = ["GPT Live"]
 
 [delegate]
 model = "the-model-the-user-chose"
@@ -137,6 +181,7 @@ def configured(home: Path, text: str = CONFIG) -> Path:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
+            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -145,6 +190,56 @@ def configured(home: Path, text: str = CONFIG) -> Path:
 
 def assembled(home: Path, text: str = CONFIG) -> Engine:
     return Engine.assemble(load(configured(home, text)))
+
+
+def with_idle_claude(home: Path) -> str:
+    """Use the real Claude spoke and the launch order that introduces a Session to it."""
+    return (
+        CONFIG.replace(
+            'session_launcher = "test_engine:one_session_launcher"',
+            'session_launcher = "test_engine:claude_registering_launcher"',
+        )
+        .replace(
+            'codex = "fakes:FakeAgent"',
+            'claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"',
+        )
+        .replace('default_agent = "codex"', 'default_agent = "claude"')
+        .replace(
+            "[delegate]",
+            "\n".join(
+                (
+                    '[adapters.settings."agent.claude"]',
+                    f'registry_directory = "{home / "sessions"}"',
+                    f'socket_directory = "{home / "sockets"}"',
+                    f'projects_directory = "{home / "projects"}"',
+                    f'peer_socket_directory = "{home / "peers"}"',
+                    "reply_window_poll_seconds = 0.02",
+                    "",
+                    "[delegate]",
+                )
+            ),
+        )
+    )
+
+
+def write_idle_claude_record(home: Path) -> None:
+    """Write the registry level the real Claude Reply-Window watcher reads."""
+    sessions = home / "sessions"
+    sessions.mkdir()
+    (sessions / f"{CLAUDE.pid}.json").write_text(
+        json.dumps(
+            {
+                "pid": CLAUDE.pid,
+                "sessionId": CLAUDE.session_id,
+                "cwd": str(home),
+                "version": PROVEN_AGAINST_VERSION,
+                "peerProtocol": PEER_PROTOCOL,
+                "messagingSocketPath": str(home / "claude.sock"),
+                "status": "idle",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 async def running(engine: Engine, work) -> object:
@@ -157,6 +252,39 @@ async def running(engine: Engine, work) -> object:
 
 
 class TestAssembly:
+    def test_generated_instructions_receive_the_launch_parsers_usage(self, home: Path) -> None:
+        instructions = assembled(home).core.instructions
+
+        assert instructions is not None
+        assert USAGE[Action.LAUNCH] in instructions.voice.text
+        assert USAGE[Action.LAUNCH] in instructions.delegated.text
+
+    def test_launch_configuration_reaches_bridge_core(self, home: Path) -> None:
+        engine = assembled(home)
+        request = Request(
+            action=Action.LAUNCH,
+            payload={
+                "request_id": new_request_id(),
+                "project": "GPT Live",
+                "task": "prove configuration composition",
+            },
+        )
+
+        async def scenario() -> Reply:
+            return await running(engine, lambda: ask(request, path=engine.socket_path))
+
+        reply = asyncio.run(scenario())
+
+        assert reply.ok
+        launcher = engine.adapters.launcher
+        assert isinstance(launcher, FakeSessionLauncher)
+        assert len(launcher.requests) == 1
+        launched = launcher.requests[0]
+        assert launched.agent is AgentKind.CODEX
+        assert launched.workspace == home
+        assert launched.label.project == "GPT-VoiceCoding"
+        assert launched.label.task == "prove configuration composition"
+
     def test_the_engine_serves_the_control_plane_it_was_configured_with(self, home: Path) -> None:
         engine = assembled(home)
 
@@ -327,6 +455,45 @@ class TestTruthAcrossARestart:
 
 
 class TestEventsReachTheHub:
+    def test_an_idle_claude_session_opens_its_reply_window_in_core_state(
+        self, home: Path
+    ) -> None:
+        """The adapter reports during launch; the assembled hub must receive that report."""
+        write_idle_claude_record(home)
+        engine = assembled(home, with_idle_claude(home))
+
+        async def scenario() -> Reply:
+            await engine.start()
+            try:
+                launched = await ask(
+                    Request(
+                        action=Action.LAUNCH,
+                        payload={
+                            "request_id": new_request_id(),
+                            "agent": "claude",
+                            "project": "GPT Live",
+                            "task": "t",
+                        },
+                    ),
+                    path=engine.socket_path,
+                )
+                assert launched.ok
+                observed = await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+                for _ in range(100):
+                    if observed.data["sessions"][0]["reply_window"] == "open":
+                        break
+                    await asyncio.sleep(0.01)
+                    observed = await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+                return observed
+            finally:
+                await engine.aclose()
+
+        sessions = asyncio.run(scenario()).data["sessions"]
+
+        assert sessions[0]["reply_window"] == "open"
+        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
+        assert persisted["sessions"][0]["reply_window"] == "open"
+
     def test_an_adapter_event_is_dispatched_while_the_engine_runs(self, home: Path) -> None:
         engine = assembled(home)
 
@@ -337,9 +504,10 @@ class TestEventsReachTheHub:
                     Request(
                         action=Action.LAUNCH,
                         payload={
+                            "request_id": new_request_id(),
                             "agent": "codex",
-                            "workspace": str(home),
-                            "label": {"project": "p", "task": "t"},
+                            "project": "GPT Live",
+                            "task": "t",
                         },
                     ),
                     path=engine.socket_path,

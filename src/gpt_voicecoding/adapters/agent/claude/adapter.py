@@ -196,6 +196,13 @@ class ClaudeAgentAdapter:
         # which is what makes it reachable at all: until a window is observed,
         # Bridge Core holds every Relay against the fail-closed default.
         self._windows.watch(target)
+        _log.info(
+            "registered Session channel agent=%s session_id=%s pid=%s socket=%s",
+            target.agent,
+            target.session_id,
+            target.pid,
+            socket_path,
+        )
 
     def forget_session(self, target: SessionTarget) -> None:
         """Stop holding a route to one Session. The Session itself is untouched."""

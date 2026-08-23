@@ -34,16 +34,18 @@ injected handlers with honest defaults rather than being invented here.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
+    ConflictingLaunchError,
+    InvalidLaunchLabelError,
     SeamUnavailableError,
     StaleSessionError,
     UnknownRelayError,
@@ -53,6 +55,7 @@ from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.policy import CorePolicy
+from gpt_voicecoding.core.projects import Project, ProjectCatalogue
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
@@ -92,6 +95,7 @@ from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundTex
 from gpt_voicecoding.seams.events import Event
 from gpt_voicecoding.seams.identity import (
     AgentKind,
+    RequestId,
     SessionLabel,
     SessionTarget,
     new_request_id,
@@ -138,6 +142,14 @@ class Status:
     pending_approvals: tuple[PendingApproval, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _LaunchTransaction:
+    """One resolved launch intent and the complete in-process transaction carrying it."""
+
+    request: LaunchRequest
+    task: asyncio.Task[LaunchOutcome]
+
+
 class BridgeCore:
     """The hub: one truth, five pipelines, and the loop that feeds them."""
 
@@ -149,6 +161,8 @@ class BridgeCore:
         channel: CompanionChannel,
         agents: Mapping[AgentKind, AgentAdapter],
         launcher: SessionLauncher | None = None,
+        default_agent: AgentKind | None = None,
+        projects: tuple[Project, ...] = (),
         events: EventQueue | None = None,
         policy: CorePolicy | None = None,
         grammar: TextGrammar | None = None,
@@ -164,7 +178,9 @@ class BridgeCore:
         self._channel = channel
         self._agents = dict(agents)
         self._launcher = launcher
-        self._events = events or EventQueue()
+        self._default_agent = default_agent
+        self._projects = ProjectCatalogue(projects) if projects else None
+        self._events = events if events is not None else EventQueue()
         self._policy = policy or CorePolicy()
         self._control = control
         self._delegate = delegate
@@ -182,6 +198,7 @@ class BridgeCore:
         #: stamped with `stamp`. A Session's `registered_at` is read back by the
         #: next engine, and a monotonic reading would come back as the future.
         self._stamp = stamp
+        self._launches: dict[RequestId, _LaunchTransaction] = {}
 
         self.interlock = CallInterlock(call)
         self.adjudicator = SwitchAdjudicator(state.switches)
@@ -295,10 +312,10 @@ class BridgeCore:
     async def launch_session(
         self,
         *,
-        agent: AgentKind,
-        workspace: Path,
-        label: SessionLabel,
-        env: Mapping[str, str] | None = None,
+        request_id: RequestId,
+        project: str,
+        task: str,
+        agent: AgentKind | None = None,
     ) -> LaunchOutcome:
         """Bring one Session into existence, and record the one that arrived.
 
@@ -312,16 +329,57 @@ class BridgeCore:
         authoritative, and a failed launch that wrote a row would be the system
         inventing a Session to Relay into.
         """
-        launcher = self._require_launcher()
-        outcome = await launcher.launch(
-            LaunchRequest(
-                request_id=new_request_id(),
-                agent=agent,
-                workspace=workspace,
-                label=label,
-                env=env or {},
-            )
+        if self._projects is None or self._default_agent is None:
+            raise BridgeCoreError("this Bridge Core has no launch configuration")
+        configured = self._projects.resolve(project)
+        selected_agent = agent or self._default_agent
+        try:
+            label = SessionLabel(project=configured.name, task=task)
+        except ValueError as refusal:
+            raise InvalidLaunchLabelError(str(refusal)) from None
+        request = LaunchRequest(
+            request_id=request_id,
+            agent=selected_agent,
+            workspace=configured.workspace,
+            label=label,
+            env={},
         )
+        transaction = self._launches.get(request_id)
+        if transaction is not None and transaction.request != request:
+            raise ConflictingLaunchError(request_id)
+        if transaction is None:
+            launcher = self._require_launcher()
+            transaction = _LaunchTransaction(
+                request=request,
+                task=asyncio.create_task(
+                    self._launch_and_register(launcher, request),
+                    name=f"launch-{request_id}",
+                ),
+            )
+            self._launches[request_id] = transaction
+
+        if transaction.task.done():
+            outcome = transaction.task.result()
+        else:
+            outcome = await asyncio.shield(transaction.task)
+        if outcome.status is not LaunchStatus.LAUNCHED:
+            _log.info("launch refused: %r", outcome.detail)
+        else:
+            assert outcome.target is not None  # the seam refuses a LAUNCHED without one
+            _log.info(
+                "launched Session agent=%s session_id=%s pid=%s workspace=%s",
+                outcome.target.agent,
+                outcome.target.session_id,
+                outcome.target.pid,
+                request.workspace,
+            )
+        return outcome
+
+    async def _launch_and_register(
+        self, launcher: SessionLauncher, request: LaunchRequest
+    ) -> LaunchOutcome:
+        """Run the adapter effect and Core registration as one shared transaction."""
+        outcome = await launcher.launch(request)
         if outcome.status is not LaunchStatus.LAUNCHED:
             return outcome
 
@@ -329,8 +387,8 @@ class BridgeCore:
         self._state.sessions.register(
             Session(
                 target=outcome.target,
-                label=label,
-                workspace=workspace,
+                label=request.label,
+                workspace=request.workspace,
                 registered_at=self._stamp(),
             )
         )
@@ -506,6 +564,7 @@ class BridgeCore:
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
+        self._state.persist()
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
 

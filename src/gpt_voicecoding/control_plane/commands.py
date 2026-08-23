@@ -23,7 +23,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.identity import SessionLabel
 
 #: How each action is written on one line. Also what a refusal quotes back.
 USAGE: dict[Action, str] = {
@@ -31,7 +30,10 @@ USAGE: dict[Action, str] = {
     Action.SWITCH: "switch <name> on|off",
     Action.SESSIONS: "sessions",
     Action.LIVE: "live",
-    Action.LAUNCH: "launch <agent> <workspace> <project · task>",
+    Action.LAUNCH: (
+        "launch --request-id <UUID> --project <project> "
+        "[--agent claude|codex] --task <words...>"
+    ),
     Action.CLOSE: "close <agent>:<session id>[:<pid>]",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
     Action.APPROVE: "approve <approval id> allow|deny|ask",
@@ -41,6 +43,10 @@ USAGE: dict[Action, str] = {
 #: The word that asks for the mid-turn route. Spelled out, because route follows
 #: the user's explicit intent and is never inferred from how busy a Session is.
 SUPPLEMENT_FLAG = "--supplement"
+REQUEST_ID_FLAG = "--request-id"
+PROJECT_FLAG = "--project"
+AGENT_FLAG = "--agent"
+TASK_FLAG = "--task"
 
 ADDRESS_SEPARATOR = ":"
 
@@ -68,10 +74,7 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
             name, state = _exactly(action, arguments, 2)
             return {"name": name, "on": _state(state)}
         case Action.LAUNCH:
-            if len(arguments) < 3:
-                raise CommandError(f"say it as: {USAGE[action]}")
-            agent, workspace, *rest = arguments
-            return {"agent": agent, "workspace": workspace, "label": _label(" ".join(rest))}
+            return _launch(arguments)
         case Action.CLOSE:
             (address,) = _exactly(action, arguments, 1)
             return {"target": parse_address(address)}
@@ -95,6 +98,35 @@ def _relay(arguments: list[str]) -> dict[str, object]:
     return {"target": parse_address(address), "text": " ".join(words), "route": route}
 
 
+def _launch(arguments: list[str]) -> dict[str, object]:
+    """Read one explicit project and the task words that follow the final flag."""
+    if (
+        len(arguments) < 6
+        or arguments[0] != REQUEST_ID_FLAG
+        or arguments[2] != PROJECT_FLAG
+    ):
+        raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
+    request_id = arguments[1]
+    project = arguments[3]
+    cursor = 4
+    agent: str | None = None
+    if arguments[cursor] == AGENT_FLAG:
+        if len(arguments) < 8:
+            raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
+        agent = arguments[cursor + 1]
+        cursor += 2
+    if arguments[cursor] != TASK_FLAG or cursor + 1 == len(arguments):
+        raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
+    payload: dict[str, object] = {
+        "request_id": request_id,
+        "project": project,
+        "task": " ".join(arguments[cursor + 1 :]),
+    }
+    if agent is not None:
+        payload["agent"] = agent
+    return payload
+
+
 def _exactly(action: Action, arguments: list[str], count: int) -> list[str]:
     if len(arguments) != count:
         raise CommandError(f"say it as: {USAGE[action]}")
@@ -106,14 +138,6 @@ def _state(word: str) -> bool:
     if word.casefold() in ("on", "off"):
         return word.casefold() == "on"
     raise CommandError(f"a switch is on or off; {word!r} is neither")
-
-
-def _label(text: str) -> dict[str, str]:
-    try:
-        label = SessionLabel.parse(text)
-    except ValueError as refusal:
-        raise CommandError(str(refusal)) from None
-    return {"project": label.project, "task": label.task}
 
 
 def parse_address(address: str) -> dict[str, object]:
@@ -196,7 +220,7 @@ def _roster_lines(sessions: object) -> list[str]:
     if not sessions:
         return ["sessions: none"]
     return ["sessions:"] + [
-        f"  {session['label']} — {format_address(session['target'])} "
+        f"  {session['label']} — {format_address(session['target'])} — {session['workspace']} "
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions
     ]

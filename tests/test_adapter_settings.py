@@ -55,6 +55,10 @@ def document(**adapters: Any) -> dict[str, Any]:
     return {
         "engine": {},
         "adapters": chosen,
+        "launch": {
+            "default_agent": "codex",
+            "projects": [{"name": "adapter tests", "workspace": "/tmp"}],
+        },
         "delegate": {"model": "a-model"},
         "log": {"max_bytes": 1, "retained_files": 0, "stripped_environment_prefixes": []},
     }

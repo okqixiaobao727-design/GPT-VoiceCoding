@@ -133,11 +133,14 @@ class ControlPlane:
         return payloads.call_document(await self._core.live_toggle())
 
     async def _launch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        payloads.reject_unknown(
+            payload, frozenset({"request_id", "project", "task", "agent"})
+        )
         outcome = await self._core.launch_session(
-            agent=payloads.read_agent(payload),
-            workspace=payloads.read_workspace(payload),
-            label=payloads.read_label(payload),
-            env=payloads.read_environment(payload),
+            request_id=payloads.read_request_id(payload),
+            project=payloads.read_text(payload, "project"),
+            task=payloads.read_text(payload, "task"),
+            agent=payloads.read_optional_agent(payload),
         )
         return payloads.launch_document(outcome)
 
