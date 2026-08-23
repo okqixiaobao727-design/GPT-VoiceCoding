@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -31,6 +32,7 @@ from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
+from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
@@ -236,6 +238,40 @@ def write_idle_claude_record(home: Path) -> None:
                 "peerProtocol": PEER_PROTOCOL,
                 "messagingSocketPath": str(home / "claude.sock"),
                 "status": "idle",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def a_dead_pid() -> int:
+    """A pid that really is gone: one this process started and has already reaped."""
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    return child.pid
+
+
+def write_state_holding_a_live_session(home: Path, *, pid: int) -> None:
+    """The shape #26 captured: a state file whose Session says `live`."""
+    (home / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "switches": {"duty": True, "message": False, "voice": True},
+                "sessions": [
+                    {
+                        "target": {
+                            "agent": "claude",
+                            "session_id": CLAUDE.session_id,
+                            "pid": pid,
+                        },
+                        "label": {"project": "GPT-VoiceCoding", "task": "acceptance step 3"},
+                        "workspace": str(home),
+                        "registered_at": 1787302123.276521,
+                        "state": "live",
+                        "reply_window": "closed",
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -452,6 +488,134 @@ class TestTruthAcrossARestart:
 
         assert json.loads((home / "state.json").read_text())["switches"]["duty"] is True
         assert asyncio.run(read()).data["switches"]["duty"] is True
+
+
+class TestARestoredSessionIsOneTheEngineCanHonour:
+    """#26, through the production wiring: assemble, restore, and ask the engine.
+
+    `state.restore()` repopulates Bridge Core's roster only. Nothing on that path
+    calls the Agent adapter's `register_session()`, which is the sole place a
+    Session's channel *and* its Reply Window watch are established — and the
+    channel's address arrives from the launch that minted it, so it cannot come
+    back. A row that returned LIVE would claim a reachability the engine has no
+    way to honour, and — being unwatched — could never be reported dead either.
+
+    Both of the ticket's consequences are exercised here against the real Claude
+    spoke and the real state file: the Session whose process is gone, and the
+    Session whose process is perfectly healthy.
+    """
+
+    def a_launched_session(self, home: Path) -> str:
+        """Launch one real Claude Session, stop the engine, and leave state behind."""
+        write_idle_claude_record(home)
+        text = with_idle_claude(home)
+        engine = assembled(home, text)
+
+        async def scenario() -> Reply:
+            return await running(
+                engine,
+                lambda: ask(
+                    Request(
+                        action=Action.LAUNCH,
+                        payload={
+                            "request_id": new_request_id(),
+                            "agent": "claude",
+                            "project": "GPT Live",
+                            "task": "t",
+                        },
+                    ),
+                    path=engine.socket_path,
+                ),
+            )
+
+        assert asyncio.run(scenario()).ok
+        return text
+
+    def test_a_live_session_is_what_the_stopped_engine_really_wrote_down(
+        self, home: Path
+    ) -> None:
+        """The premise of the rest: a Session that was live is persisted as live."""
+        self.a_launched_session(home)
+
+        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
+
+        assert [row["state"] for row in persisted["sessions"]] == ["live"]
+
+    def test_a_restored_session_whose_process_is_alive_is_not_left_claiming_to_be_live(
+        self, home: Path
+    ) -> None:
+        """Consequence 2, isolated: the agent never died — the restart is the whole cause.
+
+        `CLAUDE.pid` is this test process, so the Session is genuinely healthy
+        across the restart. It still may not come back LIVE, because the engine
+        holds no channel to it and Bridge Core would queue the user's own words
+        against a Reply Window nothing observes.
+        """
+        text = self.a_launched_session(home)
+        restarted = assembled(home, text)
+
+        async def read() -> Reply:
+            return await running(
+                restarted,
+                lambda: ask(Request(action=Action.SESSIONS), path=restarted.socket_path),
+            )
+
+        sessions = asyncio.run(read()).data["sessions"]
+
+        assert [session["state"] for session in sessions] == ["ended"]
+        assert [session["reply_window"] for session in sessions] == ["closed"]
+
+    def test_the_roster_says_only_what_the_adapter_can_back_up(self, home: Path) -> None:
+        """The point of the fix: core state and the adapter's real reach agree."""
+        text = self.a_launched_session(home)
+        restarted = assembled(home, text)
+        claude = restarted.adapters.agents[AgentKind.CLAUDE]
+
+        assert restarted.core.status().sessions[0].state is SessionState.ENDED
+        assert claude.reachable() == ()  # type: ignore[attr-defined]
+
+    def test_a_restored_session_whose_process_is_dead_does_not_live_forever(
+        self, home: Path
+    ) -> None:
+        """Consequence 1, from the captured shape: an unwatched row survived every restart.
+
+        Nothing but the Reply Window sweep ever reports a Claude Session's death,
+        and the sweep only ever visits Sessions `register_session()` entered into
+        it. A restored row was in nobody's population, so `live` outlived the
+        process by days. Ending it on the restore path is what stops that.
+        """
+        write_state_holding_a_live_session(home, pid=a_dead_pid())
+        text = with_idle_claude(home)
+
+        async def read(engine: Engine) -> Reply:
+            return await running(
+                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+            )
+
+        first = asyncio.run(read(assembled(home, text))).data["sessions"]
+        second = asyncio.run(read(assembled(home, text))).data["sessions"]
+
+        assert [session["state"] for session in first] == ["ended"]
+        assert [session["state"] for session in second] == ["ended"]
+
+    def test_repeated_restarts_do_not_rewrite_a_row_that_is_already_ended(
+        self, home: Path
+    ) -> None:
+        """Idempotent: an ended Session is never ended a second time."""
+        write_state_holding_a_live_session(home, pid=a_dead_pid())
+        text = with_idle_claude(home)
+        state = home / "state.json"
+
+        async def read(engine: Engine) -> Reply:
+            return await running(
+                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+            )
+
+        asyncio.run(read(assembled(home, text)))
+        once = state.read_text(encoding="utf-8")
+        asyncio.run(read(assembled(home, text)))
+
+        assert state.read_text(encoding="utf-8") == once
 
 
 class TestEventsReachTheHub:
