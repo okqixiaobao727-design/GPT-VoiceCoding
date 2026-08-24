@@ -31,26 +31,14 @@ public struct ProcessLauncher: EngineLaunching {
             process.environment = environment
         }
 
-        // Only the engine's *pre-adoption* words arrive here: once it owns its
-        // log (ADR 0004) its stderr is that file. Which is exactly the window
-        // that matters — an exit-2 refusal is said before adoption, so this pipe
-        // is the only place it exists.
-        let errors = Pipe()
-        process.standardError = errors
-        errors.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty { stderr(chunk) }
-        }
+        let errors = PreAdoptionStderr(deliver: stderr)
+        process.standardError = errors.pipe
+        errors.read()
 
         process.terminationHandler = { finished in
-            errors.fileHandleForReading.readabilityHandler = nil
-            // Drain what is still in the pipe **before** reporting the exit. A
-            // process that dies immediately after writing its reason is the
-            // ordinary case here — exit 2 is precisely that — and reporting the
-            // death first would race the words that explain it out of existence.
-            if let remaining = try? errors.fileHandleForReading.readToEnd(), !remaining.isEmpty {
-                stderr(remaining)
-            }
+            // The residue reaches the Retry panel **before** the exit does; the
+            // ordering, and why it is load-bearing, belong to `finish()`.
+            errors.finish()
             // A signal is not an exit code. Reported apart so a kill is never
             // mistaken for the engine's own "I could not start".
             let code =
