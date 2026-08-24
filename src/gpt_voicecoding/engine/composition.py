@@ -399,7 +399,8 @@ def _introduce_the_launcher(adapters: Adapters) -> None:
     A launch carries things only an Agent spoke can name. The Claude one is the
     clearest: a launched Session's `PermissionRequest` hook has to be told where
     this engine parks dialogs, and its Session Channel has to be told which byte
-    budgets this engine was configured with — both of which live in that
+    budgets this engine was configured with; the launcher also has to read the
+    same registry directory that adapter observes. Those facts live in the Agent
     adapter's settings and its own derived socket path, not in the launcher's.
     The Codex one is smaller and the same shape: a launched Session's app-server
     address is something only the launch knows, and only that adapter needs.

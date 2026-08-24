@@ -246,6 +246,10 @@ class ClaudeAgentAdapter:
             return _failed(request_id, APPROVAL_UNROUTED)
         return await self._approvals.answer(request.approval_id, verdict, request_id=request_id)
 
+    def registry_directory(self) -> Path:
+        """Where launches find the Session records this adapter later observes."""
+        return self._settings.registry_directory
+
     def approval_socket_path(self) -> Path:
         """Where a launch should tell this Session's hook to find us.
 

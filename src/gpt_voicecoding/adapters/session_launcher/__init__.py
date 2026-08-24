@@ -13,10 +13,11 @@ adapter can get through a first-run dialog.
 
 Both adapters need to be introduced to the Agent adapters, because a launch
 carries things only those spokes can name: where this engine parks permission
-dialogs, and what byte budgets its Session Channel was configured with. The
-composition root does the introducing, which is the same shape and the same
-reason as the Codex app-server being shared with the Call adapter — only the
-root is allowed to know two adapters at once.
+dialogs, what byte budgets its Session Channel was configured with, and where
+Claude writes the Session record the launcher must claim. The composition root
+does the introducing, which is the same shape and the same reason as the Codex
+app-server being shared with the Call adapter — only the root is allowed to know
+two adapters at once.
 """
 
 from __future__ import annotations

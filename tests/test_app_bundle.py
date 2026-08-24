@@ -402,6 +402,25 @@ class TestTheLock:
 class TestTheThingsThatMustAgree:
     """Facts that exist in two languages, or in two files, held to each other."""
 
+    def test_the_shell_and_the_engine_name_the_same_default_socket_path(self) -> None:
+        """The Swift shell and Python engine must meet at the same default address.
+
+        If the two literals drift, the shell dials a socket the engine never
+        bound and reports a missing engine while that engine is running.
+        """
+        swift = (inputs.SHELL_PACKAGE / "Sources/ShellCore/EngineLocation.swift").read_text()
+        default = re.search(
+            r'defaultSocketPath\(.*?"(?P<prefix>[^"\n]*)'
+            r'\\\(uid \?\? getuid\(\)\)(?P<suffix>[^"\n]*)"',
+            swift,
+            re.DOTALL,
+        )
+        assert default is not None, "EngineLocation no longer states the default as one path"
+        uid = 4242
+        shell_path = Path(f"{default['prefix']}{uid}{default['suffix']}")
+
+        assert shell_path == config.default_socket_path(uid)
+
     def test_the_shell_and_the_pipeline_name_the_same_interpreter_path(self) -> None:
         """`BundleLayout.engineInterpreterRelativePath` and `inputs.ENGINE_INTERPRETER`.
 

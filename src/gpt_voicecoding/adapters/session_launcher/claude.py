@@ -73,14 +73,16 @@ CHANNEL_PLUGIN_DIRECTORY = "channel-plugin"
 
 
 class ClaudeEngineFacts(Protocol):
-    """The two things only the running Claude Agent adapter can answer.
+    """The three things only the running Claude Agent adapter can answer.
 
-    A Protocol rather than the adapter class, so this module depends on the two
+    A Protocol rather than the adapter class, so this module depends on the three
     questions it actually asks rather than on the whole spoke — and so a test can
     answer them without constructing one.
     """
 
     def launch_bootstrap(self, channel_socket_path: Path) -> str: ...
+
+    def registry_directory(self) -> Path: ...
 
     def register_session(self, target: SessionTarget, socket_path: Path) -> None: ...
 
@@ -99,6 +101,7 @@ class ClaudePreparation:
         self._request = request
         self._settings = settings
         self._engine = engine
+        self._registry_directory = engine.registry_directory()
         self._timeout = confirm_timeout_seconds
         self._directory = (
             settings.runtime_directory / f"{LAUNCH_DIRECTORY_PREFIX}{request.request_id}"
@@ -131,7 +134,7 @@ class ClaudePreparation:
         write_hook_plugin(self._plugin_directory, self._settings.interpreter)
         write_plugin(self._channel_plugin_directory, self._settings.interpreter)
 
-        self._before = snapshot(self._settings.registry_directory)
+        self._before = snapshot(self._registry_directory)
         return Launch(
             argv=(
                 str(binary),
@@ -166,7 +169,7 @@ class ClaudePreparation:
         """
         try:
             record = await claim(
-                self._settings.registry_directory,
+                self._registry_directory,
                 workspace=workspace_of(self._request),
                 before=self._before,
                 ancestor=ancestor,

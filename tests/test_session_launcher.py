@@ -124,10 +124,14 @@ def a_script(path: Path, body: str) -> Path:
 
 
 class FakeClaudeEngine:
-    """The two things the running Claude Agent adapter answers for a launch."""
+    """The three things the running Claude Agent adapter answers for a launch."""
 
-    def __init__(self) -> None:
+    def __init__(self, registry_directory: Path) -> None:
+        self._registry_directory = registry_directory
         self.registered: list[tuple[SessionTarget, Path]] = []
+
+    def registry_directory(self) -> Path:
+        return self._registry_directory
 
     def launch_bootstrap(self, channel_socket_path: Path) -> str:
         return json.dumps({"socketPath": str(channel_socket_path), "approvalSocketPath": "/tmp/a"})
@@ -179,13 +183,12 @@ def _clean_up_after_every_test():
         shutil.rmtree(_RUNTIME_ROOTS.pop(), ignore_errors=True)
 
 
-def settings_for(tmp_path: Path, *, binary: Path, registry: Path, **extra) -> LauncherSettings:
+def settings_for(tmp_path: Path, *, binary: Path, **extra) -> LauncherSettings:
     runtime = Path(tempfile.mkdtemp(prefix="vc-t-", dir="/tmp"))
     _RUNTIME_ROOTS.append(runtime)
     return LauncherSettings(
         claude_binary=binary,
         codex_binary=binary,
-        registry_directory=registry,
         runtime_directory=runtime,
         **extra,
     )
@@ -475,10 +478,8 @@ class TestTheConsole:
 
 class TestTheDirectChildLauncher:
     def _launcher(self, tmp_path: Path, binary: Path, registry: Path) -> DirectChildLauncher:
-        launcher = DirectChildLauncher(
-            settings=settings_for(tmp_path, binary=binary, registry=registry)
-        )
-        launcher.use_claude(FakeClaudeEngine())
+        launcher = DirectChildLauncher(settings=settings_for(tmp_path, binary=binary))
+        launcher.use_claude(FakeClaudeEngine(registry))
         return launcher
 
     def test_a_launched_session_comes_back_with_the_exact_identity(self, tmp_path: Path) -> None:
@@ -494,6 +495,24 @@ class TestTheDirectChildLauncher:
         assert outcome.target is not None
         assert outcome.target.session_id == "abc-123"
         assert outcome.target.pid is not None
+
+    def test_a_non_default_registry_directory_preserves_the_launch_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        registry = tmp_path / "deployment-registry"
+        decoy_registry = tmp_path / "launcher-registry-decoy"
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        a_record(decoy_registry, os.getpid(), cwd=workspace, session_id="decoy-session")
+        binary = a_fake_claude(tmp_path / "claude", registry, session_id="configured-session")
+        launcher = DirectChildLauncher(settings=settings_for(tmp_path, binary=binary))
+        launcher.use_claude(FakeClaudeEngine(registry))
+
+        outcome = asyncio.run(self._launch_then_close(launcher, a_request(workspace)))
+
+        assert outcome.status is LaunchStatus.LAUNCHED
+        assert outcome.target is not None
+        assert outcome.target.session_id == "configured-session"
 
     def test_the_launch_carries_the_hook_plugin_and_the_permission_mode(
         self, tmp_path: Path
@@ -535,11 +554,10 @@ class TestTheDirectChildLauncher:
         settings = settings_for(
             tmp_path,
             binary=binary,
-            registry=registry,
             interpreter=interpreter,
         )
         launcher = DirectChildLauncher(settings=settings)
-        launcher.use_claude(FakeClaudeEngine())
+        launcher.use_claude(FakeClaudeEngine(registry))
 
         async def run() -> tuple[list[dict], list[Path]]:
             outcome = await launcher.launch(a_request(workspace))
@@ -714,9 +732,7 @@ class TestTheDirectChildLauncher:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc")
-        launcher = DirectChildLauncher(
-            settings=settings_for(tmp_path, binary=binary, registry=registry)
-        )
+        launcher = DirectChildLauncher(settings=settings_for(tmp_path, binary=binary))
 
         outcome = asyncio.run(launcher.launch(a_request(workspace)))
 
@@ -729,10 +745,7 @@ class TestTheDirectChildLauncher:
         return outcome
 
     def test_it_verifies_by_reaching_for_the_binaries(self, tmp_path: Path) -> None:
-        registry = tmp_path / "registry"
-        launcher = DirectChildLauncher(
-            settings=settings_for(tmp_path, binary=tmp_path / "absent", registry=registry)
-        )
+        launcher = DirectChildLauncher(settings=settings_for(tmp_path, binary=tmp_path / "absent"))
 
         result = asyncio.run(launcher.verify())
 
@@ -746,10 +759,8 @@ class TestClosingADirectChild:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc-123")
-        launcher = DirectChildLauncher(
-            settings=settings_for(tmp_path, binary=binary, registry=registry)
-        )
-        launcher.use_claude(FakeClaudeEngine())
+        launcher = DirectChildLauncher(settings=settings_for(tmp_path, binary=binary))
+        launcher.use_claude(FakeClaudeEngine(registry))
         return launcher, workspace
 
     def test_a_close_ends_the_session(self, tmp_path: Path) -> None:
@@ -1009,10 +1020,8 @@ class TestThePaneCommand:
 
 class TestTheTmuxLauncher:
     def _launcher(self, tmp_path: Path, tmux: FakeTmux, *, binary: Path, registry: Path):
-        launcher = TmuxLauncher(
-            settings=settings_for(tmp_path, binary=binary, registry=registry), tmux=tmux
-        )
-        launcher.use_claude(FakeClaudeEngine())
+        launcher = TmuxLauncher(settings=settings_for(tmp_path, binary=binary), tmux=tmux)
+        launcher.use_claude(FakeClaudeEngine(registry))
         return launcher
 
     async def _with_short_confirm(self, launcher: TmuxLauncher, request: LaunchRequest):
@@ -1094,9 +1103,8 @@ class TestTheTmuxLauncher:
         assert not any(held.poll() is None for held in tmux.windows.values())
 
     def test_it_verifies_against_the_tmux_it_would_actually_use(self, tmp_path: Path) -> None:
-        registry = tmp_path / "registry"
         launcher = TmuxLauncher(
-            settings=settings_for(tmp_path, binary=tmp_path / "claude", registry=registry),
+            settings=settings_for(tmp_path, binary=tmp_path / "claude"),
             tmux=FakeTmux(available=False),
         )
 
@@ -1134,10 +1142,8 @@ class TestClosingATmuxSession:
         workspace.mkdir()
         tmux = FakeTmux()
         binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc-123")
-        launcher = TmuxLauncher(
-            settings=settings_for(tmp_path, binary=binary, registry=registry), tmux=tmux
-        )
-        launcher.use_claude(FakeClaudeEngine())
+        launcher = TmuxLauncher(settings=settings_for(tmp_path, binary=binary), tmux=tmux)
+        launcher.use_claude(FakeClaudeEngine(registry))
         return launcher, tmux, workspace
 
     def test_a_tmux_that_cannot_be_asked_fails_rather_than_presuming_the_session_gone(
@@ -1228,12 +1234,12 @@ class TestOneLaunchPerIdentity:
         workspace = tmp_path / "ws"
         workspace.mkdir()
         binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc-123")
-        settings = settings_for(tmp_path, binary=binary, registry=registry)
+        settings = settings_for(tmp_path, binary=binary)
         if adapter == "tmux":
             launcher = TmuxLauncher(settings=settings, tmux=FakeTmux())
         else:
             launcher = DirectChildLauncher(settings=settings)
-        launcher.use_claude(FakeClaudeEngine())
+        launcher.use_claude(FakeClaudeEngine(registry))
 
         async def run():
             request = a_request(workspace)
@@ -1260,6 +1266,10 @@ class TestSettings:
         this file is somebody adding the key.
         """
         assert "permission_mode" not in {field for field in LauncherSettings.__dataclass_fields__}
+
+    def test_registry_directory_belongs_to_the_claude_agent(self) -> None:
+        with pytest.raises(SettingsError, match="does not have"):
+            LauncherSettings.of({"registry_directory": "/tmp/other-registry"})
 
     def test_a_binary_that_is_named_but_absent_is_refused_by_name(self, tmp_path: Path) -> None:
         settings = LauncherSettings(claude_binary=tmp_path / "nowhere")
@@ -1336,7 +1346,7 @@ class TestPreparingACodexSession:
     def _preparation(self, tmp_path: Path, workspace: Path, host: FakeAppServerHost):
         return CodexPreparation(
             a_codex_request(workspace),
-            settings=settings_for(tmp_path, binary=Path("/bin/sh"), registry=tmp_path / "r"),
+            settings=settings_for(tmp_path, binary=Path("/bin/sh")),
             host=host,
             engine=FakeCodexEngine(),
             confirm_timeout_seconds=3.0,
