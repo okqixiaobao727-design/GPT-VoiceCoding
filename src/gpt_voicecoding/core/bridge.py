@@ -640,6 +640,15 @@ class BridgeCore:
                 await self._relay_inbound(found)
             case InboundClass.UNKNOWN:
                 await self._reply(found.reply)
+        if found.kind is InboundClass.ANSWER_RELAY:
+            assert found.target is not None  # the router sets one for every ANSWER_RELAY
+            _log.info(
+                "handled inbound Companion Channel message kind=%s target=%s",
+                found.kind,
+                found.target,
+            )
+        else:
+            _log.info("handled inbound Companion Channel message kind=%s", found.kind)
 
     async def _relay_inbound(self, found: Classification) -> None:
         assert found.target is not None  # the router sets one for every ANSWER_RELAY
