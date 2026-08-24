@@ -12,6 +12,12 @@ suite design must be approved on ticket
 [#51](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/51) before the suite
 is built. Amendment history: charting session added #48 to scope, ungated #41 (RETIRE
 decided), and replaced the #12 acceptance leg with Simon's manual acceptance run.
+2026-08-24 pre-work rulings (Simon-directed, recorded on
+[#52](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/52)): #32's exact pin
+stands (already on `main` at `89bc65b`; the branch clears the post-pin drift); #42+#37 are
+ONE branch; #45+#47 are ONE branch (#45 via `ClaudeEngineFacts`, #47 via
+`TestTheThingsThatMustAgree`); the whole-bundle self-containment check is delivered by #43's
+branch and #38 closes against it — #38 moved to share #43's row.
 
 ## Scope — exactly these tickets, nothing else
 
@@ -19,17 +25,16 @@ All on `okqixiaobao727-design/GPT-VoiceCoding`:
 
 | order | ticket | one-line |
 | --- | --- | --- |
-| 1 | #32 | CI enforces a formatter it does not pin — fix FIRST, it unbreaks CI for every branch after |
-| 2 | #42 + #37 | channel plugin never rendered/installed (#42) and never selected (#37) — two halves of one feature; propose to the advisor whether one branch or two BEFORE starting |
-| 3 | #38 | manifest symptom resolves via #42; #38's own deliverable is the bundle self-containment check (widened per #43's note) |
-| 4 | #39 | engine never attaches to a launched Codex Session's app-server |
-| 5 | #40 | Claude side never raises SessionStopped (read #20 alongside — sibling, same observation point) |
-| 6 | #41 | Notice Relay: **RETIRE — decided** (Simon, 2026-08-24, recorded on the ticket): remove `notice_relay` from the Agent seam and both adapters, plus `peer.py`, `notice.py`, the cc-socks receipt listener, `remove_stale_listeners` — no orphaned remainder |
-| 7 | #43 | build pipeline rewrites only enumerated shebangs, not all of engine/bin/ |
-| 8 | #44 | /tmp/vc-approvals-<pid>/ never removed |
-| 9 | #48 | inbound Companion Channel messages leave no trace in the engine log — log the exercised path per the engine's `getLogger` convention (precedent: legacy #23) |
-| 10 | #45 + #47 | mirrored constants: registry dir (Python×2) and socket path (cross-language) — one convention, precedent in `TestTheThingsThatMustAgree` (test_app_bundle.py:262); see ledger V19 |
-| 11 | #46 | protocol version compared by nobody — the check is the fix; deleting the field is not on the table |
+| 1 | #32 | CI enforces a formatter it does not pin — fix FIRST, it unbreaks CI for every branch after. **Ruled:** the exact pin is already on `main` (`89bc65b`, `ruff==0.16.4`); the branch rebuilds the venv to the pin, reformats the post-pin drift (10 files), brings CI green. Formatter upgrades are henceforth deliberate pin-bump+reformat commits |
+| 2 | #42 + #37 | channel plugin never rendered/installed (#42) and never selected (#37) — two halves of one feature. **Ruled: ONE branch**, mirroring the hook-plugin pattern (`claude.py:120/:128/:173`); two red tests, each ticket closed with its own resolution comment |
+| 3 | #39 | engine never attaches to a launched Codex Session's app-server |
+| 4 | #40 | Claude side never raises SessionStopped (read #20 alongside — sibling, same observation point) |
+| 5 | #41 | Notice Relay: **RETIRE — decided** (Simon, 2026-08-24, recorded on the ticket): remove `notice_relay` from the Agent seam and both adapters, plus `peer.py`, `notice.py`, the cc-socks receipt listener, `remove_stale_listeners` — no orphaned remainder |
+| 6 | #43 + #38 | **Ruled: one check, one home.** #43's branch delivers the exhaustive shebang rewrite over `engine/bin/` AND the whole-bundle self-containment check wired into the build (red-first flips in-branch). #38's manifest symptom resolves via #42; #38 closes against #43's check with its own resolution comment |
+| 7 | #44 | /tmp/vc-approvals-<pid>/ never removed |
+| 8 | #48 | inbound Companion Channel messages leave no trace in the engine log — log the exercised path per the engine's `getLogger` convention (precedent: legacy #23) |
+| 9 | #45 + #47 | mirrored constants — **Ruled: ONE branch, one convention.** #45: delete the launcher's `registry_directory` key; the adapter tells it via the existing `ClaudeEngineFacts` protocol (`approval_socket_path` precedent). #47: enroll the socket path in `TestTheThingsThatMustAgree` (test_app_bundle.py:262); the convention is a case in that class per two-language constant — no scanner, no framework. See ledger V19 |
+| 10 | #46 | protocol version compared by nobody — the check is the fix; deleting the field is not on the table |
 
 NOT in scope: #31, #33, #36 (post-v0 queue), #17/#29 (parked), any refactor not demanded by
 a ticket. Scope creep goes to the advisor first, always.
