@@ -29,6 +29,7 @@ import pytest
 from codex_fake import FakeAppServer, FakeRemoteError
 from gpt_voicecoding.adapters.call.realtime import (
     APPROVAL_POLICY,
+    DEFAULT_REALTIME_MODEL,
     SANDBOX,
     DelegatedTurnError,
     RealtimeCallAdapter,
@@ -170,6 +171,92 @@ class TestBringingACallUp:
                 assert started["approvalPolicy"] == APPROVAL_POLICY == "never"
                 assert started["sandbox"] == SANDBOX == "danger-full-access"
                 assert started["cwd"] == "/tmp"
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_realtime_model_the_backend_still_accepts_is_sent(
+        self, socket_path: Path
+    ) -> None:
+        """The model rides at the top level of the start, and it is not codex's default.
+
+        codex serializes a `session.model` of its own on this path no matter how
+        it is configured, and on 2026-08-22 the backend stopped accepting the
+        value it picks. The refusal names the field — `Field \u0060session.model\u0060
+        is not allowed for this Codex realtime session` — but what is refused is
+        the *value*; the allowlist moved (#35, openai/codex#40140). Stating a
+        model that is still on the allowlist is what brings the call up.
+
+        This value is granted by the far side, not derived here. When it expires
+        the call fails the same way again: **re-run the probe and re-derive the
+        model — do not loosen this assertion.** A test that stopped checking
+        which model was sent would let the next expiry look like our bug.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(server, Sink())
+
+                await adapter.ensure_call(HOUSE_RULES)
+
+                start = server.calls_to("thread/realtime/start")[0]
+                assert start["model"] == DEFAULT_REALTIME_MODEL == "gpt-live-1-codex"
+                assert "session" not in start, "the model rides at the top level"
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_stated_realtime_model_overrides_the_default(self, socket_path: Path) -> None:
+        """The operator's escape hatch when the allowlist moves again, exercised."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(
+                    server, Sink(), settings=quick(realtime_model="gpt-live-2-later")
+                )
+
+                await adapter.ensure_call(HOUSE_RULES)
+
+                start = server.calls_to("thread/realtime/start")[0]
+                assert start["model"] == "gpt-live-2-later"
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_refused_start_says_which_realtime_model_was_asked_for(
+        self, socket_path: Path, caplog
+    ) -> None:
+        """The upstream words verbatim, plus the value this engine actually sent.
+
+        The 2026-08-22 outage was an upstream refusal of the model *value*
+        reported as a refusal of the *field*, and our own failure line never
+        said which model had gone out — so the log agreed with the misleading
+        reading for two days (#35). Upstream still speaks for itself; we add
+        only what upstream declined to mention.
+        """
+        caplog.set_level("INFO", logger="gpt_voicecoding.adapters.call.realtime.adapter")
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+
+                def refuse(_params: dict) -> dict:
+                    raise FakeRemoteError(
+                        '{"detail":"Field `session.model` is not allowed for '
+                        'this Codex realtime session"}'
+                    )
+
+                server.answers("thread/realtime/start", refuse)
+                adapter, _ = await riding(server, Sink())
+
+                snapshot = await adapter.ensure_call(HOUSE_RULES)
+
+                assert snapshot.state is CallState.DOWN
+                logged = " ".join(record.getMessage() for record in caplog.records)
+                assert "Field `session.model` is not allowed" in logged
+                assert DEFAULT_REALTIME_MODEL in logged
                 await adapter.aclose()
 
         asyncio.run(scenario())
@@ -828,6 +915,26 @@ class TestWhatThisSpokeMayBeTold:
         for name in ("approval_policy", "sandbox", "approvalPolicy"):
             with pytest.raises(SettingsError):
                 RealtimeCallSettings.of({name: "on-request"})
+
+    def test_the_realtime_model_is_a_setting_because_the_peer_can_revoke_it(self) -> None:
+        """Unlike the approval policy and the sandbox, this value is not ours to pin.
+
+        Those two are mechanism identity: this repository verifies them and they
+        move only when our code moves. The realtime model's validity is granted
+        and withdrawn by the backend — it moved once inside five days with no
+        client change (#35) — so it is an environment fact with a default, and
+        the operator gets a one-line escape hatch instead of a wait for our next
+        release.
+        """
+        assert RealtimeCallSettings().realtime_model == DEFAULT_REALTIME_MODEL
+        assert RealtimeCallSettings.of({"realtime_model": "gpt-live-2-later"}).realtime_model == (
+            "gpt-live-2-later"
+        )
+
+    def test_an_empty_realtime_model_refuses_to_start(self) -> None:
+        for value in ("", "   ", 7):
+            with pytest.raises(SettingsError):
+                RealtimeCallSettings.of({"realtime_model": value})
 
     def test_the_workspace_defaults_to_a_directory_that_always_exists(self) -> None:
         assert RealtimeCallSettings().cwd == Path.home()
