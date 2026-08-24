@@ -499,6 +499,23 @@ class TestTheSocketItself:
     def test_two_engines_do_not_share_one_socket(self, socket_root: Path) -> None:
         assert approval_socket_path(socket_root, 1) != approval_socket_path(socket_root, 2)
 
+    def test_closing_removes_the_private_socket_directory(self, socket_root: Path) -> None:
+        async def scenario() -> Path:
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=14,
+            )
+            await listener.start()
+            directory = listener.path.parent
+            assert directory.exists(), "start creates the private socket directory"
+            await listener.aclose()
+            return directory
+
+        directory = asyncio.run(scenario())
+        assert not directory.exists(), "close removes the private socket directory"
+
     def test_closing_the_engine_releases_every_parked_dialog_to_its_human(
         self, socket_root: Path
     ) -> None:
