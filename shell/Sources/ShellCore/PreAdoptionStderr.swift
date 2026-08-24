@@ -46,7 +46,13 @@ final class PreAdoptionStderr: @unchecked Sendable {
         lock.withLock { monitoring = true }
         pipe.fileHandleForReading.readabilityHandler = { [self] handle in
             let chunk = handle.availableData
-            if !chunk.isEmpty { deliver(chunk) }
+            // An empty read **is** the end of the pipe, and a descriptor at its
+            // end is permanently readable — so a watch that reads emptiness and
+            // returns is asked again at once, and again, for as long as the
+            // watch is up. Stop watching, which is the only thing the end of a
+            // pipe ever asks for.
+            guard !chunk.isEmpty else { return stopMonitoring() }
+            deliver(chunk)
         }
     }
 
