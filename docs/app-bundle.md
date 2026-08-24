@@ -172,12 +172,25 @@ own words.
 **7. Approval Relay.** Get the Session to ask for a permission it needs, and
 answer it by voice. One verdict, one request.
 
-**8. The Companion Channel.** End the call. A notice must reach Telegram, and a
-reply typed there must come back as inbound text.
+A live Session is reachable *only* through the Answer Relay: `launch --task`
+carries a label, not an instruction, and a launched Session has no terminal to
+type into. Steps 6 and 7 therefore share the fate of the Session Channel — if
+the carrier is not there, neither step is performable, and that is a blocked
+step rather than a failed one.
+
+**8. The Companion Channel.** A notice must reach Telegram, and a reply typed
+there must come back as inbound text. **Run this with Voice off**, together with
+step 9's text-only leg — with Voice on it cannot pass, and that is correct
+behaviour rather than a fault. The escalation matrix sends a notice to the
+Companion Channel only when the call route is shut: with Voice on and no call
+up, escalation *opens a call and speaks* instead of pushing. Ending a call with
+Voice on therefore produces no push, and must not be recorded as a failure of
+this step.
 
 **9. The switches.** Duty off: nothing is spoken and nothing is pushed, but
 events are still recorded and the control plane still answers. Voice off,
-Message on: text-only operation. Then back.
+Message on: text-only operation — this is the leg step 8's Telegram clause is
+exercised under. Then back.
 
 **10. Headless.** Every one of the above must be reachable through `bridgectl`
 from a terminal, against the same running engine.
