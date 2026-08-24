@@ -17,7 +17,10 @@ decided), and replaced the #12 acceptance leg with Simon's manual acceptance run
 stands (already on `main` at `89bc65b`; the branch clears the post-pin drift); #42+#37 are
 ONE branch; #45+#47 are ONE branch (#45 via `ClaudeEngineFacts`, #47 via
 `TestTheThingsThatMustAgree`); the whole-bundle self-containment check is delivered by #43's
-branch and #38 closes against it — #38 moved to share #43's row.
+branch and #38 closes against it — #38 moved to share #43's row. 2026-08-25 amendment (wayfinder ticket
+[#53](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/53), Simon-decided): #55 added to
+scope as order 11 — the Telegram token's durable home, delivered before the bundle rebuild so
+the manual acceptance run uses the shipped mechanism.
 
 ## Scope — exactly these tickets, nothing else
 
@@ -35,6 +38,7 @@ All on `okqixiaobao727-design/GPT-VoiceCoding`:
 | 8 | #48 | inbound Companion Channel messages leave no trace in the engine log — log the exercised path per the engine's `getLogger` convention (precedent: legacy #23) |
 | 9 | #45 + #47 | mirrored constants — **Ruled: ONE branch, one convention.** #45: delete the launcher's `registry_directory` key; the adapter tells it via the existing `ClaudeEngineFacts` protocol (`approval_socket_path` precedent). #47: enroll the socket path in `TestTheThingsThatMustAgree` (test_app_bundle.py:262); the convention is a case in that class per two-language constant — no scanner, no framework. See ledger V19 |
 | 10 | #46 | protocol version compared by nobody — the check is the fix; deleting the field is not on the table |
+| 11 | #55 | Telegram token is set from the menu bar and survives a reboot — **decided on #53** (Simon, 2026-08-25): the shell owns the token in a 0600 `KEY=VALUE` file under its Application Support base and injects it at engine spawn under the name `config.toml` `token_env` gives (read via `MinimalTOML`); pre-spawn preflight replaces the empty Retry panel. No Keychain, no `launchctl setenv`, engine unchanged. Red-first in `swift test` |
 
 NOT in scope: #31, #33, #36 (post-v0 queue), #17/#29 (parked), any refactor not demanded by
 a ticket. Scope creep goes to the advisor first, always.
