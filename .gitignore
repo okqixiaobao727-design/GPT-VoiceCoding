@@ -32,6 +32,8 @@ scratch/
 CLAUDE.md
 AGENTS.md
 docs/agents/
+agentcrew.toml
+crewtask/
 
 # Secrets and local runtime config
 .env
