@@ -415,9 +415,10 @@ rather than `Contents/MacOS`: `pip` installs a console script beside the
 interpreter that installed it, and the bundle's interpreter is under
 `Contents/Resources/engine/`. There is no second copy in `Contents/MacOS/` — a
 duplicate binary that shadowed the real one would be two things to sign and two
-things to be wrong. The bundled `bridgectl` is a two-line wrapper that execs the
-interpreter sitting beside it, because `pip`'s own console script carries an
-*absolute* shebang and would stop working the moment the `.app` is moved. See
+things to be wrong. The bundled `bridgectl` keeps `pip`'s console-script body,
+but the pipeline replaces its *absolute* shebang with a shell/Python preamble
+that resolves the script's real path and execs the interpreter sitting beside
+it. The same rewrite covers every Python console script in `engine/bin/`; see
 [`docs/app-bundle.md`](app-bundle.md).
 
 An unconfigured Call, Companion Channel or Session Launcher seam **refuses to

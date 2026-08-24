@@ -141,14 +141,26 @@ def install(plan: BuildPlan) -> None:
     )
 
 
-def relocate_cli(plan: BuildPlan) -> None:
-    """Replace pip's absolute-shebang console script with one that moves.
+def remove_install_provenance(plan: BuildPlan) -> None:
+    """Drop local-source metadata so the installed tree names no checkout."""
+    for provenance in plan.engine_root.glob(
+        "lib/python*/site-packages/*.dist-info/direct_url.json"
+    ):
+        record = provenance.with_name("RECORD")
+        if record.exists():
+            entry = f"{provenance.parent.name}/{provenance.name},"
+            lines = record.read_text().splitlines(keepends=True)
+            record.write_text("".join(line for line in lines if not line.startswith(entry)))
+        provenance.unlink()
 
-    Written after `install`, because that is what put the script there, and
-    before `sign`, because it is bundle content and the signature seals it.
+
+def relocate_console_scripts(plan: BuildPlan) -> None:
+    """Replace every pip-installed absolute shebang with one that moves.
+
+    Written after `install`, because that is what put the scripts there, and
+    before `sign`, because they are bundle content and the signature seals them.
     """
-    plan.engine_cli.write_text(console_script.WRAPPER)
-    plan.engine_cli.chmod(console_script.MODE)
+    console_script.relocate_all(plan.engine_root / "bin")
 
 
 def precompile(plan: BuildPlan) -> None:
@@ -280,6 +292,42 @@ def verify_relocatable(plan: BuildPlan) -> None:
         )
 
 
+def _shared_checkout_root(source_root: Path) -> Path:
+    """Return the primary checkout when ``source_root`` is a linked worktree."""
+    git_pointer = source_root / ".git"
+    if not git_pointer.is_file():
+        return source_root
+    prefix = "gitdir: "
+    pointer = git_pointer.read_text().strip()
+    if not pointer.startswith(prefix):
+        return source_root
+    git_directory = Path(pointer.removeprefix(prefix))
+    if not git_directory.is_absolute():
+        git_directory = (source_root / git_directory).resolve()
+    for candidate in (git_directory, *git_directory.parents):
+        if candidate.name == ".git":
+            return candidate.parent
+    return source_root
+
+
+def verify_self_contained(app: Path, *, source_root: Path = inputs.REPO_ROOT) -> None:
+    """Refuse text in the assembled bundle that still names its source tree."""
+    sources = {
+        str(source_root).encode(),
+        str(_shared_checkout_root(source_root)).encode(),
+    }
+    leaked: list[Path] = []
+    for path in sorted(app.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        contents = path.read_bytes()
+        if b"\0" not in contents and any(source in contents for source in sources):
+            leaked.append(path.relative_to(app))
+    if leaked:
+        names = "\n".join(f"- {path}" for path in leaked)
+        raise BuildFailed(f"the bundle contains source-checkout references:\n{names}")
+
+
 # --- the whole thing --------------------------------------------------------
 
 
@@ -289,8 +337,10 @@ def build(plan: BuildPlan) -> Path:
     if not plan.without_engine:
         extract(fetch(plan.interpreter), into=plan.engine_root)
         install(plan)
-        relocate_cli(plan)
+        remove_install_provenance(plan)
+        relocate_console_scripts(plan)
         precompile(plan)
+    verify_self_contained(plan.app)
     sign(plan)
     verify(plan)
     if not plan.without_engine:

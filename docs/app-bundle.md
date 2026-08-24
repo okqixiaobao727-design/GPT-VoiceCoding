@@ -21,6 +21,16 @@ the shell's own resolver falls through past, to `GPTVOICECODING_ENGINE_PYTHON` o
 `PATH` — the developer path, which is a stated feature rather than a degraded
 build.
 
+After the engine is installed, the pipeline inspects every ordinary executable
+text file in `engine/bin/`. A Python console script whose shebang names the
+interpreter in this build tree is given a shell/Python preamble that re-executes
+the `python3` beside the script; shell scripts and binaries are left as they are.
+There is no list of console-script names, so a script added by a future locked
+dependency takes the same path automatically. Before signing, the pipeline also
+checks every text file in the assembled `.app` and refuses the build if any one
+still names the source checkout. The real bundle build in CI runs that same
+check.
+
 ## What ends up inside
 
 ```
@@ -71,7 +81,8 @@ produces a bundle that verifies clean and fails at the one moment it matters.
 | Hardened runtime **off** | It buys nothing v0 ships — it is what notarization needs — and it is the most likely cause of the CFFI audio-callback crash the `allow-jit` escape hatch was reserved for, whose usual companion fix (`disable-library-validation`) is forbidden. It becomes the notarization-era ticket's decision, where `allow-jit` becomes live again. |
 | `com.apple.security.device.audio-input` on the bundled interpreter only | Entitlements go on executables, and `python3.12` is the process that opens the device. Without the sandbox or the hardened runtime it is **inert** — belt and braces, deliberately, so the bundle is already the right shape later. It is not what earns the grant. |
 | Bytecode pre-compiled at build time | Nothing may write into the bundle at runtime. The shell already sets `PYTHONDONTWRITEBYTECODE` for the bundled interpreter it spawns; this covers the two cases it cannot see — the engine run headless from a terminal, and the relocated `bridgectl` — and it also means a start does not recompile from source into memory. |
-| `bridgectl` is a two-line wrapper, not pip's console script | `pip` writes an **absolute** shebang. The interpreter relocates; its scripts do not. The engine's own check on `[delegate] cli` is "is a runnable file", which a dead shebang passes — so the failure would surface as `bad interpreter` inside a generated instruction. |
+| Every Python console script is relocated, without a name list | `pip` writes an **absolute** shebang. The interpreter relocates; its scripts do not. The pipeline examines every executable text file in `engine/bin/` and replaces only a shebang that names this build's bundled interpreter. `bridgectl`, `cffi-gen-src`, `pyav`, and any future locked dependency script therefore share one mechanism. |
+| The assembled bundle must not name its source checkout | A build-tree path works on the build machine and dies when that checkout or worktree is removed. The final pre-signing check scans the whole `.app`, and CI's real bundle build fails if any text file still carries the source root. Local-install provenance (`direct_url.json`) is removed because it would otherwise violate the same invariant even though the engine never reads it. |
 | The user's `PATH` is read from an **interactive** login shell, delimited by sentinels | launchd hands a Finder-launched `.app` `/usr/bin:/bin:/usr/sbin:/sbin`, and the engine and every Session it launches inherit it. The fix reads the user's own shell — but `-lc` was the wrong question: zsh sources `~/.zshrc` only when interactive, and `~/.zshrc` is where `nvm`'s installer and `brew shellenv` actually write. `-i` reaches that page of the ledger; the sentinels are what make an interactive shell's chatter (powerlevel10k's instant prompt) separable from the answer. Same shape VS Code's shell integration uses. `.zprofile` is a steadier home for a `PATH`, but a product that only works for users who already knew that is broken for the majority. |
 | `config.example.toml` is shipped, never installed | The configuration is a file the user owns and the engine only reads, and it names adapters by import reference, so it runs with the privileges of whoever wrote it. An installer that authored it would be claiming something that is not the installer's. |
 
