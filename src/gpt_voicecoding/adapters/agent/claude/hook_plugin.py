@@ -20,13 +20,12 @@ structural rather than disciplinary: a Session that did not get the flag has no
 hook to fire, so there is no foreign dialog for the engine to refuse. The hook's
 own bootstrap-variable check remains as a second line, not as the scope.
 
-**A separate directory from the channel plugin, and it has to be.** The channel
-is selected as `plugin:<name>@<marketplace>`, which only resolves for a plugin
-installed from a registered marketplace; `--plugin-dir` has no marketplace. One
-directory cannot be both without being loaded twice, so there are two plugins.
-The name below is chosen once and does not change, for the same reason the
-channel plugin's does not: Claude Code caches a plugin by name and version, and a
-planned rename is scheduled identity churn.
+**A separate directory from the channel plugin.** Both plugins are now loaded
+inline per Session (ADR 0007's Session Channel launch probe). Their established
+identities and directories remain separate so either Relay route can be loaded
+or absent independently. The name below is chosen once and does not change, for
+the same reason the channel plugin's does not: Claude Code caches a plugin by
+name and version, and a planned rename is scheduled identity churn.
 
 **The version is a fingerprint of what the plugin actually says**, exactly as the
 channel plugin's is, so a changed hook command is a new directory by construction

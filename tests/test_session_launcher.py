@@ -513,6 +513,63 @@ class TestTheDirectChildLauncher:
         assert "--permission-mode default" in said
         assert "--plugin-dir" in said
 
+    def test_the_launch_renders_the_channel_plugin_with_the_deployment_interpreter(
+        self, tmp_path: Path
+    ) -> None:
+        """The launcher, not its test, supplies the Session Channel manifest."""
+        registry = tmp_path / "registry"
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc-123")
+        interpreter = tmp_path / "bundle-python3"
+        settings = settings_for(
+            tmp_path,
+            binary=binary,
+            registry=registry,
+            interpreter=interpreter,
+        )
+        launcher = DirectChildLauncher(settings=settings)
+        launcher.use_claude(FakeClaudeEngine())
+
+        async def run() -> tuple[list[dict], list[Path]]:
+            outcome = await launcher.launch(a_request(workspace))
+            assert outcome.target is not None
+            manifests = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in settings.runtime_directory.rglob("plugin.json")
+            ]
+            await launcher.aclose()
+            return manifests, list(settings.runtime_directory.iterdir())
+
+        manifests, left_after_close = asyncio.run(run())
+        channel_manifests = [manifest for manifest in manifests if "channels" in manifest]
+        assert len(channel_manifests) == 1
+        assert channel_manifests[0]["mcpServers"]["gpt-voicecoding-claude-channel"][
+            "command"
+        ] == str(interpreter)
+        assert left_after_close == []
+
+    def test_the_launch_loads_and_selects_the_session_channel(self, tmp_path: Path) -> None:
+        """The product supplies both the inline plugin and its channel selector."""
+        registry = tmp_path / "registry"
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        binary = a_fake_claude(tmp_path / "claude", registry, session_id="abc-123")
+        launcher = self._launcher(tmp_path, binary, registry)
+
+        async def run() -> str:
+            outcome = await launcher.launch(a_request(workspace))
+            assert outcome.target is not None
+            console = launcher._live[outcome.target].console
+            await asyncio.sleep(0.5)
+            said = console.tail()
+            await launcher.aclose()
+            return said
+
+        said = asyncio.run(run())
+        assert said.count("--plugin-dir") == 2
+        assert "--channels plugin:gpt-voicecoding-session-channel@gpt-voicecoding-channel" in said
+
     def test_the_same_request_id_never_starts_a_second_child(self, tmp_path: Path) -> None:
         registry = tmp_path / "registry"
         workspace = tmp_path / "ws"
@@ -1004,7 +1061,9 @@ class TestTheTmuxLauncher:
         command = tmux.commands[0][2]
         assert "--permission-mode" in command
         assert "default" in command
-        assert "--plugin-dir" in command
+        assert command.count("--plugin-dir") == 2
+        assert "--channels" in command
+        assert "plugin:gpt-voicecoding-session-channel@gpt-voicecoding-channel" in command
 
     def test_a_launch_that_never_registers_fails_and_kills_its_window(self, tmp_path: Path) -> None:
         """Nothing is left running after a launch that did not happen."""

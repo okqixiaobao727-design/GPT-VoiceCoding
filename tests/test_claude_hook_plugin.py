@@ -60,11 +60,7 @@ class TestWhatIsRendered:
         assert manifest["name"] == HOOK_PLUGIN_NAME
 
     def test_it_is_not_the_channel_plugin(self) -> None:
-        """`--plugin-dir` has no marketplace and `plugin:name@market` needs one.
-
-        One directory cannot be loaded both ways without being loaded twice, so
-        the two names must differ — and they must keep differing.
-        """
+        """The independently loaded Relay routes keep their established identities."""
         assert HOOK_PLUGIN_NAME != PLUGIN_NAME
 
     def test_the_version_fingerprints_what_the_plugin_says(self) -> None:

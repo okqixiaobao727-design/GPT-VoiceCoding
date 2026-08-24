@@ -40,10 +40,12 @@ survives a settings round trip" — wording that assumes the first mechanism.
 **The hook is rendered as its own plugin directory and loaded per Session with
 `--plugin-dir`.**
 
-- **A separate plugin from the channel's, and it has to be.** The channel is
-  selected as `plugin:<name>@<marketplace>`, which resolves only for a plugin
-  installed from a registered marketplace; `--plugin-dir` has no marketplace. One
-  directory cannot be loaded both ways without being loaded twice.
+- **A separate plugin from the channel's.** This decision originally followed
+  from the channel being marketplace-installed while the hook was inline. The
+  Session Channel launch probe below later established that both can be inline.
+  Their established identities and directories remain separate so either Relay
+  route can be loaded or absent independently; this wiring repair does not merge
+  two plugin identities into one.
 - **One name, chosen once**: `gpt-voicecoding-approval-hook`. Claude Code caches a
   plugin by name and version and that cache outlives what it came from, so a
   planned rename is scheduled identity churn — the same reasoning ADR 0006's
@@ -59,6 +61,34 @@ survives a settings round trip" — wording that assumes the first mechanism.
 The manifest names no interpreter, for the reason ADR 0006 gives: which Python
 runs it is a property of the deployment, so it is an argument the launcher and
 the bundle supply.
+
+### Session Channel launch probe
+
+On 2026-08-25, Claude Code 2.1.241 was probed with the approval hook and the
+Session Channel supplied as two repeated `--plugin-dir` arguments, plus
+`--channels plugin:gpt-voicecoding-session-channel@gpt-voicecoding-channel`.
+The probe used an isolated `HOME` and `CLAUDE_CONFIG_DIR` containing no installed
+plugins or marketplaces. Claude Code loaded the Session Channel as an inline
+plugin, connected its MCP server, and exposed `acknowledge_answer`; its debug log
+also recorded that no marketplaces were declared. Authentication failed only
+after plugin initialization, so it did not affect the observed loading and MCP
+connection.
+
+The isolation did not and cannot remove the administrator-owned
+`/Library/Application Support/ClaudeCode/managed-settings.json`. The probe
+machine had channels enabled and an `allowedChannelPlugins` entry matching
+`gpt-voicecoding-session-channel@gpt-voicecoding-channel`. That managed policy
+remains a deployment precondition: without it Claude Code does not admit the
+channel. The probe establishes that marketplace registration and installation
+are unnecessary; it does not establish that administrator admission is
+unnecessary.
+
+Therefore a launch renders the Session Channel plugin into its own per-launch
+directory, passes that directory as a second `--plugin-dir`, and selects it with
+`--channels`. Discarding the launch removes the per-launch directory and both
+plugins with it. No marketplace registration, installation, cache entry, or
+user-owned Claude configuration is part of this route; the managed policy above
+is still required.
 
 ## Consequences
 

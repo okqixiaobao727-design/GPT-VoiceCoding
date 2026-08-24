@@ -66,12 +66,12 @@ class LauncherSettings:
     #: never looks at it.
     tmux_binary: Path | None = None
     #: Where this engine puts what one launch needs: the Session Channel socket,
-    #: the per-TUI app-server socket, and the rendered hook plugin.
+    #: the per-TUI app-server socket, and the rendered plugins.
     runtime_directory: Path = DEFAULT_RUNTIME_DIRECTORY
     #: Where a launched Claude Session says who it is. Read, never written.
     registry_directory: Path = DEFAULT_REGISTRY_DIRECTORY
-    #: Which Python runs the `PermissionRequest` hook. A property of the
-    #: deployment (ADR 0006), which is why the bundle may state it.
+    #: Which Python runs the Session Channel and `PermissionRequest` hook. A
+    #: property of the deployment (ADR 0006), which is why the bundle may state it.
     interpreter: Path = Path(sys.executable)
     terminal_type: str = DEFAULT_TERMINAL_TYPE
     #: The tmux session every launched window is created in, so an operator has

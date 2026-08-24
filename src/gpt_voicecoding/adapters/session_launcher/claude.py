@@ -1,17 +1,23 @@
-"""Starting a Claude Session: two things in the environment, one flag, one readback.
+"""Starting a Claude Session: two inline plugins, one selector, one environment, one readback.
 
-Everything the three Relay routes need from a launch arrives here, and each half
+Everything the three Relay routes need from a launch arrives here, and each route
 fails independently and fails open:
 
 - **`--plugin-dir <rendered hook plugin>`** installs the `PermissionRequest` hook
   for this Session and no other (ADR 0007). A Session launched without it has no
   hook to fire, which is silent and leaves the dialog with its human.
+- **`--plugin-dir <rendered channel plugin>` plus `--channels <selector>`** loads
+  and selects the Session Channel for this Session (ADR 0007), once the
+  administrator-owned managed settings admit that plugin identity. Without any
+  one of those three, the channel cannot carry words into the Session.
 - **the bootstrap variable**, carrying where this launch's Session Channel should
   listen and where this engine parks dialogs. A Session launched without it gets
   a channel server that cannot bind and a hook that exits without printing.
 
-Neither half is written into a settings file — the flag is per-invocation and the
-address is per-launch — so this engine still touches nothing a user owns.
+Neither inline plugin is installed into a user settings file — their paths and
+the selector are per-invocation and the addresses are per-launch — so this
+engine still touches nothing a user owns. The administrator-managed channel
+allowlist remains a deployment precondition; the engine does not own or edit it.
 
 **The binary is exec'd by absolute path.** This is not defensive style: the
 machine this was built on defines a `claude` shell function that rewrites the
@@ -33,6 +39,7 @@ from gpt_voicecoding.adapters.agent.claude.hook_plugin import (
     remove_hook_plugin,
     write_hook_plugin,
 )
+from gpt_voicecoding.adapters.agent.claude.plugin import channel_selector, write_plugin
 from gpt_voicecoding.adapters.agent.claude.privacy import (
     prepare_private_directory,
     verify_bindable_length,
@@ -60,6 +67,9 @@ CHANNEL_SOCKET_NAME = "channel.sock"
 
 #: Where the session-scoped hook plugin is rendered, inside that directory.
 HOOK_PLUGIN_DIRECTORY = "hook-plugin"
+
+#: Where the session-scoped channel plugin is rendered, inside that directory.
+CHANNEL_PLUGIN_DIRECTORY = "channel-plugin"
 
 
 class ClaudeEngineFacts(Protocol):
@@ -95,6 +105,7 @@ class ClaudePreparation:
         )
         self._channel_socket = self._directory / CHANNEL_SOCKET_NAME
         self._plugin_directory = self._directory / HOOK_PLUGIN_DIRECTORY
+        self._channel_plugin_directory = self._directory / CHANNEL_PLUGIN_DIRECTORY
         #: Taken before the spawn, so claiming can tell a Session this launch
         #: started from one that was already there. See `claiming`.
         self._before: frozenset[int] = frozenset()
@@ -105,7 +116,7 @@ class ClaudePreparation:
         return self._channel_socket
 
     async def prepare(self) -> Launch:
-        """Render the hook plugin, mint the addresses, and build the invocation."""
+        """Render both plugins, mint the addresses, and build the invocation."""
         workspace = workspace_of(self._request)
         try:
             binary = self._settings.binary_for(AgentKind.CLAUDE)
@@ -118,6 +129,7 @@ class ClaudePreparation:
         verify_bindable_length(self._channel_socket)
         prepare_private_directory(self._directory)
         write_hook_plugin(self._plugin_directory, self._settings.interpreter)
+        write_plugin(self._channel_plugin_directory, self._settings.interpreter)
 
         self._before = snapshot(self._settings.registry_directory)
         return Launch(
@@ -127,6 +139,10 @@ class ClaudePreparation:
                 PERMISSION_MODE,
                 "--plugin-dir",
                 str(self._plugin_directory),
+                "--plugin-dir",
+                str(self._channel_plugin_directory),
+                "--channels",
+                channel_selector(),
             ),
             env=child_environment(
                 {
@@ -168,7 +184,7 @@ class ClaudePreparation:
         return target
 
     async def discard(self) -> tuple[ChildOutcome, ...]:
-        """Take back the plugin this preparation rendered. It owns no processes."""
+        """Remove the hook's files, then the owned launch directory and channel plugin."""
         with contextlib.suppress(OSError):
             remove_hook_plugin(self._plugin_directory)
         with contextlib.suppress(OSError):
