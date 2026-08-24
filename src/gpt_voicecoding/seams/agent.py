@@ -1,8 +1,7 @@
 """The Agent seam — carrying words into a Session, and hearing back from it.
 
-Verbs Bridge Core calls: `answer_relay`, `notice_relay`, `approval_relay`,
-`reply_window` and `verify` (ADR 0003 — liveness is a verb on every pluggable
-seam).
+Verbs Bridge Core calls: `answer_relay`, `approval_relay`, `reply_window` and
+`verify` (ADR 0003 — liveness is a verb on every pluggable seam).
 
 **The Reply Window is a level, so it is both asked for and reported.** `reply_
 window` answers where it stands right now and is asked exactly once, when Bridge
@@ -20,9 +19,8 @@ Reply-Window queueing is Bridge Core policy. Adapters deliver; they never queue.
 grilling fixed two required behaviours — deliver (between turns) and supplement
 (mid-turn, with the user's authority intact) — and both are required of both
 agents. They are a parameter of `answer_relay` alone, because supplement only
-ever carries *user-authored* words: a Notice Relay is system-authored by
-construction and an Approval Relay is a verdict. A second verb would duplicate
-one signature to encode one boolean.
+ever carries *user-authored* words, while an Approval Relay is a verdict. A
+second verb would duplicate one signature to encode one boolean.
 
 Which routes an adapter really has is reported by `supported_routes`, statically.
 An adapter that lacks SUPPLEMENT says so and does nothing else — deciding what to
@@ -192,12 +190,6 @@ class AgentAdapter(Protocol):
         route: RelayRoute = RelayRoute.DELIVER,
     ) -> DeliveryReceipt:
         """Carry the user's own words in, with the user's authority."""
-        ...
-
-    async def notice_relay(
-        self, target: SessionTarget, text: str, *, request_id: RequestId
-    ) -> DeliveryReceipt:
-        """Carry words the system itself originates. Claims no user authority."""
         ...
 
     async def approval_relay(

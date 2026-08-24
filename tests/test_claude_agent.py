@@ -417,7 +417,7 @@ class TestWhatTheWireSays:
     def test_a_verb_that_does_not_ride_this_route_is_refused_rather_than_defaulted(self) -> None:
         """No second Relay kind may be smuggled in under the first one's name."""
         with pytest.raises(ValueError, match="does not ride the MCP channel"):
-            channel_kind_for("notice_relay")
+            channel_kind_for("unknown_relay")
 
 
 class TestTheRoutesThisBuildReallyHas:
@@ -469,28 +469,6 @@ class TestTheRoutesThisBuildReallyHas:
         verdict, received = asyncio.run(scenario())
         assert verdict.outcome is Delivery.FAILED and verdict.reason == APPROVAL_UNROUTED
         assert received == [], "a verdict never travels over the channel wire"
-
-    def test_a_notice_relay_never_touches_the_channel(self, socket_path: Path) -> None:
-        """It rides the peer socket. The two wires must not leak into each other.
-
-        The target here is in no registry, so the Notice Relay fails before the
-        wire — which is exactly the point: whatever it does, it does somewhere
-        else. `test_claude_notice.py` covers what it does on its own route.
-        """
-
-        async def scenario():
-            async with FakeChannel(socket_path) as channel:
-                adapter = reaching(socket_path, Sink())
-                try:
-                    notice = await adapter.notice_relay(TARGET, "it stopped", request_id=rid())
-                    return notice, channel.received
-                finally:
-                    await adapter.aclose()
-
-        notice, received = asyncio.run(scenario())
-        assert notice.outcome is Delivery.FAILED
-        assert notice.reason, "a failure must always say why"
-        assert received == [], "the Notice Relay must put nothing on the channel"
 
 
 class TestFailingBeforeTheWordsLeave:

@@ -10,20 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from gpt_voicecoding.adapters.agent.codex.adapter import (
-    NOTICE_FRAME,
-    CodexAgentAdapter,
-    notice_text,
-)
+from gpt_voicecoding.adapters.agent.codex.adapter import CodexAgentAdapter
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
 
 __all__ = [
-    "NOTICE_FRAME",
     "CodexAgentAdapter",
     "CodexSettings",
     "SettingsError",
     "codex_agent",
-    "notice_text",
 ]
 
 

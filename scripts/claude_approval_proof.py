@@ -7,7 +7,7 @@ decision hands the dialog back, and that `--plugin-dir` loads a plugin's
 `hooks/hooks.json` for one session and no other. CI runs no Claude Code, so the
 tests can prove the socket and the verdict and cannot prove any of that. This
 script is that gate, and it is a **manual, local job deliberately outside the
-test suite**, like the Answer Relay's and the Notice Relay's.
+test suite**, like the Answer Relay's.
 
     python3 scripts/claude_approval_proof.py            # render, park, and wait
     python3 scripts/claude_approval_proof.py --deny     # answer the dialog "no"

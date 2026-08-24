@@ -421,8 +421,6 @@ def a_record(*, pid: int, session_id: str) -> SessionRecord:
         session_id=session_id,
         cwd=Path("/a/workspace"),
         version="2.1.238",
-        peer_protocol=PEER_PROTOCOL,
-        socket_path=Path(f"/tmp/cc-socks/{pid}.sock"),
         status="idle",
     )
 

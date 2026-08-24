@@ -68,8 +68,6 @@ def test_a_record_is_read_into_exactly_what_the_adapter_addresses(tmp_path: Path
         session_id="430b0def-38ef-4783-8d57-d800710d83bd",
         cwd=Path("/Users/someone/work"),
         version="2.1.238",
-        peer_protocol=PEER_PROTOCOL,
-        socket_path=Path(f"/tmp/cc-socks/{LIVE_PID}.sock"),
         status="idle",
         name="a-session",
     )
@@ -165,4 +163,3 @@ def test_a_fork_is_two_records_under_one_session_id(tmp_path: Path) -> None:
     listed = records(tmp_path)
 
     assert len({record.session_id for record in listed}) == 1
-    assert read_record(tmp_path, 4243).socket_path == Path("/tmp/cc-socks/4243.sock")

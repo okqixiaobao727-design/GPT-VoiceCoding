@@ -220,9 +220,8 @@ Queued is not delivered, and `state` says which it was.
 Route follows the user's explicit intent and is never inferred from how busy a
 Session is — the same "busy" carries both "add this now" and "this can wait".
 
-**There is no Notice Relay action.** A Notice is words the system itself
-originates, so a surface asking for one would be a surface claiming to be the
-system.
+There is no action for system-authored words: a surface asking for one would be
+a surface claiming to be the system.
 
 ### `approve`
 

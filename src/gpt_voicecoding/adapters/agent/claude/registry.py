@@ -14,11 +14,11 @@ socket; the protocol number moves when the socket changes. Refusing on the
 number is the check that means something, and refusing on the string would
 refuse every live Session on the machine the day after an upgrade.
 
-Static re-probe of the currently pinned build (2.1.238) against the protocol
-this module assumes: `peerProtocol`, `msgV`, `orig_msg_id`, `peer_message_status`,
-`queued_command`, `source_uuid` and `crossSessionInbound` all still present, and
-the receiver's inbound dispatch still keys on a top-level `type` of `user` or
-`control`. See `peer.py` for the frame shapes those govern.
+Static re-probe of the currently pinned build (2.1.238) confirmed the registry
+fields this module validates: `pid`, `sessionId`, `cwd`, `version`,
+`peerProtocol`, `messagingSocketPath` and `status`. The validated shape is
+retained so retiring its former consumer does not widen the records accepted by
+the remaining Reply Window and Session Launcher paths.
 
 **Liveness is a separate question and is asked separately.** A record parses
 whether or not its process still exists, because "the registry says this" and
@@ -59,12 +59,6 @@ class SessionRecord:
     session_id: str
     cwd: Path
     version: str
-    peer_protocol: int
-    #: The peer socket this Session listens on, inside the shared `cc-socks`
-    #: directory. Both the address a Notice Relay is sent to and — because the
-    #: receiver only accepts reply addresses from its own socket namespace — the
-    #: directory our own receipt listener has to bind in.
-    socket_path: Path
     #: What Claude Code says this Session is doing right now: `idle`, `busy` or
     #: `waiting`. Left as the registry's own word; translating it into a Reply
     #: Window is `window.py`'s job, not this reader's.
@@ -147,14 +141,15 @@ def _record(path: Path, raw: str, *, expected_pid: int | None) -> SessionRecord:
             f"{PEER_PROTOCOL} only (last re-probed against Claude Code "
             f"{PROVEN_AGAINST_VERSION}) and will not guess at another wire"
         )
+    # Keep the existing record-acceptance contract even though no surviving
+    # consumer needs to store this address.
+    _text(document, "messagingSocketPath", path)
 
     return SessionRecord(
         pid=pid,
         session_id=_text(document, "sessionId", path),
         cwd=Path(_text(document, "cwd", path, default=str(path.parent))),
         version=_text(document, "version", path, default=""),
-        peer_protocol=protocol,
-        socket_path=Path(_text(document, "messagingSocketPath", path)),
         status=_text(document, "status", path, default=""),
         name=_text(document, "name", path, default=""),
     )
