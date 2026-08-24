@@ -22,7 +22,7 @@ DerivedData/
 .code-review-graph/
 
 # Local-only research notes, scratch work, and throwaway prototypes.
-docs/research/
+docs/research
 notes/
 scratch/
 *.local.md
@@ -31,7 +31,7 @@ scratch/
 # project: they describe how the AI agents operate here, not how the code runs.
 CLAUDE.md
 AGENTS.md
-docs/agents/
+docs/agents
 agentcrew.toml
 crewtask/
 
