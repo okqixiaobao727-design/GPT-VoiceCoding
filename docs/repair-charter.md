@@ -20,7 +20,10 @@ ONE branch; #45+#47 are ONE branch (#45 via `ClaudeEngineFacts`, #47 via
 branch and #38 closes against it — #38 moved to share #43's row. 2026-08-25 amendment (wayfinder ticket
 [#53](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/53), Simon-decided): #55 added to
 scope as order 11 — the Telegram token's durable home, delivered before the bundle rebuild so
-the manual acceptance run uses the shipped mechanism.
+the manual acceptance run uses the shipped mechanism. 2026-08-25 amendment (wayfinder ticket
+[#51](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/51), Simon-decided): the
+E2E design is approved; exit item 4's manual acceptance run is replaced by a fully automated
+real-environment acceptance, designed on its own map ticket.
 
 ## Scope — exactly these tickets, nothing else
 
@@ -69,13 +72,16 @@ a ticket. Scope creep goes to the advisor first, always.
    round-trips → stop notice fires. Real wiring on the product side of every seam; where
    a real agent binary is infeasible in CI, the fake sits on the FAR side of the socket
    (a protocol-speaking stand-in for Claude Code / codex app-server), never inside the
-   product. **Send the advisor the suite's design before building it.**
+   product. **Send the advisor the suite's design before building it.** Design approved
+   by Simon on #51 (advisor offline): [`docs/e2e-suite-design.md`](e2e-suite-design.md).
 3. Bundle rebuilt from the merged tree, installed, provenance verified (byte-compare
    against HEAD, the acceptance run's `diff -r` precedent).
-4. A closing summary: what changed, per ticket, and what Simon needs for his **manual
-   acceptance run** — he runs acceptance himself after this phase, NOT via #12. The
-   summary names the checks previously blocked (the old steps 4, 5, 6, 7, 10-remainder)
-   and points at the surviving evidence from the #12 run (steps 0–3, 8/9).
+4. A closing summary: what changed, per ticket, and what the **real-environment automated
+   acceptance** needs from this tree — acceptance is fully automated on Simon's machine
+   (no human step; its design is a map #49 ticket), NOT a manual run and NOT #12. The
+   summary names the checks the CI suite cannot prove (the voice route: spoken Stop
+   Notice, spoken instruction, spoken verdict) and points at the surviving evidence from
+   the #12 run (steps 0–3, 8/9).
 
 ## Read first
 
