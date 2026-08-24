@@ -27,6 +27,13 @@ notes/
 scratch/
 *.local.md
 
+# Process documents: charters, suite designs, audits. They record how the work was run,
+# not how the product runs; they stay on this machine (see docs/agents/local-only-files.md).
+docs/repair-charter.md
+docs/e2e-suite-design.md
+docs/acceptance-design.md
+docs/parity-gap.md
+
 # Agent working conventions. Local to this checkout, not part of the published
 # project: they describe how the AI agents operate here, not how the code runs.
 CLAUDE.md
