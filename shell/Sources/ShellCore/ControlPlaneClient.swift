@@ -50,7 +50,12 @@ private func exchange(_ line: Data, over path: String, timeout: TimeInterval) th
     defer { close(descriptor) }
 
     try writeAll(line, to: descriptor, path: path)
-    return try Reply.of(try readLine(from: descriptor, path: path))
+    let reply = try Reply.of(try readLine(from: descriptor, path: path))
+    guard reply.protocolVersion == controlPlaneProtocolVersion else {
+        throw ControlPlaneFailure.protocolMismatch(
+            received: reply.protocolVersion, supported: controlPlaneProtocolVersion)
+    }
+    return reply
 }
 
 private func writeAll(_ payload: Data, to descriptor: Int32, path: String) throws {

@@ -5,6 +5,10 @@ import Foundation
 /// resync inside a line.
 public let maxRequestBytes = 65536
 
+/// The control-plane protocol this shell can interpret. Held to the engine's
+/// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
+public let controlPlaneProtocolVersion = 3
+
 /// Every action this engine has. Nine, and the set is closed — adding one is a
 /// contract change, so the shell names them rather than composing strings.
 public enum Action: String, Sendable, CaseIterable {
@@ -107,8 +111,9 @@ public struct Reply: Sendable {
     public var ok: Bool
     /// `null` when the line never named a usable action.
     public var action: String?
-    /// Absent means an engine too old to have been asked — which ADR 0003
-    /// distinguishes from a field that is present and empty.
+    /// `nil` means the reply did not carry a numeric protocol version: a missing
+    /// field and JSON `null` decode alike. The socket client treats that and any
+    /// unsupported numeric version as a protocol mismatch.
     public var protocolVersion: Int?
     public var data: [String: JSONValue]
     public var refusal: Refusal?
@@ -143,12 +148,21 @@ public enum ControlPlaneFailure: Error, Equatable, Sendable {
     /// Nothing answered — `engine_unreachable`. A **surface-side** condition, and
     /// phrased so it can never be mistaken for something the engine said.
     case engineUnreachable(String)
+    /// The engine answered, but not in the protocol this shell can interpret.
+    case protocolMismatch(received: Int?, supported: Int)
     /// An answer arrived that this protocol cannot represent.
     case unreadable(String)
 
     public var detail: String {
         switch self {
         case .engineUnreachable(let detail), .unreadable(let detail): return detail
+        case .protocolMismatch(let received, let supported):
+            guard let received else {
+                return "the engine did not declare a control-plane protocol version; "
+                    + "this shell supports version \(supported)"
+            }
+            return "the engine speaks control-plane protocol version \(received); "
+                + "this shell supports version \(supported)"
         }
     }
 }

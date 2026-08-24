@@ -22,6 +22,7 @@ from app_bundle import run as bundle_run
 from app_bundle.plan import BuildPlan
 
 from gpt_voicecoding import config
+from gpt_voicecoding.seams.control_plane import PROTOCOL_VERSION
 
 #: What every binary in a current arm64 tree actually starts with.
 MACH_O = b"\xcf\xfa\xed\xfe"
@@ -401,6 +402,18 @@ class TestTheLock:
 
 class TestTheThingsThatMustAgree:
     """Facts that exist in two languages, or in two files, held to each other."""
+
+    def test_the_shell_and_the_engine_speak_the_same_protocol_version(self) -> None:
+        """A version bump on one side cannot leave the shell misreading replies.
+
+        Both declarations are necessary because the Swift package cannot import
+        Python. This guard makes changing either one require changing the other.
+        """
+        swift = (inputs.SHELL_PACKAGE / "Sources/ShellCore/Wire.swift").read_text()
+        declaration = re.search(r"controlPlaneProtocolVersion\s*=\s*(?P<version>\d+)", swift)
+
+        assert declaration is not None, "Wire.swift no longer declares the supported protocol"
+        assert int(declaration["version"]) == PROTOCOL_VERSION
 
     def test_the_shell_and_the_engine_name_the_same_default_socket_path(self) -> None:
         """The Swift shell and Python engine must meet at the same default address.

@@ -8,7 +8,7 @@ import Testing
     @Test func oneRequestGetsOneReply() async throws {
         let engine = try FakeEngineSocket(
             behaviour: .answer(
-                #"{"ok": true, "action": "live", "protocol": 1, "data": {"state": "up", "call_id": "call-1"}}"#
+                #"{"ok": true, "action": "live", "protocol": 3, "data": {"state": "up", "call_id": "call-1"}}"#
             ))
         defer { engine.stop() }
 
@@ -22,7 +22,7 @@ import Testing
     @Test func aRefusalIsAnAnswer() async throws {
         let engine = try FakeEngineSocket(
             behaviour: .answer(
-                #"{"ok": false, "action": "switch", "protocol": 1, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}"#
+                #"{"ok": false, "action": "switch", "protocol": 3, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}"#
             ))
         defer { engine.stop() }
 
@@ -31,6 +31,28 @@ import Testing
 
         // The engine answering "no" is not the engine being unreachable.
         #expect(reply.refusal?.message == "unknown switch: 'sound'")
+    }
+
+    @Test func anUnsupportedProtocolVersionIsAProtocolMismatch() async throws {
+        let engine = try FakeEngineSocket(
+            behaviour: .answer(
+                #"{"ok": true, "action": "status", "protocol": 4, "data": {}}"#
+            ))
+        defer { engine.stop() }
+
+        let failure = await failure(of: UnixSocketControlPlane(path: engine.path))
+
+        #expect(failure == .protocolMismatch(received: 4, supported: 3))
+    }
+
+    @Test func aMissingProtocolVersionKeepsTheAbsentDistinction() async throws {
+        let engine = try FakeEngineSocket(
+            behaviour: .answer(#"{"ok": true, "action": "status", "data": {}}"#))
+        defer { engine.stop() }
+
+        let failure = await failure(of: UnixSocketControlPlane(path: engine.path))
+
+        #expect(failure == .protocolMismatch(received: nil, supported: 3))
     }
 
     @Test func nothingListeningIsEngineUnreachable() async throws {
