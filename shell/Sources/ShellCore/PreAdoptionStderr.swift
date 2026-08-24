@@ -17,11 +17,28 @@ import Foundation
 /// Both are the same end of the same pipe, which is why this type is about the
 /// *end* rather than about the process.
 ///
-/// **The ordering constraint the code cannot show:** `finish()` must deliver the
+/// **The ordering constraint the code cannot show:** `finish()` delivers the
 /// residue *before* its caller reports the exit. A process that dies immediately
 /// after writing its reason is the ordinary case here — exit 2 is precisely that
 /// — and reporting the death first would race the words that explain it out of
 /// existence. They are the only explanation the Retry panel ever gets.
+///
+/// **How far that holds, exactly.** It holds for the case this pipe exists for: a
+/// refusal is a single short write, well under the 64 KB pipe buffer, so it
+/// arrives in one delivery, whole and ahead of the exit.
+///
+/// It does **not** hold for a large message — a traceback — that straddles the
+/// buffer while the process is dying. `finish()` clears the readability handler,
+/// which stops the next invocation but not one already running on Foundation's
+/// own queue, so that handler can be inside `availableData` while `finish()` is
+/// inside `readToEnd()`. The two readers then split the message between them and
+/// can deliver it out of order, and the handler's delivery can land after the
+/// exit has already been reported.
+///
+/// That is issue #33, along with the same guarantee failing a layer up in
+/// `EngineSupervisor`. It is stated here rather than left implied because a
+/// promise documented without its limit is worse than one never written down:
+/// the next reader trusts it exactly where it is weakest.
 final class PreAdoptionStderr: @unchecked Sendable {
     /// The child's end. `Process.standardError` is given the whole pipe rather
     /// than its write handle, so that Foundation closes *this* process's copy of
