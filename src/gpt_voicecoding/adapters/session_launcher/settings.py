@@ -34,10 +34,6 @@ from gpt_voicecoding.seams.identity import AgentKind
 #: directory cannot be bound on Darwin, and this is where per-launch sockets go.
 DEFAULT_RUNTIME_DIRECTORY = Path("/tmp")
 
-#: Where Claude Code writes one record per live process. A location, so it
-#: defaults — and it is not ours to write to, only to read.
-DEFAULT_REGISTRY_DIRECTORY = Path.home() / ".claude" / "sessions"
-
 #: What a launched Session is told its terminal is.
 #:
 #: This is a mechanic rather than a decision, and it is unavoidable rather than
@@ -68,8 +64,6 @@ class LauncherSettings:
     #: Where this engine puts what one launch needs: the Session Channel socket,
     #: the per-TUI app-server socket, and the rendered plugins.
     runtime_directory: Path = DEFAULT_RUNTIME_DIRECTORY
-    #: Where a launched Claude Session says who it is. Read, never written.
-    registry_directory: Path = DEFAULT_REGISTRY_DIRECTORY
     #: Which Python runs the Session Channel and `PermissionRequest` hook. A
     #: property of the deployment (ADR 0006), which is why the bundle may state it.
     interpreter: Path = Path(sys.executable)
