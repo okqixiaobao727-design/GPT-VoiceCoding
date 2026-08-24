@@ -189,7 +189,16 @@ public enum LoginShellPath {
 
         do { try process.run() } catch { return nil }
 
-        let collected = ReadToEnd(handle: output.fileHandleForReading)
+        // Closed on every path out, including the ones that give up early.
+        // `Pipe` hands its read end to a `FileHandle` that outlives this scope —
+        // the reader below runs on its own queue and, on the timeout path, is
+        // still holding it when we return. One descriptor per spawn, and this
+        // is asked on *every* spawn by design, so a crash loop is the case that
+        // runs a machine out of them (`aLaunchThatNeverSpawnsKeepsNoPipeAfterwards`).
+        let reading = output.fileHandleForReading
+        defer { try? reading.close() }
+
+        let collected = ReadToEnd(handle: reading)
         guard collected.wait(timeout) else {
             // A profile that hangs must not hang the engine's supervisor with
             // it. `terminate` first, because a shell given the chance usually
