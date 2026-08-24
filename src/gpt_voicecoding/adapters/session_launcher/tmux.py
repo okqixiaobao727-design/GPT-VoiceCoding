@@ -457,6 +457,11 @@ class TmuxLauncher:
                 engine=self._claude,
                 confirm_timeout_seconds=self._confirm,
             )
+        if self._codex is None:
+            raise PreparationError(
+                "this engine has no Codex Agent adapter, so a launched Codex Session "
+                "would have no Relay route at all"
+            )
         return CodexPreparation(
             request,
             settings=self._settings,

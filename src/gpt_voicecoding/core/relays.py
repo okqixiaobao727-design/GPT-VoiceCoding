@@ -123,7 +123,12 @@ class RelayPipeline:
                     route=chosen,
                     outcome=receipt.outcome,
                 )
-            _log.info("relay %s not proven delivered (%s); it waits", rid, receipt.outcome)
+            _log.info(
+                "relay %s not proven delivered (%s: %s); it waits",
+                rid,
+                receipt.outcome,
+                receipt.reason,
+            )
             outcome = receipt.outcome
         else:
             outcome = Delivery.UNKNOWN
@@ -156,6 +161,13 @@ class RelayPipeline:
             receipt = await adapter.answer_relay(
                 target, waiting.text, request_id=waiting.request_id, route=waiting.route
             )
+            if not receipt.is_delivered:
+                _log.info(
+                    "relay %s not proven delivered on Reply Window retry (%s: %s); it waits",
+                    waiting.request_id,
+                    receipt.outcome,
+                    receipt.reason,
+                )
             self._relays.classify(waiting.request_id, receipt.outcome)
             flushed.append(
                 RelayOutcome(

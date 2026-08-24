@@ -17,9 +17,11 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -28,16 +30,20 @@ import pytest
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
 from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION, ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
+from gpt_voicecoding.adapters.session_launcher import direct_child_launcher
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
+from gpt_voicecoding.core.lifecycle import Lifecycle
+from gpt_voicecoding.core.relay_queue import RelayKind
 from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
+from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
 from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest, LaunchStatus
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -46,6 +52,7 @@ CLAUDE = SessionTarget(
     session_id="430b0def-38ef-4783-8d57-d800710d83bd",
     pid=os.getpid(),
 )
+EVENT_SETTLE_TIMEOUT_SECONDS = 10.0
 
 
 def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
@@ -106,6 +113,107 @@ class IntroducedLauncher(FakeSessionLauncher):
 
 def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLauncher:
     return IntroducedLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
+
+
+def scripted_codex(path: Path) -> Path:
+    """A process-level Codex stand-in for the assembled engine's launch path."""
+    driver = path.with_suffix(".py")
+    driver.write_text(
+        textwrap.dedent(
+            f"""\
+            import asyncio
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, {str(Path(__file__).parent)!r})
+            sys.path.insert(0, {str(Path(__file__).parents[1] / "src")!r})
+
+            from codex_fake import FakeAppServer
+
+            THREAD_ID = "scripted-session"
+            TURN_ID = "scripted-turn"
+
+
+            async def serve() -> None:
+                listen = next(arg for arg in sys.argv if arg.startswith("unix://"))
+                socket_path = Path(listen.removeprefix("unix://"))
+                ready = socket_path.parent / "tui.ready"
+                open_window = Path.cwd() / "window.open"
+                delivered = []
+                server = FakeAppServer(socket_path)
+                server.answers("initialize", {{}})
+                server.answers(
+                    "thread/resume",
+                    lambda _params: {{
+                        "thread": {{"id": THREAD_ID, "status": {{"type": "active"}}}},
+                        "approvalPolicy": "on-request",
+                        "approvalsReviewer": "user",
+                    }},
+                )
+
+                def start_turn(params):
+                    delivered.append(params["clientUserMessageId"])
+                    return {{"turn": {{"id": TURN_ID, "status": "inProgress"}}}}
+
+                server.answers("turn/start", start_turn)
+                server.answers(
+                    "thread/read",
+                    lambda _params: {{
+                        "thread": {{
+                            "id": THREAD_ID,
+                            "turns": [
+                                {{
+                                    "items": [
+                                        {{"type": "userMessage", "clientId": request_id}}
+                                        for request_id in delivered
+                                    ]
+                                }}
+                            ],
+                        }}
+                    }},
+                )
+                server.answers("thread/loaded/list", {{"data": []}})
+                await server.start()
+                try:
+                    while not ready.exists() or server.connection_count == 0:
+                        await asyncio.sleep(0.01)
+                    await server.notify_all(
+                        "thread/started",
+                        {{
+                            "thread": {{
+                                "id": THREAD_ID,
+                                "cwd": str(Path.cwd()),
+                                "status": {{"type": "active"}},
+                                "turns": [],
+                            }}
+                        }},
+                    )
+                    while not open_window.exists():
+                        await asyncio.sleep(0.01)
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {{"threadId": THREAD_ID, "status": {{"type": "idle"}}}},
+                    )
+                    await asyncio.Event().wait()
+                finally:
+                    await server.aclose()
+
+
+            async def tui() -> None:
+                remote = next(arg for arg in sys.argv if arg.startswith("unix://"))
+                ready = Path(remote.removeprefix("unix://")).parent / "tui.ready"
+                ready.touch()
+                await asyncio.Event().wait()
+
+
+            asyncio.run(serve() if "app-server" in sys.argv else tui())
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.write_text(f'#!/bin/sh\nexec {sys.executable} "{driver}" "$@"\n', encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
 class ClaudeRegisteringLauncher(FakeSessionLauncher):
@@ -952,6 +1060,114 @@ class TestSharingTheOneAppServer:
         engine = assembled(home)
 
         assert not hasattr(engine.adapters.call, "riding")
+
+
+class TestALaunchedCodexSessionIsReachable:
+    """#39 through the production composition and both real adapter factories."""
+
+    def test_a_launcher_without_a_codex_agent_does_not_claim_success(self, home: Path) -> None:
+        binary = scripted_codex(home / "codex")
+        launcher = direct_child_launcher(
+            settings={"codex_binary": str(binary), "runtime_directory": str(home / "runtime")}
+        )
+        request = LaunchRequest(
+            request_id=new_request_id(),
+            agent=AgentKind.CODEX,
+            workspace=home,
+            label=SessionLabel(project="GPT-VoiceCoding", task="accept a relay"),
+        )
+
+        async def scenario() -> LaunchOutcome:
+            try:
+                return await launcher.launch(request)
+            finally:
+                await launcher.aclose()
+
+        outcome = asyncio.run(scenario())
+
+        assert outcome.status is LaunchStatus.FAILED
+        assert "Codex Agent adapter" in outcome.detail
+
+    def test_the_engine_attaches_opens_the_window_and_delivers_the_relay(self, home: Path) -> None:
+        binary = scripted_codex(home / "codex")
+        real = (
+            CONFIG.replace(
+                'session_launcher = "test_engine:one_session_launcher"',
+                'session_launcher = "gpt_voicecoding.adapters.session_launcher:'
+                'direct_child_launcher"',
+            )
+            .replace(
+                'codex = "fakes:FakeAgent"',
+                'codex = "gpt_voicecoding.adapters.agent.codex:codex_agent"',
+            )
+            .replace(
+                "[delegate]",
+                "\n".join(
+                    (
+                        "[adapters.settings.session_launcher]",
+                        f'codex_binary = "{binary}"',
+                        f'runtime_directory = "{home / "runtime"}"',
+                        "",
+                        '[adapters.settings."agent.codex"]',
+                        f'executable = "{binary}"',
+                        f'socket_directory = "{home / "agent"}"',
+                        "startup_timeout_seconds = 5",
+                        "request_timeout_seconds = 5",
+                        "receipt_timeout_seconds = 2",
+                        "receipt_poll_seconds = 0.01",
+                        "verdict_timeout_seconds = 1",
+                        "",
+                        "[delegate]",
+                    )
+                ),
+            )
+        )
+        engine = assembled(home, real)
+
+        async def scenario():
+            await engine.start()
+            target = None
+            try:
+                launched = await engine.core.launch_session(
+                    request_id=new_request_id(),
+                    agent=AgentKind.CODEX,
+                    project="GPT-VoiceCoding",
+                    task="accept a relay",
+                )
+                assert launched.status is LaunchStatus.LAUNCHED
+                assert launched.target is not None
+                target = launched.target
+                codex = engine.adapters.agents[AgentKind.CODEX]
+                relayed = await engine.core.relay(target, "inert instruction")
+                window_before = engine.core.status().sessions[0].reply_window
+                (home / "window.open").touch()
+                async with asyncio.timeout(EVENT_SETTLE_TIMEOUT_SECONDS):
+                    status = engine.core.status()
+                    while True:
+                        answers = [
+                            pending
+                            for pending in status.pending_relays
+                            if pending.kind is RelayKind.ANSWER
+                        ]
+                        if status.sessions[0].reply_window is ReplyWindow.OPEN and not answers:
+                            break
+                        await asyncio.sleep(0.01)
+                        status = engine.core.status()
+                return target in codex.watching(), window_before, relayed, status
+            finally:
+                await engine.adapters.launcher.aclose()
+                await engine.aclose()
+
+        attached, window_before, relayed, status = asyncio.run(scenario())
+
+        assert attached
+        assert window_before is ReplyWindow.CLOSED
+        assert relayed.state is Lifecycle.RETAINED
+        assert relayed.outcome is Delivery.UNKNOWN
+        assert status.sessions[0].reply_window is ReplyWindow.OPEN
+        assert [
+            pending for pending in status.pending_relays if pending.kind is RelayKind.ANSWER
+        ] == []
 
 
 class TestTheTick:

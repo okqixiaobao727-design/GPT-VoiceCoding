@@ -234,6 +234,32 @@ class TestTheRouteFollowsTheUsersIntent:
 
 
 class TestNonDelivery:
+    def test_the_engine_log_keeps_the_adapters_failure_reason(self, caplog) -> None:
+        """#39: the next diagnosis must not need `lsof` to recover this reason."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.relays")
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
+        )
+
+        harness.relay("ship it")
+
+        assert any("the far side is gone" in record.getMessage() for record in caplog.records)
+
+    def test_a_failed_retry_logs_the_adapters_reason(self, caplog) -> None:
+        """#39: the Reply Window flush must leave the same diagnostic evidence."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.relays")
+        harness = Harness()
+        harness.relay("ship it")
+        harness.agent.outcome = Delivery.FAILED
+        harness.agent.reason = "the retried connection is gone"
+
+        harness.window_opened()
+
+        assert any(
+            "the retried connection is gone" in record.getMessage() for record in caplog.records
+        )
+
     def test_an_attempt_that_proves_nothing_keeps_the_words_queued(self) -> None:
         """UNKNOWN is not delivered, and the user's own words are not lost."""
         harness = Harness(
