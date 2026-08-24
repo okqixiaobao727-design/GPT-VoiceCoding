@@ -159,9 +159,7 @@ class TestWhatOneStatusMeans:
 
         assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
-    def test_asking_for_a_level_neither_reports_nor_starts_watching(
-        self, tmp_path: Path
-    ) -> None:
+    def test_asking_for_a_level_neither_reports_nor_starts_watching(self, tmp_path: Path) -> None:
         """A pure query: Bridge Core asks it of Sessions the sweep already owns."""
         sink = Sink()
         say(tmp_path, "idle")

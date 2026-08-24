@@ -38,14 +38,11 @@ class ProjectCatalogue:
     def resolve(self, reference: str) -> Project:
         wanted = _spoken_name(reference)
         if not wanted:
-            raise UnknownProjectError(
-                reference, tuple(project.name for project in self.projects)
-            )
+            raise UnknownProjectError(reference, tuple(project.name for project in self.projects))
         matches = tuple(
             project
             for project in self.projects
-            if wanted
-            in {_spoken_name(name) for name in (project.name, *project.spoken_aliases)}
+            if wanted in {_spoken_name(name) for name in (project.name, *project.spoken_aliases)}
         )
         if not matches:
             raise UnknownProjectError(reference, tuple(project.name for project in self.projects))

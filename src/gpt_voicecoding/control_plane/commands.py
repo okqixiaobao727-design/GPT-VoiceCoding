@@ -31,8 +31,7 @@ USAGE: dict[Action, str] = {
     Action.SESSIONS: "sessions",
     Action.LIVE: "live",
     Action.LAUNCH: (
-        "launch --request-id <UUID> --project <project> "
-        "[--agent claude|codex] --task <words...>"
+        "launch --request-id <UUID> --project <project> [--agent claude|codex] --task <words...>"
     ),
     Action.CLOSE: "close <agent>:<session id>[:<pid>]",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
@@ -100,11 +99,7 @@ def _relay(arguments: list[str]) -> dict[str, object]:
 
 def _launch(arguments: list[str]) -> dict[str, object]:
     """Read one explicit project and the task words that follow the final flag."""
-    if (
-        len(arguments) < 6
-        or arguments[0] != REQUEST_ID_FLAG
-        or arguments[2] != PROJECT_FLAG
-    ):
+    if len(arguments) < 6 or arguments[0] != REQUEST_ID_FLAG or arguments[2] != PROJECT_FLAG:
         raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
     request_id = arguments[1]
     project = arguments[3]
