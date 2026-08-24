@@ -17,7 +17,9 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from app_bundle import inputs, lock, mach_o, signing
+from app_bundle import console_script, inputs, lock, mach_o, signing
+from app_bundle import run as bundle_run
+from app_bundle.plan import BuildPlan
 
 from gpt_voicecoding import config
 
@@ -47,6 +49,60 @@ def make_engine_tree(root: Path) -> None:
     package = root / "lib/python3.12/site-packages/gpt_voicecoding"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = '0.0.0'")
+
+
+class TestEveryConsoleScriptRelocates:
+    def test_installed_python_scripts_move_with_the_engine(self, tmp_path: Path) -> None:
+        engine = tmp_path / "built-engine"
+        bin_directory = engine / "bin"
+        bin_directory.mkdir(parents=True)
+        python = bin_directory / "python3"
+        python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        python.chmod(0o755)
+
+        names = ("cffi-gen-src", "pyav", "future-dependency-script")
+        for name in names:
+            script = bin_directory / name
+            script.write_text(f"#!{python}\nraise SystemExit(0)\n")
+            script.chmod(0o755)
+
+        console_script.relocate_all(bin_directory)
+
+        assert {name: (bin_directory / name).read_text().splitlines()[0] for name in names} == {
+            "cffi-gen-src": "#!/bin/sh",
+            "pyav": "#!/bin/sh",
+            "future-dependency-script": "#!/bin/sh",
+        }
+        moved = tmp_path / "moved-engine"
+        engine.rename(moved)
+        for name in names:
+            subprocess.run([moved / "bin" / name], check=True)
+        commands = tmp_path / "commands"
+        commands.mkdir()
+        linked = commands / "bridgectl"
+        linked.symlink_to(moved / "bin/future-dependency-script")
+        subprocess.run([linked], check=True)
+
+    def test_non_python_entries_are_left_as_installed(self, tmp_path: Path) -> None:
+        bin_directory = tmp_path / "engine/bin"
+        bin_directory.mkdir(parents=True)
+        python = bin_directory / "python3"
+        python.write_bytes(MACH_O + b"interpreter")
+        python.chmod(0o755)
+        shell_script = bin_directory / "pip"
+        shell_script.write_text("#!/bin/sh\nexit 0\n")
+        shell_script.chmod(0o755)
+        binary = bin_directory / "python3.12"
+        binary.write_bytes(MACH_O + b"binary")
+        binary.chmod(0o755)
+        linked = bin_directory / "pip3"
+        linked.symlink_to("pip")
+        before = {path.name: path.read_bytes() for path in (python, shell_script, binary)}
+
+        console_script.relocate_all(bin_directory)
+
+        assert {path.name: path.read_bytes() for path in (python, shell_script, binary)} == before
+        assert linked.readlink() == Path("pip")
 
 
 class TestWhatIsSignable:
@@ -128,6 +184,89 @@ def make_app(root: Path, *, with_engine: bool = True) -> Path:
     if with_engine:
         make_engine_tree(app / "Contents/Resources/engine")
     return app
+
+
+class TestBundleSelfContainment:
+    def test_a_bundle_with_only_the_user_config_placeholder_passes(self, tmp_path: Path) -> None:
+        app = make_app(tmp_path, with_engine=False)
+        example = app / "Contents/Resources/config.example.toml"
+        example.parent.mkdir(parents=True, exist_ok=True)
+        example.write_text('workspace = "/Users/you/Documents/coding/GPT-VoiceCoding"\n')
+
+        bundle_run.verify_self_contained(
+            app,
+            source_root=Path("/Users/simon/Documents/coding/GPT-VoiceCoding"),
+        )
+
+    def test_a_source_checkout_reference_anywhere_in_the_bundle_fails(self, tmp_path: Path) -> None:
+        app = make_app(tmp_path, with_engine=False)
+        source_root = Path(
+            "/Users/simon/Documents/coding/GPT-VoiceCoding/.claude/worktrees/issue-12-app-bundle"
+        )
+        provenance = (
+            app / "Contents/Resources/engine/lib/python3.12/site-packages/"
+            "gpt_voicecoding-0.0.0.dist-info/direct_url.json"
+        )
+        provenance.parent.mkdir(parents=True)
+        provenance.write_text(f'{{"url": "file://{source_root}"}}')
+
+        with pytest.raises(bundle_run.BuildFailed, match="direct_url.json"):
+            bundle_run.verify_self_contained(app, source_root=source_root)
+
+    def test_a_worktree_build_also_rejects_the_main_checkout_path(self, tmp_path: Path) -> None:
+        checkout = tmp_path / "GPT-VoiceCoding"
+        git_directory = checkout / ".git"
+        worktree_git_directory = git_directory / "worktrees/43-43"
+        worktree_git_directory.mkdir(parents=True)
+        worktree = checkout / ".claude/worktrees/43-43"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: {worktree_git_directory}\n")
+        app = make_app(tmp_path / "artifact", with_engine=False)
+        leaked = app / "Contents/Resources/channel.json"
+        leaked.parent.mkdir(parents=True, exist_ok=True)
+        leaked.write_text(f'{{"interpreter": "{checkout}/.venv/bin/python"}}')
+
+        with pytest.raises(bundle_run.BuildFailed, match="channel.json"):
+            bundle_run.verify_self_contained(app, source_root=worktree)
+
+    def test_an_external_worktree_path_is_also_rejected(self, tmp_path: Path) -> None:
+        checkout = tmp_path / "repository/GPT-VoiceCoding"
+        worktree_git_directory = checkout / ".git/worktrees/issue-12-app-bundle"
+        worktree_git_directory.mkdir(parents=True)
+        worktree = tmp_path / "worktrees/issue-12-app-bundle"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: {worktree_git_directory}\n")
+        app = make_app(tmp_path / "artifact", with_engine=False)
+        script = app / "Contents/Resources/engine/bin/cffi-gen-src"
+        script.parent.mkdir(parents=True)
+        script.write_text(f"#!{worktree}/shell/.build/GPT-VoiceCoding.app/python3\n")
+
+        with pytest.raises(bundle_run.BuildFailed, match="cffi-gen-src"):
+            bundle_run.verify_self_contained(app, source_root=worktree)
+
+    def test_the_local_install_does_not_leave_source_provenance(self, tmp_path: Path) -> None:
+        plan = BuildPlan.resolve(machine="arm64", build_root=tmp_path)
+        python = plan.engine_root / "bin/python3"
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/sh\nexit 0\n")
+        python.chmod(0o755)
+        provenance = (
+            plan.engine_root / "lib/python3.12/site-packages/"
+            "gpt_voicecoding-0.0.0.dist-info/direct_url.json"
+        )
+        provenance.parent.mkdir(parents=True)
+        provenance.write_text(f'{{"url": "file://{inputs.REPO_ROOT}"}}')
+        record = provenance.with_name("RECORD")
+        record.write_text(
+            f"{provenance.parent.name}/direct_url.json,sha256=ticket-43,103\n"
+            f"{provenance.parent.name}/METADATA,,\n"
+        )
+
+        bundle_run.install(plan)
+        bundle_run.remove_install_provenance(plan)
+
+        assert not provenance.exists()
+        assert "direct_url.json" not in record.read_text()
 
 
 class TestTheSigningPlan:

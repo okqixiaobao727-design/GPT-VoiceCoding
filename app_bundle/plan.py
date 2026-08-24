@@ -49,11 +49,6 @@ class BuildPlan:
         return self.app / inputs.RESOURCES / inputs.ENGINE_ROOT
 
     @property
-    def engine_cli(self) -> Path:
-        """What `[delegate] cli` names. There is no second copy in `Contents/MacOS`."""
-        return self.app / inputs.RESOURCES / inputs.ENGINE_CLI
-
-    @property
     def executable(self) -> Path:
         return self.app / inputs.MACOS / self.identity.executable
 
