@@ -310,9 +310,7 @@ class TestWhatItRefuses:
 
         config = load(written(tmp_path, text))
 
-        assert config.launch.projects[0].workspace == Path(
-            "/definitely/offline/project volume"
-        )
+        assert config.launch.projects[0].workspace == Path("/definitely/offline/project volume")
         assert config.launch.projects[0].spoken_aliases == ()
 
     def test_a_wholly_duplicated_project_entry_is_invalid_configuration(

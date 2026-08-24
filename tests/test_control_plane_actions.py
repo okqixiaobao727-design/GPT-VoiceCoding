@@ -489,9 +489,7 @@ class TestLaunchingAndClosing:
 
     def test_a_project_reference_shared_by_two_projects_is_refused(self) -> None:
         projects = (
-            Project(
-                name="First Project", workspace=WORKSPACE, spoken_aliases=("Shared-Project",)
-            ),
+            Project(name="First Project", workspace=WORKSPACE, spoken_aliases=("Shared-Project",)),
             Project(
                 name="Second Project",
                 workspace=SECOND_WORKSPACE,
@@ -520,9 +518,7 @@ class TestLaunchingAndClosing:
         first = surface.launch(request_id=LAUNCH_REQUEST_ID)
         second = surface.launch(request_id=LAUNCH_REQUEST_ID)
 
-        assert json.dumps(first.as_document()).encode() == json.dumps(
-            second.as_document()
-        ).encode()
+        assert json.dumps(first.as_document()).encode() == json.dumps(second.as_document()).encode()
         assert surface.launcher is not None
         assert len(surface.launcher.requests) == 1
         assert surface.launcher.requests[0].request_id == LAUNCH_REQUEST_ID
@@ -581,9 +577,7 @@ class TestLaunchingAndClosing:
 
         first, second = asyncio.run(overlap())
 
-        assert json.dumps(first.as_document()).encode() == json.dumps(
-            second.as_document()
-        ).encode()
+        assert json.dumps(first.as_document()).encode() == json.dumps(second.as_document()).encode()
         assert len(launcher.requests) == 1
         assert len(surface.core.status().sessions) == 1
 
@@ -647,9 +641,7 @@ class TestLaunchingAndClosing:
         surface = Surface(launcher=launcher)
 
         first = surface.launch(request_id=LAUNCH_REQUEST_ID)
-        second = surface.launch(
-            request_id=RequestId("d86f92c9-02b8-4b55-9a1e-ab579469ce75")
-        )
+        second = surface.launch(request_id=RequestId("d86f92c9-02b8-4b55-9a1e-ab579469ce75"))
 
         assert first.data["target"] == CODEX_ADDRESS
         assert second.data["target"] == {

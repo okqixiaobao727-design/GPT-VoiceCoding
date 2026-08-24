@@ -662,17 +662,13 @@ class TestTheLevelItIsAskedFor:
         assert asked is ReplyWindow.OPEN
         assert asked is held
 
-    def test_an_active_thread_answers_closed_with_what_it_observed(
-        self, socket_path: Path
-    ) -> None:
+    def test_an_active_thread_answers_closed_with_what_it_observed(self, socket_path: Path) -> None:
         asked, held = self._asked(socket_path, status="active")
 
         assert asked is ReplyWindow.CLOSED
         assert asked is held
 
-    def test_a_thread_that_has_reported_no_status_answers_closed(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_thread_that_has_reported_no_status_answers_closed(self, socket_path: Path) -> None:
         """Fail closed, and provisionally so.
 
         A status kind this build does not recognise leaves `observed` False, so
@@ -695,9 +691,7 @@ class TestTheLevelItIsAskedFor:
         assert asked is ReplyWindow.CLOSED
         assert observed is False
 
-    def test_a_session_this_adapter_does_not_watch_answers_closed(
-        self, socket_path: Path
-    ) -> None:
+    def test_a_session_this_adapter_does_not_watch_answers_closed(self, socket_path: Path) -> None:
         """Not reachable is not the same as not busy, and neither is an open window."""
 
         async def scenario() -> ReplyWindow:

@@ -175,9 +175,7 @@ class TestBringingACallUp:
 
         asyncio.run(scenario())
 
-    def test_the_realtime_model_the_backend_still_accepts_is_sent(
-        self, socket_path: Path
-    ) -> None:
+    def test_the_realtime_model_the_backend_still_accepts_is_sent(self, socket_path: Path) -> None:
         """The model rides at the top level of the start, and it is not codex's default.
 
         codex serializes a `session.model` of its own on this path no matter how

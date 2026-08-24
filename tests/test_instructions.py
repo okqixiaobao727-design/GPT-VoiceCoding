@@ -95,15 +95,11 @@ class TestCatalogue:
 
     def test_issue_25_launch_rules_name_their_actual_source(self) -> None:
         assert (
-            catalogue_module.BY_ID[
-                "voice.start.complete-request-launches-directly"
-            ].source
+            catalogue_module.BY_ID["voice.start.complete-request-launches-directly"].source
             == "issue/25"
         )
         assert (
-            catalogue_module.BY_ID[
-                "delegated.start.complete-request-launches-directly"
-            ].source
+            catalogue_module.BY_ID["delegated.start.complete-request-launches-directly"].source
             == "issue/25"
         )
 
@@ -156,10 +152,7 @@ class TestCoverage:
             instructions.carrier_of("delegated.start.complete-request-launches-directly")
             is Audience.DELEGATED
         )
-        assert (
-            instructions.carrier_of("voice.start.needs-an-explicit-agent-and-workspace")
-            is None
-        )
+        assert instructions.carrier_of("voice.start.needs-an-explicit-agent-and-workspace") is None
 
     def test_each_retained_rule_lands_in_exactly_its_own_set(self, instructions) -> None:
         for rule in RULES:

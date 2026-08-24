@@ -576,9 +576,7 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
         assert asyncio.run(scenario()).ok
         return text
 
-    def test_a_live_session_is_what_the_stopped_engine_really_wrote_down(
-        self, home: Path
-    ) -> None:
+    def test_a_live_session_is_what_the_stopped_engine_really_wrote_down(self, home: Path) -> None:
         """The premise of the rest: a Session that was live is persisted as live."""
         self.a_launched_session(home)
 
@@ -643,9 +641,7 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
         assert [session["state"] for session in first] == ["ended"]
         assert [session["state"] for session in second] == ["ended"]
 
-    def test_repeated_restarts_do_not_rewrite_a_row_that_is_already_ended(
-        self, home: Path
-    ) -> None:
+    def test_repeated_restarts_do_not_rewrite_a_row_that_is_already_ended(self, home: Path) -> None:
         """Idempotent: an ended Session is never ended a second time."""
         write_state_holding_a_live_session(home, pid=a_dead_pid())
         text = with_idle_claude(home)
@@ -708,9 +704,7 @@ class TestTheStartingReplyWindow:
 
         return asyncio.run(scenario())
 
-    def test_a_session_already_idle_at_registration_is_reachable_at_once(
-        self, home: Path
-    ) -> None:
+    def test_a_session_already_idle_at_registration_is_reachable_at_once(self, home: Path) -> None:
         """#27's defect, at the case that exposes it.
 
         The Session is idle *before* its launch confirms, which is the ordinary
@@ -768,9 +762,7 @@ class TestTheStartingReplyWindow:
 
 
 class TestEventsReachTheHub:
-    def test_an_idle_claude_session_opens_its_reply_window_in_core_state(
-        self, home: Path
-    ) -> None:
+    def test_an_idle_claude_session_opens_its_reply_window_in_core_state(self, home: Path) -> None:
         """The hub establishes the level at registration; the sweep keeps it current."""
         write_idle_claude_record(home)
         engine = assembled(home, with_idle_claude(home))
