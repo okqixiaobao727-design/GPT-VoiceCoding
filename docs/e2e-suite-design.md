@@ -1,9 +1,13 @@
 # The end-to-end integration suite — design
 
 Status: **design, approved on wayfinder ticket
-[#51](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/51)** (map #49).
-This is the repair charter's exit-criterion item 2. Building it is gated on this document;
-nothing here is built yet.
+[#51](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/51)**. It was the
+first repair charter's exit-criterion item 2; that charter is superseded. Under map
+[#58](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/58) (ADR 0010) the
+exit criterion is the real-environment acceptance (`docs/acceptance-design.md`), and this
+suite is a regression net — whether it is built, and what standing it has in CI, is decided
+on ticket [#62](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/62).
+Nothing here is built yet.
 
 ## What it proves
 

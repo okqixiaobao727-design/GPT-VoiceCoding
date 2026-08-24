@@ -1,13 +1,16 @@
 # The real-environment automated acceptance — design
 
 Status: **design, decided on wayfinder ticket
-[#56](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/56)** (map #49,
-Simon, 2026-08-25). It is what the repair charter's exit item 4 points at, and it replaces
-the manual v0 acceptance in `docs/app-bundle.md` § The v0 acceptance for everything it
-covers. Building it belongs to the repair execution ticket
-[#52](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/52), **after** the
-E2E suite (`docs/e2e-suite-design.md`) exists, because it reuses that suite's support
-code. Nothing here is built yet.
+[#56](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/56)** (Simon,
+2026-08-25). It replaces the manual v0 acceptance in `docs/app-bundle.md` § The v0
+acceptance for everything it covers. Under map
+[#58](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/58) (ADR 0010) this
+run is the **exit criterion** of the repair phase, and it is built **first** — before any
+further repair — on ticket
+[#60](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/60). This document
+assumed the E2E suite (`docs/e2e-suite-design.md`) would exist beforehand and lend its
+support code; it does not, and whether to build that support module here or first is #60's
+own call. Nothing here is built yet.
 
 ## The one decision this design rests on
 
