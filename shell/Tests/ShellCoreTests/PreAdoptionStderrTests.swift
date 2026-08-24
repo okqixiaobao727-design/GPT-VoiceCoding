@@ -22,7 +22,7 @@ import Testing
         try await said.waits(for: "starting\n")
         try stderr.pipe.fileHandleForWriting.close()
 
-        try await waitUntil { !stderr.isMonitoring }
+        try await waitUntil("the watch came down") { !stderr.isMonitoring }
         #expect(!stderr.isMonitoring)
     }
 
@@ -39,7 +39,10 @@ import Testing
 
         stderr.finish()
 
-        #expect(said.text() == "config: [delegate] model is required\n")
+        // Which of the two readers got the bytes is Foundation's to decide, and
+        // the handler delivers on its own queue — so wait for the words rather
+        // than assuming they have landed by the time `finish()` returns.
+        try await said.waits(for: "config: [delegate] model is required\n")
         #expect(!stderr.isMonitoring)
     }
 
@@ -54,7 +57,7 @@ import Testing
         try stderr.pipe.fileHandleForWriting.write(contentsOf: Data("starting\n".utf8))
         try await said.waits(for: "starting\n")
         try stderr.pipe.fileHandleForWriting.close()
-        try await waitUntil { !stderr.isMonitoring }
+        try await waitUntil("the watch came down") { !stderr.isMonitoring }
 
         stderr.finish()
 
@@ -63,16 +66,25 @@ import Testing
     }
 }
 
+/// Waited for something that never happened. An error rather than a quiet
+/// return: a poll that gives up silently turns every wait built on it into an
+/// assertion that cannot fail.
+private struct NeverHappened: Error, CustomStringConvertible {
+    let what: String
+    var description: String { "waited, and \(what) never happened" }
+}
+
 /// Polls a condition the way a caller would have to: the end of a pipe is
 /// noticed on Foundation's own queue, not on this one.
 private func waitUntil(
-    within limit: Duration = .seconds(2), _ condition: @Sendable () -> Bool
+    _ what: String, within limit: Duration = .seconds(2), _ condition: @Sendable () -> Bool
 ) async throws {
     let deadline = ContinuousClock.now + limit
     while ContinuousClock.now < deadline {
         if condition() { return }
         try await Task.sleep(for: .milliseconds(10))
     }
+    throw NeverHappened(what: what)
 }
 
 /// What the pipe handed over, in order.
@@ -85,6 +97,8 @@ private final class Collected: @unchecked Sendable {
     func text() -> String { lock.withLock { String(decoding: data, as: UTF8.self) } }
 
     func waits(for expected: String) async throws {
-        try await waitUntil { self.text() == expected }
+        try await waitUntil("the pipe handed over \(String(reflecting: expected))") {
+            self.text() == expected
+        }
     }
 }

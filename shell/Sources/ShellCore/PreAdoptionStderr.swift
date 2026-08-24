@@ -67,6 +67,19 @@ final class PreAdoptionStderr: @unchecked Sendable {
         }
     }
 
+    /// Give up on a pipe that will never end by itself.
+    ///
+    /// `finish()`'s drain waits for the end of the pipe, and after a launch that
+    /// never spawned there is no end coming: Foundation closes this process's
+    /// copy of the write end when it hands the pipe to a child, so a child that
+    /// was never made leaves this process holding it, waiting on itself. There
+    /// is nothing to drain either — nothing ever wrote.
+    func abandon() {
+        stopMonitoring()
+        try? pipe.fileHandleForWriting.close()
+        try? pipe.fileHandleForReading.close()
+    }
+
     private func stopMonitoring() {
         pipe.fileHandleForReading.readabilityHandler = nil
         lock.withLock { monitoring = false }

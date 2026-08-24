@@ -47,7 +47,18 @@ public struct ProcessLauncher: EngineLaunching {
             exited(code)
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            // Nothing spawned, so nothing will ever end this pipe: this process
+            // still holds the write end, and `terminationHandler` never runs for
+            // a process that never ran. Without this the watch — which holds the
+            // pipe, which holds the watch — outlives the failed launch, and a
+            // Retry against a broken install leaves another one behind each
+            // press.
+            errors.abandon()
+            throw error
+        }
         return SpawnedEngine(process)
     }
 }
