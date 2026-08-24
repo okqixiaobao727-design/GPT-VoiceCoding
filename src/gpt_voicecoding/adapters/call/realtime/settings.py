@@ -21,6 +21,18 @@ this table, and their absence is the point.
   choice. If codex ever grants a socket exemption to a narrower sandbox,
   tightening this is an obligation rather than an option.
 
+`realtime_model` *is* here, and it is the one key that looks like it should have
+been pinned beside those two. The rule that separates them is **who controls the
+value**. `approvalPolicy`, `sandbox` and `REALTIME_VERSION` are values this
+repository verifies and then pins; they move only when our code moves, which is
+what makes them mechanism identity. The realtime model's validity is granted and
+withdrawn by the backend: on 2026-08-22 the value codex sends by default fell out
+of an allowlist we do not see, with no client change, and every call failed for
+two days (#35). A value the far side can revoke at will is not mechanism
+identity — it is an **environment fact with a default**, and the operator is owed
+a one-line escape hatch rather than a wait for our next release. The default is
+the single pin point; there is no second constant holding the same fact.
+
 `workspace` *is* a location, so it defaults — to the user's home directory,
 which always exists and assumes no project. Deliberately **not** the engine's
 own state directory: an adapter that derived it would have to reach into Bridge
@@ -49,6 +61,16 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_DELEGATED_TURN_TIMEOUT_SECONDS = 300.0
 
 
+#: The realtime model the backend still accepts. codex populates `session.model`
+#: on this path no matter how it is configured, and its own default
+#: (`gpt-live-1-boulder-alpha`) is refused for ChatGPT-authenticated sessions —
+#: reported, misleadingly, as the *field* not being allowed (#35,
+#: openai/codex#40140). Stating an accepted model is what brings the call up.
+#: Granted by the far side, so it can expire again: re-run the probe in #35 and
+#: re-derive it.
+DEFAULT_REALTIME_MODEL = "gpt-live-1-codex"
+
+
 class SettingsError(Exception):
     """The settings table names something this adapter does not have."""
 
@@ -72,6 +94,9 @@ class RealtimeCallSettings:
     connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     delegated_turn_timeout_seconds: float = DEFAULT_DELEGATED_TURN_TIMEOUT_SECONDS
+    #: Which realtime model the call asks for. Defaulted, not pinned: see the
+    #: module docstring for why this one key is the operator's to state.
+    realtime_model: str = DEFAULT_REALTIME_MODEL
     #: Which audio devices to open, by the index the host audio library uses.
     #: `None` means the machine's own default, which is what a laptop wants.
     input_device: int | None = None
@@ -85,6 +110,8 @@ class RealtimeCallSettings:
         ):
             if getattr(self, name) <= 0:
                 raise SettingsError(f"{name} must be a positive number of seconds")
+        if not self.realtime_model.strip():
+            raise SettingsError("realtime_model must be a model name")
         for name in ("input_device", "output_device"):
             device = getattr(self, name)
             if device is not None and device < 0:
@@ -116,6 +143,10 @@ def _typed(key: str, value: Any) -> Any:
         if not isinstance(value, str) or not value.strip():
             raise SettingsError(f"{key} must be a directory path")
         return Path(value.strip()).expanduser()
+    if key == "realtime_model":
+        if not isinstance(value, str) or not value.strip():
+            raise SettingsError(f"{key} must be a model name")
+        return value.strip()
     if key in ("input_device", "output_device"):
         if isinstance(value, bool) or not isinstance(value, int):
             raise SettingsError(f"{key} must be an audio device index")

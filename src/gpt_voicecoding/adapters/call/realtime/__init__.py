@@ -20,7 +20,11 @@ from gpt_voicecoding.adapters.call.realtime.adapter import (
     DelegatedTurnError,
     RealtimeCallAdapter,
 )
-from gpt_voicecoding.adapters.call.realtime.settings import RealtimeCallSettings, SettingsError
+from gpt_voicecoding.adapters.call.realtime.settings import (
+    DEFAULT_REALTIME_MODEL,
+    RealtimeCallSettings,
+    SettingsError,
+)
 from gpt_voicecoding.adapters.call.realtime.transport import (
     CallTransport,
     TransportError,
@@ -29,6 +33,7 @@ from gpt_voicecoding.adapters.call.realtime.transport import (
 
 __all__ = [
     "APPROVAL_POLICY",
+    "DEFAULT_REALTIME_MODEL",
     "SANDBOX",
     "CallTransport",
     "DelegatedTurnError",
