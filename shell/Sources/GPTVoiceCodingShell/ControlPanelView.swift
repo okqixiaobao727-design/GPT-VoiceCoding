@@ -167,9 +167,9 @@ private struct StatusSection: View {
     }
 }
 
-/// The two control-plane failure kinds, kept apart in the words themselves. A
-/// refusal is Bridge Core speaking; an unreachable engine is this shell speaking
-/// about itself, and it says so.
+/// The three control-plane failure kinds, kept apart in the words themselves. A
+/// refusal is Bridge Core speaking; unreachable and protocol mismatch are this
+/// shell speaking about what happened, and each says so.
 private struct FailurePanel: View {
     let failure: ActionFailure
 
@@ -186,6 +186,12 @@ private struct FailurePanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             case .unreachable(let detail):
                 Text("This shell could not reach the engine")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(detail)
+                    .font(.callout).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .protocolMismatch(let detail):
+                Text("Control-plane protocol mismatch")
                     .font(.caption).foregroundStyle(.secondary)
                 Text(detail)
                     .font(.callout).textSelection(.enabled)

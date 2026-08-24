@@ -3,16 +3,19 @@ import Observation
 
 /// How an ask ended when it did not bring back an answer.
 ///
-/// Two of the three failure kinds this surface must keep apart. The third —
+/// Three of the four failure kinds this surface must keep apart. The fourth —
 /// there is no engine process at all — is process parenthood and lives in
 /// ``EngineHealth``, because "the engine refused", "nothing answered" and "there
-/// is no engine" are three different sentences, and a merged rendering would be
-/// this surface inventing engine speech.
+/// is no engine" are different sentences. So is "the engine answered in an
+/// unsupported protocol", and a merged rendering would hide the one fact that
+/// tells the user which side needs updating.
 public enum ActionFailure: Equatable, Sendable {
     /// **(a)** Bridge Core answered, and answered no. Its own words, verbatim.
     case refused(Refusal)
     /// **(b)** Nothing answered. Raised here, never sent by the engine.
     case unreachable(String)
+    /// **(c)** The engine answered in a protocol this shell cannot interpret.
+    case protocolMismatch(String)
 }
 
 /// What the last `status` read found.
@@ -168,7 +171,7 @@ public final class ControlPanel {
         lastFailure = outcome.failure
     }
 
-    /// One request, and the two ways it can end without an answer.
+    /// One request, and the three ways it can end without an answer.
     private func ask<T>(
         _ request: Request, _ read: ([String: JSONValue]) -> T
     ) async -> Outcome<T> {
@@ -182,7 +185,12 @@ public final class ControlPanel {
             }
             return .answered(read(reply.data))
         } catch let failure as ControlPlaneFailure {
-            return .failed(.unreachable(failure.detail))
+            switch failure {
+            case .protocolMismatch:
+                return .failed(.protocolMismatch(failure.detail))
+            case .engineUnreachable, .unreadable:
+                return .failed(.unreachable(failure.detail))
+            }
         } catch {
             return .failed(.unreachable("\(error)"))
         }

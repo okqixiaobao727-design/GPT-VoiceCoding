@@ -74,9 +74,17 @@ import Testing
     }
 
     @Test func anAbsentProtocolIsNotAnEmptyOne() throws {
-        // ADR 0003: absent means an engine too old to have been asked.
+        // Absence means the reply did not declare a numeric protocol version.
         let reply = try Reply.of(Data(#"{"ok": true, "action": "status", "data": {}}"#.utf8))
         #expect(reply.protocolVersion == nil)
+    }
+
+    @Test func missingAndPresentProtocolMismatchesHaveDifferentDetails() {
+        let missing = ControlPlaneFailure.protocolMismatch(received: nil, supported: 3).detail
+        let present = ControlPlaneFailure.protocolMismatch(received: 4, supported: 3).detail
+
+        #expect(!missing.isEmpty)
+        #expect(missing != present)
     }
 
     @Test func anUnreadableAnswerIsNotAReply() {

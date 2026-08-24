@@ -60,9 +60,11 @@ start with a named error rather than an `OSError` from inside asyncio.
 {"ok": false, "action": "switch", "protocol": 3, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
-`action` is `null` when the line never named a usable one. `protocol` is `3`;
-a field being **absent** means an engine too old to have been asked, which is
-distinct from a field being empty ([ADR 0003](adr/0003-the-engine-reports-what-it-loaded.md)).
+`action` is `null` when the line never named a usable one. `protocol` is the
+numeric protocol version, currently `3`. A missing field or JSON `null` means the
+reply did not declare a usable version. The Swift shell refuses to interpret any
+reply whose version is missing or differs from the version it supports, and shows
+that protocol mismatch separately from an engine refusal or an unreachable engine.
 
 **`error.message` is rendered verbatim.** It is the refusal's own words, from
 Bridge Core. A surface that rephrased one would be a second voice deciding what
