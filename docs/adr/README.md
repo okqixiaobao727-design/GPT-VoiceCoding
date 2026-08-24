@@ -10,6 +10,7 @@
 | [0006](0006-the-claude-channel-server-is-python-and-stdlib-only.md) | The Claude Session Channel server is Python, and speaks MCP with the standard library alone |
 | [0007](0007-the-approval-hook-is-a-session-scoped-plugin.md) | The Claude Approval Relay's hook is registered as a session-scoped plugin |
 | [0008](0008-the-direct-child-launcher-is-headless.md) | The direct-child launcher is headless, and visibility is the tmux adapter's job |
+| [0009](0009-a-launch-carries-its-opening-instruction.md) | A launch carries its Opening Instruction, and a bare launch is refused |
 
 ## Provenance
 

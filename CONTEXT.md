@@ -65,6 +65,10 @@ _Avoid_: task, job, window
 The capability that brings a Session into existence in a workspace.
 _Avoid_: terminal control, tmux (one optional way to launch, not the capability)
 
+**Opening Instruction**:
+The words a Session is launched to act on, carried by the launch itself and performed as that Session's first turn. Every launch has one: a Session brought into existence with nothing to do is not a supported state.
+_Avoid_: initial task (`task` is reserved against for a Session), prompt (the agent's word, not the product's), first message
+
 **Relay**:
 Carrying words *into* a Session — the agent-ward direction.
 _Avoid_: injection (a mechanism, not the capability), push, channel (reserved for the Companion Channel)
