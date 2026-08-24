@@ -41,6 +41,14 @@ from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
 
 
 class TestTheStopNoticePipelineEndToEnd:
+    def test_a_stop_notice_never_relays_words_back_into_a_session(self) -> None:
+        """The system tells the user about a stop; it does not address an agent."""
+        hub = Hub()
+
+        hub.emit(SessionStopped(target=CODEX))
+
+        assert hub.agent.calls == []
+
     def test_a_stopped_session_is_announced_by_its_label(self) -> None:
         hub = Hub()
 

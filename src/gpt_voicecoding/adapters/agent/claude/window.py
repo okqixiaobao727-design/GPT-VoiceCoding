@@ -7,12 +7,10 @@ working as designed — a window nobody has observed is not one anything may cla
 is open — but it leaves a Claude Session unreachable in the assembled engine, so
 observing it is this module's whole job.
 
-**A Reply Window is a level, not an event.** Claude Code publishes exactly that,
-in the same registry record the Notice Relay already reads: a `status` field
-carrying `idle`, `busy` or `waiting`, rewritten sub-second. Reading a level from
-the field that *is* the level beats reconstructing it from a stream of transcript
-events, which is why this watches the registry rather than the transcript the
-rest of this spoke reads.
+**A Reply Window is a level, not an event.** Claude Code publishes exactly that
+in its registry record: a `status` field carrying `idle`, `busy` or `waiting`,
+rewritten sub-second. Reading the field that *is* the level beats reconstructing
+it from a stream of events.
 
 **`waiting` is CLOSED.** It means a permission dialog is on screen, and a dialog
 blocks every Relay there is — verified live: three routes, all enqueued, none

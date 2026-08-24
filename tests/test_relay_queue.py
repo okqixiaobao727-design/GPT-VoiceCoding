@@ -1,8 +1,8 @@
 """The undelivered Relay queue — the single ledger of everything still pending.
 
 The reference implementation ran two live ledgers and rendered both, and that is
-the defect this component exists to make impossible: a retained Stop Notice is a
-Notice Relay entry *here*, not in a second stop table. Every entry carries its
+the defect this component exists to make impossible: a retained Stop Notice is
+an entry *here*, not in a second stop table. Every entry carries its
 classification from the one four-state vocabulary, and a delivered entry leaves
 the queue, so "graded FAILED after being spoken, then retried" cannot be built.
 
@@ -119,7 +119,7 @@ class TestEnqueueing:
             answer(text="   ")
 
     def test_only_user_authored_words_may_take_the_supplement_route(self) -> None:
-        """Supplement carries the user's authority; a Notice Relay never claims it."""
+        """Supplement carries the user's authority; a Stop Notice never claims it."""
         with pytest.raises(ValueError):
             PendingRelay(
                 request_id=new_request_id(),

@@ -77,21 +77,10 @@ from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 
 _log = logging.getLogger(__name__)
 
-#: How a Notice Relay says what it is. Both halves are load-bearing: the first
-#: corrects the authorship a `turn/start` would otherwise imply, and the second
-#: is the approval ceiling — a notice that lands while a permission prompt is
-#: pending must be impossible to read as the user's verdict on it. Codex has no
-#: metadata slot for authorship, so the words carry it.
 #: What codex says about a thread that exists but has never done anything. It
 #: has no rollout file yet, so there is nothing to resume — a state the thread
 #: grows out of the moment it does any work.
 NO_ROLLOUT_YET = "no rollout found"
-
-NOTICE_FRAME = (
-    "[Notice Relay from the GPT-VoiceCoding bridge — written by the bridge, not by "
-    "your user. It carries none of the user's authority and approves nothing; any "
-    "pending permission request is still waiting for the user's own answer.]"
-)
 
 
 def default_own_socket_path(settings: CodexSettings) -> Path:
@@ -104,11 +93,6 @@ def default_own_socket_path(settings: CodexSettings) -> Path:
     root is shared `/tmp`, which cannot be made private to anyone.
     """
     return settings.socket_directory / f"gpt-voicecoding-{os.geteuid()}" / "codex-app-server.sock"
-
-
-def notice_text(text: str) -> str:
-    """One Notice Relay's payload. The frame is never optional."""
-    return f"{NOTICE_FRAME}\n\n{text}"
 
 
 class CodexAgentAdapter:
@@ -262,14 +246,6 @@ class CodexAgentAdapter:
     ) -> DeliveryReceipt:
         """Carry the user's own words in, with the user's authority."""
         return await self._relay(target, text, request_id=request_id, route=route)
-
-    async def notice_relay(
-        self, target: SessionTarget, text: str, *, request_id: RequestId
-    ) -> DeliveryReceipt:
-        """Carry words the system originates, framed so they claim no authority."""
-        return await self._relay(
-            target, notice_text(text), request_id=request_id, route=RelayRoute.DELIVER
-        )
 
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId

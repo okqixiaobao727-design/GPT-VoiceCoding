@@ -90,9 +90,8 @@ CHANNEL_ERROR: Final = "error"
 #: The Relay kind each seam verb puts on the wire.
 #:
 #: One entry, and that is the honest size of it: the channel is the Answer
-#: Relay's route and nothing else's. A Notice Relay rides the peer socket and an
-#: Approval Relay rides a hook, so neither has a channel kind to name — when
-#: those routes arrive they extend this mapping or they do not touch it at all.
+#: Relay's route and nothing else's. Approval Relay rides a hook, so it has no
+#: channel kind to name.
 #:
 #: `user_message` is deliberately not `user_answer`. Answer Relay carries both
 #: the user's answers to a Session's questions *and* their unsolicited

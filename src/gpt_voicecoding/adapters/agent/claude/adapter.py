@@ -16,15 +16,12 @@ therefore kept, for a second and longer budget, purely so a late receipt can be
 raised upward and the hub can drop what it was holding. Only DELIVERED is ever
 raised that way; a late anything-else is logged and changes nothing.
 
-**Three verbs over three different wires.** This package is the shared Claude
+**Two verbs over two different wires.** This package is the shared Claude
 adapter. The Answer Relay rides the MCP Session Channel, described above. The
-Notice Relay rides the **peer socket** — a separate route with a separate proof,
-delegated to `notice.py`, and separate because the peer socket wraps every
-message in a hard-coded "not typed by your user" preamble that is correct for
-system-authored words and a lie about the user's own. The Approval Relay rides
-the **`PermissionRequest` hook**, delegated to `approval.py`, and it is the one
-route where *we* are the server: a hook process dials in holding a displayed
-dialog open, and the verdict travels back down the connection it is waiting on.
+Approval Relay rides the **`PermissionRequest` hook**, delegated to
+`approval.py`, and it is the route where *we* are the server: a hook process
+dials in holding a displayed dialog open, and the verdict travels back down the
+connection it is waiting on.
 
 The Approval Relay is also the one verb whose route this adapter cannot start.
 The hook only exists for a Session launched with `--plugin-dir` naming the
@@ -49,8 +46,6 @@ from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
 from gpt_voicecoding.adapters.agent.claude.bootstrap import bootstrap_value
-from gpt_voicecoding.adapters.agent.claude.notice import NoticeRelay
-from gpt_voicecoding.adapters.agent.claude.peer import ReceiptListener
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     ACKNOWLEDGED,
     CHANNEL_ERROR,
@@ -107,15 +102,9 @@ class ClaudeAgentAdapter:
         self._channels: dict[SessionTarget, Path] = {}
         #: Late-receipt listeners in flight, so none outlives this adapter.
         self._listening: set[asyncio.Task[None]] = set()
-        #: The one long-lived resource this adapter owns: a socket in Claude
-        #: Code's own `cc-socks` directory, where peer receipts are delivered.
-        self._receipts = ReceiptListener(self._settings.peer_socket_directory)
-        self._notices = NoticeRelay(
-            settings=self._settings, listener=self._receipts, emit=self._emit
-        )
         self._windows = ReplyWindowWatcher(settings=self._settings, emit=self._emit)
-        #: The second socket this adapter owns, and the only one it is the
-        #: *server* on: hook processes dial in here holding a dialog open.
+        #: The socket this adapter owns: hook processes dial in here holding a
+        #: dialog open, so this adapter is the server on this route.
         self._approvals = ApprovalListener(
             settings=self._settings, resolve=self._registered_as, emit=self._emit
         )
@@ -125,17 +114,10 @@ class ClaudeAgentAdapter:
     async def connect(self) -> None:
         """Start watching Reply Windows, and open the socket dialogs are parked on.
 
-        The receipt listener is deliberately *not* bound here. It lives in a
-        directory Claude Code owns, and binding a socket there on the strength of
-        "this engine started" would leave one sitting in a shared namespace for
-        every run that never sends a Notice Relay. It is bound on first use and
-        removed on `aclose`.
-
-        The approval socket is the opposite case and is bound here for exactly
-        the reason the receipt listener is not: it lives in a directory of this
-        engine's own, and its address has to be knowable *before* any Session
-        launches, because the launch is what carries it to the hook. A socket
-        bound on first use would be one no launch could ever have named.
+        The approval socket is bound here because it lives in a directory of
+        this engine's own, and its address has to be knowable *before* any Session
+        launches: the launch is what carries it to the hook. A socket bound on
+        first use would be one no launch could ever have named.
 
         A socket that will not bind is logged and not raised. It costs the
         Approval Relay and nothing else — every verdict aimed at this adapter is
@@ -152,11 +134,7 @@ class ClaudeAgentAdapter:
         """Stop everything this adapter started, and take its socket back out.
 
         A channel is a process Claude Code owns. Closing this adapter lets go of
-        connections to it and nothing more — there is nothing there to reap. The
-        receipt listener is the exception, and the reason this method has more to
-        do than the Answer Relay left it: that socket is ours, it sits in a
-        directory shared with every Session on the machine, and leaving it behind
-        would litter that namespace with dead inodes.
+        connections to it and nothing more — there is nothing there to reap.
 
         **Each cancelled task is waited for, not merely cancelled.** A
         cancellation is a request, delivered the next time the task runs, so
@@ -172,10 +150,8 @@ class ClaudeAgentAdapter:
             with suppress(asyncio.CancelledError):
                 await task
         self._listening.clear()
-        await self._notices.aclose()
         await self._windows.aclose()
-        await self._receipts.aclose()
-        # Closes last of the three, and releases every parked dialog to its human
+        # Closes last, and releases every parked dialog to its human
         # on the way out: an engine shutting down must never be the reason a
         # permission prompt resolves without the person it was asked of.
         await self._approvals.aclose()
@@ -250,21 +226,6 @@ class ClaudeAgentAdapter:
             # never this adapter's.
             return _failed(request_id, SUPPLEMENT_UNAVAILABLE)
         return await self._deliver(target, text, request_id=request_id, verb="answer_relay")
-
-    async def notice_relay(
-        self, target: SessionTarget, text: str, *, request_id: RequestId
-    ) -> DeliveryReceipt:
-        """Carry words the system itself originates, over the peer socket.
-
-        A different wire from the Answer Relay, and deliberately so: the peer
-        socket frames everything it carries as a message from another session and
-        never as the user's own — right for a Notice, wrong for a user's words —
-        so nothing about the channel route applies here beyond the four states
-        both must classify into.
-        """
-        if target.agent is not AgentKind.CLAUDE:
-            return _failed(request_id, f"{target.agent} sessions are not this adapter's to reach")
-        return await self._notices.send(target, text, request_id=request_id)
 
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId

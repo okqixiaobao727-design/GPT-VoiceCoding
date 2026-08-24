@@ -119,14 +119,6 @@ class FakeAgent:
             )
         return self._receipt(request_id)
 
-    async def notice_relay(
-        self, target: SessionTarget, text: str, *, request_id: RequestId
-    ) -> DeliveryReceipt:
-        self.calls.append(
-            RelayCall(verb="notice_relay", target=target, request_id=request_id, text=text)
-        )
-        return self._receipt(request_id)
-
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:

@@ -360,8 +360,6 @@ def with_idle_claude(home: Path, *, poll_seconds: float = 0.02) -> str:
                     '[adapters.settings."agent.claude"]',
                     f'registry_directory = "{home / "sessions"}"',
                     f'socket_directory = "{home / "sockets"}"',
-                    f'projects_directory = "{home / "projects"}"',
-                    f'peer_socket_directory = "{home / "peers"}"',
                     f"reply_window_poll_seconds = {poll_seconds}",
                     "",
                     "[delegate]",

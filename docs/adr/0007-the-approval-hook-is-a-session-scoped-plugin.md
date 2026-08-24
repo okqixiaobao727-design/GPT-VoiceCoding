@@ -102,8 +102,7 @@ the channel proof already makes for the launch wrapper.
 
 **The `--plugin-dir` behaviour is part of the 2.1.238 pin**, alongside this
 route's wire shapes. It is undocumented and was established by live probe, so a
-Claude Code upgrade re-verifies it the way an upgrade re-probes the peer socket's
-protocol number.
+Claude Code upgrade re-verifies the flag and the hook contract together.
 
 **"Survives a settings round trip" is satisfied by construction**, not by the
 mechanism the issue imagined: there is no settings file in this story, so there is

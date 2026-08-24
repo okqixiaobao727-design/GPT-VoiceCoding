@@ -149,9 +149,8 @@ class ControlPlane:
     async def _relay(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """An Answer Relay: the user's own words, carrying the user's authority.
 
-        There is deliberately no Notice Relay action. A Notice is words the
-        system itself originates, so a surface asking for one would be a surface
-        claiming to be the system.
+        There is deliberately no action for system-authored words: a surface
+        asking for one would be a surface claiming to be the system.
         """
         outcome = await self._core.relay(
             payloads.read_target(payload),

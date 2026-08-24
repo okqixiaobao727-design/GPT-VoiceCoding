@@ -123,14 +123,6 @@ class TestTheAgentContract:
         assert receipt.outcome in set(Delivery)
         assert receipt.is_delivered is True
 
-    def test_the_verb_carries_the_relay_kind_so_no_envelope_has_to_guess(self) -> None:
-        """The reference implementation hard-coded `kind: "user_answer"` for everything."""
-        agent = FakeAgent()
-        request_id = new_request_id()
-        asyncio.run(agent.answer_relay(CODEX, "my own words", request_id=request_id))
-        asyncio.run(agent.notice_relay(CODEX, "the system's words", request_id=request_id))
-        assert [call.verb for call in agent.calls] == ["answer_relay", "notice_relay"]
-
     def test_an_adapter_without_the_supplement_route_says_so_and_does_nothing_else(
         self,
     ) -> None:
@@ -155,7 +147,7 @@ class TestTheAgentContract:
     def test_a_held_relay_is_never_reported_as_delivered(self) -> None:
         agent = FakeAgent(outcome=Delivery.HELD, reason="parked in front of the human")
         receipt = asyncio.run(
-            agent.notice_relay(CLAUDE, "you are needed", request_id=new_request_id())
+            agent.answer_relay(CLAUDE, "keep this waiting", request_id=new_request_id())
         )
         assert receipt.is_delivered is False
 

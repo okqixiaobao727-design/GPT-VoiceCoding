@@ -24,7 +24,7 @@ import pytest
 
 from codex_fake import FakeAppServer, FakeRemoteError
 from gpt_voicecoding.adapters.agent.codex import codex_agent
-from gpt_voicecoding.adapters.agent.codex.adapter import NOTICE_FRAME, CodexAgentAdapter
+from gpt_voicecoding.adapters.agent.codex.adapter import CodexAgentAdapter
 from gpt_voicecoding.adapters.agent.codex.approvals import voice_menu
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
@@ -383,30 +383,6 @@ class TestSupplement:
         receipt = asyncio.run(scenario())
         assert receipt.outcome is Delivery.FAILED
         assert "expected active turn id `a-stale-turn`" in receipt.reason
-
-
-class TestNoticeRelay:
-    def test_every_notice_is_framed_as_the_bridge_speaking(self, socket_path: Path) -> None:
-        """The frame is what stops system words being read as the user's."""
-
-        async def scenario():
-            async with Codex(socket_path).script() as server:
-                adapter = await watching(server, Sink())
-                try:
-                    receipt = await adapter.notice_relay(TARGET, "you are needed", request_id=rid())
-                    return receipt, server.calls_to("turn/start")[0]["input"][0]["text"]
-                finally:
-                    await adapter.aclose()
-
-        receipt, sent = asyncio.run(scenario())
-        assert receipt.outcome is Delivery.DELIVERED
-        assert sent.startswith(NOTICE_FRAME)
-        assert "you are needed" in sent
-
-    def test_the_frame_says_it_carries_no_authority_and_approves_nothing(self) -> None:
-        """Both halves are load-bearing; the second is the approval ceiling."""
-        assert "not by your user" in " ".join(NOTICE_FRAME.split())
-        assert "approves nothing" in NOTICE_FRAME
 
 
 class TestApprovals:

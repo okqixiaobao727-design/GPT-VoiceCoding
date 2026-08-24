@@ -34,7 +34,7 @@ through a seam.
 | Module / seam | Adapters | Notes |
 | --- | --- | --- |
 | Call | bridge-owned realtime call (aiortc) — the **only** adapter shipped | the GUI Live Driver is not migrated; the seam survives because it is what let the second adapter replace the first |
-| Agent | Codex (app-server JSON-RPC), Claude (MCP server + peer socket + `PermissionRequest` hook) | one interface, two adapters |
+| Agent | Codex (app-server JSON-RPC), Claude (MCP server + `PermissionRequest` hook) | one interface, two adapters |
 | Session Launcher | tmux (optional), direct child process | launching and conversing are orthogonal seams |
 | Companion Channel | capability public; the Telegram adapter is generic and public, a deployment's own wiring is not | see ADR 0003 |
 | Menu-bar shell | Swift, thin | **not** a module with a private protocol — just another control-plane surface; its only extra relationship to the engine is process parenthood (spawn, health, restart) |
@@ -73,8 +73,8 @@ those files, or the disk becomes a second truth.
   `call_state` · `speak(text)` · `delegate(text) -> reply`. Events up: user-speech
   transcript, call started / ended / dropped. The one-call invariant lives *above*
   this seam.
-- **Agent**: `answer_relay(session, text)` · `notice_relay(session, text)` ·
-  `approval_relay(session, request, verdict)` · `reply_window(session)`. Events
+- **Agent**: `answer_relay(session, text)` · `approval_relay(session, request,
+  verdict)` · `reply_window(session)`. Events
   up: Session stopped, awaiting approval, Reply Window changed, delivery
   receipts (delivered / held / expired). Reply-Window queueing is Bridge Core
   policy — adapters deliver, never queue.

@@ -73,10 +73,6 @@ _Avoid_: injection (a mechanism, not the capability), push, channel (reserved fo
 A Relay of the user's own words — their spoken instructions and their answers to a Session's questions — carrying the user's authority.
 _Avoid_: MCP Channel (one adapter, not the capability)
 
-**Notice Relay**:
-A Relay of words the system itself originates; it neither needs nor claims the user's authority.
-_Avoid_: system message, notification (that word belongs to the user-ward direction)
-
 **Approval Relay**:
 A Relay of the user's verdict on a Session's pending permission request — one decision for one request, carrying the user's authority.
 _Avoid_: auto-approve (the user decides, the system only carries), permission bypass
