@@ -389,6 +389,9 @@ class RealtimeCallAdapter:
                 {
                     "threadId": live.thread_id,
                     "version": REALTIME_VERSION,
+                    # Top level, beside the version — not nested in a `session`
+                    # object. codex overrides its own default with this (#35).
+                    "model": self._settings.realtime_model,
                     "outputModality": OUTPUT_MODALITY,
                     "transport": {"type": "webrtc", "sdp": offer},
                     "realtimeStartInstructions": instructions,
@@ -412,7 +415,15 @@ class RealtimeCallAdapter:
             AppServerError,
             asyncio.CancelledError,
         ) as failed:
-            await self._abandon(live, f"the call did not come up: {failed}")
+            # The model is named because the failure that cost two days was an
+            # upstream refusal of the model value reported as a refusal of the
+            # field, from a message that never said which value had been sent
+            # (#35). Upstream's own words still come through verbatim.
+            await self._abandon(
+                live,
+                f"the call did not come up: {failed} "
+                f"(asking for realtime model {self._settings.realtime_model})",
+            )
             return CallSnapshot(state=CallState.DOWN)
 
         self._state = CallState.UP
