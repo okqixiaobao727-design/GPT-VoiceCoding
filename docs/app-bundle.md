@@ -99,6 +99,19 @@ codex skill, and make sure nothing else is polling this engine's bot. Both are
 preconditions rather than steps — get either wrong and the run produces results
 that cannot be attributed to this engine at all.
 
+**And before attributing any voice failure to this engine, re-verify the realtime
+contract with an engine-free probe:** a bare `codex app-server` client that sends
+the v3 realtime start and nothing else. The realtime methods are an alpha backend
+surface, absent from the official app-server docs and gated server-side, so the
+contract can move without anything here changing — the research that approved
+this route said to re-run the probe on every codex bump, and it was right. A
+probe that fails identically outside the engine has told you, in seconds, that
+the engine is not the subject. On the maintainer's machine this is
+`scripts/rt_prototype.py --silent` in the legacy checkout — thirty seconds, no
+microphone, no bundle, its own app-server child. The probe is not shipped here;
+what is portable is the instruction to run one, and the research resolution it
+came from defines its shape.
+
 **0. Configure it, and read *both* failures first.** Copy
 `Contents/Resources/config.example.toml` into
 `~/Library/Application Support/GPT-VoiceCoding/engine/config.toml`, and before
@@ -133,15 +146,21 @@ first-generation bridge's `companionChannel` is empty and it never spoke to
 Telegram at all. The constraint is Telegram's and still real; that one bridge is
 simply not what would violate it.
 
-**3. Launch a Session.** From the menu bar, and again headless with
-`bridgectl launch`. Both must reach a real agent in a real workspace — this is
-also the step that proves the `PATH` the shell hands the engine is your own and
-not launchd's.
+**3. Launch a Session.** Twice, by both routes that exist: headless with
+`bridgectl launch`, and by voice inside a Live Call started from the menu bar —
+the shell deliberately has no launch control of its own, because launching
+belongs to the control plane and the call, not to the lifecycle owner. The voice
+leg may be performed when the first Live Call comes up and recorded against this
+step. Both must reach a real agent in a real workspace, and the headless leg is
+also what proves the `PATH` the shell hands the engine is your own and not
+launchd's.
 
-A cold launch can take the better part of a minute, which is longer than the
-control-plane client waits — expect `bridgectl launch` to report a timeout here
-and read the limitation below before you retry, because retrying the wrong way
-starts a second agent.
+A cold launch can take the better part of a minute, and the client now waits up
+to 150 s for `launch` alone — a ceiling derived from the launch itself rather
+than the ordinary request deadline (#28). So a reported timeout no longer means
+"cold launch, be patient": it means the engine genuinely hung. Read the
+limitation below before you retry, because retrying the wrong way starts a
+second agent.
 
 **4. Let it stop.** Wait for the Session to finish a turn.
 
@@ -188,8 +207,11 @@ acceptance exists so this is met once on purpose.
 
 **Nothing ends an engine it did not start.** Kill the shell abnormally and the
 engine is orphaned, and there is no supported way to stop it but `kill` on the
-process. Two reasons, both load-bearing rather than incidental: `bridgectl` is a
-*control-plane surface* — status and switches — and giving it a stop verb would
+process. Note this is about the *engine*, not the Sessions it launched: under the
+`direct_child` launcher a Session is a direct child of the engine and goes with
+its process group, so quitting normally takes the agents with it rather than
+leaving them behind. Two reasons, both load-bearing rather than incidental:
+`bridgectl` is a *control-plane surface* — status and switches — and giving it a stop verb would
 make the control plane a lifecycle owner, which is not what it is; and a
 relaunched shell holds no handle on a process it did not spawn, so its Quit
 stops its own child and it has none, having refused to start one against the
@@ -201,13 +223,16 @@ convenience feature.
 **An update may re-prompt for the microphone.** Ad-hoc signatures change per
 build. Charter decision 9, accepted; it waits for notarization.
 
-**A cold `bridgectl launch` outlives the client's deadline, and says so as
-though it failed.** Starting an agent from nothing takes far longer than the ten
-seconds the control-plane client waits, so the CLI prints `the engine at … did
-not answer within 10s` and exits 2 — for a launch that is proceeding normally
-and completes moments later. The engine is not wedged and the Session is not
-lost; only the answer was late. Confirm with `bridgectl status`, which will show
-the Session once it registers.
+**`bridgectl verify` proves wiring, not that a call can be placed.** Each seam's
+verify reports which implementation is loaded and whether that seam's far side
+answers — for the Call seam, whether the `codex app-server` responds. It does
+**not** establish a realtime session, because a health check that did would open
+the microphone, spend a realtime session and need a teardown path. So
+`call: pass — the call is down` means "the wiring is sound and no call is
+currently up", not "a call can be placed": a refusal that lives further out, at
+the realtime backend, is invisible to it. **The first real call attempt is that
+proof**, and when it fails the reason is reported verbatim — which is the sentence
+to read, and to quote in a bug report.
 
 **Retry with the *same* `--request-id`, never a fresh one.** A launch is held as
 a transaction keyed by its request id, so re-issuing the identical command joins
@@ -241,6 +266,19 @@ launched at all — the control-plane launch action refuses raw `workspace` and
 `~/.codex/skills/` for a first-generation skill and move it out.** On the
 reference machine it was `~/.codex/skills/gpt-voicecoding/`, six files, and it
 took three launches to notice.
+
+**Check for the first generation's whole runtime too, not only its skill, and
+identify it by what it is rather than by where it was last seen.** It has been
+found installed at `~/Library/Application Support/GPT-VoiceCoding/runtime/` —
+inside *this* product's own directory, which is exactly where an operator will
+not think to look, and where a check written against some other address returns
+a confident CLEAN. Two tests settle it wherever it turns up: a `bridgectl` whose
+verbs are the first generation's (`serve`, `duty-toggle`, `session-label`,
+`stop`, `stops`, `install-hooks`) rather than this engine's (`status`,
+`switch`, `sessions`, `launch`, `verify`); and a `.source-revision` that
+`git cat-file -t` cannot resolve in this repository, which means it was built
+from another codebase. An installed runtime whose daemon is not running is
+still worth knowing about before you attribute anything.
 
 The Live Call's voice thread runs on a codex app-server, and codex loads skills
 from the user's own directory. A skill written for the first-generation bridge
