@@ -176,6 +176,28 @@ class TestTheRelayPipelineEndToEnd:
 
 
 class TestTheInboundRouterEndToEnd:
+    def test_an_inbound_command_records_its_classification(self, caplog) -> None:
+        """Ticket #48's coordinator ruling pins this exact log format."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub()
+
+        hub.emit(InboundText(text="/status"))
+
+        assert [record.getMessage() for record in caplog.records] == [
+            "handled inbound Companion Channel message kind=control"
+        ]
+
+    def test_an_inbound_answer_relay_records_its_target(self, caplog) -> None:
+        """The ruling appends the SessionTarget only for an Answer Relay."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub()
+
+        hub.emit(InboundText(text="ship it"))
+
+        assert [record.getMessage() for record in caplog.records] == [
+            f"handled inbound Companion Channel message kind=answer_relay target={CODEX}"
+        ]
+
     def test_a_command_reaches_the_wired_control_surface(self) -> None:
         seen: list[Classification] = []
 
