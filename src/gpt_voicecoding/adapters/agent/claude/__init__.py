@@ -24,6 +24,12 @@ to exist before any Session launches — the launch is what carries it to the ho
 in the bootstrap variable. `write_hook_plugin` renders the first and
 `approval_socket_path` names the second; `remove_hook_plugin` is the uninstall
 path, and it is a directory removal rather than a settings edit.
+
+**The Answer Relay likewise needs two launch arguments**: a second
+`--plugin-dir` naming the rendered Session Channel plugin and `--channels`
+naming its selector. `write_plugin` renders the directory and
+`channel_selector` names the channel; the Session Launcher removes both inline
+plugins with their per-launch directory.
 """
 
 from __future__ import annotations
@@ -40,7 +46,6 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     CHANNEL_CONFIG_VARIABLE,
     BootstrapError,
     bootstrap_value,
-    socket_path_in,
 )
 from gpt_voicecoding.adapters.agent.claude.hook_plugin import (
     HOOK_PLUGIN_NAME,
@@ -75,7 +80,6 @@ __all__ = [
     "hook_decision",
     "remove_hook_plugin",
     "remove_stale_listeners",
-    "socket_path_in",
     "write_hook_plugin",
     "write_plugin",
 ]

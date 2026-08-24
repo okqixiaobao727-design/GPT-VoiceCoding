@@ -123,19 +123,6 @@ def read_bootstrap(environ: Mapping[str, str]) -> ChannelBootstrap:
     )
 
 
-def socket_path_in(environ: Mapping[str, str]) -> Path | None:
-    """Where this launch's channel was told to listen, or `None` if it has none.
-
-    The Session Launcher's hook subprocess inherits the same variable the
-    wrapper set, which is how a registering Session reports its channel without
-    anything else needing to know the concept exists.
-    """
-    try:
-        return read_bootstrap(environ).socket_path
-    except BootstrapError:
-        return None
-
-
 def approval_socket_path_in(environ: Mapping[str, str]) -> Path | None:
     """Where this launch's engine parks permission dialogs, or `None` if nowhere.
 

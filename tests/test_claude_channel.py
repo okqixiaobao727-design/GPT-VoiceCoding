@@ -32,7 +32,6 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     ChannelBootstrap,
     bootstrap_value,
     read_bootstrap,
-    socket_path_in,
 )
 from gpt_voicecoding.adapters.agent.claude.channel import ChannelServer
 from gpt_voicecoding.adapters.agent.claude.privacy import ChannelPathError
@@ -416,7 +415,6 @@ class TestWhatTheLauncherMustTellIt:
         assert read.socket_path == Path("/tmp/x.sock")
         assert read.max_message_bytes == settings.max_message_bytes
         assert read.max_text_bytes == settings.max_text_bytes
-        assert socket_path_in(environ) == Path("/tmp/x.sock")
 
     @pytest.mark.parametrize(
         "value, expected",
@@ -438,9 +436,6 @@ class TestWhatTheLauncherMustTellIt:
         """Fail closed on every field: a default here is a channel nobody can find."""
         with pytest.raises(BootstrapError, match=expected):
             read_bootstrap({CHANNEL_CONFIG_VARIABLE: value})
-
-    def test_a_session_with_no_channel_reports_none_rather_than_raising(self) -> None:
-        assert socket_path_in({}) is None
 
 
 class TestAsARealProcess:
