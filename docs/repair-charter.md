@@ -5,7 +5,18 @@ work, one ticket per branch, off `main` (origin is current at `0a0add2`). You fi
 advisor (`gpt-voicecoding-8e`, via `SendMessage`) adjudicates every uncertain call and
 Simon's standing rules override everyone. Report to Simon in Chinese; artifacts in English.
 
-**Status: ACTIVE (unfrozen 2026-08-24).** This phase is governed by the wayfinder map
+**Status: SUPERSEDED (2026-08-25).** This charter no longer binds. Its scope table and exit
+criterion were derived from the wiring audit, which asked "is what was built connected?"
+and never "is what was built what the first generation proved necessary?" — so every
+repair batch it ordered answered the wrong question. The successor effort is the wayfinder
+map [#58](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/58): acceptance
+harness first, then a legacy-vs-v1.0 parity audit, then a charter rewritten from that gap
+table (ticket [#62](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/62)).
+The **Discipline** section below carries into the rewrite unchanged; the rest of this file
+is kept as the record of what the first repair phase did. Of its scope, #32, #37, #40–#46
+and #48 are merged on `main`; #38, #39, #47 and #55 remain open and are re-scoped by #62.
+
+*History, as it stood when superseded:* this phase was governed by the wayfinder map
 [#49](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/49) and tracked as its
 ticket [#52](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/52); the E2E
 suite design must be approved on ticket
