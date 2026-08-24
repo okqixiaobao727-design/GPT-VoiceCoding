@@ -101,7 +101,7 @@ class CodexPreparation:
         *,
         settings: LauncherSettings,
         host: AppServerHost,
-        engine: CodexEngineFacts | None = None,
+        engine: CodexEngineFacts,
         confirm_timeout_seconds: float = CONFIRM_TIMEOUT_SECONDS,
     ) -> None:
         self._request = request
@@ -169,8 +169,7 @@ class CodexPreparation:
             )
 
         target = SessionTarget(agent=AgentKind.CODEX, session_id=session_id)
-        if self._engine is not None:
-            await self._engine.register_session(target, self._socket)
+        await self._engine.register_session(target, self._socket)
         return target
 
     async def discard(self) -> tuple[ChildOutcome, ...]:

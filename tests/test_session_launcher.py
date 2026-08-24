@@ -136,6 +136,16 @@ class FakeClaudeEngine:
         self.registered.append((target, socket_path))
 
 
+class FakeCodexEngine:
+    """The launched app-server address the running Codex Agent adapter takes."""
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[SessionTarget, Path]] = []
+
+    async def register_session(self, target: SessionTarget, socket_path: Path) -> None:
+        self.registered.append((target, socket_path))
+
+
 def a_request(workspace: Path, *, env: dict[str, str] | None = None) -> LaunchRequest:
     return LaunchRequest(
         request_id=new_request_id(),
@@ -1328,6 +1338,7 @@ class TestPreparingACodexSession:
             a_codex_request(workspace),
             settings=settings_for(tmp_path, binary=Path("/bin/sh"), registry=tmp_path / "r"),
             host=host,
+            engine=FakeCodexEngine(),
             confirm_timeout_seconds=3.0,
         )
 
