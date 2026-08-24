@@ -31,6 +31,16 @@ baseline this watcher compares against and stays silent; Bridge Core learns the
 starting level by *asking* — the Agent seam's `reply_window`, answered here by
 `level` — at the moment it enters the Session in its roster.
 
+**A turn stop is an observed active status reaching `idle`.** Both `busy` and
+`waiting` belong to the same active turn: `waiting` is that turn paused at a
+permission dialog, not the next user prompt. A missing, torn or unrecognised
+record does not prove activity and does not erase activity already observed.
+That distinction prevents the first `idle` record written after registration
+from being announced as a turn that stopped, while still surviving an ordinary
+mid-turn registry rewrite. A whole active-to-idle cycle that begins and ends
+between two polls remains invisible, the same sampling limit this level watcher
+already has for Reply Window transitions.
+
 That split is #27's. Registration announced the starting level once, and the
 announcement was always dropped: an adapter is registered before Bridge Core
 holds the Session, so the report arrived for a Session nobody knew, while having
@@ -94,6 +104,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionStopped,
 )
 from gpt_voicecoding.seams.identity import SessionTarget
 
@@ -103,6 +114,10 @@ _log = logging.getLogger(__name__)
 #: A whitelist rather than a blacklist: a new status this build has never seen
 #: must read as CLOSED, and a blacklist would let it read as OPEN.
 STATUS_MEANING_OPEN = "idle"
+
+#: Registry statuses that prove a turn is still in progress. `waiting` is the
+#: permission-dialog pause described above, so it remains part of that turn.
+STATUSES_MEANING_TURN_ACTIVE = frozenset(("busy", "waiting"))
 
 #: The two `SessionEnded.detail` strings, one per qualifying fact, so a reader can
 #: tell a vanished process from a pid that now belongs to somebody else.
@@ -151,10 +166,9 @@ def _record_for_live_target(
 class ReplyWindowWatcher:
     """Watches every registered Claude Session's registry record, and reports changes.
 
-    Two reports come out of one sweep: the Reply Window as a level, and the
-    Session's death as a one-shot event. They share a sweep because they share
-    their evidence, and reusing the one poll interval is why death needs no
-    configuration of its own.
+    Three reports come out of one sweep: the Reply Window as a level, a turn
+    stopping as an event, and the Session's death as a terminal event. They share
+    a sweep because they share their evidence, and reuse one poll interval.
     """
 
     def __init__(
@@ -167,6 +181,9 @@ class ReplyWindowWatcher:
         self._emit = emit
         #: The last level reported for each target, so only transitions are sent.
         self._reported: dict[SessionTarget, ReplyWindow] = {}
+        #: Targets whose current turn has been observed in progress. Kept across
+        #: unreadable records because absence is not evidence that a turn ended.
+        self._active_turns: set[SessionTarget] = set()
         self._polling: asyncio.Task[None] | None = None
 
     def level(self, target: SessionTarget) -> ReplyWindow:
@@ -211,11 +228,16 @@ class ReplyWindowWatcher:
         """
         if target in self._reported:
             return
-        self._reported[target] = self.level(target)
+        record, alive = self._observe(target)
+        live_record = _record_for_live_target(target, record, alive=alive)
+        self._reported[target] = window_for(live_record)
+        if live_record is not None and live_record.status in STATUSES_MEANING_TURN_ACTIVE:
+            self._active_turns.add(target)
 
     def forget(self, target: SessionTarget) -> None:
         """Stop watching one Session. Its own process is untouched."""
         self._reported.pop(target, None)
+        self._active_turns.discard(target)
 
     @property
     def watching(self) -> tuple[SessionTarget, ...]:
@@ -234,6 +256,7 @@ class ReplyWindowWatcher:
             with contextlib.suppress(asyncio.CancelledError):
                 await polling
         self._reported.clear()
+        self._active_turns.clear()
 
     def poll_once(self) -> None:
         """One sweep of every watched Session: death first, then the level.
@@ -247,12 +270,23 @@ class ReplyWindowWatcher:
             death = death_for(target, record, alive=alive)
             if death is not None:
                 self._reported.pop(target, None)
+                self._active_turns.discard(target)
                 self._emit(SessionEnded(target=target, detail=death))
                 continue
-            window = window_for(_record_for_live_target(target, record, alive=alive))
-            if self._reported.get(target) != window:
+            live_record = _record_for_live_target(target, record, alive=alive)
+            was_active = target in self._active_turns
+            if live_record is not None:
+                if live_record.status in STATUSES_MEANING_TURN_ACTIVE:
+                    self._active_turns.add(target)
+                elif live_record.status == STATUS_MEANING_OPEN:
+                    self._active_turns.discard(target)
+            window = window_for(live_record)
+            previous_window = self._reported.get(target)
+            if previous_window != window:
                 self._reported[target] = window
                 self._emit(ReplyWindowChanged(target=target, window=window))
+            if was_active and live_record is not None and live_record.status == STATUS_MEANING_OPEN:
+                self._emit(SessionStopped(target=target))
 
     def _observe(self, target: SessionTarget) -> tuple[SessionRecord | None, bool]:
         """The sweep's only evidence: one registry read and one liveness probe.

@@ -40,6 +40,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionStopped,
 )
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
@@ -64,12 +65,12 @@ class Sink:
 
 @dataclass
 class AllEvents:
-    """Everything the watcher raises, for the cases that are about death.
+    """Everything the watcher raises, for the cases that intentionally mix events.
 
     Deliberately not a widening of `Sink`. `Sink` collects windows and nothing
-    else, so a `SessionEnded` leaking into a window case breaks it loudly — and
-    that is exactly the regression the death rule could introduce, so the sentinel
-    the older cases already are has to keep its edge.
+    else, so an unrelated event leaking into a window-only case breaks it loudly.
+    Cases where a stop or death is part of the specified behavior opt into this
+    broader sink instead.
     """
 
     events: list[AgentEvent] = field(default_factory=list)
@@ -84,6 +85,10 @@ class AllEvents:
     @property
     def deaths(self) -> list[SessionEnded]:
         return [event for event in self.events if isinstance(event, SessionEnded)]
+
+    @property
+    def stops(self) -> list[SessionStopped]:
+        return [event for event in self.events if isinstance(event, SessionStopped)]
 
 
 def registry(tmp_path: Path) -> Path:
@@ -207,7 +212,7 @@ class TestWhatGetsReported:
         assert sink.events == []
 
     def test_only_transitions_are_reported_after_that(self, tmp_path: Path) -> None:
-        sink = Sink()
+        sink = AllEvents()
         watcher = watching(tmp_path, sink)
         say(tmp_path, "busy")
         watcher.watch(TARGET)
@@ -221,6 +226,8 @@ class TestWhatGetsReported:
         watcher.poll_once()
 
         assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        assert [event.target for event in sink.stops] == [TARGET]
+        assert sink.deaths == []
 
     def test_watching_the_same_session_twice_holds_it_once(self, tmp_path: Path) -> None:
         """Idempotent. Read off the watched set now that registration is silent."""
@@ -260,9 +267,58 @@ class TestWhatGetsReported:
         assert sink.windows == [ReplyWindow.CLOSED]
 
 
+class TestReportingStops:
+    def test_a_session_that_finishes_a_turn_is_reported_stopped(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_a_first_idle_record_is_not_a_turn_that_stopped(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        watcher.watch(TARGET)
+
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        assert sink.stops == []
+
+    def test_a_permission_wait_that_finishes_is_reported_stopped(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "waiting")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_a_mid_turn_missing_record_does_not_erase_the_stop(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        (registry(tmp_path) / f"{LIVE_PID}.json").unlink()
+        watcher.poll_once()
+        say(tmp_path, "idle")
+        watcher.poll_once()
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+        assert sink.deaths == []
+
+
 class TestPolling:
     def test_polling_sees_a_change_nobody_asked_about(self, tmp_path: Path) -> None:
-        sink = Sink()
+        sink = AllEvents()
 
         async def scenario():
             watcher = watching(tmp_path, sink)
@@ -280,6 +336,8 @@ class TestPolling:
 
         asyncio.run(scenario())
         assert sink.windows == [ReplyWindow.OPEN]
+        assert [event.target for event in sink.stops] == [TARGET]
+        assert sink.deaths == []
 
     def test_closing_stops_the_polling(self, tmp_path: Path) -> None:
         sink = Sink()
@@ -299,7 +357,7 @@ class TestPolling:
         assert sink.windows == []
 
     def test_starting_twice_does_not_double_the_reads(self, tmp_path: Path) -> None:
-        sink = Sink()
+        sink = AllEvents()
 
         async def scenario():
             watcher = watching(tmp_path, sink)
@@ -315,6 +373,8 @@ class TestPolling:
 
         asyncio.run(scenario())
         assert sink.windows == [ReplyWindow.OPEN]
+        assert [event.target for event in sink.stops] == [TARGET]
+        assert sink.deaths == []
 
 
 class Child:
