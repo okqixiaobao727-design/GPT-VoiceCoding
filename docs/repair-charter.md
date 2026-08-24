@@ -23,7 +23,11 @@ scope as order 11 — the Telegram token's durable home, delivered before the bu
 the manual acceptance run uses the shipped mechanism. 2026-08-25 amendment (wayfinder ticket
 [#51](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/51), Simon-decided): the
 E2E design is approved; exit item 4's manual acceptance run is replaced by a fully automated
-real-environment acceptance, designed on its own map ticket.
+real-environment acceptance, designed on its own map ticket. 2026-08-25 amendment (wayfinder
+ticket [#56](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/56),
+Simon-decided): that acceptance is designed at [`docs/acceptance-design.md`](acceptance-design.md)
+— the E2E journey against the real far side, driven from text through `bridgectl`, built
+under #52 after the E2E suite; the voice route is proved by nothing automated.
 
 ## Scope — exactly these tickets, nothing else
 
@@ -76,12 +80,13 @@ a ticket. Scope creep goes to the advisor first, always.
    by Simon on #51 (advisor offline): [`docs/e2e-suite-design.md`](e2e-suite-design.md).
 3. Bundle rebuilt from the merged tree, installed, provenance verified (byte-compare
    against HEAD, the acceptance run's `diff -r` precedent).
-4. A closing summary: what changed, per ticket, and what the **real-environment automated
-   acceptance** needs from this tree — acceptance is fully automated on Simon's machine
-   (no human step; its design is a map #49 ticket), NOT a manual run and NOT #12. The
-   summary names the checks the CI suite cannot prove (the voice route: spoken Stop
-   Notice, spoken instruction, spoken verdict) and points at the surviving evidence from
-   the #12 run (steps 0–3, 8/9).
+4. A closing summary: what changed, per ticket, and how to run the **real-environment
+   automated acceptance** designed at [`docs/acceptance-design.md`](acceptance-design.md)
+   — the command, the one-time Telegram user-account login it needs, where the verdict
+   lands. It is fully automated on Simon's machine (no human step), NOT a manual run and
+   NOT #12. The summary states plainly that the voice route (spoken Stop Notice, spoken
+   instruction, spoken verdict) is proved by nothing automated — Simon's decision on #56
+   — and points at the surviving evidence from the #12 run (steps 0–3, 8/9).
 
 ## Read first
 
