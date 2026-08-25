@@ -86,8 +86,11 @@ final class ShellModel {
             return
         }
 
-        let report = await Task.detached { InstallationRunner().run(command) }.value
-        installationFailure = report.failure
+        // Not `Task.detached`: the runner waits on a subprocess, and a detached
+        // task doing that holds a cooperative-pool thread — one of about as many
+        // as this machine has cores — for the whole run. The runner owns its own
+        // threads and hands this one back; see its note.
+        installationFailure = await InstallationRunner().run(command).failure
     }
 
     private func healthChanged(_ health: EngineHealth) async {

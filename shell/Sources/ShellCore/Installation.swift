@@ -81,10 +81,32 @@ private final class OutputBox: @unchecked Sendable {
 public struct InstallationRunner: Sendable {
     public init() {}
 
+    /// Waits on threads of its own, and never on a pooled one.
+    ///
+    /// Everything below is blocking — semaphores and `readDataToEndOfFile` — and
+    /// whose thread it blocks is not a detail. Swift concurrency's cooperative
+    /// pool holds about one thread per core, so a `Task` that blocks one for the
+    /// length of a subprocess is a core the whole process cannot use; CI found
+    /// this by slowing every unrelated test in the suite by four times. So the
+    /// waiting happens on threads created for it and thrown away after, and the
+    /// public entry point is `async` and gives its caller's thread back.
+    ///
     /// `deadline` is a parameter for one reason: a test that proved the ceiling
     /// by waiting out the real one would take longer than the whole suite.
     public func run(
         _ command: EngineCommand, deadline: TimeInterval = Installation.deadline
+    ) async -> InstallationReport {
+        await withCheckedContinuation { continuation in
+            let thread = Thread {
+                continuation.resume(returning: Self.runBlocking(command, deadline: deadline))
+            }
+            thread.name = "gpt-voicecoding.installation"
+            thread.start()
+        }
+    }
+
+    private static func runBlocking(
+        _ command: EngineCommand, deadline: TimeInterval
     ) -> InstallationReport {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command.executable)
@@ -117,15 +139,20 @@ public struct InstallationRunner: Sendable {
         // than never closing it: it passes on the machine you wrote it on.
         try? output.fileHandleForWriting.close()
 
-        // Drained on another queue from the start: a pipe nobody reads fills, and
-        // a child blocked on a full pipe is a child that never exits.
+        // Drained from the start, on a thread of its own: a pipe nobody reads
+        // fills, and a child blocked on a full pipe is a child that never exits.
+        // A thread rather than a queue for the reason in the type's own note —
+        // this read has no ceiling of its own, so it must not sit on a shared
+        // worker while it waits.
         let collected = OutputBox()
         let drained = DispatchSemaphore(value: 0)
         let reading = output.fileHandleForReading
-        DispatchQueue.global().async {
+        let reader = Thread {
             collected.set(reading.readDataToEndOfFile())
             drained.signal()
         }
+        reader.name = "gpt-voicecoding.installation.read"
+        reader.start()
 
         if exited.wait(timeout: .now() + deadline) == .timedOut {
             process.terminate()

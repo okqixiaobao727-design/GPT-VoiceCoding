@@ -7,7 +7,7 @@ import Testing
 /// run one verb, report what it said. Everything the verb *does* is Python's, and
 /// is tested there — a second copy of it here would be the duplication this
 /// arrangement exists to avoid.
-@Suite struct InstallationTests {
+@Suite(.serialized) struct InstallationTests {
     private func withExecutable(_ names: [String], _ body: (URL) throws -> Void) rethrows {
         let directory = URL(fileURLWithPath: "/tmp/gvc-install-\(UUID().uuidString.prefix(8))")
         for name in names {
@@ -59,8 +59,8 @@ import Testing
         }
     }
 
-    @Test func aRunThatCannotStartIsReportedRatherThanThrown() {
-        let report = InstallationRunner().run(
+    @Test func aRunThatCannotStartIsReportedRatherThanThrown() async {
+        let report = await InstallationRunner().run(
             EngineCommand(
                 executable: "/nowhere/python3", arguments: ["-m", "x", "reconcile"],
                 source: .developerPath))
@@ -69,13 +69,13 @@ import Testing
         #expect(report.failure != nil)
     }
 
-    @Test func aSuccessfulRunCarriesItsOwnWordsAndNoFailure() {
+    @Test func aSuccessfulRunCarriesItsOwnWordsAndNoFailure() async {
         // Timed, not only checked: this collected nothing on CI while passing
         // locally, because this process was holding the pipe's write end open
         // and the read could only ever end on the grace timeout. An assertion on
         // the words alone would have gone green again for the wrong reason.
         let started = Date()
-        let report = InstallationRunner().run(
+        let report = await InstallationRunner().run(
             EngineCommand(
                 executable: "/bin/echo", arguments: ["claude-hooks: current"],
                 source: .developerPath))
@@ -87,12 +87,12 @@ import Testing
         #expect(waited < Installation.grace, "the output arrived on a timeout, not on EOF")
     }
 
-    @Test func aChildThatIgnoresSigtermIsStillStopped() {
+    @Test func aChildThatIgnoresSigtermIsStillStopped() async {
         // The claim is that a reconcile which hangs never becomes an engine that
         // never starts. SIGTERM is a request, and this child refuses it — so the
         // only thing that makes the claim true is the escalation after it.
         let started = Date()
-        let report = InstallationRunner().run(
+        let report = await InstallationRunner().run(
             EngineCommand(
                 executable: "/bin/sh",
                 arguments: ["-c", "trap '' TERM; echo holding; while :; do sleep 1; done"],
@@ -105,8 +105,8 @@ import Testing
         #expect(waited < 1 + (Installation.grace * 3) + 5, "the run was not bounded: \(waited)s")
     }
 
-    @Test func aFailedRunReportsTheFirstThingItSaid() {
-        let report = InstallationRunner().run(
+    @Test func aFailedRunReportsTheFirstThingItSaid() async {
+        let report = await InstallationRunner().run(
             EngineCommand(
                 executable: "/bin/sh",
                 arguments: ["-c", "echo 'claude-hooks: FAILED — a reason'; exit 1"],
