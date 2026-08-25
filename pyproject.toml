@@ -35,6 +35,14 @@ dev = ["pytest>=8", "ruff==0.16.4"]
 # in exactly one module (`adapters/call/realtime/webrtc.py`), and the Call
 # adapter's factory refuses to build without them rather than failing mid-call.
 voice = ["aiortc>=1.9", "av>=12", "sounddevice>=0.4"]
+# The real-environment acceptance's one actor: a Telegram *user*-account client,
+# because a bot cannot message a bot and inbound has to be real
+# (`docs/acceptance-design.md`). An extra rather than a dev dependency, and never
+# a dependency: `tests/test_architecture.py` lists `telethon` among the protocol
+# libraries Bridge Core and the seams may not import, this is the only place in
+# the repository that imports it, and it must not reach the bundle — the bundle's
+# interpreter installs the project, not its extras.
+acceptance = ["telethon>=1.41"]
 
 [project.urls]
 Homepage = "https://github.com/okqixiaobao727-design/GPT-VoiceCoding"
@@ -48,7 +56,15 @@ packages = ["src/gpt_voicecoding"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# `-m "not acceptance"` is what keeps `pytest -q` meaning what it has always
+# meant. The acceptance suite needs THIS machine, THESE credentials and THAT bot;
+# it spends real agent turns and writes real messages into a real chat, so it is
+# opt-in by marker and never runs in CI. Run it deliberately:
+#   .venv/bin/python -m pytest -m acceptance tests/acceptance -v
+addopts = "-q -m \"not acceptance\""
+markers = [
+  "acceptance: the real-environment run (docs/acceptance-design.md); needs credentials and costs money",
+]
 # Test modules import the shared fakes bare (`from fakes import ...`); this pins that path.
 # The repository root is here for `app_bundle`, the build pipeline, which lives
 # outside `src/` on purpose: the product does not ship its own build system.
