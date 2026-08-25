@@ -273,17 +273,24 @@ def lane_engine(request, run_directory, journal, engine_path, bot_token):  # noq
         path_value=engine_path,
         stdio=run_directory / f"engine-{lane}.stdio",
     )
-    engine.start()
-    try:
-        yield (
-            engine,
-            config,
-            support.Bridgectl(
-                bundle=support.bundle_path(), socket_path=config.socket_path, journal=journal
-            ),
-        )
-    finally:
-        engine.stop()
-        import shutil as _shutil
+    # The workspace is fresh by design, and a launch into a directory an agent has
+    # never seen stops at its full-screen trust dialog, so step 1a would be the
+    # only thing this run ever measured. `support.TrustGate` grants trust for this
+    # one workspace, backs both user files up into the run directory, and revokes
+    # on the way out; `journey.walk` records the arrangement as `0c workspace
+    # trust` and the journal carries the grant and the revoke.
+    with support.TrustGate(workspace, run_directory=run_directory, journal=journal):
+        engine.start()
+        try:
+            yield (
+                engine,
+                config,
+                support.Bridgectl(
+                    bundle=support.bundle_path(), socket_path=config.socket_path, journal=journal
+                ),
+            )
+        finally:
+            engine.stop()
+            import shutil as _shutil
 
-        _shutil.rmtree(socket_root, ignore_errors=True)
+            _shutil.rmtree(socket_root, ignore_errors=True)
