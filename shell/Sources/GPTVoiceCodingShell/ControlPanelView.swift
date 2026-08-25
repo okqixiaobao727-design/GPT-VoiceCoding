@@ -18,6 +18,14 @@ struct ControlPanelView: View {
                 ConfigurationPanel(detail: failure)
             }
 
+            // And an installation that did not land, for the same reason: a
+            // Session that cannot be reached looks like a broken engine until
+            // you know the hook never got installed into its config directory.
+            // Reported, never edited here — see this file's own first line.
+            if let failure = shell.installationFailure {
+                ConfigurationPanel(detail: failure)
+            }
+
             // The Live Toggle is rendered whatever `status` did. It needs no
             // status to press — it is one action, and Bridge Core decides what
             // it means — and a control-plane action that disappears when a read

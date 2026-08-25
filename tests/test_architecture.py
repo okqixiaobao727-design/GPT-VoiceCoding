@@ -73,6 +73,11 @@ WIRE_MODULES = frozenset({"http", "socket", "socketserver", "ssl", "struct"})
 
 FORBIDDEN_INTERNAL_PREFIX = "gpt_voicecoding.adapters"
 CORE_PREFIX = "gpt_voicecoding.core"
+SEAMS_PREFIX = "gpt_voicecoding.seams"
+
+#: Installation (ADR 0012) is not a seam and not policy: it has to run when no
+#: engine exists, so it reaches nothing the engine is made of.
+INSTALLATION = PACKAGE / "installation"
 
 
 def _imported_modules(source: str) -> set[str]:
@@ -353,3 +358,28 @@ def test_nothing_allocates_a_pseudo_terminal() -> None:
     ]
     named = "; ".join(offences)
     assert not offences, f"nothing may allocate a pseudo-terminal: {named}"
+
+
+def test_installation_reaches_nothing_the_engine_is_made_of() -> None:
+    """ADR 0012's one-way rule, and the reason installation is a package apart.
+
+    Installation runs before any engine, from a shell that has not spawned one
+    and with no `config.toml` to read. An import of `core`, `seams` or an adapter
+    would be a claim that some part of the engine has to be constructible before
+    the product is installed — which is the loop this arrangement exists to
+    break. `locations` is deliberately not on this list: it is the leaf that
+    exists so the paths are spelled once.
+    """
+    offences = [
+        offence
+        for prefix in (CORE_PREFIX, SEAMS_PREFIX, FORBIDDEN_INTERNAL_PREFIX)
+        for offence in _imports_under(INSTALLATION, prefix)
+    ]
+    assert not offences, (
+        "installation must be constructible with no engine, so it imports none of it: "
+        + "; ".join(offences)
+    )
+
+
+def test_installation_package_exists() -> None:
+    assert _sources(INSTALLATION), f"no Python sources found under {INSTALLATION}"

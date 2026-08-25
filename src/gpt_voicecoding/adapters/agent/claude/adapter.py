@@ -24,11 +24,12 @@ dials in holding a displayed dialog open, and the verdict travels back down the
 connection it is waiting on.
 
 The Approval Relay is also the one verb whose route this adapter cannot start.
-The hook only exists for a Session launched with `--plugin-dir` naming the
-rendered hook plugin, and only reaches us when the launch also carried the
-approval socket's address — so a Session launched without either has no Approval
-Relay, and the honest report for a verdict aimed at it is a classified failure
-naming what is not there.
+The hook exists for a Session only when it is installed in that Session's config
+directory (ADR 0011, `installation/claude_hooks.py`), and it reaches us only when
+this engine published an address for it to dial — so a Session in a directory
+this product was never installed into has no Approval Relay, and the honest
+report for a verdict aimed at it is a classified failure naming what is not
+there.
 
 **The Reply Window is reported from the registry**, by `window.py`. Without it
 nothing ever tells Bridge Core that a Claude Session is ready for a user turn, so
@@ -45,7 +46,11 @@ from contextlib import suppress
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
-from gpt_voicecoding.adapters.agent.claude.bootstrap import bootstrap_value
+from gpt_voicecoding.adapters.agent.claude.bootstrap import (
+    bootstrap_value,
+    publish_address,
+    withdraw_address,
+)
 from gpt_voicecoding.adapters.agent.claude.protocol import (
     ACKNOWLEDGED,
     CHANNEL_ERROR,
@@ -81,8 +86,8 @@ _log = logging.getLogger(__name__)
 #: looks like a race that was lost rather than a route that was never there.
 APPROVAL_UNROUTED = (
     "no permission dialog is parked on this engine for that Session; a Claude Session "
-    "answers by voice only when its launch carried both the hook plugin (--plugin-dir) "
-    "and this engine's approval socket address"
+    "answers by voice only when this product is installed in its config directory "
+    "(bridge-install status) and this engine has published an approval address"
 )
 SUPPLEMENT_UNAVAILABLE = (
     "the Claude Session Channel has no mid-turn route: a channel message delivered inside "
@@ -129,6 +134,16 @@ class ClaudeAgentAdapter:
             await self._approvals.start()
         except ApprovalError as refused:
             _log.warning("no Approval Relay this run: %s", refused)
+            return
+        # Only now, and only if it bound: a published address nobody is listening
+        # on costs every permission dialog in this config directory a full dial
+        # timeout, which is worse than the silence of publishing nothing.
+        try:
+            published = publish_address(self.approval_socket_path(), self._settings)
+        except OSError as refused:
+            _log.warning("the approval address could not be published: %s", refused)
+        else:
+            _log.info("approval address published at %s", published)
 
     async def aclose(self) -> None:
         """Stop everything this adapter started, and take its socket back out.
@@ -155,6 +170,10 @@ class ClaudeAgentAdapter:
         # on the way out: an engine shutting down must never be the reason a
         # permission prompt resolves without the person it was asked of.
         await self._approvals.aclose()
+        # And the address goes with it. A published address nobody answers is a
+        # dial into nothing, paid by every permission dialog in this config
+        # directory until something else publishes over it.
+        withdraw_address()
         self._channels.clear()
 
     # -- the Session roster this adapter can reach ------------------------

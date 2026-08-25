@@ -2,7 +2,8 @@
 
 Claude Code starts this, one process per displayed permission dialog, and reads
 its stdout for a verdict. Everything it needs it is told: the dialog on stdin,
-the engine's address in the environment the launch wrapper set.
+and the engine's address from the file the engine published (ADR 0011) or,
+for a launch that set one, the environment.
 
 **Silence is the safe answer, so silence is every failure's answer.** Anything
 this process prints that is not `{"behavior": "allow"}` is read by Claude Code as
@@ -39,12 +40,19 @@ reading. Blocking sockets rather than `wire.py`'s asyncio framing because this
 process sends one line and reads one line — an event loop to do that would be
 startup cost paid on every permission dialog for nothing.
 
-**Two gates, both fail open.** No bootstrap variable means this is not a Session
-this engine launched, and the process exits before it opens a socket. Past that,
-the engine itself refuses any session it does not hold a registration for. The
-first is defence in depth — the per-session `--plugin-dir` that installs this
-hook already means only our own Sessions load it — and it is also simply the
-natural failure path, because the variable is where the engine's address is.
+**Two gates, both fail open.** No address at all — no bootstrap variable and no
+engine has published one — means there is nobody to ask, and the process exits
+before it opens a socket. Past that, the engine itself refuses any session it
+does not hold a registration for.
+
+The first gate used to be scope as well as failure: a `--plugin-dir` installed
+this hook per Session, so only our own Sessions loaded it. ADR 0011 gave that up
+knowingly. A user-scope hook fires for **every** Session in its config directory,
+so scope is now these two soft lines rather than one structural one — this
+process prints nothing when no engine holds the Session, and the engine refuses
+what it does not hold. A Session the bridge does not hold pays the cost of
+starting this process and nothing else: no socket is opened and nothing is
+written, which is why the address lookup stays the first thing that happens.
 """
 
 from __future__ import annotations

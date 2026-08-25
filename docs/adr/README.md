@@ -11,6 +11,7 @@
 | [0007](0007-the-approval-hook-is-a-session-scoped-plugin.md) | The Claude Approval Relay's hook is registered as a session-scoped plugin — **superseded by 0011** |
 | [0010](0010-legacy-is-the-behaviour-spec.md) | The seam architecture stays, and the first generation is the behaviour spec it must satisfy |
 | [0011](0011-the-claude-hooks-are-a-fingerprinted-block-in-the-user-settings-file.md) | The Claude hooks are a fingerprinted block in the user's settings file |
+| [0012](0012-installation-runs-at-first-launch.md) | Installation runs at first launch, from a package that needs no engine |
 
 0008 (headless direct-child launcher) and 0009 (a launch carries its Opening Instruction) were removed with the launcher when v1.0 became a bridge over Sessions the user starts ([#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67), [#68](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/68)); they return with the launch map, from git history.
 
