@@ -14,6 +14,12 @@ jobs:
     # macOS only: the microphone grant, the menu-bar shell and the push path are
     # all macOS-shaped (see docs/adr/0005).
     runs-on: macos-latest
+    # A hung test reads as `pending`, never as `failure`, so without a ceiling
+    # it holds a macOS runner — 10x billing — until GitHub's own 6h limit. One
+    # did, for 26h49m, before #65 was raised. Every healthy job here has
+    # finished in 64-125s, so 15 minutes is roughly seven times the slowest and
+    # still turns a hang into a fast red.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +51,7 @@ jobs:
     # mean main could break the shell and the packaging ticket would be the one
     # to find out.
     runs-on: macos-latest
+    timeout-minutes: 15  # why 15: see the `check` job.
 
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +87,7 @@ jobs:
     # right about a fixture and wrong about `av`'s eighteen dylibs is precisely
     # the gap the plan/do split exists to close.
     runs-on: macos-latest
+    timeout-minutes: 15  # why 15: see the `check` job.
 
     steps:
       - uses: actions/checkout@v4
