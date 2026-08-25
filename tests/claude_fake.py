@@ -104,6 +104,14 @@ class FakeChannel:
             return
         finally:
             self.open_connections -= 1
+            # This end of the socket has to be closed even when the bridge is the
+            # one that hung up, because a server transport stays attached to its
+            # `asyncio.Server` until it is. `aclose` awaits `wait_closed`, which
+            # does not return while any transport is still attached, so a handler
+            # that returns on end-of-file without closing leaves the fake
+            # unstoppable. 3.13 stopped blocking there and 3.12 did not, which is
+            # the whole of why only the 3.12 lane hung.
+            writer.close()
 
     async def _acknowledge(self, writer: asyncio.StreamWriter, request_id: str) -> None:
         assert self.acknowledge_after is not None
