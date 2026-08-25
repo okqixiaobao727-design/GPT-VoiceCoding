@@ -18,12 +18,6 @@ reply is not a push, and the Companion Channel is one of the control-plane's
 surfaces, so an inbound message always gets an answer. If that were gated, the
 one way to turn Duty back on from away from the computer would be gated too.
 
-**Launching and closing are hub verbs, not surface ones.** The Session registry
-is the hub's truth, so the hub is what writes it: the Launcher is injected here
-like every other adapter, and a surface asks the hub to launch rather than
-calling the Launcher and registering the result itself. A surface that held
-that transaction would hold half of it the moment the second half failed.
-
 Three things are recorded here rather than decided here. `UserSpeech` is the
 in-call transcript, and Bridge Core never parses one: spoken intent arrives as
 structured control-plane calls the voice thread makes, so the event is written
@@ -34,7 +28,6 @@ injected handlers with honest defaults rather than being invented here.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -42,31 +35,22 @@ from dataclasses import dataclass
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
-from gpt_voicecoding.core.errors import (
-    BridgeCoreError,
-    ConflictingLaunchError,
-    InvalidLaunchLabelError,
-    SeamUnavailableError,
-    StaleSessionError,
-    UnknownRelayError,
-)
+from gpt_voicecoding.core.errors import BridgeCoreError, UnknownRelayError
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.policy import CorePolicy
-from gpt_voicecoding.core.projects import Project, ProjectCatalogue
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session, SessionState
+from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
     AGENT_SEAM_PREFIX,
     CALL_SEAM,
     CHANNEL_SEAM,
-    LAUNCHER_SEAM,
     SeamLoad,
     SeamVerification,
     Verifiable,
@@ -95,19 +79,8 @@ from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundTex
 from gpt_voicecoding.seams.events import Event
 from gpt_voicecoding.seams.identity import (
     AgentKind,
-    RequestId,
-    SessionLabel,
     SessionTarget,
     new_request_id,
-)
-from gpt_voicecoding.seams.session_launcher import (
-    CloseOutcome,
-    CloseRequest,
-    CloseStatus,
-    LaunchOutcome,
-    LaunchRequest,
-    LaunchStatus,
-    SessionLauncher,
 )
 
 _log = logging.getLogger(__name__)
@@ -142,14 +115,6 @@ class Status:
     pending_approvals: tuple[PendingApproval, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _LaunchTransaction:
-    """One resolved launch intent and the complete in-process transaction carrying it."""
-
-    request: LaunchRequest
-    task: asyncio.Task[LaunchOutcome]
-
-
 class BridgeCore:
     """The hub: one truth, five pipelines, and the loop that feeds them."""
 
@@ -160,9 +125,6 @@ class BridgeCore:
         call: CallAdapter,
         channel: CompanionChannel,
         agents: Mapping[AgentKind, AgentAdapter],
-        launcher: SessionLauncher | None = None,
-        default_agent: AgentKind | None = None,
-        projects: tuple[Project, ...] = (),
         events: EventQueue | None = None,
         policy: CorePolicy | None = None,
         grammar: TextGrammar | None = None,
@@ -177,9 +139,6 @@ class BridgeCore:
         self._call = call
         self._channel = channel
         self._agents = dict(agents)
-        self._launcher = launcher
-        self._default_agent = default_agent
-        self._projects = ProjectCatalogue(projects) if projects else None
         self._events = events if events is not None else EventQueue()
         self._policy = policy or CorePolicy()
         self._control = control
@@ -198,7 +157,6 @@ class BridgeCore:
         #: stamped with `stamp`. A Session's `registered_at` is read back by the
         #: next engine, and a monotonic reading would come back as the future.
         self._stamp = stamp
-        self._launches: dict[RequestId, _LaunchTransaction] = {}
 
         self.interlock = CallInterlock(call)
         self.adjudicator = SwitchAdjudicator(state.switches)
@@ -309,165 +267,6 @@ class BridgeCore:
         """
         await self.escalation.sweep()
 
-    async def launch_session(
-        self,
-        *,
-        request_id: RequestId,
-        project: str,
-        task: str,
-        agent: AgentKind | None = None,
-    ) -> LaunchOutcome:
-        """Bring one Session into existence, and record the one that arrived.
-
-        The registry is the hub's truth, so the hub is what writes it. A surface
-        that called the Launcher itself and then registered the result would be
-        holding half a transaction — the shape the reference implementation had,
-        and the one that leaves a live child nothing knows about the moment the
-        second half fails.
-
-        Only a `LAUNCHED` outcome registers anything: an outcome is
-        authoritative, and a failed launch that wrote a row would be the system
-        inventing a Session to Relay into.
-        """
-        if self._projects is None or self._default_agent is None:
-            raise BridgeCoreError("this Bridge Core has no launch configuration")
-        configured = self._projects.resolve(project)
-        selected_agent = agent or self._default_agent
-        try:
-            label = SessionLabel(project=configured.name, task=task)
-        except ValueError as refusal:
-            raise InvalidLaunchLabelError(str(refusal)) from None
-        request = LaunchRequest(
-            request_id=request_id,
-            agent=selected_agent,
-            workspace=configured.workspace,
-            label=label,
-            env={},
-        )
-        transaction = self._launches.get(request_id)
-        if transaction is not None and transaction.request != request:
-            raise ConflictingLaunchError(request_id)
-        if transaction is None:
-            launcher = self._require_launcher()
-            transaction = _LaunchTransaction(
-                request=request,
-                task=asyncio.create_task(
-                    self._launch_and_register(launcher, request),
-                    name=f"launch-{request_id}",
-                ),
-            )
-            self._launches[request_id] = transaction
-
-        if transaction.task.done():
-            outcome = transaction.task.result()
-        else:
-            outcome = await asyncio.shield(transaction.task)
-        if outcome.status is not LaunchStatus.LAUNCHED:
-            _log.info("launch refused: %r", outcome.detail)
-        else:
-            assert outcome.target is not None  # the seam refuses a LAUNCHED without one
-            _log.info(
-                "launched Session agent=%s session_id=%s pid=%s workspace=%s",
-                outcome.target.agent,
-                outcome.target.session_id,
-                outcome.target.pid,
-                request.workspace,
-            )
-        return outcome
-
-    async def _launch_and_register(
-        self, launcher: SessionLauncher, request: LaunchRequest
-    ) -> LaunchOutcome:
-        """Run the adapter effect and Core registration as one shared transaction."""
-        outcome = await launcher.launch(request)
-        if outcome.status is not LaunchStatus.LAUNCHED:
-            return outcome
-
-        assert outcome.target is not None  # the seam refuses a LAUNCHED without one
-        self._state.sessions.register(
-            Session(
-                target=outcome.target,
-                label=request.label,
-                workspace=request.workspace,
-                registered_at=self._stamp(),
-            )
-        )
-        self._establish_reply_window(outcome.target)
-        self._state.persist()
-        return outcome
-
-    def _establish_reply_window(self, target: SessionTarget) -> None:
-        """Ask the adapter where this Session's window stands, now that the roster holds it.
-
-        **The one line that must not move (#27).** A Session's starting level
-        cannot arrive as an event: the adapter is registered before this method
-        runs, so anything it raised at registration was dropped as belonging to a
-        Session Bridge Core did not yet hold — and having been recorded by the
-        adapter as reported, it was never repeated. A Session that was already
-        idle when it was launched stayed at the fail-closed default forever,
-        unreachable while perfectly healthy. Asking here cannot be dropped,
-        because the row was written one statement above.
-
-        **Synchronous on purpose.** The seam's `reply_window` takes no await, so
-        nothing can run between the roster write and the answer being applied —
-        the gap this exists to close is not reopened by closing it.
-
-        **A level query may never fail a launch.** An adapter that raises, or one
-        this hub does not hold at all, leaves the Session at CLOSED and the launch
-        succeeds. A Session listed as conservatively closed is corrected by its
-        next transition; a Session that was never launched because a question
-        about it raised is not recoverable at all.
-
-        An OPEN established here deliberately does *not* run the queued-Relay
-        flush `_reply_window_changed` runs. This Session did not exist a
-        statement ago, so nothing can be queued against it, and there is no
-        transition to act on — the level is being established, not changed.
-        Every later opening is an event and takes that path as before.
-        """
-        adapter = self._agents.get(target.agent)
-        if adapter is None:
-            return
-        try:
-            window = adapter.reply_window(target)
-            self._state.sessions.set_reply_window(target, window)
-        except Exception:
-            # Broad, and the whole establishment is inside it: "may never fail a
-            # launch" has to cover applying the answer as well as asking for it,
-            # or the promise holds for one statement and not the next.
-            _log.exception("establishing a launched Session's Reply Window raised; it stays closed")
-            return
-        _log.info(
-            "established Reply Window at registration agent=%s session_id=%s pid=%s window=%s",
-            target.agent,
-            target.session_id,
-            target.pid,
-            window,
-        )
-
-    async def close_session(self, target: SessionTarget) -> CloseOutcome:
-        """Close exactly one Session, by exact identity, and record that it ended.
-
-        Fails closed on an identity this engine never registered, and on a wrong
-        pid under a known session id — that is a fork, not a typo. A Session the
-        registry already holds as ended answers `already_closed` without
-        touching the Launcher: the caller asked for a state that already holds,
-        which is what idempotent means, and dialling the Launcher again to be
-        told the same thing risks reaping whatever now owns that identity.
-        """
-        launcher = self._require_launcher()
-        try:
-            self._state.sessions.resolve(target)
-        except StaleSessionError:
-            if self._already_ended(target):
-                return CloseOutcome(request_id=new_request_id(), status=CloseStatus.ALREADY_CLOSED)
-            raise
-
-        outcome = await launcher.close(CloseRequest(request_id=new_request_id(), target=target))
-        if outcome.status in (CloseStatus.CLOSED, CloseStatus.ALREADY_CLOSED):
-            self._state.sessions.mark_ended(target)
-            self._state.persist()
-        return outcome
-
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
     ) -> RelayOutcome:
@@ -508,26 +307,12 @@ class BridgeCore:
             return self._call
         if seam == CHANNEL_SEAM:
             return self._channel
-        if seam == LAUNCHER_SEAM:
-            return self._launcher
         if seam.startswith(AGENT_SEAM_PREFIX):
             try:
                 return self._agents.get(AgentKind(seam[len(AGENT_SEAM_PREFIX) :]))
             except ValueError:
                 return None
         return None
-
-    def _require_launcher(self) -> SessionLauncher:
-        if self._launcher is None:
-            raise SeamUnavailableError("Session Launcher")
-        return self._launcher
-
-    def _already_ended(self, target: SessionTarget) -> bool:
-        """Whether this exact identity is one the registry holds as finished."""
-        return any(
-            held.target == target and held.state is SessionState.ENDED
-            for held in self._state.sessions.all()
-        )
 
     # ------------------------------------------------------------------
     # The dispatch loop.

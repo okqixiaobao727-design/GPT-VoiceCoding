@@ -9,14 +9,12 @@ SEAMS = (
     "call",
     "companion_channel",
     "control_plane",
-    "session_launcher",
 )
 
 ADAPTER_FAMILIES = (
     "agent",
     "call",
     "companion_channel",
-    "session_launcher",
 )
 
 

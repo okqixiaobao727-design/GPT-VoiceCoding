@@ -14,23 +14,15 @@ words, under a code a surface can branch on.
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
 
-from fakes import (
-    FakeAgent,
-    FakeCall,
-    FakeCompanionChannel,
-    FakeSessionLauncher,
-    instruction_context,
-)
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.core.bridge import BridgeCore
-from gpt_voicecoding.core.projects import Project
 from gpt_voicecoding.core.relay_queue import RelayQueue
-from gpt_voicecoding.core.sessions import SessionRegistry
+from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.core.verification import SeamLoad
@@ -41,14 +33,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindowChanged,
 )
 from gpt_voicecoding.seams.control_plane import Action, ErrorCode, Reply, Request
-from gpt_voicecoding.seams.identity import (
-    AgentKind,
-    RequestId,
-    SessionLabel,
-    SessionTarget,
-    new_request_id,
-)
-from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 WORKSPACE = Path("/tmp/workspace")
 SECOND_WORKSPACE = Path("/tmp/another-workspace")
@@ -57,62 +42,26 @@ CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="claude-abc", pid=1234)
 SECOND_CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="def")
 CODEX_ADDRESS = {"agent": "codex", "session_id": "abc", "pid": None}
-LAUNCH_REQUEST_ID = RequestId("21d73168-b1f0-4b18-977d-fba0d1f2cc13")
-PROJECTS = (
-    Project(
-        name="GPT-VoiceCoding",
-        workspace=WORKSPACE,
-        spoken_aliases=("Voice Coding", "GPT Live", "GPT Voice Coding"),
-    ),
-    Project(name="Other Project", workspace=SECOND_WORKSPACE),
-)
-
-
-class HoldingLauncher(FakeSessionLauncher):
-    """A boundary fake whose launch stays in flight until the test releases it."""
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
-        self.started.set()
-        await self.release.wait()
-        return await super().launch(request)
 
 
 class Surface:
     """One assembled engine-side control plane, and the knobs a test needs."""
 
-    def __init__(
-        self,
-        *,
-        duty: bool = True,
-        launcher: bool | FakeSessionLauncher = True,
-        projects: tuple[Project, ...] = PROJECTS,
-    ) -> None:
+    def __init__(self, *, duty: bool = True) -> None:
         self.agent = FakeAgent()
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
-        if launcher is True:
-            self.launcher = FakeSessionLauncher(targets=[CODEX])
-        elif launcher is False:
-            self.launcher = None
-        else:
-            self.launcher = launcher
-        state = BridgeState(switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue())
-        state.switches.flip(SwitchName.DUTY, duty)
-        state.switches.flip(SwitchName.VOICE, duty)
-        state.switches.flip(SwitchName.MESSAGE, duty)
+        self.state = BridgeState(
+            switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue()
+        )
+        self.state.switches.flip(SwitchName.DUTY, duty)
+        self.state.switches.flip(SwitchName.VOICE, duty)
+        self.state.switches.flip(SwitchName.MESSAGE, duty)
         self.core = BridgeCore(
-            state=state,
+            state=self.state,
             call=self.call,
             channel=self.channel,
             agents={AgentKind.CLAUDE: self.agent, AgentKind.CODEX: self.agent},
-            launcher=self.launcher,
-            default_agent=AgentKind.CLAUDE,
-            projects=projects,
             inventory=(SeamLoad(seam="call", configured="a.call"),),
             instruction_context=instruction_context(),
         )
@@ -121,13 +70,17 @@ class Surface:
     def ask(self, action: Action, **payload: object) -> Reply:
         return asyncio.run(self.plane.handle(Request(action=action, payload=payload)))
 
-    def launch(self, *, request_id: RequestId | None = None) -> Reply:
-        return self.ask(
-            Action.LAUNCH,
-            request_id=request_id or new_request_id(),
-            agent="codex",
-            project=LABEL.project,
-            task=LABEL.task,
+    def register(self, target: SessionTarget = CODEX) -> Session:
+        """Put one Session on the roster.
+
+        Written straight into the registry because nothing else can: the launch
+        transaction that used to seed these tests is parked (#72), and the
+        discovery path that replaces it is not built yet. What these tests are
+        about is what the control plane does with a roster, not how a row got
+        onto one.
+        """
+        return self.state.sessions.register(
+            Session(target=target, label=LABEL, workspace=WORKSPACE, registered_at=0.0)
         )
 
     def open_window(self) -> None:
@@ -140,7 +93,7 @@ class TestWithEverySwitchOff:
 
     def test_every_action_succeeds_with_duty_voice_and_message_off(self) -> None:
         surface = Surface(duty=False)
-        surface.launch()
+        surface.register()
         asyncio.run(
             surface.core.approvals.opened(
                 ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
@@ -155,7 +108,6 @@ class TestWithEverySwitchOff:
             Action.RELAY: surface.ask(Action.RELAY, target=CODEX_ADDRESS, text="carry on"),
             Action.APPROVE: surface.ask(Action.APPROVE, approval_id="a1", verdict="allow"),
             Action.VERIFY: surface.ask(Action.VERIFY),
-            Action.CLOSE: surface.ask(Action.CLOSE, target=CODEX_ADDRESS),
         }
 
         refused = {action: reply.error for action, reply in replies.items() if not reply.ok}
@@ -186,7 +138,7 @@ class TestWithEverySwitchOff:
 class TestStatus:
     def test_status_renders_the_whole_hub(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
 
         data = surface.ask(Action.STATUS).data
 
@@ -200,7 +152,7 @@ class TestStatus:
 
     def test_the_roster_is_answerable_on_its_own(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
 
         assert (
             surface.ask(Action.SESSIONS).data["sessions"]
@@ -223,7 +175,7 @@ class TestRefusalsKeepTheirIdentity:
         assert reply.error.code is ErrorCode.INVALID_PAYLOAD
 
     def test_an_unknown_session(self) -> None:
-        reply = Surface().ask(Action.CLOSE, target=CODEX_ADDRESS)
+        reply = Surface().ask(Action.RELAY, target=CODEX_ADDRESS, text="carry on")
 
         assert reply.error is not None
         assert reply.error.code is ErrorCode.UNKNOWN_SESSION
@@ -231,99 +183,14 @@ class TestRefusalsKeepTheirIdentity:
     def test_a_claude_target_without_a_pid_never_reaches_the_hub(self) -> None:
         """A resumed Claude session forks; a target without a pid is ambiguous."""
         reply = Surface().ask(
-            Action.CLOSE, target={"agent": "claude", "session_id": "abc", "pid": None}
+            Action.RELAY,
+            target={"agent": "claude", "session_id": "abc", "pid": None},
+            text="carry on",
         )
 
         assert reply.error is not None
         assert reply.error.code is ErrorCode.INVALID_PAYLOAD
         assert "pid" in reply.error.message
-
-    def test_an_engine_with_no_launcher_says_which_seam_is_empty(self) -> None:
-        surface = Surface(launcher=False)
-
-        reply = surface.launch()
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.SEAM_UNAVAILABLE
-
-    def test_a_launch_without_the_senders_request_identity_is_unusable(self) -> None:
-        surface = Surface()
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            project=LABEL.project,
-            task=LABEL.task,
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.INVALID_PAYLOAD
-        assert "request_id" in reply.error.message
-        assert surface.launcher is not None
-        assert surface.launcher.requests == []
-
-    def test_a_launch_identity_that_is_not_a_uuid_is_unusable(self) -> None:
-        surface = Surface()
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id="not-a-uuid",
-            agent="codex",
-            project=LABEL.project,
-            task=LABEL.task,
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.INVALID_PAYLOAD
-        assert "UUID" in reply.error.message
-        assert surface.launcher is not None
-        assert surface.launcher.requests == []
-
-    @pytest.mark.parametrize(
-        ("legacy_key", "legacy_value"),
-        [
-            pytest.param("workspace", str(WORKSPACE), id="workspace"),
-            pytest.param(
-                "label",
-                {"project": LABEL.project, "task": LABEL.task},
-                id="label",
-            ),
-            pytest.param("env", {"LAUNCH_SETTING": "value"}, id="environment"),
-        ],
-    )
-    def test_legacy_launch_fields_are_not_a_second_interface(
-        self, legacy_key: str, legacy_value: object
-    ) -> None:
-        surface = Surface()
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project=LABEL.project,
-            task=LABEL.task,
-            **{legacy_key: legacy_value},
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.INVALID_PAYLOAD
-        assert legacy_key in reply.error.message
-        assert surface.launcher is not None
-        assert surface.launcher.requests == []
-
-    def test_task_text_that_cannot_form_a_session_label_is_refused(self) -> None:
-        surface = Surface()
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project=LABEL.project,
-            task="first half · second half",
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "task" in reply.error.message
-        assert surface.launcher is not None
-        assert surface.launcher.requests == []
 
     def test_a_verdict_nothing_is_waiting_for(self) -> None:
         reply = Surface().ask(Action.APPROVE, approval_id="never", verdict="allow")
@@ -339,7 +206,7 @@ class TestRefusalsKeepTheirIdentity:
 
     def test_relayed_words_that_are_not_there(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
 
         reply = surface.ask(Action.RELAY, target=CODEX_ADDRESS, text="   ")
 
@@ -347,342 +214,10 @@ class TestRefusalsKeepTheirIdentity:
         assert reply.error.code is ErrorCode.INVALID_PAYLOAD
 
 
-class TestLaunchingAndClosing:
-    def test_a_spoken_project_alias_launches_once_with_the_default_agent(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(launcher=launcher)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="GPT Live",
-            task="build the control plane",
-        )
-
-        assert reply.ok
-        assert len(launcher.requests) == 1
-        request = launcher.requests[0]
-        assert request.agent is AgentKind.CLAUDE
-        assert request.workspace == WORKSPACE
-        assert request.label == SessionLabel(
-            project="GPT-VoiceCoding", task="build the control plane"
-        )
-        assert dict(request.env) == {}
-
-    def test_an_explicit_agent_overrides_the_configured_default(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CODEX])
-        surface = Surface(launcher=launcher)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="GPT Live",
-            task="build the control plane",
-            agent="codex",
-        )
-
-        assert reply.ok
-        assert launcher.requests[0].agent is AgentKind.CODEX
-
-    @pytest.mark.parametrize(
-        "reference",
-        [
-            pytest.param("GPT-VoiceCoding", id="canonical"),
-            pytest.param("gPt voice coding", id="case-and-space"),
-            pytest.param("GPT--Voice  Coding", id="repeated-hyphen-and-space"),
-            pytest.param("GPT\t-\N{NO-BREAK SPACE}Voice---Coding", id="unicode-whitespace"),
-            pytest.param("GPTVoiceCoding", id="joined-words"),
-            pytest.param("gpt_voice-coding", id="mixed-punctuation"),
-            pytest.param(
-                "ＧＰＴ—Ｖｏｉｃｅ　Ｃｏｄｉｎｇ",
-                id="unicode-width-and-punctuation",
-            ),
-        ],
-    )
-    def test_project_lookup_ignores_typographic_differences(self, reference: str) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(launcher=launcher)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project=reference,
-            task="build the control plane",
-        )
-
-        assert reply.ok
-        assert launcher.requests[0].label.project == "GPT-VoiceCoding"
-
-    def test_a_configured_workspace_with_spaces_reaches_the_launcher_unchanged(self) -> None:
-        workspace = Path("/tmp/project volume/GPT-VoiceCoding")
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(
-            launcher=launcher,
-            projects=(Project(name="GPT-VoiceCoding", workspace=workspace),),
-        )
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="GPT Voice Coding",
-            task="build the control plane",
-        )
-
-        assert reply.ok
-        assert launcher.requests[0].workspace == workspace
-
-    def test_project_lookup_does_not_guess_a_misspelling(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(launcher=launcher)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="GPT Voice Codng",
-            task="build the control plane",
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert launcher.requests == []
-
-    def test_punctuation_alone_cannot_be_a_project_lookup_key(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(
-            launcher=launcher,
-            projects=(
-                Project(
-                    name="GPT-VoiceCoding",
-                    workspace=WORKSPACE,
-                    spoken_aliases=("---",),
-                ),
-            ),
-        )
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="___",
-            task="build the control plane",
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert launcher.requests == []
-
-    def test_an_unknown_project_is_refused_with_the_configured_names(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(launcher=launcher)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="Not Configured",
-            task="build the control plane",
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "GPT-VoiceCoding" in reply.error.message
-        assert "Other Project" in reply.error.message
-        assert launcher.requests == []
-
-    def test_a_project_reference_shared_by_two_projects_is_refused(self) -> None:
-        projects = (
-            Project(name="First Project", workspace=WORKSPACE, spoken_aliases=("Shared-Project",)),
-            Project(
-                name="Second Project",
-                workspace=SECOND_WORKSPACE,
-                spoken_aliases=("Shared_Project",),
-            ),
-        )
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        surface = Surface(launcher=launcher, projects=projects)
-
-        reply = surface.ask(
-            Action.LAUNCH,
-            request_id=LAUNCH_REQUEST_ID,
-            project="shared project",
-            task="build the control plane",
-        )
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "First Project" in reply.error.message
-        assert "Second Project" in reply.error.message
-        assert launcher.requests == []
-
-    def test_a_repeated_launch_intent_returns_one_document_and_registers_once(self) -> None:
-        surface = Surface()
-
-        first = surface.launch(request_id=LAUNCH_REQUEST_ID)
-        second = surface.launch(request_id=LAUNCH_REQUEST_ID)
-
-        assert json.dumps(first.as_document()).encode() == json.dumps(second.as_document()).encode()
-        assert surface.launcher is not None
-        assert len(surface.launcher.requests) == 1
-        assert surface.launcher.requests[0].request_id == LAUNCH_REQUEST_ID
-        assert len(surface.core.status().sessions) == 1
-
-    @pytest.mark.parametrize(
-        "changes",
-        [
-            pytest.param({"agent": "claude"}, id="agent"),
-            pytest.param({"project": "Other Project"}, id="project"),
-            pytest.param({"task": "a different task"}, id="task"),
-        ],
-    )
-    def test_reusing_a_launch_identity_for_a_different_intent_is_refused(
-        self, changes: dict[str, object]
-    ) -> None:
-        surface = Surface()
-        surface.launch(request_id=LAUNCH_REQUEST_ID)
-        payload: dict[str, object] = {
-            "request_id": LAUNCH_REQUEST_ID,
-            "agent": "codex",
-            "project": LABEL.project,
-            "task": LABEL.task,
-        }
-        payload.update(changes)
-
-        conflicting = surface.ask(Action.LAUNCH, **payload)
-
-        assert conflicting.error is not None
-        assert conflicting.error.code is ErrorCode.REFUSED
-        assert str(LAUNCH_REQUEST_ID) in conflicting.error.message
-        assert surface.launcher is not None
-        assert len(surface.launcher.requests) == 1
-        assert len(surface.core.status().sessions) == 1
-
-    def test_concurrent_duplicate_launches_share_one_transaction(self) -> None:
-        launcher = HoldingLauncher(targets=[CODEX])
-        surface = Surface(launcher=launcher)
-        request = Request(
-            action=Action.LAUNCH,
-            payload={
-                "request_id": LAUNCH_REQUEST_ID,
-                "agent": "codex",
-                "project": LABEL.project,
-                "task": LABEL.task,
-            },
-        )
-
-        async def overlap() -> tuple[Reply, Reply]:
-            first = asyncio.create_task(surface.plane.handle(request))
-            await launcher.started.wait()
-            second = asyncio.create_task(surface.plane.handle(request))
-            await asyncio.sleep(0)
-            launcher.release.set()
-            return await asyncio.gather(first, second)
-
-        first, second = asyncio.run(overlap())
-
-        assert json.dumps(first.as_document()).encode() == json.dumps(second.as_document()).encode()
-        assert len(launcher.requests) == 1
-        assert len(surface.core.status().sessions) == 1
-
-    def test_a_lost_first_response_does_not_cancel_the_launch_transaction(self) -> None:
-        launcher = HoldingLauncher(targets=[CODEX])
-        surface = Surface(launcher=launcher)
-        request = Request(
-            action=Action.LAUNCH,
-            payload={
-                "request_id": LAUNCH_REQUEST_ID,
-                "agent": "codex",
-                "project": LABEL.project,
-                "task": LABEL.task,
-            },
-        )
-
-        async def lose_then_retry() -> Reply:
-            lost = asyncio.create_task(surface.plane.handle(request))
-            await launcher.started.wait()
-            lost.cancel()
-            try:
-                await lost
-            except asyncio.CancelledError:
-                pass
-
-            retry = asyncio.create_task(surface.plane.handle(request))
-            await asyncio.sleep(0)
-            launcher.release.set()
-            return await retry
-
-        retry = asyncio.run(lose_then_retry())
-
-        assert retry.ok
-        assert retry.data["request_id"] == LAUNCH_REQUEST_ID
-        assert len(launcher.requests) == 1
-        assert len(surface.core.status().sessions) == 1
-
-    @pytest.mark.parametrize(
-        ("targets", "available", "status"),
-        [
-            pytest.param([], True, "failed", id="failed"),
-            pytest.param([CODEX], False, "unavailable", id="unavailable"),
-        ],
-    )
-    def test_a_failed_or_unavailable_launch_is_the_authoritative_repeat_outcome(
-        self, targets: list[SessionTarget], available: bool, status: str
-    ) -> None:
-        launcher = FakeSessionLauncher(targets=targets, available=available)
-        surface = Surface(launcher=launcher)
-
-        first = surface.launch(request_id=LAUNCH_REQUEST_ID)
-        second = surface.launch(request_id=LAUNCH_REQUEST_ID)
-
-        assert first.data["status"] == status
-        assert first.as_document() == second.as_document()
-        assert len(launcher.requests) == 1
-        assert surface.core.status().sessions == ()
-
-    def test_distinct_launch_identities_may_start_distinct_sessions(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CODEX, SECOND_CODEX])
-        surface = Surface(launcher=launcher)
-
-        first = surface.launch(request_id=LAUNCH_REQUEST_ID)
-        second = surface.launch(request_id=RequestId("d86f92c9-02b8-4b55-9a1e-ab579469ce75"))
-
-        assert first.data["target"] == CODEX_ADDRESS
-        assert second.data["target"] == {
-            "agent": "codex",
-            "session_id": "def",
-            "pid": None,
-        }
-        assert len(launcher.requests) == 2
-        assert len(surface.core.status().sessions) == 2
-
-    def test_a_launch_returns_the_identity_the_hub_registered(self) -> None:
-        surface = Surface()
-
-        data = surface.launch().data
-
-        assert data["status"] == "launched"
-        assert data["target"] == CODEX_ADDRESS
-
-    def test_a_failed_launch_is_an_answer_carrying_the_real_error(self) -> None:
-        """The Launcher tried and failed: that is news, not a protocol refusal."""
-        surface = Surface()
-        surface.launch()
-
-        second = surface.launch()  # the fake has one target and it is spent
-
-        assert second.ok
-        assert second.data["status"] == "failed"
-        assert second.data["detail"]
-
-    def test_closing_and_repeating_it(self) -> None:
-        surface = Surface()
-        surface.launch()
-
-        assert surface.ask(Action.CLOSE, target=CODEX_ADDRESS).data["status"] == "closed"
-        assert surface.ask(Action.CLOSE, target=CODEX_ADDRESS).data["status"] == "already_closed"
-
-
 class TestRelayingAndApproving:
     def test_the_users_words_reach_the_session(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
         surface.open_window()
 
         data = surface.ask(Action.RELAY, target=CODEX_ADDRESS, text="carry on").data
@@ -692,7 +227,7 @@ class TestRelayingAndApproving:
 
     def test_a_relay_names_the_route_it_took(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
         surface.open_window()
 
         data = surface.ask(
@@ -703,7 +238,7 @@ class TestRelayingAndApproving:
 
     def test_a_verdict_is_carried_and_the_loop_closed(self) -> None:
         surface = Surface()
-        surface.launch()
+        surface.register()
         asyncio.run(
             surface.core.dispatch(
                 AwaitingApproval(

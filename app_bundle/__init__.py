@@ -4,10 +4,9 @@ This lives at the repository root rather than under `src/`, because the product
 does not ship its own build system. The wheel's contents are `src/gpt_voicecoding`
 and nothing else, and a test asserts that this package never appears in it.
 
-**The pipeline is split into a plan and a doing side**, the same shape
-`adapters/session_launcher/plan.py` uses for a launch, and for the same reason:
-the decisions are where the failures live, and decisions can be held still by a
-test while subprocesses cannot.
+**The pipeline is split into a plan and a doing side**, because the decisions
+are where the failures live, and decisions can be held still by a test while
+subprocesses cannot.
 
 - The **plan** side (`inputs`, `mach_o`, `lock`, `plan`) may read; it never
   writes, never spawns and never reaches the network. It answers: which

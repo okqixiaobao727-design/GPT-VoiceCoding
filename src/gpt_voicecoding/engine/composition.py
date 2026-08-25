@@ -17,10 +17,10 @@ Assembled here and nowhere else:
 - the Delegated Turn handler, carrying the model from configuration — the cost
   lever is a user-facing setting and nothing here may default it;
 - the generation context for Bridge Core's two instruction sets: where the
-  control-plane CLI really is on this machine, which engine it reaches, and the
-  parser-owned launch form. This root states those facts rather than letting
-  generated prose guess them — configuration first, then the console script
-  beside this interpreter, and a refusal when neither is really there;
+  control-plane CLI really is on this machine, which engine it reaches, and its
+  version. This root states those facts rather than letting generated prose
+  guess them — configuration first, then the console script beside this
+  interpreter, and a refusal when neither is really there;
 - the two loops the engine needs to be alive: one that drains events into the
   hub's dispatch, and one that advances the hub's two ceilings on a timer.
 
@@ -48,7 +48,7 @@ from typing import Any
 from gpt_voicecoding import __version__
 from gpt_voicecoding.config import EngineConfig
 from gpt_voicecoding.control_plane.actions import ControlPlane
-from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
+from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
 from gpt_voicecoding.control_plane.server import ControlPlaneServer
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.events import EventQueue
@@ -67,7 +67,6 @@ from gpt_voicecoding.seams.connection import Connectable
 from gpt_voicecoding.seams.control_plane import Action
 from gpt_voicecoding.seams.events import EventSink
 from gpt_voicecoding.seams.identity import AgentKind, new_request_id
-from gpt_voicecoding.seams.session_launcher import SessionLauncher
 
 _log = logging.getLogger(__name__)
 
@@ -116,12 +115,11 @@ class Adapters:
 
     call: CallAdapter
     channel: CompanionChannel
-    launcher: SessionLauncher
     agents: dict[AgentKind, AgentAdapter]
 
     def all(self) -> tuple[object, ...]:
         """Everything behind a seam, in the order it is opened."""
-        return (self.call, self.channel, self.launcher, *self.agents.values())
+        return (self.call, self.channel, *self.agents.values())
 
     def connectable(self) -> tuple[Connectable, ...]:
         """The ones with something of their own to open and close."""
@@ -159,7 +157,6 @@ class Engine:
         events = EventQueue()
         adapters = _adapters(config, events, factory_of)
         _share_the_app_server(adapters)
-        _introduce_the_launcher(adapters)
 
         state = BridgeState(
             switches=Switchboard(),
@@ -198,9 +195,6 @@ class Engine:
             call=adapters.call,
             channel=adapters.channel,
             agents=adapters.agents,
-            launcher=adapters.launcher,
-            default_agent=config.launch.default_agent,
-            projects=config.launch.projects,
             events=events,
             policy=config.policy,
             # The grammar's command words are the action set itself, so the
@@ -346,7 +340,6 @@ def _adapters(
     return Adapters(
         call=built("call", config.adapters.call),
         channel=built("companion_channel", config.adapters.companion_channel),
-        launcher=built("session_launcher", config.adapters.session_launcher),
         agents={
             agent: built(f"agent.{agent}", reference)
             for agent, reference in config.adapters.agents.items()
@@ -393,38 +386,6 @@ def _share_the_app_server(adapters: Adapters) -> None:
     consumer(provider)
 
 
-def _introduce_the_launcher(adapters: Adapters) -> None:
-    """Tell the Session Launcher which Agent adapters a launch has to serve.
-
-    A launch carries things only an Agent spoke can name. The Claude one is the
-    clearest: a launched Session's `PermissionRequest` hook has to be told where
-    this engine parks dialogs, and its Session Channel has to be told which byte
-    budgets this engine was configured with; the launcher also has to read the
-    same registry directory that adapter observes. Those facts live in the Agent
-    adapter's settings and its own derived socket path, not in the launcher's.
-    The Codex one is smaller and the same shape: a launched Session's app-server
-    address is something only the launch knows, and only that adapter needs.
-
-    Introducing them is this root's job for the reason `_share_the_app_server`
-    states — the only place allowed to know two adapters at once is here.
-
-    **A launcher that wants no introduction is left alone**, so a fake or a null
-    implementation needs to know nothing about any of this. And a launcher that
-    wants one but finds no such Agent adapter is *not* stopped here: the
-    consequence is per-agent rather than fatal — an engine configured for Codex
-    only should start — and the launcher itself refuses that agent's launches by
-    name, which is the truthful place for that refusal.
-    """
-    launcher = adapters.launcher
-    for agent, introduce in (
-        (AgentKind.CLAUDE, getattr(launcher, "use_claude", None)),
-        (AgentKind.CODEX, getattr(launcher, "use_codex", None)),
-    ):
-        adapter = adapters.agents.get(agent)
-        if introduce is not None and adapter is not None:
-            introduce(adapter)
-
-
 def _instruction_context(config: EngineConfig) -> InstructionContext:
     """The real control-plane CLI and parser form generated instructions may name.
 
@@ -459,7 +420,6 @@ def _instruction_context(config: EngineConfig) -> InstructionContext:
             version=__version__,
             socket_path=config.socket_path,
         ),
-        launch_usage=USAGE[Action.LAUNCH],
     )
 
 

@@ -9,7 +9,7 @@ the thread only that one door.
 **The action set is generated from the closed set itself.** Every action the
 control plane has appears below with one line saying what it is for, and the
 mapping is total by test — an action added to the protocol fails the suite until
-somebody writes its line. Argument syntax is never copied: launch's form is
+somebody writes its line. Argument syntax is never copied: each action's form is
 injected from the parser because it must run without a help preflight, and the
 thread asks the real binary about other actions. One command grammar, in one
 place, on the machine that has it.
@@ -37,8 +37,6 @@ ACTION_GIST: dict[Action, str] = {
     Action.SWITCH: "flip one switch on or off",
     Action.SESSIONS: "the session roster on its own",
     Action.LIVE: "the Live Toggle — end the call that is up, or start one when none is",
-    Action.LAUNCH: "bring exactly one session into a configured project for a stated task",
-    Action.CLOSE: "close exactly one session, by its exact identity",
     Action.RELAY: "carry the user's own words into one exact session",
     Action.APPROVE: "carry the user's verdict on one pending permission request",
     Action.VERIFY: "what this engine actually loaded behind each seam",
@@ -193,43 +191,8 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
             ),
         ),
         Section(
-            title="Starting, closing, and failures",
+            title="Failures",
             blocks=(
-                Block(
-                    covers=("delegated.start.resolves-without-guessing",),
-                    text=(
-                        "A launch carries the project reference and task the user named. Bridge "
-                        "Core resolves the absolute workspace and canonical project name. If the "
-                        "project cannot be resolved uniquely, ask — never invent a workspace to "
-                        "make a launch possible."
-                    ),
-                ),
-                Block(
-                    covers=(
-                        "delegated.start.launches-once-and-waits",
-                        "delegated.start.complete-request-launches-directly",
-                    ),
-                    text=(
-                        "A complete project-and-task request uses this exact command form, "
-                        "replacing each placeholder with the user's request:\n\n"
-                        f"    {context.launch_invocation}\n\n"
-                        "Make one launch action immediately: "
-                        "do not read help, sessions or status first, and do not add a confirmation "
-                        "round. Carry one request identity, wait for the outcome rather than "
-                        "assuming it, and if transport needs the same request again, reuse that "
-                        "identity — the engine returns the first outcome instead of opening a "
-                        "second session."
-                    ),
-                ),
-                Block(
-                    covers=("delegated.close.acts-on-the-exact-session",),
-                    text=(
-                        "Closing is irreversible and acts on one exact identity, once, only "
-                        "after the user has confirmed that one. Whatever else is open on that "
-                        "machine is not your target, and no window, directory or recent "
-                        "activity ever selects one for you."
-                    ),
-                ),
                 Block(
                     covers=("delegated.retry.only-a-retryable-notice",),
                     text=(

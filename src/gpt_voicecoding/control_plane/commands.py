@@ -30,10 +30,6 @@ USAGE: dict[Action, str] = {
     Action.SWITCH: "switch <name> on|off",
     Action.SESSIONS: "sessions",
     Action.LIVE: "live",
-    Action.LAUNCH: (
-        "launch --request-id <UUID> --project <project> [--agent claude|codex] --task <words...>"
-    ),
-    Action.CLOSE: "close <agent>:<session id>[:<pid>]",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
     Action.APPROVE: "approve <approval id> allow|deny|ask",
     Action.VERIFY: "verify",
@@ -42,10 +38,6 @@ USAGE: dict[Action, str] = {
 #: The word that asks for the mid-turn route. Spelled out, because route follows
 #: the user's explicit intent and is never inferred from how busy a Session is.
 SUPPLEMENT_FLAG = "--supplement"
-REQUEST_ID_FLAG = "--request-id"
-PROJECT_FLAG = "--project"
-AGENT_FLAG = "--agent"
-TASK_FLAG = "--task"
 
 ADDRESS_SEPARATOR = ":"
 
@@ -72,11 +64,6 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
         case Action.SWITCH:
             name, state = _exactly(action, arguments, 2)
             return {"name": name, "on": _state(state)}
-        case Action.LAUNCH:
-            return _launch(arguments)
-        case Action.CLOSE:
-            (address,) = _exactly(action, arguments, 1)
-            return {"target": parse_address(address)}
         case Action.RELAY:
             return _relay(arguments)
         case Action.APPROVE:
@@ -95,31 +82,6 @@ def _relay(arguments: list[str]) -> dict[str, object]:
         raise CommandError(f"say it as: {USAGE[Action.RELAY]}")
     address, *words = remaining
     return {"target": parse_address(address), "text": " ".join(words), "route": route}
-
-
-def _launch(arguments: list[str]) -> dict[str, object]:
-    """Read one explicit project and the task words that follow the final flag."""
-    if len(arguments) < 6 or arguments[0] != REQUEST_ID_FLAG or arguments[2] != PROJECT_FLAG:
-        raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
-    request_id = arguments[1]
-    project = arguments[3]
-    cursor = 4
-    agent: str | None = None
-    if arguments[cursor] == AGENT_FLAG:
-        if len(arguments) < 8:
-            raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
-        agent = arguments[cursor + 1]
-        cursor += 2
-    if arguments[cursor] != TASK_FLAG or cursor + 1 == len(arguments):
-        raise CommandError(f"say it as: {USAGE[Action.LAUNCH]}")
-    payload: dict[str, object] = {
-        "request_id": request_id,
-        "project": project,
-        "task": " ".join(arguments[cursor + 1 :]),
-    }
-    if agent is not None:
-        payload["agent"] = agent
-    return payload
 
 
 def _exactly(action: Action, arguments: list[str], count: int) -> list[str]:
@@ -178,13 +140,6 @@ def render(reply: Reply) -> str:
                 if data["state"] == "up"
                 else f"no Live Call is up ({data['state']})"
             )
-        case Action.LAUNCH:
-            if data["status"] != "launched":
-                return f"launch {data['status']}: {data['detail']}"
-            return f"launched {format_address(data['target'])}"
-        case Action.CLOSE:
-            detail = f": {data['detail']}" if data["detail"] else ""
-            return f"{str(data['status']).replace('_', ' ')}{detail}"
         case Action.RELAY:
             return _relay_line(data)
         case Action.APPROVE:

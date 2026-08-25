@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry
@@ -26,7 +26,11 @@ from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 
 CALL_SEAM = "call"
 CHANNEL_SEAM = "companion_channel"
-LAUNCHER_SEAM = "session_launcher"
+#: A seam name this engine holds nothing behind, for the two "configured but not
+#: built" cases. It is an agent rather than a seam of its own because every seam
+#: left is one configuration requires, so the only way to name an adapter this
+#: engine did not build is to name an agent it was not given.
+ABSENT_SEAM = "agent.claude"
 
 
 def hub(
@@ -34,7 +38,6 @@ def hub(
     inventory: tuple[SeamLoad, ...],
     call: FakeCall | None = None,
     channel: FakeCompanionChannel | None = None,
-    launcher: FakeSessionLauncher | None = None,
 ) -> BridgeCore:
     state = BridgeState(switches=Switchboard(), sessions=SessionRegistry(), relays=RelayQueue())
     return BridgeCore(
@@ -42,7 +45,6 @@ def hub(
         call=call or FakeCall(),
         channel=channel or FakeCompanionChannel(),
         agents={AgentKind.CODEX: FakeAgent()},
-        launcher=launcher,
         inventory=inventory,
     )
 
@@ -88,13 +90,13 @@ class TestEveryPluggableSeamAnswersForItself:
 
 class TestThePresenceOfAnAdapter:
     def test_a_configured_seam_with_nothing_behind_it_fails(self) -> None:
-        """The Launcher was named and never built: "should have one, has none"."""
-        core = hub(inventory=(loaded(LAUNCHER_SEAM, "a.launcher"),), launcher=None)
+        """An adapter was named and never built: "should have one, has none"."""
+        core = hub(inventory=(loaded(ABSENT_SEAM, "a.claude"),))
 
-        outcome, detail = verified(core)[LAUNCHER_SEAM]
+        outcome, detail = verified(core)[ABSENT_SEAM]
 
         assert outcome is VerifyOutcome.FAIL
-        assert "a.launcher" in detail and "nothing" in detail
+        assert "a.claude" in detail and "nothing" in detail
 
     def test_the_null_implementation_answering_for_itself_is_not_an_outage(self) -> None:
         """Empty `loaded` is the null implementation, which is present and answering.
@@ -137,9 +139,9 @@ class TestThePresenceOfAnAdapter:
         assert "no implementation" in detail
 
     def test_nothing_configured_and_nothing_loaded_is_handed_to_the_operator(self) -> None:
-        core = hub(inventory=(SeamLoad(seam=LAUNCHER_SEAM, configured=""),), launcher=None)
+        core = hub(inventory=(SeamLoad(seam=ABSENT_SEAM, configured=""),))
 
-        assert verified(core)[LAUNCHER_SEAM][0] is VerifyOutcome.MANUAL
+        assert verified(core)[ABSENT_SEAM][0] is VerifyOutcome.MANUAL
 
     def test_something_loaded_that_nothing_configured_fails(self) -> None:
         core = hub(inventory=(SeamLoad(seam=CALL_SEAM, configured=""),))

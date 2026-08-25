@@ -10,7 +10,7 @@ Three locked rules are enforced here by shape rather than by discipline:
   is refused at construction.
 - **`request_id` is one sender-minted UUID**, reused across every delivery of
   the same intent: Claude sends it as both `uuid` and `msg_id`, Codex as
-  `clientUserMessageId`, and launch callers carry it through the control plane.
+  `clientUserMessageId`, and control-plane callers carry it through unchanged.
   It stays a plain string precisely so every route can carry it unchanged.
   Bridge Core and adapters map or bind it; they never replace it.
 """
@@ -35,7 +35,7 @@ def new_request_id() -> RequestId:
 
 
 class AgentKind(StrEnum):
-    """The terminal coding agents this system launches, watches and Relays into."""
+    """The terminal coding agents this system watches and Relays into."""
 
     CLAUDE = "claude"
     CODEX = "codex"

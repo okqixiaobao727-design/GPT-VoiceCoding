@@ -477,7 +477,7 @@ class TestTheThingsThatMustAgree:
         read = config.load(placed)
         assert read.delegated_turn_model
         assert read.log.max_bytes > 0
-        assert set(read.adapters.as_mapping()) >= {"call", "companion_channel", "session_launcher"}
+        assert set(read.adapters.as_mapping()) >= {"call", "companion_channel"}
 
     def test_the_example_config_points_at_the_cli_the_bundle_really_lays_out(self) -> None:
         """`[delegate] cli` has to be true, or the instructions naming it are not.

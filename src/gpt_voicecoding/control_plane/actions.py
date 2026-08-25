@@ -13,18 +13,16 @@ itself — and one that could reach a pipeline the hub would have guarded.
 
 **ADR 0002 is honoured by omission.** Nothing in this file consults switch
 state, and there is no branch that could. The reference implementation gated
-seven actions — `sessions`, `launch`, `close` and four more — behind the Duty
-Switch, so a user away from the computer with Duty off could see nothing and do
-nothing; that dispatch behaviour is dropped, not ported, and
+seven actions — `sessions` and six more — behind the Duty Switch, so a user
+away from the computer with Duty off could see nothing and do nothing; that
+dispatch behaviour is dropped, not ported, and
 `tests/test_control_plane_actions.py` proves every action still answers with
 every switch off.
 
 **A refusal keeps its identity.** Bridge Core's refusals map onto the closed
 error set by type, and the message that travels is the refusal's own words —
 surfaces render it verbatim rather than rephrasing it, so honest wording lives
-in one place. What is *not* a refusal: a Launcher that tried and failed. That is
-news the user asked for, so it answers `ok` carrying the real error, exactly as
-the seam reported it.
+in one place.
 """
 
 from __future__ import annotations
@@ -37,7 +35,6 @@ from gpt_voicecoding.control_plane.payloads import InvalidPayload, NothingPendin
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
-    SeamUnavailableError,
     SecondCallRefused,
     StaleSessionError,
     UnknownRelayError,
@@ -55,7 +52,6 @@ _CODES: tuple[tuple[type[BridgeCoreError], ErrorCode], ...] = (
     (UnknownSessionError, ErrorCode.UNKNOWN_SESSION),
     (UnknownRelayError, ErrorCode.UNKNOWN_PENDING),
     (SecondCallRefused, ErrorCode.SECOND_CALL_REFUSED),
-    (SeamUnavailableError, ErrorCode.SEAM_UNAVAILABLE),
 )
 
 
@@ -77,8 +73,6 @@ class ControlPlane:
             Action.SWITCH: self._switch,
             Action.SESSIONS: self._sessions,
             Action.LIVE: self._live,
-            Action.LAUNCH: self._launch,
-            Action.CLOSE: self._close,
             Action.RELAY: self._relay,
             Action.APPROVE: self._approve,
             Action.VERIFY: self._verify,
@@ -131,20 +125,6 @@ class ControlPlane:
     async def _live(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """The Live Toggle. One action, and every surface calls this one."""
         return payloads.call_document(await self._core.live_toggle())
-
-    async def _launch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        payloads.reject_unknown(payload, frozenset({"request_id", "project", "task", "agent"}))
-        outcome = await self._core.launch_session(
-            request_id=payloads.read_request_id(payload),
-            project=payloads.read_text(payload, "project"),
-            task=payloads.read_text(payload, "task"),
-            agent=payloads.read_optional_agent(payload),
-        )
-        return payloads.launch_document(outcome)
-
-    async def _close(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        outcome = await self._core.close_session(payloads.read_target(payload))
-        return payloads.close_document(outcome)
 
     async def _relay(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """An Answer Relay: the user's own words, carrying the user's authority.

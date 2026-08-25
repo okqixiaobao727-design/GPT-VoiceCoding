@@ -20,106 +20,26 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeCall, FakeSessionLauncher
+from fakes import FakeCall
 from gpt_voicecoding.cli import main
 from gpt_voicecoding.config import load
-from gpt_voicecoding.control_plane.client import (
-    DEFAULT_TIMEOUT_SECONDS,
-    LAUNCH_TIMEOUT_SECONDS,
-    EngineUnreachable,
-)
-from gpt_voicecoding.control_plane.commands import CommandError, build_request
+from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, EngineUnreachable
 from gpt_voicecoding.engine.composition import Engine
 from gpt_voicecoding.seams.call import CallSnapshot
-from gpt_voicecoding.seams.control_plane import Action, Reply
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
-from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest
-
-CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
-LAUNCH_REQUEST_ID = "21d73168-b1f0-4b18-977d-fba0d1f2cc13"
-
-
-class TestTheLaunchCommand:
-    def test_project_and_task_enter_the_launch_payload_without_an_agent(self) -> None:
-        request = build_request(
-            "launch",
-            [
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "GPT Live",
-                "--task",
-                "build",
-                "the control plane",
-            ],
-        )
-
-        assert request.action is Action.LAUNCH
-        assert dict(request.payload) == {
-            "request_id": LAUNCH_REQUEST_ID,
-            "project": "GPT Live",
-            "task": "build the control plane",
-        }
-
-    def test_an_explicit_agent_enters_the_launch_payload(self) -> None:
-        request = build_request(
-            "launch",
-            [
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "GPT Live",
-                "--agent",
-                "codex",
-                "--task",
-                "build the control plane",
-            ],
-        )
-
-        assert dict(request.payload) == {
-            "request_id": LAUNCH_REQUEST_ID,
-            "project": "GPT Live",
-            "task": "build the control plane",
-            "agent": "codex",
-        }
-
-    def test_a_positional_request_identity_is_not_a_second_interface(self) -> None:
-        with pytest.raises(CommandError):
-            build_request(
-                "launch",
-                [LAUNCH_REQUEST_ID, "codex", "/tmp/workspace", "a project · a task"],
-            )
-
-
-def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
-    """A Launcher with exactly one Session to hand out."""
-    return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
-
+from gpt_voicecoding.seams.control_plane import Reply
 
 #: Longer than any deadline these tests hand the surface, and short enough that
 #: the engine's own shutdown does not wait on it. It stands in for the real
-#: thing #28 was found on: a cold launch that outruns the client's patience.
+#: thing #28 was found on: an action that outruns the client's patience.
 SLOWER_THAN_ANY_DEADLINE_SECONDS = 3.0
 
 
-class SlowSessionLauncher(FakeSessionLauncher):
-    """A Launcher that is still working when the surface has given up waiting."""
-
-    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
-        await asyncio.sleep(SLOWER_THAN_ANY_DEADLINE_SECONDS)
-        return await super().launch(request)
-
-
 class SlowCall(FakeCall):
-    """A Call adapter that is slow, so a *non*-launch action can time out too."""
+    """A Call adapter that is slow, so an action can time out against it."""
 
     async def ensure_call(self, instructions: str) -> CallSnapshot:
         await asyncio.sleep(SLOWER_THAN_ANY_DEADLINE_SECONDS)
         return await super().ensure_call(instructions)
-
-
-def slow_session_launcher(*, sink: object = None) -> SlowSessionLauncher:
-    return SlowSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
 
 def slow_call(*, sink: object = None, **rest: object) -> SlowCall:
@@ -134,18 +54,9 @@ state_path = "{state}"
 [adapters]
 call = "fakes:FakeCall"
 companion_channel = "fakes:FakeCompanionChannel"
-session_launcher = "test_bridgectl:one_session_launcher"
 
 [adapters.agents]
 codex = "fakes:FakeAgent"
-
-[launch]
-default_agent = "codex"
-
-[[launch.projects]]
-name = "a project"
-workspace = "{workspace}"
-spoken_aliases = ["spoken project"]
 
 [delegate]
 model = "the-model-the-user-chose"
@@ -169,12 +80,7 @@ def home() -> Iterator[Path]:
 
 
 #: The same engine, wired to adapters that outlast the surface's patience.
-SLOW_CONFIG = CONFIG.replace(
-    'call = "fakes:FakeCall"', 'call = "test_bridgectl:slow_call"'
-).replace(
-    'session_launcher = "test_bridgectl:one_session_launcher"',
-    'session_launcher = "test_bridgectl:slow_session_launcher"',
-)
+SLOW_CONFIG = CONFIG.replace('call = "fakes:FakeCall"', 'call = "test_bridgectl:slow_call"')
 
 
 @pytest.fixture
@@ -201,7 +107,6 @@ def _engine_serving(home: Path, config: str) -> Iterator[Path]:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
-            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -263,81 +168,19 @@ class TestAskingARunningEngine:
         assert "call: pass" in capsys.readouterr().out
 
 
-class TestTheWholeSessionCommandSet:
-    """The chain #3 asks for end to end: CLI, socket, hub, Launcher, and back."""
+class TestActingOnASessionThatIsNotThere:
+    """Addressing is exact, and an address nothing registered is refused.
 
-    def test_launch_then_roster_then_relay_then_close(
+    The launch-through-close chain this class used to walk went with the
+    launcher (#72): nothing registers a Session at runtime until discovery
+    lands, so the roster is empty here and the refusals are what remain
+    reachable. They are the half that mattered — an address is never guessed at.
+    """
+
+    def test_a_session_that_was_never_registered_cannot_be_reached(
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        config = ["--config", str(engine_at)]
-        assert main([*config, "sessions"]) == 0
-        assert "sessions: none" in capsys.readouterr().out
-
-        assert (
-            main(
-                [
-                    *config,
-                    "launch",
-                    "--request-id",
-                    LAUNCH_REQUEST_ID,
-                    "--project",
-                    "spoken project",
-                    "--agent",
-                    "codex",
-                    "--task",
-                    "a task",
-                ]
-            )
-            == 0
-        )
-        assert "launched codex:abc" in capsys.readouterr().out
-
-        assert main([*config, "sessions"]) == 0
-        roster = capsys.readouterr().out
-        assert "a project · a task" in roster and "codex:abc" in roster
-        assert str(engine_at.parent) in roster
-
-        assert main([*config, "relay", "codex:abc", "carry", "on"]) == 0
-        assert "deliver" in capsys.readouterr().out
-
-        assert main([*config, "close", "codex:abc"]) == 0
-        assert "closed" in capsys.readouterr().out
-
-        assert main([*config, "close", "codex:abc"]) == 0
-        assert "already closed" in capsys.readouterr().out
-
-    def test_repeating_one_launch_command_returns_the_first_result_and_one_session(
-        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        command = [
-            "--config",
-            str(engine_at),
-            "launch",
-            "--request-id",
-            LAUNCH_REQUEST_ID,
-            "--project",
-            "spoken project",
-            "--agent",
-            "codex",
-            "--task",
-            "a task",
-        ]
-
-        assert main(command) == 0
-        first = capsys.readouterr().out
-        assert main(command) == 0
-        second = capsys.readouterr().out
-        assert first == second
-
-        assert main(["--config", str(engine_at), "sessions"]) == 0
-        roster = capsys.readouterr().out
-        assert roster.count("a project · a task") == 1
-        assert roster.count("codex:abc") == 1
-
-    def test_a_session_that_was_never_launched_cannot_be_closed(
-        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        code = main(["--config", str(engine_at), "close", "codex:never-seen"])
+        code = main(["--config", str(engine_at), "relay", "codex:never-seen", "carry", "on"])
 
         assert code == 1
         assert "unknown Session" in capsys.readouterr().err
@@ -346,10 +189,16 @@ class TestTheWholeSessionCommandSet:
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """`--resume` forks a second process under the same session id."""
-        code = main(["--config", str(engine_at), "close", "claude:abc"])
+        code = main(["--config", str(engine_at), "relay", "claude:abc", "carry", "on"])
 
         assert code == 1
         assert "pid" in capsys.readouterr().err
+
+    def test_an_empty_roster_says_so(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["--config", str(engine_at), "sessions"]) == 0
+        assert "sessions: none" in capsys.readouterr().out
 
 
 class TestSayingNoOutLoud:
@@ -398,136 +247,35 @@ class TestNoEngineAtAll:
         assert "--socket" in error
 
 
-def _launching(config: Path, *, timeout: str | None = None) -> list[str]:
-    """One launch command line, so each test below carries only its own point."""
-    deadline = ["--timeout", timeout] if timeout is not None else []
-    return [
-        "--config",
-        str(config),
-        *deadline,
-        "launch",
-        "--request-id",
-        LAUNCH_REQUEST_ID,
-        "--project",
-        "a project",
-        "--task",
-        "say hello",
-    ]
+class TestAnEngineThatTakesTooLong:
+    """A silent deadline is this surface's own, and is reported as its own.
 
-
-class TestALaunchThatOutrunsTheDeadline:
-    """A launch that is still in flight is not a launch that failed (#28).
-
-    The engine holds an in-flight launch under its request id and joins a repeat
-    to it, so re-issuing the *identical* command is the safe recovery. That is
-    worth nothing if the operator cannot learn it at the moment it is needed,
-    and the obvious guess — retry with a fresh id — is precisely the one that
-    starts a second agent in the same workspace.
+    #28 was the opposite: an action still in flight reported as one that failed.
+    Nothing is invented about the engine's side — it said nothing, so nothing
+    is said on its behalf.
     """
 
-    def test_the_operator_is_told_the_launch_may_still_be_running(
+    def test_a_silent_engine_is_not_reported_as_a_refusal(
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = main(_launching(slow_engine_at, timeout="0.3"))
-
-        assert code == 2
-        error = capsys.readouterr().err
-        # Not "it failed": the launch's fate is genuinely unknown to this surface.
-        assert "may still be in flight" in error
-
-    def test_the_recovery_names_the_operator_s_own_request_id(
-        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Quoted back, so the recovery is copyable rather than merely described."""
-        main(_launching(slow_engine_at, timeout="0.3"))
-
-        error = capsys.readouterr().err
-        assert LAUNCH_REQUEST_ID in error
-        assert "--request-id" in error
-
-    def test_it_warns_that_a_fresh_request_id_would_start_a_second_agent(
-        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """The wrong guess is named, because naming only the right move invites it."""
-        main(_launching(slow_engine_at, timeout="0.3"))
-
-        assert "second agent" in capsys.readouterr().err
-
-    def test_an_action_that_is_not_a_launch_keeps_the_plain_sentence(
-        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """There is no in-flight launch to join, so there is nothing to advise."""
-        code = main(
-            [
-                "--config",
-                str(slow_engine_at),
-                "--timeout",
-                "0.3",
-                "live",
-            ]
-        )
-
-        assert code == 2
-        error = capsys.readouterr().err
-        assert "did not answer within 0.3s" in error
-        assert "request-id" not in error
-
-    def test_no_engine_at_all_is_never_told_a_launch_may_be_in_flight(
-        self, home: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Nothing was ever reached, so nothing is running — advising a rejoin would
-        be the same untruth this ticket exists to remove, pointed the other way."""
-        code = main(
-            [
-                "--socket",
-                str(home / "absent.sock"),
-                "launch",
-                "--request-id",
-                LAUNCH_REQUEST_ID,
-                "--project",
-                "a project",
-                "--task",
-                "say hello",
-            ]
-        )
-
-        assert code == 2
-        error = capsys.readouterr().err
-        assert str(home / "absent.sock") in error
-        assert "may still be in flight" not in error
-        assert "second agent" not in error
-
-
-class TestTheDeadlineTheOperatorAsked:
-    """`--timeout` is the operator's, and it outranks the per-action default."""
-
-    def test_an_explicit_timeout_overrides_the_launch_default(
-        self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Proved by the sentence naming the operator's number, not the default's:
-        had the 150s launch deadline applied, this test would still be waiting."""
-        code = main(_launching(slow_engine_at, timeout="0.3"))
+        code = main(["--config", str(slow_engine_at), "--timeout", "0.3", "live"])
 
         assert code == 2
         assert "did not answer within 0.3s" in capsys.readouterr().err
 
-
-class TestASlowLaunchIsNotAFailure:
-    """The first thing #28 asks for: a launch that is merely slow still succeeds."""
-
-    def test_a_launch_slower_than_an_ordinary_action_still_reports_success(
+    def test_an_explicit_timeout_outranks_the_action_default(
         self, slow_engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = main(_launching(slow_engine_at))
+        """Proved by the sentence naming the operator's number, not the default's."""
+        code = main(["--config", str(slow_engine_at), "--timeout", "0.3", "live"])
 
-        assert code == 0
-        assert "launched codex:abc" in capsys.readouterr().out
+        assert code == 2
+        assert "did not answer within 0.3s" in capsys.readouterr().err
 
-    def test_a_launch_is_given_the_derived_deadline_and_other_actions_are_not(
+    def test_the_action_default_is_what_reaches_the_wire(
         self, home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The number reaches the wire. Asserted here rather than by spending it:
-        a test that actually waited out the launch deadline would take 150s."""
+        """The deadline is read off the action rather than written at the call site."""
         waited: list[float] = []
 
         async def record(request: object, *, path: Path, timeout: float) -> Reply:
@@ -538,8 +286,7 @@ class TestASlowLaunchIsNotAFailure:
 
         monkeypatch.setattr("gpt_voicecoding.cli.bridgectl.ask", record)
         socket = ["--socket", str(home / "control.sock")]
-        launch = ["launch", "--request-id", LAUNCH_REQUEST_ID, "--project", "p", "--task", "t"]
-        main([*socket, *launch])
+        main([*socket, "live"])
         main([*socket, "status"])
 
-        assert waited == [LAUNCH_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
+        assert waited == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]

@@ -27,7 +27,7 @@ rotation cannot be told to reopen, so its output stays with the generation it wa
 writing to and ages out with retention. That is why a generation is trimmed on
 its own inode and never by replacing the file — see `_trim_to_tail`. Removing
 that limitation rather than bounding it means giving children a pipe instead of
-the log descriptor, which belongs to the launcher's ticket.
+the log descriptor, which belongs to whichever ticket first needs it.
 
 **The cap binds every generation**, not only the one a rotation just created, and
 rotation keeps the *newest* bytes of what it rotates: the tail is the part that
@@ -45,10 +45,10 @@ adapter log paths, and such a log must never be the engine's own. See ADR 0004.
 variable that filled the log and the file it filled. It is called once per
 process that spawns others, not at each spawn site — the sites are many and each
 new one would have to remember, while the environment they all inherit is a
-single place. The engine calls it at start. **A Session launched into a tmux
-server inherits that server's environment rather than the engine's**, so a
-launcher adapter that spawns through one must call this on its own path too;
-being a pure function over a mapping is what makes that cheap.
+single place. The engine calls it at start. **A process this engine did not
+spawn inherits whatever started it, not the engine's environment**, so anything
+that later spawns through such a path must call this on its own path too; being
+a pure function over a mapping is what makes that cheap.
 """
 
 from __future__ import annotations

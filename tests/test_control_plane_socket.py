@@ -24,17 +24,10 @@ from pathlib import Path
 
 import pytest
 
-# Imported to pin the launch deadline against the engine's own budget, and for
-# no other reason: nothing in `control_plane` reaches into `adapters` at runtime.
-from gpt_voicecoding.adapters.codex_app_server.settings import DEFAULT_REQUEST_TIMEOUT_SECONDS
-from gpt_voicecoding.adapters.session_launcher.codex import APP_SERVER_TIMEOUT_SECONDS
-from gpt_voicecoding.adapters.session_launcher.plan import CONFIRM_TIMEOUT_SECONDS
 from gpt_voicecoding.control_plane.client import (
     DEFAULT_TIMEOUT_SECONDS,
-    LAUNCH_TIMEOUT_SECONDS,
     EngineUnreachable,
     ask,
-    timeout_for,
 )
 from gpt_voicecoding.control_plane.ownership import SocketPathTooLong
 from gpt_voicecoding.control_plane.server import AlreadyServing, ControlPlaneServer
@@ -290,17 +283,17 @@ class TestOneBadLineCostsOneRequest:
 
 class TestTwoSurfacesAtOnce:
     def test_concurrent_clients_each_get_their_own_reply(self, socket_dir: Path) -> None:
-        held = Held(Action.LAUNCH)
+        held = Held(Action.RELAY)
         plane = StubPlane(held=held)
 
         async def scenario() -> tuple[Reply, Reply]:
             server = await serving(socket_dir, plane)
             try:
                 slow = asyncio.ensure_future(
-                    ask(Request(action=Action.LAUNCH), path=server.path, timeout=5)
+                    ask(Request(action=Action.RELAY), path=server.path, timeout=5)
                 )
                 # Wait for the slow handler to be in flight — but never past the
-                # slow request itself, or a LAUNCH that failed before it ever
+                # slow request itself, or a RELAY that failed before it ever
                 # reached the plane would hang the suite instead of failing it.
                 reaching = asyncio.ensure_future(held.reached.wait())
                 await asyncio.wait([reaching, slow], return_when=asyncio.FIRST_COMPLETED)
@@ -322,9 +315,9 @@ class TestTwoSurfacesAtOnce:
 
         slow, quick = asyncio.run(scenario())
 
-        assert slow.action is Action.LAUNCH
+        assert slow.action is Action.RELAY
         assert quick.action is Action.STATUS
-        assert plane.handled == [Action.STATUS, Action.LAUNCH]
+        assert plane.handled == [Action.STATUS, Action.RELAY]
 
     def test_every_reply_names_the_action_it_answers(self, socket_dir: Path) -> None:
         """A surface that guessed which reply was its own is a surface that races."""
@@ -395,54 +388,18 @@ class TestAPathThatCannotBeBound:
             asyncio.run(ControlPlaneServer(plane=StubPlane(), path=too_long).start())
 
 
-def _engine_budget() -> float:
-    """The longest the engine may spend deciding one launch. Summed in one place,
-    so a wait added to the launch path is added to the derivation with it."""
-    return (
-        APP_SERVER_TIMEOUT_SECONDS  # the app-server binding its socket
-        + DEFAULT_REQUEST_TIMEOUT_SECONDS  # the `initialise` handshake
-        + CONFIRM_TIMEOUT_SECONDS  # the Session saying who it is
-    )
+class TestTheDeadlineIsNeverLeftToTheCallSite:
+    """`ask` supplies the deadline itself, never leaving it to the call site.
 
-
-class TestTheLaunchDeadlineIsDerived:
-    """The launch deadline is not a taste; it is read off the engine's own budget.
-
-    A launch that outran the surface's deadline was reported as a failure while
-    it was in fact succeeding (#28). The fix is only sound while the surface
-    waits longer than the engine can possibly take to decide, so that a
-    client-side timeout means "the engine hung" and never "the launch was slow".
-
-    These tests defend against the way that soundness is silently lost: someone
-    raises one of the engine-side constants, the derivation stops holding, and
-    nothing fails. If one of these trips, **re-derive the deadline — do not
-    loosen the assertion.** The engine-side constants are imported here and
-    never at runtime: `control_plane` does not reach into `adapters`.
+    #28 was a launch held to an ordinary action's patience, reported as a
+    failure while it was in fact succeeding. Launch is parked, so every action
+    left answers from state the hub already holds and one budget covers them
+    all — but the half of the fix that stops #28 coming back is not the
+    per-action number, it is that a caller which does not think about the
+    deadline is still given one.
     """
 
-    def test_it_outlives_every_bound_the_engine_can_spend_on_one_launch(self) -> None:
-        assert LAUNCH_TIMEOUT_SECONDS > _engine_budget(), (
-            "the surface would give up while the engine is still entitled to be working"
-        )
-
-    def test_it_leaves_room_for_the_spawn_the_bounds_do_not_cover(self) -> None:
-        """The bounded waits are not the whole launch: processes still have to start."""
-        assert LAUNCH_TIMEOUT_SECONDS - _engine_budget() >= 20.0
-
-    def test_a_launch_waits_longer_than_anything_else_does(self) -> None:
-        assert timeout_for(Action.LAUNCH) == LAUNCH_TIMEOUT_SECONDS
-        for action in Action:
-            if action is not Action.LAUNCH:
-                assert timeout_for(action) == DEFAULT_TIMEOUT_SECONDS
-
-    def test_a_client_that_names_no_deadline_still_gets_the_launch_one(
-        self, socket_dir: Path
-    ) -> None:
-        """The trap #28 was: a launch held to an ordinary action's patience.
-
-        `ask` reads the deadline off the action when it is not told one, so a
-        caller cannot reintroduce that bug by simply not thinking about it.
-        """
+    def test_a_client_that_names_no_deadline_is_given_one(self, socket_dir: Path) -> None:
         recorded: list[float] = []
         real = asyncio.timeout
 
@@ -455,11 +412,11 @@ class TestTheLaunchDeadlineIsDerived:
             try:
                 with pytest.MonkeyPatch.context() as patched:
                     patched.setattr(asyncio, "timeout", watch)
-                    for action in (Action.LAUNCH, Action.STATUS):
+                    for action in (Action.RELAY, Action.STATUS):
                         await ask(Request(action=action), path=server.path)
             finally:
                 await server.aclose()
 
         asyncio.run(scenario())
 
-        assert recorded == [LAUNCH_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
+        assert recorded == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]

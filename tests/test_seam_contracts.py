@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import fields
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,7 +25,6 @@ from fakes import (
     FakeAgent,
     FakeCall,
     FakeCompanionChannel,
-    FakeSessionLauncher,
     RecordingSink,
 )
 from gpt_voicecoding.seams.agent import (
@@ -39,23 +37,10 @@ from gpt_voicecoding.seams.call import CallAdapter, CallState
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.events import EventSink
-from gpt_voicecoding.seams.identity import (
-    AgentKind,
-    SessionLabel,
-    SessionTarget,
-    new_request_id,
-)
-from gpt_voicecoding.seams.session_launcher import (
-    CloseRequest,
-    CloseStatus,
-    LaunchRequest,
-    LaunchStatus,
-    SessionLauncher,
-)
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
-WORKSPACE = Path(__file__).resolve().parents[1]
 
 
 def _members(protocol: type) -> list[str]:
@@ -96,7 +81,6 @@ CONTRACTS = [
     pytest.param(AgentAdapter, FakeAgent(), id="agent"),
     pytest.param(CallAdapter, FakeCall(), id="call"),
     pytest.param(CompanionChannel, FakeCompanionChannel(), id="companion_channel"),
-    pytest.param(SessionLauncher, FakeSessionLauncher(), id="session_launcher"),
     pytest.param(EventSink, RecordingSink(), id="event_sink"),
 ]
 
@@ -107,7 +91,7 @@ def test_the_fake_satisfies_its_seam(protocol: type, implementation: object) -> 
     assert_implements(protocol, implementation)
 
 
-@pytest.mark.parametrize(("protocol", "implementation"), CONTRACTS[:4])
+@pytest.mark.parametrize(("protocol", "implementation"), CONTRACTS[:3])
 def test_every_pluggable_seam_can_be_asked_what_it_loaded(
     protocol: type, implementation: Any
 ) -> None:
@@ -231,71 +215,3 @@ class TestTheCompanionChannelContract:
         receipt = asyncio.run(channel.send("you are needed", request_id=new_request_id()))
         assert receipt.is_delivered is False
         assert receipt.reason
-
-
-class TestTheSessionLauncherContract:
-    def test_a_launch_returns_the_exact_identity_core_will_register(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        outcome = asyncio.run(launcher.launch(self.request()))
-        assert outcome.status is LaunchStatus.LAUNCHED
-        assert outcome.target == CLAUDE
-
-    def test_repeating_a_launch_request_id_yields_one_child_and_one_outcome(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE, CODEX])
-        request = self.request()
-        first = asyncio.run(launcher.launch(request))
-        second = asyncio.run(launcher.launch(request))
-        assert first == second
-        assert launcher.targets == [CODEX]
-
-    def test_a_failed_launch_registers_nothing_and_carries_the_real_error(self) -> None:
-        launcher = FakeSessionLauncher(targets=[])
-        outcome = asyncio.run(launcher.launch(self.request()))
-        assert outcome.status is LaunchStatus.FAILED
-        assert outcome.target is None
-        assert outcome.detail
-
-    def test_an_unavailable_launcher_is_not_a_failed_launch(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE], available=False)
-        assert asyncio.run(launcher.launch(self.request())).status is LaunchStatus.UNAVAILABLE
-
-    def test_the_launcher_is_handed_exactly_the_environment_it_should_set(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        asyncio.run(launcher.launch(self.request(env={"CLAUDE_BG_BACKEND": "daemon"})))
-        assert launcher.environments == [{"CLAUDE_BG_BACKEND": "daemon"}]
-
-    def test_closing_twice_is_idempotent_and_says_which_it_was(self) -> None:
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        asyncio.run(launcher.launch(self.request()))
-
-        first = asyncio.run(
-            launcher.close(CloseRequest(request_id=new_request_id(), target=CLAUDE))
-        )
-        second = asyncio.run(
-            launcher.close(CloseRequest(request_id=new_request_id(), target=CLAUDE))
-        )
-        assert first.status is CloseStatus.CLOSED
-        assert second.status is CloseStatus.ALREADY_CLOSED
-
-    def test_closing_an_identity_that_was_never_launched_fails_closed(self) -> None:
-        """Locked semantics: fail closed on a missing or stale identity."""
-        launcher = FakeSessionLauncher(targets=[CLAUDE])
-        outcome = asyncio.run(
-            launcher.close(CloseRequest(request_id=new_request_id(), target=CODEX))
-        )
-        assert outcome.status is CloseStatus.FAILED
-        assert outcome.detail
-        assert CODEX not in launcher.closed
-
-    def test_a_close_request_carries_a_target_and_never_a_label(self) -> None:
-        assert "label" not in inspect.signature(CloseRequest).parameters
-
-    @staticmethod
-    def request(env: dict[str, str] | None = None) -> LaunchRequest:
-        return LaunchRequest(
-            request_id=new_request_id(),
-            agent=AgentKind.CLAUDE,
-            workspace=WORKSPACE,
-            label=SessionLabel("GPT-VoiceCoding", "a task"),
-            env=env or {},
-        )

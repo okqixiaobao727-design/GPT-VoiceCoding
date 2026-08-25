@@ -173,9 +173,9 @@ class AgentAdapter(Protocol):
         **Fail closed, and never fail the caller.** An adapter that does not hold
         this target answers CLOSED, because "I cannot reach this Session" is not
         an observation that its window is open. Bridge Core treats a raise the
-        same way and completes the launch regardless: a Session that is listed
-        but conservatively closed is recoverable on the next transition, while a
-        launch failed over a level query is not.
+        same way and carries on regardless: a Session that is listed but
+        conservatively closed is recoverable on its next transition, while one
+        dropped from the roster over a level query is not.
 
         Extending this seam's verb set was adjudicated for this use case.
         """

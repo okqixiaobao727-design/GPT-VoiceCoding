@@ -53,15 +53,15 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 3, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 4, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 3, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 4, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
 `action` is `null` when the line never named a usable one. `protocol` is the
-numeric protocol version, currently `3`. A missing field or JSON `null` means the
+numeric protocol version, currently `4`. A missing field or JSON `null` means the
 reply did not declare a usable version. The Swift shell refuses to interpret any
 reply whose version is missing or differs from the version it supports, and shows
 that protocol mismatch separately from an engine refusal or an unreachable engine.
@@ -82,14 +82,19 @@ the user is told.
 | `stale_session` | Known session id, unreachable under that identity — a fork, or an end. |
 | `unknown_pending` | Nothing is waiting under that id; it was answered or it expired. |
 | `second_call_refused` | Something asked to open a call while the system owns one. |
-| `launch_failed` / `close_failed` | Reserved for refusals; a Launcher that *tried* and failed answers `ok: true` — see below. |
-| `seam_unavailable` | This engine has nothing loaded behind the seam that action needs. |
 | `refused` | Any other Bridge Core refusal. Still carries its own words. |
 | `engine_unreachable` | Raised by a **surface**, never sent by the engine: nothing answered. |
 
 ## The actions
 
-Nine, and the set is closed. Adding one is a contract change.
+Seven, and the set is closed. Adding one is a contract change.
+
+`launch` and `close` were the eighth and ninth until protocol 4. They are parked
+with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
+v1.0 is a bridge over the Sessions the user starts, so nothing here brings one
+into existence or ends one. Their two error codes, `launch_failed` and
+`close_failed`, went with them. A surface still sending either action is
+answered `unknown_action`.
 
 ### `status`
 
@@ -147,65 +152,6 @@ surface calls this one — a surface holding its own call state is how two toggl
 once opened two calls. It is bound only by the one-call-at-a-time invariant,
 never by a switch.
 
-### `launch`
-
-Payload:
-
-```json
-{"request_id": "21d73168-b1f0-4b18-977d-fba0d1f2cc13",
- "project": "GPT Live", "task": "build the control plane", "agent": "codex"}
-```
-
-`request_id` is the sender-minted UUID for this distinct launch intent. A retry
-carries the same UUID; an intentional second Session carries a new one. Reusing
-one UUID with a different resolved agent, workspace or Session Label is refused.
-`agent` is optional; when absent, Bridge Core uses `[launch] default_agent`.
-Bridge Core resolves `project` against the configured project catalogue, uses
-the entry's canonical name for the Session Label, and passes its absolute
-workspace to the Session Launcher. The former `workspace`, `label` and `env`
-control-plane fields are not a compatibility interface and are refused. The
-Launcher seam still receives its unchanged typed request, including its internal
-environment mapping. Data:
-
-```json
-{"request_id": "…", "status": "launched" | "failed" | "unavailable",
- "target": {…} | null, "detail": ""}
-```
-
-**A Launcher that tried and failed answers `ok: true`.** That is news the caller
-asked for, carrying the real error in `detail`; a protocol refusal would say the
-request was unusable, which is a different thing. Only a `launched` outcome
-registers a Session. Sequential or concurrent repeats under one UUID return the
-first complete outcome and neither launch nor register a second Session. This
-in-process guarantee does not survive an engine restart.
-
-An unknown or non-unique project is a `refused` response carrying Bridge Core's
-own explanation and canonical candidate names. There is no second wire error
-code: surfaces need the truthful reason, but have no different action to branch
-to. Nothing launches until the reference resolves to exactly one configured
-project.
-
-### `close`
-
-Payload: `{"target": {"agent": "codex", "session_id": "abc", "pid": null}}`. Data:
-
-```json
-{"request_id": "…", "status": "closed" | "already_closed" | "failed" | "unavailable",
- "detail": "", "children": [{"ref": "…", "closed": true, "detail": ""}]}
-```
-
-Three-way, and the distinction is load-bearing for adapters (#9):
-
-- **Live** in the registry → the Launcher is asked to close it.
-- **Known-ended** in the registry → `already_closed`, and the Launcher is *not*
-  dialled. The caller asked for a state that already holds, which is what
-  idempotent means; re-dialling risks reaping whatever now owns that pid or pane.
-- **Unknown, or a wrong pid under a known session id** → a refusal
-  (`unknown_session` / `stale_session`). A wrong pid is a fork, not a typo.
-
-`children` is empty unless the adapter actually owns child destinations. Pane
-semantics never cross this seam.
-
 ### `relay` — an Answer Relay
 
 Payload: `{"target": {…}, "text": "carry on", "route": "deliver" | "supplement"}`.
@@ -247,13 +193,12 @@ Payload: none. Data:
             "configured": "…", "loaded": "…", "detail": ""}]}
 ```
 
-Seam names: `call`, `companion_channel`, `session_launcher`, and `agent.<kind>`
-per configured agent.
+Seam names: `call`, `companion_channel`, and `agent.<kind>` per configured agent.
 
 The engine reports what it **actually loaded**, never what a configuration file
 says it should have loaded. `configured` is what the file named; `loaded` is what
 the adapter says about *itself* when asked — every seam here is pluggable and
-every one of them has a `verify` verb, so all four are asked, and a Call adapter
+every one of them has a `verify` verb, so all of them are asked, and a Call adapter
 whose far side is down reports that rather than the engine reciting the
 configuration back and calling it an observation.
 
@@ -275,8 +220,6 @@ status
 switch <name> on|off
 sessions
 live
-launch --request-id <UUID> --project <project> [--agent claude|codex] --task <words...>
-close <agent>:<session id>[:<pid>]
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
 approve <approval id> allow|deny|ask
 verify
@@ -304,18 +247,9 @@ One TOML file, read once, by the composition root and nothing else.
 socket_path = "/tmp/gpt-voicecoding-501/control.sock"   # optional
 state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"  # optional
 
-[launch]
-default_agent = "claude"
-
-[[launch.projects]]
-name = "GPT-VoiceCoding"
-workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"
-spoken_aliases = ["Voice Coding", "GPT Live"]
-
 [adapters]
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
 companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
-session_launcher  = "gpt_voicecoding.adapters.session_launcher.child:build"
 
 [adapters.agents]
 claude = "gpt_voicecoding.adapters.agent.claude:build"
@@ -337,31 +271,6 @@ stripped_environment_prefixes = ["Malloc"]
 model = "the-model-you-chose"       # required: the cost lever has no default
 cli   = "/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/bridgectl"
 ```
-
-`[launch] default_agent` is the global agent used when a launch request names no
-agent. Each `[[launch.projects]]` entry carries one canonical `name`, one absolute
-`workspace`, and optional `spoken_aliases` used only for spoken project lookup.
-The launch table, its default agent and at least one project are required. The
-default may be `claude` or `codex`, and must name an agent adapter this engine is
-configured to load. A workspace must be absolute when configuration is read;
-whether it currently exists is checked by the Launcher when a launch is asked
-for, so an offline volume does not prevent the engine itself from starting.
-
-Project lookup first applies Unicode compatibility normalisation and ignores
-case, then removes whitespace and punctuation to compare only letters and
-numbers. Thus `GPT-VoiceCoding`, `gpt voice coding`, `GPTVoiceCoding` and
-`gpt_voice-coding` match without duplicating configuration. It does not guess a
-misspelling or choose by similarity. Repeated equivalent names inside one
-project still resolve to that one project. A key shared by different projects
-is retained as an honest runtime ambiguity, while a wholly duplicated project
-entry is invalid configuration. Spoken aliases carry no agent, model,
-permission mode, shell command or shell argument; shell aliases remain
-independent and are never read or migrated.
-
-Resolution lives in `core/projects.py`, an internal deep module of Bridge Core.
-It adds no seam, adapter, state copy or private test surface: observable project
-resolution remains tested through Control Plane -> Bridge Core -> fake Session
-Launcher.
 
 Each adapter reference is `module:attribute`, resolved by the composition root —
 the only thing in the system that imports an adapter. A factory is called as
@@ -423,8 +332,8 @@ that resolves the script's real path and execs the interpreter sitting beside
 it. The same rewrite covers every Python console script in `engine/bin/`; see
 [`docs/app-bundle.md`](app-bundle.md).
 
-An unconfigured Call, Companion Channel or Session Launcher seam **refuses to
-start**, with a named error. An engine that silently loaded nothing behind a seam
+An unconfigured Call or Companion Channel seam **refuses to start**, with a
+named error. An engine that silently loaded nothing behind a seam
 looks exactly like a healthy one until it is needed — the outage ADR 0003 exists
 to prevent. Running without a Companion Channel is legitimate, but the null
 implementation ships with that adapter (#10) and is not built yet, so today it is

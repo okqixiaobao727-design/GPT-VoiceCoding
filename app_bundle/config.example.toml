@@ -26,23 +26,10 @@
 # socket_path = "/tmp/gpt-voicecoding-501/control.sock"
 # state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json"
 
-[launch]
-# Required. The agent a launch request uses when it names none, and the projects
-# a spoken launch may resolve. Lookup data only: no permission modes, no shell
-# flags. A project not listed here cannot be launched by voice — add it here
-# rather than speaking its path.
-default_agent = "claude"
-
-[[launch.projects]]
-name = "GPT-VoiceCoding"
-workspace = "/Users/you/Documents/coding/GPT-VoiceCoding"
-spoken_aliases = ["Voice Coding", "GPT Live"]
-
 [adapters]
 # Each is `module:attribute`, imported by the composition root and nothing else.
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
 companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"
-session_launcher  = "gpt_voicecoding.adapters.session_launcher:direct_child_launcher"
 
 # With no text reach at all, name the null channel instead — running without a
 # Companion Channel is legitimate, but it has to be said out loud:
@@ -70,20 +57,14 @@ chat_id   = "000000000"
 # --- The external binaries, stated because this is a bundle ------------------
 #
 # The menu-bar shell reads your login shell's PATH and hands it to the engine,
-# so in the ordinary case these are found. State them anyway if your setup is
+# so in the ordinary case these are found. State one anyway if your setup is
 # not ordinary — the resolution fails open, so a profile that errors or hangs
 # leaves the engine with launchd's PATH (/usr/bin:/bin:/usr/sbin:/sbin) and
-# nothing you installed on it. `which claude`, `which codex`, `which tmux` in
-# your own shell and paste the answers.
+# nothing you installed on it. `which codex` in your own shell, and paste the
+# answer.
 #
 # You will know if you get it wrong: `bridgectl verify` fails naming the binary,
 # and the engine refuses to start rather than serving a seam it cannot use.
-
-[adapters.settings.session_launcher]
-claude_binary = "/opt/homebrew/bin/claude"
-codex_binary = "/opt/homebrew/bin/codex"
-# Only the tmux adapter reads this one.
-# tmux_binary = "/opt/homebrew/bin/tmux"
 
 # The dotted seam name has to be quoted, or TOML reads it as two nested tables.
 [adapters.settings."agent.codex"]

@@ -48,17 +48,9 @@ state_path = "{state}"
 [adapters]
 call = "fakes:FakeCall"
 companion_channel = "fakes:FakeCompanionChannel"
-session_launcher = "fakes:FakeSessionLauncher"
 
 [adapters.agents]
 codex = "fakes:FakeAgent"
-
-[launch]
-default_agent = "codex"
-
-[[launch.projects]]
-name = "runner tests"
-workspace = "{workspace}"
 
 [delegate]
 model = "the-model-the-user-chose"
@@ -90,7 +82,6 @@ def configured(home: Path) -> Path:
             state=home / "state.json",
             log=home / "engine.log",
             noise=NOISE,
-            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -136,7 +127,6 @@ class TestWhatIsOwnedBeforeTheEngineExists:
                 state=home / "state.json",
                 log=nested,
                 noise=NOISE,
-                workspace=home,
             ),
             encoding="utf-8",
         )

@@ -83,7 +83,7 @@ produces a bundle that verifies clean and fails at the one moment it matters.
 | Bytecode pre-compiled at build time | Nothing may write into the bundle at runtime. The shell already sets `PYTHONDONTWRITEBYTECODE` for the bundled interpreter it spawns; this covers the two cases it cannot see — the engine run headless from a terminal, and the relocated `bridgectl` — and it also means a start does not recompile from source into memory. |
 | Every Python console script is relocated, without a name list | `pip` writes an **absolute** shebang. The interpreter relocates; its scripts do not. The pipeline examines every executable text file in `engine/bin/` and replaces only a shebang that names this build's bundled interpreter. `bridgectl`, `cffi-gen-src`, `pyav`, and any future locked dependency script therefore share one mechanism. |
 | The assembled bundle must not name its source checkout | A build-tree path works on the build machine and dies when that checkout or worktree is removed. The final pre-signing check scans the whole `.app`, and CI's real bundle build fails if any text file still carries the source root. Local-install provenance (`direct_url.json`) is removed because it would otherwise violate the same invariant even though the engine never reads it. |
-| The user's `PATH` is read from an **interactive** login shell, delimited by sentinels | launchd hands a Finder-launched `.app` `/usr/bin:/bin:/usr/sbin:/sbin`, and the engine and every Session it launches inherit it. The fix reads the user's own shell — but `-lc` was the wrong question: zsh sources `~/.zshrc` only when interactive, and `~/.zshrc` is where `nvm`'s installer and `brew shellenv` actually write. `-i` reaches that page of the ledger; the sentinels are what make an interactive shell's chatter (powerlevel10k's instant prompt) separable from the answer. Same shape VS Code's shell integration uses. `.zprofile` is a steadier home for a `PATH`, but a product that only works for users who already knew that is broken for the majority. |
+| The user's `PATH` is read from an **interactive** login shell, delimited by sentinels | launchd hands a Finder-launched `.app` `/usr/bin:/bin:/usr/sbin:/sbin`, and the engine inherits it — which is the `PATH` it resolves the agent binaries on (`shutil.which`). A Session is not in this picture: the user starts one in their own terminal, and it carries that terminal's `PATH`. The fix reads the user's own shell — but `-lc` was the wrong question: zsh sources `~/.zshrc` only when interactive, and `~/.zshrc` is where `nvm`'s installer and `brew shellenv` actually write. `-i` reaches that page of the ledger; the sentinels are what make an interactive shell's chatter (powerlevel10k's instant prompt) separable from the answer. Same shape VS Code's shell integration uses. `.zprofile` is a steadier home for a `PATH`, but a product that only works for users who already knew that is broken for the majority. |
 | `config.example.toml` is shipped, never installed | The configuration is a file the user owns and the engine only reads, and it names adapters by import reference, so it runs with the privileges of whoever wrote it. An installer that authored it would be claiming something that is not the installer's. |
 
 ## Regenerating the lock
@@ -98,6 +98,18 @@ wheels. It writes `app_bundle/locks/<triple>.lock`. Read the diff: it is the lis
 of binaries the next build will sign.
 
 ## The v0 acceptance
+
+> **This procedure predates v1.0's scope cut and has not been reshaped yet.**
+> Launching and closing Sessions are parked
+> ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72));
+> `bridgectl launch` and `bridgectl close` no longer exist, so every step below
+> that runs one is unperformable as written. Read them as the record of the v0
+> run they are. The reshaped procedure — the harness starting Sessions through
+> the ordinary installed `claude` / `codex` path, the way a user does — is the
+> exit condition of
+> [#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67) and
+> is written there, not here. The findings in this section, including the
+> limitations below, are kept as measured.
 
 Everything above is machine-checked on every PR. What follows is not, and cannot
 be: it needs a microphone, a person to click a TCC prompt, a real Telegram bot

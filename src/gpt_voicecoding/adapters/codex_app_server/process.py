@@ -18,22 +18,15 @@ user's session. Either way, **nothing here spawns one**: `attach` becomes one mo
 client of a process somebody else started, and that is the whole of this module's
 relationship to it.
 
-Who that somebody is depends on whether the Session is visible, and ADR 0008
-settles it along the same line as visibility itself:
+**The engine never owns one.** Every Session in v1.0 is one the user started in
+their own terminal, so its app-server belongs to whatever started it there, and
+an engine restart does not take down a session a human is using.
 
-- **A visible Session's app-server belongs to the tmux server**, which the tmux
-  launcher starts it under. The engine never owns it, and an engine restart does
-  not take down a session a human is using — the original reason for this rule,
-  preserved exactly where it applies.
-- **A headless Session's app-server is the engine's own child** and dies with it.
-  That Session runs on a pseudo-terminal the engine holds, so an engine that goes
-  takes the TUI with it regardless; an app-server left serving a client that no
-  longer exists, and that nobody could have reached, is not something to keep
-  alive.
-
-This module said "the engine **never** owns one" before the launcher existed. That
-was true of every path there was at the time, and it is now true of the visible
-path only. It is corrected here rather than left to become quietly false.
+This module briefly qualified that rule, while a headless launcher existed whose
+Sessions really were the engine's own children. The launcher is parked (#72) and
+the qualification went with it, back to the unconditional form the rule had
+before — recorded here rather than silently reverted, because a rule that
+loosens and tightens again is one somebody will otherwise re-litigate.
 
 Attaching is possible because of a fact established by probing codex 0.148.0
 directly: one app-server accepts many concurrent clients, `thread/resume` against

@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.core.instructions import (
     ACTION_GIST,
     MAX_VOICE_INSTRUCTION_BYTES,
@@ -42,7 +41,7 @@ CLI = ControlPlaneCli(
     version="1.4.2",
     socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
 )
-CONTEXT = InstructionContext(cli=CLI, launch_usage=USAGE[Action.LAUNCH])
+CONTEXT = InstructionContext(cli=CLI)
 
 
 @pytest.fixture(scope="module")
@@ -89,20 +88,6 @@ class TestCatalogue:
         """A deleted rule and a forgotten one look identical unless one is written down."""
         assert rules_for(Audience.DROPPED)
 
-    def test_the_tmux_row_is_owned_by_an_adapter_and_by_nothing_shared(self) -> None:
-        rule = catalogue_module.BY_ID["adapter.launcher.tmux-destinations-are-tmux-only"]
-        assert rule.audience is Audience.ADAPTER
-
-    def test_issue_25_launch_rules_name_their_actual_source(self) -> None:
-        assert (
-            catalogue_module.BY_ID["voice.start.complete-request-launches-directly"].source
-            == "issue/25"
-        )
-        assert (
-            catalogue_module.BY_ID["delegated.start.complete-request-launches-directly"].source
-            == "issue/25"
-        )
-
 
 class TestTheTableLandedWhole:
     """Exhaustiveness over the disposition tables, not just over what got written.
@@ -125,6 +110,16 @@ class TestTheTableLandedWhole:
         "skill/starting.md": 151,
     }
 
+    #: Lines whose rules left with launch and close (#72). Written down rather
+    #: than deleted from `MIGRATED`, for the same reason a dropped rule is: an
+    #: unclaimed line and a parked one look identical when both are simply
+    #: absent. These come back with the actions they describe; until then they
+    #: are readable at the `parked/launch-close` tag.
+    PARKED = {
+        "skill/closing.md": ((1, 60),),
+        "skill/starting.md": ((1, 24), (42, 96), (127, 138)),
+    }
+
     def test_every_line_of_every_migrated_file_is_accounted_for(self) -> None:
         claimed: dict[str, set[int]] = {name: set() for name in self.MIGRATED}
         for rule in RULES:
@@ -135,25 +130,31 @@ class TestTheTableLandedWhole:
             first, _, last = lines.partition("-")
             claimed[name].update(range(int(first), int(last or first) + 1))
 
+        for name, spans in self.PARKED.items():
+            for first, last in spans:
+                claimed[name].update(range(first, last + 1))
+
         for name, length in self.MIGRATED.items():
             missing = sorted(set(range(1, length + 1)) - claimed[name])
             assert not missing, f"{name} lines {missing} were migrated by nobody"
 
+    def test_a_parked_span_names_no_line_a_rule_still_claims(self) -> None:
+        """Parking is a record of absence, so it may not paper over a live rule."""
+        live: dict[str, set[int]] = {name: set() for name in self.MIGRATED}
+        for rule in RULES:
+            if not rule.source.startswith("skill/"):
+                continue
+            name, _, lines = rule.source.partition(":")
+            first, _, last = lines.partition("-")
+            live[name].update(range(int(first), int(last or first) + 1))
+
+        for name, spans in self.PARKED.items():
+            for first, last in spans:
+                overlap = sorted(set(range(first, last + 1)) & live[name])
+                assert not overlap, f"{name} lines {overlap} are parked and still claimed"
+
 
 class TestCoverage:
-    def test_natural_launch_is_carried_without_the_superseded_preflight_rule(
-        self, instructions
-    ) -> None:
-        assert (
-            instructions.carrier_of("voice.start.complete-request-launches-directly")
-            is Audience.VOICE
-        )
-        assert (
-            instructions.carrier_of("delegated.start.complete-request-launches-directly")
-            is Audience.DELEGATED
-        )
-        assert instructions.carrier_of("voice.start.needs-an-explicit-agent-and-workspace") is None
-
     def test_each_retained_rule_lands_in_exactly_its_own_set(self, instructions) -> None:
         for rule in RULES:
             if rule.audience is Audience.DROPPED:
@@ -282,7 +283,6 @@ class TestTheDelegatedSetNamesTheRealCli:
                     version="9.9.9",
                     socket_path=Path("/tmp/other.sock"),
                 ),
-                launch_usage=USAGE[Action.LAUNCH],
             )
         )
         assert "/opt/homebrew/bin/bridgectl" in elsewhere.text
@@ -297,7 +297,6 @@ class TestTheDelegatedSetNamesTheRealCli:
                     version="1.0",
                     socket_path=Path("/tmp/s.sock"),
                 ),
-                launch_usage=USAGE[Action.LAUNCH],
             )
         )
         assert "'/Application Support/GPT-VoiceCoding/bridgectl'" in spaced.text
@@ -305,12 +304,6 @@ class TestTheDelegatedSetNamesTheRealCli:
     def test_the_voice_set_names_it_too(self, instructions) -> None:
         """The voice thread reaches the engine through the same one door."""
         assert str(CLI.command) in instructions.voice.text
-
-    def test_complete_launch_uses_the_parsers_exact_syntax(self, instructions) -> None:
-        launch = f"{CLI.invocation} {USAGE[Action.LAUNCH]}"
-
-        assert launch in instructions.voice.text
-        assert launch in instructions.delegated.text
 
     def test_a_cli_that_is_not_where_it_really_is_gets_refused(self) -> None:
         """A bare name resolves against a PATH the generated thread may not share."""
@@ -324,10 +317,6 @@ class TestTheDelegatedSetNamesTheRealCli:
             ControlPlaneCli(
                 command=Path("/x/bridgectl"), version="  ", socket_path=Path("/tmp/s.sock")
             )
-
-    def test_a_context_without_the_parsers_launch_usage_is_refused(self) -> None:
-        with pytest.raises(InstructionError, match="launch usage"):
-            InstructionContext(cli=CLI, launch_usage="  ")
 
 
 class TestTheActionSetIsGeneratedFromTheClosedSet:

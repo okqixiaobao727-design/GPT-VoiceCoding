@@ -24,18 +24,27 @@ from gpt_voicecoding.seams.control_plane import (
 
 
 class TestTheActionSet:
-    def test_every_action_the_build_issue_names_is_present(self) -> None:
+    def test_the_action_set_is_exactly_these(self) -> None:
         assert {str(action) for action in Action} == {
             "status",
             "switch",
             "sessions",
             "live",
-            "launch",
-            "close",
             "relay",
             "approve",
             "verify",
         }
+
+    def test_launching_and_closing_are_not_actions_this_engine_has(self) -> None:
+        """Parked with the launcher (#72), and their absence is asserted, not assumed.
+
+        An action that quietly came back would be a wire this engine answers on
+        with nothing behind it. A surface still sending either gets
+        `unknown_action`, which is the honest answer and the reason the protocol
+        version moved with them.
+        """
+        assert {"launch", "close"} & {str(action) for action in Action} == set()
+        assert {"launch_failed", "close_failed"} & {str(code) for code in ErrorCode} == set()
 
     def test_no_legacy_alias_survives(self) -> None:
         """The old CLI carried both a legacy and a current Stop command."""
@@ -68,8 +77,9 @@ class TestARequestOnTheWire:
 
 
 class TestAReplyOnTheWire:
-    def test_the_natural_launch_payload_is_protocol_three(self) -> None:
-        assert PROTOCOL_VERSION == 3
+    def test_dropping_launch_and_close_moved_the_protocol_version(self) -> None:
+        """A surface built against 3 sends actions this engine no longer has."""
+        assert PROTOCOL_VERSION == 4
 
     def test_an_answer_carries_the_action_it_answers_and_the_protocol_version(self) -> None:
         document = Reply.answered(Action.STATUS, {"call_id": None}).as_document()
@@ -99,7 +109,7 @@ class TestAReplyOnTheWire:
             Reply.refused(Action.STATUS, ErrorCode.REFUSED, "   ")
 
     def test_a_reply_survives_the_round_trip(self) -> None:
-        reply = Reply.refused(Action.CLOSE, ErrorCode.STALE_SESSION, "that Session is ended")
+        reply = Reply.refused(Action.RELAY, ErrorCode.STALE_SESSION, "that Session is ended")
         assert Reply.of(json.loads(json.dumps(reply.as_document()))) == reply
 
 

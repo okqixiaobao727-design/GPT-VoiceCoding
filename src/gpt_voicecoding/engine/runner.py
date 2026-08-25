@@ -43,9 +43,9 @@ phase raised it, and the last line is a sentence. A `TypeError` inside somebody'
 **The environment is cleaned once, here, before anything is spawned.** Every
 adapter child inherits what this process holds, so ADR 0004's stripped prefixes
 are applied at the one point all of them descend from rather than at each spawn
-site. A Session launched into a long-lived tmux server inherits that server's
-environment instead, which is the launcher adapter's own obligation, not one this
-call can discharge for it.
+site. A process this engine did not spawn — a Session the user started in their
+own terminal — inherits that terminal's environment instead, which this call
+cannot discharge for it and does not pretend to.
 
 Signals: SIGINT and SIGTERM both mean stop, and stopping is orderly — the loops
 are cancelled and the socket file is removed, so the next start is not left
