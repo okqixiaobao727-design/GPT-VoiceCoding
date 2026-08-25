@@ -130,10 +130,17 @@ REFUSAL_TYPE: Final = "approval_refused"
 #: DELIVERED on the connection ending looks sound — the hook reads the line and
 #: exits — but the end of a connection has two causes and they mean opposite
 #: things: the hook leaving with its verdict, and the human answering the dialog
-#: on screen, after which Claude Code cancels the hook. A close that was already
-#: in flight when the verdict was written is indistinguishable from a close the
-#: verdict caused, so an engine reading EOF as a receipt reports "approved by
-#: voice" for a tool call that never ran. The hook says so explicitly instead.
+#: on screen, after which Claude Code takes the hook process away. An engine
+#: reading EOF as a receipt therefore reports "approved by voice" for a tool call
+#: that never ran. The hook says so explicitly instead.
+#:
+#: How much the connection alone can tell, measured on 2.1.245 (#71): a pre-empt
+#: that lands *before* the verdict is written announces itself — with the engine
+#: holding for 25 s and the human answering *No* at 9 s, the late write raised
+#: `BrokenPipeError` and the tool never ran. A pre-empt that lands after the
+#: write does not: the bytes go, and nothing on this side says whether the hook
+#: lived to read them. The ack covers both, which is why the grade hangs on it
+#: rather than on the write succeeding.
 ACK_TYPE: Final = "approval_ack"
 
 TYPE_FIELD: Final = "type"
