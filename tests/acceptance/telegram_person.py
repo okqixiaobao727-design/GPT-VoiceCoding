@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import stat
@@ -72,6 +73,35 @@ API_HASH_VARIABLE = "GPTVOICECODING_ACCEPTANCE_TG_API_HASH"
 #: bearer credential for a whole Telegram account.
 PRIVATE_DIRECTORY = stat.S_IRWXU
 PRIVATE_FILE = stat.S_IRUSR | stat.S_IWUSR
+
+
+def _shut_down(client: TelegramClient, loop: asyncio.AbstractEventLoop) -> None:
+    """Disconnect a client whose loop this code owns, then close the loop.
+
+    `TelegramClient.disconnect` is a **dual-form** API: with the loop running it
+    returns an awaitable, and with the loop stopped it runs the loop itself and
+    returns `None`. Every call here is from outside the loop, so it takes the
+    second path — and wrapping `None` in `run_until_complete` is a `TypeError`
+    raised out of a `finally`, which is how a *successful* login came to end in a
+    traceback with its session file left at 0644.
+    """
+    closing = client.disconnect()
+    if inspect.isawaitable(closing):
+        loop.run_until_complete(closing)
+    if loop.is_closed():
+        return
+    # `disconnect` *requests* cancellation of Telethon's six background loops; a
+    # loop closed in the same breath never gives them the turn they need to
+    # finish, and asyncio prints "Task was destroyed but it is pending!" once per
+    # task. Harmless, and six lines of noise on every acceptance run — so the
+    # pending tasks are given that turn here.
+    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    if pending:
+        for task in pending:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
 
 
 class PersonError(RuntimeError):
@@ -211,9 +241,7 @@ class TelegramPerson:
         )
 
     def close(self) -> None:
-        if self._client.is_connected():
-            self._run(self._client.disconnect())
-        self._loop.close()
+        _shut_down(self._client, self._loop)
         self._journal("telegram.person.closed", peer=self._peer_name)
 
     # --- reading and writing the chat -------------------------------------
@@ -343,14 +371,14 @@ def login(directory: Path | None = None) -> int:
         me = loop.run_until_complete(client.get_me())
         print(f"Authorised as {me.first_name} (@{me.username}, id {me.id}).")
     finally:
-        if client.is_connected():
-            loop.run_until_complete(client.disconnect())
-        loop.close()
-
-    written = session_path(directory)
-    if written.exists():
-        written.chmod(PRIVATE_FILE)
-        print(f"Session written 0600 at {written}.")
+        # Before the disconnect, not after: the session file is a bearer
+        # credential for a whole account, and a shutdown that raises must not be
+        # what decides whether it is readable by everyone on this machine.
+        written = session_path(directory)
+        if written.exists():
+            written.chmod(PRIVATE_FILE)
+            print(f"Session written 0600 at {written}.")
+        _shut_down(client, loop)
     return 0
 
 
@@ -379,9 +407,7 @@ def status(directory: Path | None = None) -> int:
         print(f"AUTHORISED as {me.first_name} (@{me.username}, id {me.id}); session {session}")
         return 0
     finally:
-        if client.is_connected():
-            loop.run_until_complete(client.disconnect())
-        loop.close()
+        _shut_down(client, loop)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
