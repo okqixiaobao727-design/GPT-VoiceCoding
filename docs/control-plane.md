@@ -82,7 +82,6 @@ the user is told.
 | `stale_session` | Known session id, unreachable under that identity — a fork, or an end. |
 | `unknown_pending` | Nothing is waiting under that id; it was answered or it expired. |
 | `second_call_refused` | Something asked to open a call while the system owns one. |
-| `seam_unavailable` | This engine has nothing loaded behind the seam that action needs. |
 | `refused` | Any other Bridge Core refusal. Still carries its own words. |
 | `engine_unreachable` | Raised by a **surface**, never sent by the engine: nothing answered. |
 

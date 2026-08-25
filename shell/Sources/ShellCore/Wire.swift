@@ -70,7 +70,6 @@ public enum ErrorCode: Equatable, Sendable {
     case staleSession
     case unknownPending
     case secondCallRefused
-    case seamUnavailable
     case refused
     /// A code this shell does not know. Still carried, because an engine that
     /// grew one has still refused, and the user is owed its words.
@@ -86,7 +85,6 @@ public enum ErrorCode: Equatable, Sendable {
         case "stale_session": self = .staleSession
         case "unknown_pending": self = .unknownPending
         case "second_call_refused": self = .secondCallRefused
-        case "seam_unavailable": self = .seamUnavailable
         case "refused": self = .refused
         default: self = .other(wire)
         }

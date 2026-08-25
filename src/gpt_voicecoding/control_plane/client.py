@@ -24,7 +24,6 @@ from pathlib import Path
 from gpt_voicecoding.control_plane.ownership import OwnerOf, path_owner, verify_private_socket
 from gpt_voicecoding.seams.control_plane import (
     MAX_REQUEST_BYTES,
-    Action,
     ErrorCode,
     MalformedRequest,
     Reply,
@@ -36,17 +35,13 @@ from gpt_voicecoding.seams.control_plane import (
 #: that is not running fails immediately on `connect`, so nothing waits this long
 #: to be told there is nothing there.
 #:
-#: One number for every action, again. It stopped being one when `launch` needed
-#: a longer deadline than the rest (#28) — every action this engine still has
-#: answers from state the hub already holds, so the exception left with the
-#: action that needed it. An action that later outlives this budget gets its own
-#: derived number here, and `timeout_for` grows a branch back.
+#: One number for every action. It stopped being one when `launch` needed a
+#: longer deadline than the rest (#28) — every action this engine still has
+#: answers from state the hub already holds, so the per-action dispatch left
+#: with the action that needed it. The part of #28's fix that has to survive is
+#: not the dispatch but the default: a caller that names no deadline is given
+#: one here rather than writing its own at the call site.
 DEFAULT_TIMEOUT_SECONDS = 10.0
-
-
-def timeout_for(action: Action) -> float:
-    """How long to wait on one action. One budget, until an action needs its own."""
-    return DEFAULT_TIMEOUT_SECONDS
 
 
 class EngineUnreachable(Exception):
@@ -77,12 +72,12 @@ async def ask(
 ) -> Reply:
     """Send one request to a running engine and return the one reply.
 
-    `timeout` defaults to the deadline the action carries rather than being
-    written at each call site, so a caller that does not think about it cannot
-    accidentally hold an action to the wrong patience — which is the bug in #28.
+    `timeout` defaults to this engine's budget rather than being written at
+    each call site, so a caller that does not think about it cannot accidentally
+    hold an action to the wrong patience — which is the bug in #28.
     """
     if timeout is None:
-        timeout = timeout_for(request.action)
+        timeout = DEFAULT_TIMEOUT_SECONDS
     try:
         verify_private_socket(Path(path), owner_of=owner_of)
     except PermissionError as refused:

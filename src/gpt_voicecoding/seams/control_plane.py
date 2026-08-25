@@ -33,9 +33,11 @@ from typing import Any
 
 #: Bumped when the shapes below change incompatibly. Carried on every reply so a
 #: surface can tell an engine that disagrees from one too old to have been asked.
-#: 4 dropped `launch` and `close` from the action set, and their two error codes
-#: with them: a surface built against 3 would send an action this engine no
-#: longer has, so the disagreement has to be visible before the request is made.
+#: 4 dropped `launch` and `close` from the action set, and three error codes
+#: with them — their own two, and `seam_unavailable`, which had no producer left
+#: once every seam a hub verb reaches became one configuration requires. A
+#: surface built against 3 would send an action this engine no longer has, so
+#: the disagreement has to be visible before the request is made.
 PROTOCOL_VERSION = 4
 
 #: The longest line either side will read. Generous for a roster, small enough
@@ -91,8 +93,6 @@ class ErrorCode(StrEnum):
     UNKNOWN_PENDING = "unknown_pending"
     #: Something asked to open a voice surface while the system owns one.
     SECOND_CALL_REFUSED = "second_call_refused"
-    #: Nothing is loaded behind the seam this action needs.
-    SEAM_UNAVAILABLE = "seam_unavailable"
     #: Any other refusal Bridge Core raised. Still carries its own words.
     REFUSED = "refused"
     #: Raised by a *surface*, never by the engine: nothing answered the socket.

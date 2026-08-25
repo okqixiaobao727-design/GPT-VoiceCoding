@@ -120,24 +120,6 @@ class StateFormatError(BridgeCoreError):
         self.reason = reason
 
 
-class SeamUnavailableError(BridgeCoreError):
-    """Something was asked for that needs a seam this engine has nothing behind.
-
-    Raised rather than answered with a hopeful default: "this engine cannot"
-    and "it tried and failed" are different news, and a hopeful default is how
-    the second gets reported as the first.
-
-    Nothing raises it while every seam a hub verb reaches is one configuration
-    requires. It stays because the distinction is the wire's, not one caller's
-    — it is a code the closed error set carries and `actions.py` maps, so the
-    first optional seam to arrive travels correctly rather than as `refused`.
-    """
-
-    def __init__(self, seam: str) -> None:
-        super().__init__(f"this engine has nothing loaded behind the {seam} seam")
-        self.seam = seam
-
-
 class SecondCallRefused(BridgeCoreError):
     """Something asked to open a voice surface while the system already owns one.
 

@@ -26,10 +26,10 @@ from pathlib import Path
 
 from gpt_voicecoding.config import ConfigError, default_config_path, load
 from gpt_voicecoding.control_plane.client import (
+    DEFAULT_TIMEOUT_SECONDS,
     EngineSilent,
     EngineUnreachable,
     ask,
-    timeout_for,
 )
 from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
 from gpt_voicecoding.seams.control_plane import Action
@@ -80,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{refusal}. Point at a running engine with --socket.", file=sys.stderr)
         return EXIT_UNREACHABLE
 
-    timeout = arguments.timeout if arguments.timeout is not None else timeout_for(request.action)
+    timeout = arguments.timeout if arguments.timeout is not None else DEFAULT_TIMEOUT_SECONDS
     try:
         reply = asyncio.run(ask(request, path=socket_path, timeout=timeout))
     except EngineSilent as unanswered:

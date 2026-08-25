@@ -28,7 +28,6 @@ from gpt_voicecoding.control_plane.client import (
     DEFAULT_TIMEOUT_SECONDS,
     EngineUnreachable,
     ask,
-    timeout_for,
 )
 from gpt_voicecoding.control_plane.ownership import SocketPathTooLong
 from gpt_voicecoding.control_plane.server import AlreadyServing, ControlPlaneServer
@@ -389,23 +388,18 @@ class TestAPathThatCannotBeBound:
             asyncio.run(ControlPlaneServer(plane=StubPlane(), path=too_long).start())
 
 
-class TestTheDeadlineIsReadOffTheAction:
-    """`ask` takes its deadline from the action, never from the call site.
+class TestTheDeadlineIsNeverLeftToTheCallSite:
+    """`ask` supplies the deadline itself, never leaving it to the call site.
 
     #28 was a launch held to an ordinary action's patience, reported as a
     failure while it was in fact succeeding. Launch is parked, so every action
     left answers from state the hub already holds and one budget covers them
-    all — but the *shape* of the fix is what stops #28 coming back: a caller
-    that does not think about the deadline still gets the action's own one, so
-    the next action that needs its own number only has to be given one in
-    `timeout_for`.
+    all — but the half of the fix that stops #28 coming back is not the
+    per-action number, it is that a caller which does not think about the
+    deadline is still given one.
     """
 
-    def test_every_action_carries_a_deadline(self) -> None:
-        for action in Action:
-            assert timeout_for(action) == DEFAULT_TIMEOUT_SECONDS
-
-    def test_a_client_that_names_no_deadline_gets_the_actions_own(self, socket_dir: Path) -> None:
+    def test_a_client_that_names_no_deadline_is_given_one(self, socket_dir: Path) -> None:
         recorded: list[float] = []
         real = asyncio.timeout
 
@@ -425,4 +419,4 @@ class TestTheDeadlineIsReadOffTheAction:
 
         asyncio.run(scenario())
 
-        assert recorded == [timeout_for(Action.RELAY), timeout_for(Action.STATUS)]
+        assert recorded == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]

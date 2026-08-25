@@ -35,7 +35,6 @@ from gpt_voicecoding.control_plane.payloads import InvalidPayload, NothingPendin
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
-    SeamUnavailableError,
     SecondCallRefused,
     StaleSessionError,
     UnknownRelayError,
@@ -53,7 +52,6 @@ _CODES: tuple[tuple[type[BridgeCoreError], ErrorCode], ...] = (
     (UnknownSessionError, ErrorCode.UNKNOWN_SESSION),
     (UnknownRelayError, ErrorCode.UNKNOWN_PENDING),
     (SecondCallRefused, ErrorCode.SECOND_CALL_REFUSED),
-    (SeamUnavailableError, ErrorCode.SEAM_UNAVAILABLE),
 )
 
 
