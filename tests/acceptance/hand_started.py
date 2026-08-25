@@ -12,11 +12,12 @@ against `claude` 2.1.246 and `codex-cli` 0.149.1):
   a Claude Code session, and Claude Code marks its children — `CLAUDECODE`,
   `CLAUDE_PID` and the whole `CLAUDE_CODE_*` family, including the
   `CLAUDE_CODE_MESSAGING_SOCKET` and `_TOKEN` pair #71 rides on. Measured: a
-  `claude` started with those inherited runs as a **child session** — transcript
-  saving off, and *absent from `claude agents --json` altogether*. A harness that
-  did not scrub them would start Sessions the product is right to ignore, and
-  read the roster's correct silence as a bug. `child_environment` puts the marker
-  back on purpose, which is how the `child` step gets a child to look at.
+  `claude` started with those inherited is treated by Claude Code as one of its
+  own children rather than as a Session — transcript saving off, and *absent from
+  `claude agents --json` altogether*. A harness that did not scrub them would
+  start runs the product is right to ignore, and read the roster's correct
+  silence as a bug. `child_environment` puts the marker back on purpose, which is
+  how the `child` step gets a Child Process to look at.
 
 * **The shell function is not the command.** `~/.zshrc:169-183` on this machine
   redefines `claude` and `codex` as functions routing into gen-1's
@@ -59,7 +60,10 @@ AGENT_MARKER_PREFIX = "CLAUDE_CODE_"
 AGENT_MARKER_NAMES = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
 
 #: The one marker `child_environment` puts back. Measured above: it is what turns
-#: an otherwise identical run into something the official roster does not list.
+#: an otherwise identical run into something the official roster does not list —
+#: upstream's own name for the distinction, not the glossary's. In this project
+#: the concept is a **Child Process** (`CONTEXT.md`), and "child Session" is a
+#: synonym the glossary asks us to avoid.
 CHILD_MARKER = "CLAUDE_CODE_CHILD_SESSION"
 
 #: A terminal the size a person's would be. A pty opens at 0×0, and a TUI given
@@ -310,7 +314,7 @@ def claude_ground_truth(pid: int, environment: dict[str, str]) -> GroundTruth | 
     Read by the harness as an oracle, never as a substitute for the product: what
     `roster` asserts is that `bridgectl` reports what this returns.
     """
-    for row in _claude_rows(environment):
+    for row in claude_rows(environment):
         if row.get("pid") != pid:
             continue
         session_id = str(row.get("sessionId", ""))
@@ -326,11 +330,7 @@ def claude_ground_truth(pid: int, environment: dict[str, str]) -> GroundTruth | 
 
 
 def claude_rows(environment: dict[str, str]) -> list[dict]:
-    """Every row the official roster shows, for the steps that count rows."""
-    return _claude_rows(environment)
-
-
-def _claude_rows(environment: dict[str, str]) -> list[dict]:
+    """Every row `claude agents --json` shows, decoded. Empty when it cannot be read."""
     binary = resolve("claude", environment.get("PATH", os.environ["PATH"]))
     if binary is None:
         return []

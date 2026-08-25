@@ -88,7 +88,53 @@ class PreflightRefused(Exception):
     """The environment is not one this run can be attributed to."""
 
 
+#: The run's verdict, once there is one, so an ordinary refusal lands on the same
+#: record every step lands on.
+_verdict: support.Verdict | None = None
+
+#: Where a refusal writes when there is **not** one yet. Made on first ask rather
+#: than by a fixture: `preflight` is autouse and lists `engine_path` before
+#: `run_directory`, so the fixture graph resolves the one that can refuse *first*
+#: and a refusal that waited for the fixture would find nothing there. Memoised,
+#: so the fixture and a refusal always name the same directory.
+_run_directory: Path | None = None
+
+
+def _ensure_run_directory() -> Path:
+    global _run_directory
+    if _run_directory is None:
+        _run_directory = support.new_run_directory()
+        print(f"\nacceptance run directory: {_run_directory}")
+    return _run_directory
+
+
 def _refuse(reason: str) -> None:
+    """Refuse, and leave the reason somewhere that outlives the terminal.
+
+    `docs/acceptance-design.md` § Preflight: a refusal produces "verdict
+    `REFUSED` with the reason". Raising alone put the reason on stderr and
+    nowhere else, so a run that refused left an artifact directory whose
+    `verdict.json` did not say why — or no `verdict.json` at all.
+
+    **The refusals that matter most happen before there is a `Verdict` to write
+    on**, and that is not an edge case — it is the ordinary shape of this
+    fixture graph. `verdict` is built from `bundle`, `provenance` and
+    `engine_path`, so a PATH that cannot be read, or a bundle with no
+    interpreter to ask for a version, refuses *while `verdict` is still being
+    constructed*. Recording only when a `Verdict` already exists therefore
+    silences exactly the environment failures step 0 exists to report.
+
+    So a refusal with no verdict writes its own: the minimum a reader needs to
+    know why this run directory has nothing else in it. The directory is made on
+    first ask rather than taken from the fixture, because `preflight` is autouse
+    and lists `engine_path` **before** `run_directory` — a refusal that waited
+    for the fixture would find nothing there, which is exactly what the first
+    attempt at this did.
+    """
+    if _verdict is not None:
+        _verdict.refuse("preflight", reason)
+    else:
+        support.write_refusal(_ensure_run_directory(), reason)
     raise PreflightRefused(reason)
 
 
@@ -118,9 +164,7 @@ def engine_path() -> str:
 
 @pytest.fixture(scope="session")
 def run_directory() -> Path:
-    directory = support.new_run_directory()
-    print(f"\nacceptance run directory: {directory}")
-    return directory
+    return _ensure_run_directory()
 
 
 @pytest.fixture(scope="session")
@@ -228,21 +272,30 @@ def preflight(
 def verdict(
     run_directory: Path, bundle: Path, provenance: support.Provenance, engine_path: str
 ) -> Iterator[support.Verdict]:
+    global _verdict
     record = support.Verdict(
         run_id=run_directory.name,
         bundle=str(bundle),
         commit=provenance.commit,
         provenance=provenance.reason,
+        # What this run promised to observe. `Verdict.result` will not say PASS
+        # while any of it is missing, so a lane that never ran cannot be silently
+        # absent from a green verdict.
+        expected_lanes=tuple(lane.name for lane in journey_module.LANES),
+        expected_steps=journey_module.STEPS,
         versions={
             "claude": support.binary_version("claude", engine_path),
             "codex": support.binary_version("codex", engine_path),
             "bundle_python": _version_of(support.bundled_python(bundle)),
         },
     )
+    _verdict = record
     try:
         yield record
     finally:
         written = record.write(run_directory / "verdict.json")
+        if record.missing:
+            print(f"\nnot observed: {', '.join(record.missing)}")
         print(f"\nverdict: {record.result} — {written}")
 
 
@@ -293,7 +346,6 @@ def lane_engine(lane, run_directory, journal, engine_path, bot_token):  # noqa: 
         journal=journal,
         token=bot_token,
         path_value=engine_path,
-        stdio=run_directory / f"engine-{lane.name}.stdio",
     )
     with support.TrustGate(workspace, run_directory=run_directory, journal=journal):
         engine.start()

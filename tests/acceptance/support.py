@@ -37,6 +37,7 @@ import tomllib
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -275,7 +276,16 @@ def compare_engine_to_tree(bundle: Path, repository: Path) -> Provenance:
 
 
 def _differing(tree: Path, installed: Path) -> Iterator[str]:
-    """Every `.py` under `tree` that the bundle lacks or holds differently."""
+    """Every `.py` the two sides do not agree on — **in both directions**.
+
+    Walking the tree alone answers "is everything in this checkout in the
+    bundle", which is not the question. The question is whether the engine
+    inside the `.app` **is** this checkout, and a bundle carrying a module the
+    checkout has since deleted is not — it is an installation that still has the
+    old file, still imports it, and would still run it. A one-way compare called
+    that byte-identical and let the run attribute its verdict to a tree that
+    never produced it.
+    """
     for source in sorted(tree.rglob("*.py")):
         relative = source.relative_to(tree)
         candidate = installed / relative
@@ -283,6 +293,10 @@ def _differing(tree: Path, installed: Path) -> Iterator[str]:
             yield f"{relative} missing from the bundle"
         elif not filecmp.cmp(source, candidate, shallow=False):
             yield f"{relative} differs"
+    for extra in sorted(installed.rglob("*.py")):
+        relative = extra.relative_to(installed)
+        if not (tree / relative).exists():
+            yield f"{relative} is in the bundle and not in the tree"
 
 
 # --- the run's configuration ------------------------------------------------
@@ -458,14 +472,12 @@ class Engine:
         journal: Journal,
         token: str,
         path_value: str,
-        stdio: Path,
     ) -> None:
         self._config = config
         self._bundle = bundle
         self._journal = journal
         self._token = token
         self._path_value = path_value
-        self._stdio = stdio
         self._process: subprocess.Popen[bytes] | None = None
 
     @property
@@ -492,10 +504,19 @@ class Engine:
             str(self._config.path),
         ]
         self._journal("engine.start", command=command, socket=str(self._config.socket_path))
+        # **Not redirected**, and that is ADR 0004 rather than an oversight: "the
+        # engine owns its log … nothing that starts the engine redirects output".
+        # The legacy log grew ~1 GB/month and could not be rotated precisely
+        # because a shell redirect owned the descriptor, and a harness that took
+        # the descriptor here would be that shell. The engine `dup2`s the
+        # configured log — `engine-<lane>/engine.log`, under the run directory —
+        # onto its own stdout and stderr before it exists, so a redirect here
+        # would only ever have caught the moments before that, which the ADR
+        # accounts for in as many words: "Output before adoption is discarded —
+        # an engine dying that early is surfaced by silence on the socket."
+        # `start` below is that silence, with the reason on the exception.
         self._process = subprocess.Popen(
             command,
-            stdout=self._stdio.open("wb"),
-            stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             env=self.environment,
         )
@@ -507,12 +528,13 @@ class Engine:
             if self._process.poll() is not None:
                 raise EngineRefused(
                     f"the engine exited {self._process.returncode} before binding its socket; "
-                    f"stdio at {self._stdio}, log at {self._config.log_path}"
+                    f"log at {self._config.log_path} (ADR 0004: output before the engine adopts "
+                    f"its own log is discarded, and this silence is how that surfaces)"
                 )
             time.sleep(0.2)
         raise EngineRefused(
             f"the engine did not bind {self._config.socket_path} within "
-            f"{ENGINE_START_SECONDS:.0f}s; stdio at {self._stdio}"
+            f"{ENGINE_START_SECONDS:.0f}s; log at {self._config.log_path}"
         )
 
     def stop(self) -> None:
@@ -572,12 +594,10 @@ class Bridgectl:
         self._journal = journal
 
     def __call__(self, *arguments: str, timeout: float | None = None) -> Answer:
-        action = _action_named(arguments[0]) if arguments else None
-        deadline = timeout if timeout is not None else _deadline_for(action)
+        deadline = timeout if timeout is not None else _default_deadline()
         # `--timeout` is passed only when the caller states one. Left off, the CLI
-        # picks its own deadline from `timeout_for`, which is the behaviour the run
-        # is accepting; passing it every time would hide exactly the defect step 5b
-        # records.
+        # picks its own deadline, which is the behaviour the run is accepting;
+        # passing it every time would hide exactly the mismatch `relay` records.
         stated = ["--timeout", f"{deadline:.1f}"] if timeout is not None else []
         argv = [str(self._executable), "--socket", str(self._socket), *stated, *arguments]
         finished = subprocess.run(
@@ -603,25 +623,17 @@ class Bridgectl:
         return answer
 
 
-def _action_named(word: str) -> Action | None:
-    for action in Action:
-        if str(action) == word:
-            return action
-    return None
+def _default_deadline() -> float:
+    """The deadline `bridgectl` itself would use — read from the client, not copied.
 
-
-def _deadline_for(action: Action | None) -> float:
-    """The deadline `bridgectl` itself would use — one number now, and read, not copied.
-
-    This used to call `control_plane.client.timeout_for`, which gave `launch` a
-    longer budget than everything else. #72 parked the launcher and `timeout_for`
-    went with it, so there is a single default and `action` no longer changes the
-    answer. The parameter stays because the *reason* for a per-action deadline
-    has not gone away — `relay` still needs longer than the surface gives it, see
-    `RELAY_DEADLINE_SECONDS` — and a signature that already takes the action is
-    where that will land when it does.
+    This used to call `control_plane.client.timeout_for` and take the action,
+    because `launch` had a longer budget than everything else. #72 parked the
+    launcher and `timeout_for` went with it: there is one number now, and a
+    parameter kept for a per-action future that may never come is a parameter
+    that lies about what this function does. When an action needs its own budget
+    again, this grows one then. `relay` already needs more than the surface gives
+    it and says so in one place — `RELAY_DEADLINE_SECONDS`, passed explicitly.
     """
-    del action  # one budget today; see above
     return DEFAULT_TIMEOUT_SECONDS
 
 
@@ -754,10 +766,31 @@ def wait_for(
 
 # --- the verdict ------------------------------------------------------------
 
-PASS = "PASS"
-FAIL = "FAIL"
-REFUSED = "REFUSED"
-SKIPPED = "SKIPPED"
+
+class Result(StrEnum):
+    """The closed set a step's verdict comes from, and it is closed for a reason.
+
+    `docs/acceptance-design.md` § Artifacts names exactly these four. They were
+    four bare module-level strings, which is the shape that lets a typo become a
+    fifth state nobody notices until a reader is told a run `PASSSED`. A StrEnum
+    keeps them comparable to and serialisable as the same strings — `verdict.json`
+    is byte-identical either way — while making the set the type rather than a
+    convention. The same choice, for the same reason, as `seams/delivery.Delivery`
+    and `core/lifecycle.Lifecycle`.
+    """
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    REFUSED = "REFUSED"
+    SKIPPED = "SKIPPED"
+
+
+#: Named at module level as well, because every call site reads better as
+#: `support.PASS` than `support.Result.PASS`, and the enum is what they are.
+PASS = Result.PASS
+FAIL = Result.FAIL
+REFUSED = Result.REFUSED
+SKIPPED = Result.SKIPPED
 
 
 @dataclass
@@ -790,22 +823,55 @@ class Verdict:
     #: exactly the nine the build tickets cite, and kept out of nothing else.
     observations: list[dict[str, Any]] = field(default_factory=list)
     lanes: dict[str, list[StepVerdict]] = field(default_factory=dict)
+    #: What the run promised to observe. `missing` is the difference between this
+    #: and what it recorded, and `result` will not say PASS while any is outstanding.
+    expected_lanes: tuple[str, ...] = ()
+    expected_steps: tuple[str, ...] = ()
 
     def observe(self, lane: str, what: str, detail: str) -> None:
         self.observations.append({"lane": lane, "what": what, "detail": detail})
 
-    def record(self, lane: str, step: str, result: str, evidence: str) -> StepVerdict:
-        recorded = StepVerdict(step=step, result=result, evidence=evidence)
+    def record(self, lane: str, step: str, result: Result, evidence: str) -> StepVerdict:
+        recorded = StepVerdict(step=step, result=Result(result), evidence=evidence)
         self.lanes.setdefault(lane, []).append(recorded)
         return recorded
 
+    def refuse(self, lane: str, reason: str) -> None:
+        """Write a refusal down before raising it.
+
+        Preflight refuses rather than runs, and the design says the refusal
+        carries "verdict `REFUSED` with the reason". A refusal that only raised
+        left `verdict.json` with no trace of why the run stopped: the reason
+        reached the terminal, and nothing that outlives it.
+        """
+        self.record(lane, "preflight", REFUSED, reason)
+
     @property
-    def result(self) -> str:
+    def missing(self) -> tuple[str, ...]:
+        """Every (lane, step) the run promised and did not record.
+
+        A run is judged on what it **set out** to observe, not on what it managed
+        to. Without this, a lane that never ran — a collection error, a fixture
+        raising, a lane deselected by hand — contributes no rows at all, and a
+        verdict made only of the surviving lane's greens says `PASS` for a run
+        that observed half the product. That is the one failure mode a verdict
+        file must not have, because it is the one nobody re-checks.
+        """
+        absent: list[str] = []
+        for lane in self.expected_lanes:
+            recorded = {step.step for step in self.lanes.get(lane, [])}
+            absent.extend(f"{lane}/{step}" for step in self.expected_steps if step not in recorded)
+        return tuple(absent)
+
+    @property
+    def result(self) -> Result:
         results = [step.result for steps in self.lanes.values() for step in steps]
         if not results:
             return REFUSED
         if any(result == REFUSED for result in results):
             return REFUSED
+        if self.missing:
+            return FAIL
         return PASS if all(result == PASS for result in results) else FAIL
 
     def write(self, path: Path) -> Path:
@@ -813,7 +879,8 @@ class Verdict:
             json.dumps(
                 {
                     "run_id": self.run_id,
-                    "result": self.result,
+                    "result": str(self.result),
+                    "missing": list(self.missing),
                     "bundle": self.bundle,
                     "commit": self.commit,
                     "provenance": self.provenance,
@@ -821,7 +888,15 @@ class Verdict:
                     "environment": self.environment,
                     "observations": self.observations,
                     "lanes": {
-                        lane: [vars(step) for step in steps] for lane, steps in self.lanes.items()
+                        lane: [
+                            {
+                                "step": step.step,
+                                "result": str(step.result),
+                                "evidence": step.evidence,
+                            }
+                            for step in steps
+                        ]
+                        for lane, steps in self.lanes.items()
                     },
                 },
                 indent=2,
@@ -829,6 +904,35 @@ class Verdict:
             + "\n"
         )
         return path
+
+
+def write_refusal(run_directory: Path, reason: str) -> Path:
+    """The smallest honest `verdict.json` — for a run that refused before it had one.
+
+    A refusal that reached only the terminal left an artifact directory a reader
+    could not interpret: a run id, maybe a journal, and no statement of why
+    nothing else is there. This is that statement. It carries the same `result`
+    vocabulary as a full verdict and says plainly that the refusal preceded the
+    facts a full one would have named — the bundle, the commit, the versions —
+    rather than inventing them.
+    """
+    path = run_directory / "verdict.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_directory.name,
+                "result": str(REFUSED),
+                "reason": reason,
+                "note": (
+                    "step 0 refused before the run had a verdict to write on, so the bundle, "
+                    "commit and versions a full verdict names were never established"
+                ),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return path
 
 
 # --- versions the verdict names ---------------------------------------------
@@ -969,7 +1073,7 @@ class Journey:
             self._record(step, SKIPPED, why)
             self._remaining.remove(step)
 
-    def _record(self, step: str, result: str, evidence: str) -> None:
+    def _record(self, step: str, result: Result, evidence: str) -> None:
         self._verdict.record(self.lane, step, result, evidence)
         self._journal("step.verdict", lane=self.lane, step=step, result=result, evidence=evidence)
 
