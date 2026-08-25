@@ -70,14 +70,21 @@ import Testing
     }
 
     @Test func aSuccessfulRunCarriesItsOwnWordsAndNoFailure() {
+        // Timed, not only checked: this collected nothing on CI while passing
+        // locally, because this process was holding the pipe's write end open
+        // and the read could only ever end on the grace timeout. An assertion on
+        // the words alone would have gone green again for the wrong reason.
+        let started = Date()
         let report = InstallationRunner().run(
             EngineCommand(
                 executable: "/bin/echo", arguments: ["claude-hooks: current"],
                 source: .developerPath))
+        let waited = Date().timeIntervalSince(started)
 
         #expect(report.ok)
         #expect(report.lines == ["claude-hooks: current"])
         #expect(report.failure == nil)
+        #expect(waited < Installation.grace, "the output arrived on a timeout, not on EOF")
     }
 
     @Test func aChildThatIgnoresSigtermIsStillStopped() {

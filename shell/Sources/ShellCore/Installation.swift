@@ -110,6 +110,13 @@ public struct InstallationRunner: Sendable {
             return InstallationReport(ok: false, lines: ["\(command.executable): \(error)"])
         }
 
+        // This process keeps its own copy of the pipe's write end, and the read
+        // below ends when *every* write end is closed — so leaving ours open
+        // means the child can exit and the read still never returns. Foundation
+        // closes it on some platform versions and not others, which is worse
+        // than never closing it: it passes on the machine you wrote it on.
+        try? output.fileHandleForWriting.close()
+
         // Drained on another queue from the start: a pipe nobody reads fills, and
         // a child blocked on a full pipe is a child that never exits.
         let collected = OutputBox()

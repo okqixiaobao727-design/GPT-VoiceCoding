@@ -107,9 +107,7 @@ def test_a_foreign_handler_in_our_own_group_survives(tmp_path: Path) -> None:
         ),
     ],
 )
-def test_a_command_that_does_not_run_our_module_is_not_ours(
-    tmp_path: Path, command: str
-) -> None:
+def test_a_command_that_does_not_run_our_module_is_not_ours(tmp_path: Path, command: str) -> None:
     """Naming one of our modules is not running it.
 
     The identity is the program the command runs; the program here is an
