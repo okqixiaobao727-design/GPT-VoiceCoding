@@ -906,6 +906,35 @@ class Verdict:
         return path
 
 
+def write_refusal(run_directory: Path, reason: str) -> Path:
+    """The smallest honest `verdict.json` — for a run that refused before it had one.
+
+    A refusal that reached only the terminal left an artifact directory a reader
+    could not interpret: a run id, maybe a journal, and no statement of why
+    nothing else is there. This is that statement. It carries the same `result`
+    vocabulary as a full verdict and says plainly that the refusal preceded the
+    facts a full one would have named — the bundle, the commit, the versions —
+    rather than inventing them.
+    """
+    path = run_directory / "verdict.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_directory.name,
+                "result": str(REFUSED),
+                "reason": reason,
+                "note": (
+                    "step 0 refused before the run had a verdict to write on, so the bundle, "
+                    "commit and versions a full verdict names were never established"
+                ),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return path
+
+
 # --- versions the verdict names ---------------------------------------------
 
 
