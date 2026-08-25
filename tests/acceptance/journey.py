@@ -40,6 +40,7 @@ survive, and running it twice would prove less at twice the cost.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -333,23 +334,37 @@ class Walk:
     # --- roster -----------------------------------------------------------
 
     def roster(self) -> str:
-        """The hand-started Session is in the roster, graded, and an unattached row is refused.
+        """Every main Session the user starts is in the roster, and is a target like any other.
 
-        Three claims, and the first one blocks the lane because nothing after it
-        can be observed without a Session the product admits exists:
+        **This step was rewritten after the fact, and the reason belongs here.**
+        #73's own wording asked for "provenance and separate Relay/Approval reach
+        grades, and an unattached row refused as a target" — the vocabulary
+        #74's *body* still locks. #68 removed it, and Simon said so on #74 in as
+        many words: *the product has no Reach / Attached / Unattached /
+        Provenance vocabulary — every listed Session is one the bridge talks to,
+        and a route that fails surfaces as a delivery failure with a reason
+        through the existing delivery grades. Simplify the locked `Reach`,
+        `ReachGrade` and `Provenance` types … before starting.* #82 says the same
+        of the Codex fallback: it "adds no Reach/Provenance state and returns
+        existing `FAILED` before the wire". A step asserting the old shape would
+        have been a red line #74 could only clear by building types Simon had
+        already deleted.
+
+        So there is **no second class of row**. What this step claims:
 
         1. the Session the harness started by hand — identified from the agent's
-           own record, never from the engine — has a row;
-        2. that row carries a `provenance` and **two separate** reach grades
-           (#74 locks `Reach(relay, approval)`; one inferred bit is what it
-           exists to prevent);
-        3. a row whose Relay reach is not `attached` is refused as a Relay
-           target, with a reason.
+           own record, never from the engine — has a row (blocking: nothing
+           after it is observable without one);
+        2. that row is a *target*: its `target` writes out as an address
+           `bridgectl` accepts, and its workspace is the one the harness made,
+           which is the join that makes it this Session rather than a coincidence.
 
-        The third is guaranteed a subject by the Codex lane rather than by
-        contrivance: with no shared daemon every Codex row is `unattached` by
-        construction (#82). If this lane presents no unattached row, the step
-        says so in its evidence instead of inventing one.
+        Unreachability is not this step's business and has no row of its own —
+        the Codex lane with no shared daemon is exactly such a Session, and the
+        proof it is still listed is that *this same step runs on that lane*.
+        Where its unreachability does surface is `relay`, as a graded failure
+        carrying a reason (`seams/delivery.py:40-49` — a non-delivered receipt
+        cannot be built without one).
         """
         truth = self._ground_truth()
         rows = self._roster_rows()
@@ -368,47 +383,23 @@ class Walk:
                 f"{[support.flatten([row.get('target')]) for row in rows] or 'no sessions'}"
             )
         self.address = _address_of(mine)
-
-        missing = [field for field in ("provenance", "reach") if field not in mine]
-        if missing:
+        if "<no target>" in self.address or self.address.endswith(":None"):
             raise StepFailed(
-                f"the roster row for {self.address} carries no {' and no '.join(missing)}: "
-                f"#74 locks `SessionInspection.provenance` and `Reach(relay, approval)`, and the "
-                f"row has keys {sorted(mine)}"
-            )
-        reach = mine["reach"]
-        if not isinstance(reach, dict) or {"relay", "approval"} - set(reach):
-            raise StepFailed(
-                f"reach on {self.address} is {reach!r}, not two separately graded routes — "
-                f"#74: 'graded separately, never one inferred bit'"
+                f"the roster row carries no address a surface could name it by: "
+                f"target is {mine.get('target')!r}"
             )
 
-        refusal = self._unattached_refusal(rows)
+        listed = mine.get("workspace")
+        if not listed or os.path.realpath(str(listed)) != os.path.realpath(self.config.workspace):
+            raise StepFailed(
+                f"{self.address} is listed against workspace {listed!r}, not the one the "
+                f"harness started it in ({self.config.workspace}) — the join that makes this "
+                f"row this Session rather than a coincidence"
+            )
         return (
-            f"{self.address} present; provenance {mine['provenance']!r}; "
-            f"reach relay={reach['relay']!r} approval={reach['approval']!r}; "
-            f"agent's own record {truth.describe()}; {refusal}"
+            f"{self.address} present in the roster against its own workspace; "
+            f"agent's own record {truth.describe()}; the engine lists {len(rows)} session(s)"
         )
-
-    def _unattached_refusal(self, rows: list[dict]) -> str:
-        unattached = next(
-            (
-                row
-                for row in rows
-                if isinstance(row.get("reach"), dict) and row["reach"].get("relay") != "attached"
-            ),
-            None,
-        )
-        if unattached is None:
-            return "no unattached row was in the roster to refuse (the Codex lane supplies one)"
-        address = _address_of(unattached)
-        answer = self.bridgectl("relay", address, "this must be refused")
-        self.journal("roster.unattached", lane=self.lane.name, address=address, reply=answer.text)
-        if answer.ok:
-            raise StepFailed(
-                f"the unattached row {address} was accepted as a Relay target: {answer.text!r}"
-            )
-        return f"unattached {address} refused: {answer.text!r}"
 
     # --- stable name ------------------------------------------------------
 
@@ -542,9 +533,22 @@ class Walk:
         )
         self.turns.append(Turn("relay", time.monotonic() - started, performed))
         if "delivered" not in answer.text:
+            # #68's rule, and the one place it is observable: a route that cannot
+            # be taken surfaces **as a graded delivery failure carrying a
+            # reason**, never as silence and never as a bare refusal.
+            # `seams/delivery.py:47-49` will not let a non-delivered receipt be
+            # built without one, so an answer with no reason is a defect in what
+            # reaches the surface rather than in the delivery itself.
+            reason = answer.text.partition("—")[2].strip()
             raise StepFailed(
-                f"relay answered {answer.text!r}, not `delivered` — and "
-                f"{RELAYED.filename} is {RELAYED.effect_in(self.config.workspace)!r}"
+                f"relay answered {answer.text!r}, not `delivered`"
+                + (
+                    f"; reason given: {reason!r}"
+                    if reason
+                    else "; AND no reason travelled with it — #68 requires a delivery failure "
+                    "to carry one, and `seams/delivery.py:47-49` cannot construct one without"
+                )
+                + f". {RELAYED.filename} is {RELAYED.effect_in(self.config.workspace)!r}"
             )
         if not performed:
             raise StepFailed(
@@ -750,7 +754,7 @@ class Walk:
             support.Action.SESSIONS,
             socket_path=self.config.socket_path,
             journal=self.journal,
-            why="provenance and the two reach grades have no rendering yet (#74 locks no format)",
+            why="the roster payload carries fields `bridgectl sessions` does not render",
         )
         rows = data.get("sessions", [])
         return [row for row in rows if isinstance(row, dict)]

@@ -700,13 +700,15 @@ def control_plane_payload(
     facts the rendering does not carry, and there are two:
 
     * `approval_id`, above; and
-    * the roster's **provenance** and its two **reach grades**. #74 locks
-      `Provenance`, `Reach(relay, approval)` and `SessionInspection` on the Agent
-      seam, and locks the Core row they become — but it locks no *rendering*, and
-      it should not have to. A `roster` step that asserted on the wording of
-      `control_plane/commands.py:168` would be asking #74 to invent a text
-      format and then holding it to the harness's guess at one. So the step reads
-      the fields and leaves the wording to whoever writes it.
+    * the roster row's own fields. `_roster_lines`
+      (`control_plane/commands.py:168`) renders five of them into one line, and
+      the steps after `roster` need others — the Session name #78 stabilises,
+      the `waiting_for` #75 fills, the `progress` #76 reads, the
+      `ChildClassification` #79 sets. None of those tickets locks a *text
+      format*, and none should have to: a step asserting on the wording of that
+      one line would be asking a build ticket to invent a format and then
+      holding it to this harness's guess at one. So the steps read the fields
+      and leave the wording to whoever writes it.
 
     Every call is journaled as `side-channel` with its reason, so no verdict can
     rest on one without the journal saying so.
