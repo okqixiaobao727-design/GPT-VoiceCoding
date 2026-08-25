@@ -17,8 +17,9 @@ user did not speak.
 read, the hook sends a one-line receipt back down the same connection. That
 receipt is the engine's only positive proof of delivery, because the obvious
 cheaper one is not: the connection ending has two causes — this process leaving
-with its verdict, and the human answering the dialog on screen — and they are
-indistinguishable from the far end. Sending it is best effort and never
+with its verdict, and the human answering the dialog on screen — and from the far
+end they read alike, except when the pre-empt is early enough to break the
+engine's write (2.1.245, #71). Sending it is best effort and never
 load-bearing here: a receipt that fails to go leaves this process still holding a
 verdict it will print, and leaves the engine reporting UNKNOWN, which is the
 honest grade for "we cannot tell".
