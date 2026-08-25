@@ -51,6 +51,10 @@ _Avoid_: admin commands, management interface
 The at-computer surface for seeing the system's current state — the Session roster included — and flipping switches. Runtime state only, not installation settings.
 _Avoid_: settings app, preferences window, config tool
 
+**Installation**:
+Everything the system places in files the **user** owns so the coding agents can reach it, and takes back byte for byte when asked. Done at first launch and reconciled at every launch after (ADR 0012), never by hand and never by the Control Panel.
+_Avoid_: setup, configuration (that is the user's own file, which the system only reads), provisioning
+
 ### Reach and sessions
 
 **Companion Channel**:

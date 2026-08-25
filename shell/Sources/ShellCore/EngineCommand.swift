@@ -31,14 +31,50 @@ public struct EngineCommand: Equatable, Sendable {
     /// process parenthood holds (ADR 0005).
     public static let module = "gpt_voicecoding.engine"
 
+    /// The installation module, run to completion before the engine starts.
+    /// ADR 0012: a dragged `.app` has no install step, so first launch is one.
+    public static let installationModule = "gpt_voicecoding.installation"
+
     public static func resolve(
         resources: URL?,
         configPath: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         searchPath: [String]? = nil
     ) throws -> EngineCommand {
-        let arguments = ["-m", module, "--config", configPath]
+        return try resolve(
+            resources: resources,
+            arguments: ["-m", module, "--config", configPath],
+            environment: environment,
+            searchPath: searchPath)
+    }
 
+    /// The same interpreter, asked to do one installation verb.
+    ///
+    /// It goes through this resolver rather than a second one for the reason the
+    /// module note gives: the bundled interpreter's name belongs to the app-bundle
+    /// pipeline, and a second copy of the search order would be a second thing to
+    /// keep in step. Installation takes no `--config`: the engine refuses to
+    /// start without one, and an installation that waited for a file the user has
+    /// not written yet would never happen (ADR 0012).
+    public static func resolveInstallation(
+        resources: URL?,
+        verb: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        searchPath: [String]? = nil
+    ) throws -> EngineCommand {
+        return try resolve(
+            resources: resources,
+            arguments: ["-m", installationModule, verb],
+            environment: environment,
+            searchPath: searchPath)
+    }
+
+    private static func resolve(
+        resources: URL?,
+        arguments: [String],
+        environment: [String: String],
+        searchPath: [String]?
+    ) throws -> EngineCommand {
         if let resources {
             let bundled = resources.appendingPathComponent(
                 BundleLayout.engineInterpreterRelativePath

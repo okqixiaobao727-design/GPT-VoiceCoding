@@ -43,7 +43,8 @@ GPT-VoiceCoding.app/
         └── engine/                   python-build-standalone, the locked wheels, the engine
             └── bin/
                 ├── python3 -> python3.12    what the shell spawns
-                └── bridgectl                what `[delegate] cli` names
+                ├── bridgectl                what `[delegate] cli` names
+                └── bridge-install           install, uninstall, status (ADR 0012)
 ```
 
 The engine is inside the bundle because that is what earns the microphone grant

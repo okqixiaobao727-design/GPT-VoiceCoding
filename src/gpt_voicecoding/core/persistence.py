@@ -35,20 +35,17 @@ from typing import Any
 from gpt_voicecoding.core.errors import BridgeCoreError, StateFormatError
 from gpt_voicecoding.core.sessions import Session, SessionState
 from gpt_voicecoding.core.switches import SwitchSnapshot
+from gpt_voicecoding.locations import engine_directory
 from gpt_voicecoding.seams.agent import ReplyWindow
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
-#: The application directory macOS gives a bundled app. Joined with the user's home.
-APP_SUPPORT_PARTS = ("Library", "Application Support", "GPT-VoiceCoding")
 #: Kept apart from the first-generation bridge's `runtime/` in the same directory.
-ENGINE_DIR_NAME = "engine"
 STATE_FILE_NAME = "state.json"
 
 
 def default_state_path(base_dir: Path | None = None) -> Path:
     """Where the durable subset lives. `base_dir` exists so tests can move it."""
-    base = base_dir if base_dir is not None else Path.home().joinpath(*APP_SUPPORT_PARTS)
-    return base / ENGINE_DIR_NAME / STATE_FILE_NAME
+    return engine_directory(base_dir) / STATE_FILE_NAME
 
 
 @dataclass(frozen=True, slots=True)

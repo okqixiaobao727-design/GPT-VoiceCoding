@@ -40,6 +40,7 @@ src/gpt_voicecoding/
 ├── adapters/       The implementations behind them. Protocol libraries live only here.
 ├── control_plane/  The JSON-over-UDS surface: framing, sockets, translation.
 ├── engine/         The composition root — config in, one running engine out.
+├── installation/   What this product puts in files the user owns, and takes back.
 └── cli/            bridgectl — a control-plane surface.
 shell/              The Swift menu-bar shell (see ADR 0005).
 app_bundle/         The build pipeline. Builds the product; is not part of it.

@@ -17,6 +17,9 @@ final class ShellModel {
     private(set) var engineOutput: [String] = []
     private(set) var location: EngineLocation
     private(set) var locationFailure: String?
+    /// What the launch reconcile said, when it did not go as asked. Shown, not
+    /// acted on: the panel reports installation, it does not edit it.
+    private(set) var installationFailure: String?
 
     let panel: ControlPanel
     let loginItem = LoginItem()
@@ -55,10 +58,36 @@ final class ShellModel {
     }
 
     private func begin() async {
+        await reconcileInstallation()
         await supervisor.observe { [weak self] health in
             Task { @MainActor in await self?.healthChanged(health) }
         }
         await supervisor.start()
+    }
+
+    /// First launch is the install (ADR 0012), and every launch after it is a
+    /// reconcile that writes nothing when the machine already agrees.
+    ///
+    /// It runs **before** the engine so that a Session started right after the
+    /// app opens finds the hook already there. It does not gate the engine: a
+    /// reconcile that failed costs reach into Sessions, and refusing to start
+    /// over it would cost the control plane and the Live Call too.
+    private func reconcileInstallation() async {
+        let resources = Bundle.main.resourceURL
+        let command: EngineCommand
+        do {
+            command = try EngineCommand.resolveInstallation(
+                resources: resources, verb: Installation.reconcileVerb)
+        } catch let problem as EngineCommandFailure {
+            installationFailure = problem.detail
+            return
+        } catch {
+            installationFailure = "\(error)"
+            return
+        }
+
+        let report = await Task.detached { InstallationRunner().run(command) }.value
+        installationFailure = report.failure
     }
 
     private func healthChanged(_ health: EngineHealth) async {

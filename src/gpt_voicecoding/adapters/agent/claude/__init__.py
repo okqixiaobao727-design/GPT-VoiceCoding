@@ -14,17 +14,12 @@ The approval socket is bound at `connect` in a directory of this engine's own,
 because its address has to exist before any Session launches — the launch is what
 carries it to the hook.
 
-**The Approval Relay needs two things from a launch that no other verb does**: a
-`--plugin-dir` naming the rendered hook plugin, and the approval socket's address
-in the bootstrap variable. `write_hook_plugin` renders the first and
-`approval_socket_path` names the second; `remove_hook_plugin` is the uninstall
-path, and it is a directory removal rather than a settings edit.
-
-**The Answer Relay likewise needs two launch arguments**: a second
-`--plugin-dir` naming the rendered Session Channel plugin and `--channels`
-naming its selector. `write_plugin` renders the directory and
-`channel_selector` names the channel; the Session Launcher removes both inline
-plugins with their per-launch directory.
+**The Approval Relay needs two things this package does not launch**: the hook
+installed in the Session's config directory, which is `installation`'s job
+(ADR 0011, ADR 0012), and this engine's approval address published where that
+hook can read it, which `connect` does through `bootstrap.publish_address`.
+Neither is a launch argument any more: v1.0 bridges Sessions the user starts, so
+there is no launch to carry anything (#67).
 """
 
 from __future__ import annotations
@@ -41,13 +36,9 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     CHANNEL_CONFIG_VARIABLE,
     BootstrapError,
     bootstrap_value,
+    publish_address,
+    withdraw_address,
 )
-from gpt_voicecoding.adapters.agent.claude.hook_plugin import (
-    HOOK_PLUGIN_NAME,
-    remove_hook_plugin,
-    write_hook_plugin,
-)
-from gpt_voicecoding.adapters.agent.claude.plugin import channel_selector, write_plugin
 from gpt_voicecoding.adapters.agent.claude.registry import (
     PEER_PROTOCOL,
     PROVEN_AGAINST_VERSION,
@@ -57,7 +48,6 @@ from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings, Setti
 
 __all__ = [
     "CHANNEL_CONFIG_VARIABLE",
-    "HOOK_PLUGIN_NAME",
     "PEER_PROTOCOL",
     "PROVEN_AGAINST_VERSION",
     "ApprovalError",
@@ -68,12 +58,10 @@ __all__ = [
     "SettingsError",
     "approval_socket_path",
     "bootstrap_value",
-    "channel_selector",
     "claude_agent",
     "hook_decision",
-    "remove_hook_plugin",
-    "write_hook_plugin",
-    "write_plugin",
+    "publish_address",
+    "withdraw_address",
 ]
 
 

@@ -50,6 +50,7 @@ Issues = "https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues"
 
 [project.scripts]
 bridgectl = "gpt_voicecoding.cli:main"
+bridge-install = "gpt_voicecoding.installation.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gpt_voicecoding"]
