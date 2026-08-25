@@ -4,7 +4,7 @@
 `docs/acceptance-design.md` allows the run exactly one stand-in, and this is it.
 Everything else on the far side is real — the real bot, the real Bot API, the
 real `claude` and `codex`. The person is played because a **bot cannot message a
-bot**: the inbound half of the Companion Channel (`@<label>: words` arriving at
+bot**: the inbound half of the Companion Channel (`@<name>: words` arriving at
 `getUpdates`) can only be produced by a user account, so the harness drives one
 over MTProto with Telethon.
 
@@ -151,7 +151,21 @@ class ApiCredentials:
 
 
 def load_credentials(directory: Path | None = None) -> ApiCredentials:
-    """The account's `api_id`/`api_hash`: environment first, then the login's file."""
+    """The account's `api_id`/`api_hash`: environment first, then the login's file.
+
+    **Nothing here is hard-coded, and the environment always wins.**
+    `GPTVOICECODING_ACCEPTANCE_TG_API_ID` and `…_TG_API_HASH` are consulted
+    before the disk is touched, and `GPTVOICECODING_ACCEPTANCE_PERSON_DIR` moves
+    the directory the fallback lives in.
+
+    The fallback file exists because Telethon needs the pair on **every**
+    `TelegramClient` construction while the pair is issued once, by a human, at
+    `my.telegram.org` — so the alternative is not "no file" but "Simon exports
+    two variables before every run, forever". `docs/acceptance-design.md`
+    § Credentials chose the file for that reason: 0600, in the user's own
+    application-support directory, written only by the explicit `login`
+    subcommand, and never in the repository or the journal.
+    """
     directory = directory or person_directory()
     from_environment = os.environ.get(API_ID_VARIABLE), os.environ.get(API_HASH_VARIABLE)
     if all(from_environment):

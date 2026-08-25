@@ -88,7 +88,24 @@ class PreflightRefused(Exception):
     """The environment is not one this run can be attributed to."""
 
 
+#: Set once the verdict fixture exists, so a refusal can be written down before it
+#: is raised. A module-level handle rather than a fixture argument because
+#: `_refuse` is called from fixtures that run *before* the verdict is built —
+#: `engine_path`, `bot_token` — and a refusal from one of those must still reach
+#: `verdict.json` if there is a verdict to reach.
+_verdict: support.Verdict | None = None
+
+
 def _refuse(reason: str) -> None:
+    """Refuse, and leave the reason somewhere that outlives the terminal.
+
+    `docs/acceptance-design.md` § Preflight: a refusal produces "verdict
+    `REFUSED` with the reason". Raising alone put the reason on stderr and
+    nowhere else, so a run that refused left an artifact directory whose
+    `verdict.json` did not say why — or no `verdict.json` at all.
+    """
+    if _verdict is not None:
+        _verdict.refuse("preflight", reason)
     raise PreflightRefused(reason)
 
 
@@ -228,21 +245,30 @@ def preflight(
 def verdict(
     run_directory: Path, bundle: Path, provenance: support.Provenance, engine_path: str
 ) -> Iterator[support.Verdict]:
+    global _verdict
     record = support.Verdict(
         run_id=run_directory.name,
         bundle=str(bundle),
         commit=provenance.commit,
         provenance=provenance.reason,
+        # What this run promised to observe. `Verdict.result` will not say PASS
+        # while any of it is missing, so a lane that never ran cannot be silently
+        # absent from a green verdict.
+        expected_lanes=tuple(lane.name for lane in journey_module.LANES),
+        expected_steps=journey_module.STEPS,
         versions={
             "claude": support.binary_version("claude", engine_path),
             "codex": support.binary_version("codex", engine_path),
             "bundle_python": _version_of(support.bundled_python(bundle)),
         },
     )
+    _verdict = record
     try:
         yield record
     finally:
         written = record.write(run_directory / "verdict.json")
+        if record.missing:
+            print(f"\nnot observed: {', '.join(record.missing)}")
         print(f"\nverdict: {record.result} — {written}")
 
 
@@ -293,7 +319,6 @@ def lane_engine(lane, run_directory, journal, engine_path, bot_token):  # noqa: 
         journal=journal,
         token=bot_token,
         path_value=engine_path,
-        stdio=run_directory / f"engine-{lane.name}.stdio",
     )
     with support.TrustGate(workspace, run_directory=run_directory, journal=journal):
         engine.start()

@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,39 +160,42 @@ CHILD_FILE = "child.txt"
 
 @dataclass(frozen=True)
 class Lane:
-    """Everything about a lane that is not the journey itself."""
+    """Everything about a lane that is not the journey itself.
+
+    The two things that genuinely differ between lanes are *where the agent's own
+    record of a Session lives* and *how to find out it exists at all*, and both
+    are held here as functions. They used to be two `if self.agent == "claude"`
+    branches in this class, which is the shape that grows a third branch in a
+    third method the first time a lane needs one — and the lanes are the one axis
+    this harness is certain to keep adding to. A lane is now a value that carries
+    its own answers, and `Walk` never asks which lane it is walking.
+    """
 
     name: str
     agent: str
     binary: str
     #: Arguments the *person* would not normally type, and why each is here.
     arguments: tuple[str, ...]
-    #: The words that make this lane's agent spawn a child process.
+    #: The words that make this lane's agent spawn a Child Process. "subagent"
+    #: and "sub-agent" appear here on purpose: this string is spoken *to* the
+    #: agent, where it is the agent's own mechanism word and the thing that makes
+    #: the instruction work. Everywhere the harness speaks about the concept, it
+    #: is a Child Process (`CONTEXT.md`).
     child_words: str
-
-    def ground_truth(
-        self, *, pid: int, workspace: Path, environment: dict[str, str], since: float
-    ) -> hand_started.GroundTruth | None:
-        if self.agent == "claude":
-            return hand_started.claude_ground_truth(pid, environment)
-        return hand_started.codex_ground_truth(pid, workspace, since)
-
-    def record_now(self, truth: hand_started.GroundTruth, *, since: float) -> Path | None:
-        """Where the agent's own record is **at this moment**, re-located each time.
-
-        Measured 2026-08-26, and the reason this is not a cached field on either
-        lane: **neither agent has a record until it has taken a turn.** A Claude
-        Session that has not been typed into has no transcript file, and `codex`
-        writes its rollout when the first turn starts, not when the Session does
-        — a full run watched it sit in `starting MCP servers` with an empty
-        workspace for 180s. Caching the `None` that resolves at Session start
-        would make every later turn look like a turn that never grew the record,
-        which is exactly how `_drive_turn` decides a turn is over. So both lanes
-        look again, every time.
-        """
-        if self.agent == "claude":
-            return hand_started.claude_transcript(truth.session_id)
-        return hand_started.codex_rollout(truth.workspace, since)
+    #: What the agent itself says about a Session the harness started, or None
+    #: when it says nothing yet. Takes the pid, the workspace, the environment to
+    #: read a roster with, and the moment the harness started looking.
+    ground_truth: Callable[[int, Path, dict[str, str], float], hand_started.GroundTruth | None]
+    #: Where that agent's own record is **at this moment**, or None when there is
+    #: not one yet. Re-located on every call, never cached: measured 2026-08-26,
+    #: **neither agent has a record until it has taken a turn** — a Claude Session
+    #: that has not been typed into has no transcript file, and `codex` writes its
+    #: rollout when the first turn starts, not when the Session does (a full run
+    #: watched it sit in `starting MCP servers` with an empty workspace for 180s).
+    #: Caching the `None` that resolves at Session start would make every later
+    #: turn look like a turn that never grew the record, which is exactly how
+    #: `_drive_turn` decides a turn is over.
+    record_now: Callable[[hand_started.GroundTruth, float], Path | None]
 
 
 #: `--permission-mode default` is not the person's own flag, and it is the one
@@ -210,6 +214,10 @@ CLAUDE = Lane(
     agent="claude",
     binary="claude",
     arguments=("--permission-mode", "default"),
+    ground_truth=lambda pid, workspace, environment, since: hand_started.claude_ground_truth(
+        pid, environment
+    ),
+    record_now=lambda truth, since: hand_started.claude_transcript(truth.session_id),
     child_words=(
         "Use the Task tool to start one subagent that writes a file named "
         f"{CHILD_FILE} containing the single word DELTA in the current directory. "
@@ -225,12 +233,21 @@ CODEX = Lane(
     agent="codex",
     binary="codex",
     arguments=(),
+    ground_truth=lambda pid, workspace, environment, since: hand_started.codex_ground_truth(
+        pid, workspace, since
+    ),
+    record_now=lambda truth, since: hand_started.codex_rollout(truth.workspace, since),
     child_words=(
         "Start one sub-agent to write a file named "
         f"{CHILD_FILE} containing the single word DELTA in the current directory. "
         "Do nothing else yourself."
     ),
 )
+
+
+#: Both lanes, in the order they are walked. Named here so the run can declare up
+#: front what it promised to observe — see `Verdict.expected_lanes`.
+LANES = (CLAUDE, CODEX)
 
 
 # --- the walk ---------------------------------------------------------------
@@ -498,10 +515,26 @@ class Walk:
                 f"{self.far_side.telegram_round_trip_seconds:.0f}s of the turn ending; "
                 f"engine.log stop lines: {stop_lines[-3:] or 'none'}"
             )
+        if not message.text.strip():
+            raise StepFailed(f"the Stop reached the chat as an empty message ({message.id})")
         waiting = self._roster_field("waiting_for")
+        kind = waiting.get("kind") if isinstance(waiting, dict) else None
+        if not kind:
+            raise StepFailed(
+                f"a message arrived for the Stop ({message.id}: {message.text!r}) but the roster "
+                f"does not say what the Session stopped on: waiting_for is {waiting!r}. #75 "
+                f"replaces `SessionStopped.detail` free text with the typed `WaitingFor`, and a "
+                f"notice the roster cannot corroborate is a sentence, not a state."
+            )
+        if not stop_lines:
+            raise StepFailed(
+                f"message {message.id} reached the chat and the roster says {kind!r}, but "
+                f"engine.log carries no Stop line — the run cannot attribute the message to "
+                f"this engine's own Stop"
+            )
         return (
-            f"bot message {message.id}: {message.text!r}; roster waiting_for {waiting!r}; "
-            f"engine.log: {stop_lines[-1:] or 'none'}"
+            f"bot message {message.id}: {message.text!r}; roster waiting_for kind {kind!r}; "
+            f"engine.log: {stop_lines[-1]!r}"
         )
 
     # --- relay ------------------------------------------------------------
@@ -696,6 +729,16 @@ class Walk:
         parent = child_row["child"].get("parent")
         if not parent:
             raise StepFailed(f"the child row {_address_of(child_row)} names no parent")
+        # "Listed **under its parent**" is the claim, and any non-empty parent
+        # satisfied it before — including one naming some other Session, which is
+        # precisely the bug a roster of several Sessions would produce and a
+        # roster of one would hide.
+        parent_address = _address_of({"target": parent})
+        if parent_address != self.address:
+            raise StepFailed(
+                f"the child row {_address_of(child_row)} is listed under {parent_address}, not "
+                f"under the Session that started it ({self.address})"
+            )
 
         announced = self.person.await_message(
             mark, deadline_seconds=self.far_side.absence_window_seconds
@@ -705,11 +748,22 @@ class Walk:
                 f"a child raised a Stop Notice: message {announced.id} {announced.text!r} — "
                 f"#79: children are seen, never announced"
             )
-        refused = self.bridgectl("relay", _address_of(child_row), "this must be refused")
+        child_address = _address_of(child_row)
+        refused = self.bridgectl("relay", child_address, "this must be refused")
         if refused.ok:
             raise StepFailed(
-                f"the child {_address_of(child_row)} was accepted as a Relay target: "
-                f"{refused.text!r} — #79: seen, never spoken to"
+                f"the child {child_address} was accepted as a Relay target: {refused.text!r} — "
+                f"#79: seen, never spoken to"
+            )
+        # A non-zero exit is not by itself a refusal: the surface exits non-zero
+        # for an engine that never answered, a malformed address, a socket that
+        # is not there. Only a refusal that *names this Session* proves the rule
+        # was applied rather than the call merely failing.
+        if child_address not in refused.text:
+            raise StepFailed(
+                f"the relay to the child {child_address} failed without refusing it — the answer "
+                f"{refused.text!r} does not name it, so this is the call going wrong rather than "
+                f"the child rule being applied"
             )
         return (
             f"{_address_of(child_row)} listed under {support.flatten([parent])}; no notice in "
@@ -728,10 +782,7 @@ class Walk:
 
         def found() -> bool:
             self.truth = self.lane.ground_truth(
-                pid=pid,
-                workspace=self.config.workspace,
-                environment=self.environment,
-                since=self.started_at,
+                pid, self.config.workspace, self.environment, self.started_at
             )
             return self.truth is not None
 
@@ -800,7 +851,7 @@ class Walk:
         """How big the agent's own record is — the far side's own measure of work."""
         if self.truth is None:
             return 0
-        record = self.lane.record_now(self.truth, since=self.started_at)
+        record = self.lane.record_now(self.truth, self.started_at)
         return record.stat().st_size if record and record.exists() else 0
 
     def _drive_turn(
@@ -868,14 +919,25 @@ class Walk:
                     announced=bool(announced),
                     reply=answer.text,
                 )
-                where = (
-                    f"announced as chat message {announced.id}"
-                    if announced
-                    else "NOT announced in the chat"
-                )
                 if not answer.ok:
                     raise StepFailed(f"`approve {approval_id} allow` refused: {answer.text}")
-                return f"approval {approval_id}: {where}; approve answered {answer.text!r}"
+                if announced is None:
+                    # The design says the permission "is escalated to every outlet
+                    # — with Voice off, the Companion Channel — and the real bot's
+                    # message is read by the user-account client". A run that
+                    # answered an approval nobody was ever told about has proved
+                    # the second half of the round trip and none of the first, and
+                    # reporting that as a pass is how a silent escalation ships.
+                    raise StepFailed(
+                        f"approval {approval_id} was answered through `bridgectl approve` "
+                        f"({answer.text!r}), but it never reached the Companion Channel within "
+                        f"{self.far_side.telegram_round_trip_seconds:.0f}s — no chat message "
+                        f"matched {APPROVAL_ANNOUNCEMENT.pattern!r}"
+                    )
+                return (
+                    f"approval {approval_id}: announced as chat message {announced.id} "
+                    f"({announced.text!r}); approve answered {answer.text!r}"
+                )
             time.sleep(2.0)
         self.journal("approval.none", lane=self.lane.name)
         return None
