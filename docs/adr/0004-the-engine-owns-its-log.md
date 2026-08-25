@@ -1,99 +1,16 @@
 # 4. The engine owns its log, so rotation can rename rather than truncate
 
-Date: 2026-08-18
+Date: 2026-08-18 · Status: Accepted · Source: [legacy ADR 0004](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy/blob/main/docs/adr/0004-bounded-log-files.md) (measurement), amended in [#4](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/4)
 
-Status: Accepted
-
-Carried over from: [ADR 0004 of the reference implementation](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy/blob/main/docs/adr/0004-bounded-log-files.md),
-which holds the full measurement and the adapter-log limitation. The principle is
-carried; its reference-implementation mechanics are not.
-
-## Context
-
-The reference implementation's log had no rotation, no truncation and no size cap.
-It reached 68,042,451 bytes in 49.5 hours — ~1.37 MB/hour, ~1 GB/month — and 98.1%
-of those bytes were a single `libmalloc` line repeated 681,929 times, emitted by
-every spawned subprocess because a `MallocStackLogging` variable had been inherited
-from whichever shell started the daemon. The 105 lines that explained a real outage
-were buried under it.
-
-The cause of the volume was also the reason rotation was hard: the daemon did not
-own its log. A shell redirect had handed it a descriptor and no way to be told the
-file had moved, so rename-based rotation would have left the biggest writer
-appending to the renamed file — rotation that looks like it worked while fixing
-nothing.
-
-Copy-truncate keeps the inode and was tried. It fails on correctness: a copy
-followed by a truncate is two operations, and a line appended between them is
-gone.
+The legacy log grew ~1 GB/month, 98% one inherited-environment `libmalloc` line, and could not be rotated because a shell redirect owned the descriptor. Copy-truncate loses lines written between the copy and the truncate.
 
 ## Decision
 
-**The engine owns its log.** It opens the configured log file itself and `dup2`s it
-onto its own stdout and stderr; nothing that starts the engine redirects its output
-anywhere. Whatever descriptor the launching shell supplies is replaced at adoption,
-which happens before the engine object exists — so in practice it carries only an
-interpreter-level failure, and never outlives adoption.
-
-**Rotation is rename-and-reopen.** The live file is renamed, and the owner reopens
-the path and re-points stdout and stderr at the new file. Every byte written before
-the rename is in the rotated generation and every byte after it is in the new live
-file. There is no window in which a write can be dropped.
-
-**The cap is real and binds every generation**, not only the one a rotation just
-created — a file can be over the cap without this rotation having put it there.
-Rotation keeps the **newest** bytes of what it rotates and discards the rest: the
-tail is the part that explains what just happened.
-
-**Noise is stripped at the environment, not at each spawn site.** Variables whose
-names match a configured prefix are removed once, by every process that spawns
-others.
-
-**Three of the four values have no fallback in code**: max bytes, retained
-generations and stripped prefixes are decisions this outage measured, and a
-default compiled in beside them would quietly reinstate a number the measurement
-proved matters. The log *path* is a location rather than a decision, so it
-defaults beside the state file by the same rule the state file and the socket
-follow — see the note in `config.py`. Amended during the port (issue #4), because
-the sentence this replaces lumped the path in with the three and the code would
-otherwise have contradicted it silently.
+- **The engine owns its log**: it opens the configured file and `dup2`s it onto its own stdout/stderr before the engine object exists; nothing that starts the engine redirects output.
+- **Rotation is rename-and-reopen**, so no write can be dropped. **The cap binds every generation**; rotation keeps the newest bytes.
+- **Noise is stripped at the environment**: variables matching configured prefixes are removed once by every process that spawns others.
+- **Max bytes, retained generations and stripped prefixes have no compiled-in default** — they are measured decisions. The log path defaults beside the state file, being a location rather than a decision.
 
 ## Consequences
 
-Any log the engine cannot tell to reopen — one held open for its whole life by a
-third-party child process — cannot use rename-and-reopen and falls back to
-truncate-in-place, accepting that rollover window for that log only. It must never
-be `bridge.logFile`. The reference implementation hit exactly this with the Codex
-app-server logs; see its ADR for the reasoning.
-
-**A child that is already running when a rotation happens cannot be told to
-reopen either.** Its inherited descriptor keeps referring to the file that was
-renamed, so its output rides the generation chain from that point on — carried
-along by later rotations and dropped by retention like any other old bytes,
-rather than following the engine into the new live file. Two things follow, and
-both are load bearing: a rotated generation is trimmed **on its own inode** and
-never by replacing the file, because a replacement would leave that child writing
-into an unlinked inode for the rest of its life; and the only way to remove the
-limitation rather than bound it is for the launcher to give its children a pipe
-the engine reads, instead of the log descriptor itself. Recorded during the port
-(issue #4), where both were measured; the pipe is left to the launcher's ticket.
-The same rule governs the zero-retention case: a rotation that keeps nothing
-empties the live file in place rather than unlinking it, because keeping nothing
-is what that configuration asked for and losing the writer is not.
-
-**Three properties compete here and only two are available at once**: a ceiling
-that is exact at every instant, no inode ever severed from a writer that holds
-it, and no window in which a write can be dropped. This decision takes the first
-two. The accepted residual is the third, in its narrowest form — a raw write
-landing inside a generation's in-place trim can be lost — and it is not a new
-concession: it is the truncate-in-place fallback this section already grants to
-writers the engine cannot tell to reopen, bounded to that writer and to the
-milliseconds of one trim. The alternative that would close it, trimming a
-generation only as it ages, breaks "the cap is real and binds every generation"
-for every deployment all the time, which is a headline guarantee traded for a
-bounded one. Adjudicated in #4.
-
-Output produced before adoption (argument parsing, configuration loading) has
-nowhere to go and is discarded. An engine that dies that early never answers a
-status query, so the failure is still surfaced — by silence on the socket rather
-than by a log line.
+A log the engine cannot tell to reopen (held by a third-party child) falls back to truncate-in-place and must never be `bridge.logFile`. A child already running at rotation keeps writing into the renamed generation, so a generation is trimmed **on its own inode**, never replaced; zero retention empties the live file in place rather than unlinking it. Of exact ceiling / no severed inode / no dropped write, this takes the first two; the residual is one raw write inside a generation's in-place trim. Output before adoption is discarded — an engine dying that early is surfaced by silence on the socket.

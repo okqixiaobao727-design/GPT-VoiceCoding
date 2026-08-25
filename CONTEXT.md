@@ -1,6 +1,6 @@
 # GPT-VoiceCoding
 
-Voice-controlling terminal coding agents through a realtime voice call: the system speaks agent progress to the user and carries the user's spoken instructions back to the agents.
+A bridge over every coding-agent Session on the user's Mac: it tells the user what each Session is doing and what it stopped on, carries the user's words into it, and calls the user when a Session needs a decision.
 
 ## Language
 
@@ -11,11 +11,11 @@ The system-owned realtime voice call — the system's one and only voice surface
 _Avoid_: Live thread, voice chat, call (unqualified)
 
 **Live Toggle**:
-The single action that starts a Live Call when none is up, or ends the current one. One toggle, not separate start/stop commands.
+The single action that starts a Live Call when none is up, or ends the current one.
 _Avoid_: toggle phrase
 
 **Stop Notice**:
-The spoken announcement, delivered into a Live Call, that a coding-agent session has stopped and may need the user.
+The announcement that a Session has stopped and may need the user, carrying what it stopped on: the question with its options and any recommendation, or the tool awaiting permission with a one-line summary. Spoken into the Live Call and pushed through the Companion Channel — every outlet that is on.
 
 **Delegated Turn**:
 Work the system hands to a coding model on the user's behalf during a Live Call, distinct from the call's own speech. Its model is a user-facing setting.
@@ -25,22 +25,22 @@ _Avoid_: side request, background query
 
 **Bridge Core**:
 The one decision-maker: it owns every policy and holds the system's single source of truth. It decides; the modules around it do.
-_Avoid_: Bridge Control Center (collides with Control Plane / Control Panel), supervisor, orchestrator, engine (that is the process, not the role)
+_Avoid_: Bridge Control Center, supervisor, orchestrator, engine (the process, not the role)
 
 **Duty Switch**:
-The master on/off switch for the whole voice coordination: off means the system does not speak, does not push, and does not touch the Live Call; events are still recorded. Every other switch is effective only while it is on. Exactly two states.
+The master on/off switch: off means the system does not speak, does not push, and does not touch the Live Call; events are still recorded. Every other switch is effective only while it is on.
 _Avoid_: duty mode, pause mode, do-not-disturb
 
 **Voice Switch**:
-The switch for everything spoken: whether the system may speak into, open, or otherwise touch the Live Call.
+Whether the system may speak into, open, or otherwise touch the Live Call.
 _Avoid_: speech mode, live switch
 
 **Message Switch**:
-The switch for text reach: whether the system may push messages through the Companion Channel. Independent of the Voice Switch — messages-only operation is a supported state.
+Whether the system may push messages through the Companion Channel. Independent of the Voice Switch.
 _Avoid_: notification switch, push switch
 
 **Feature Switch**:
-An independent on/off setting for one capability. Feature Switches are flat booleans under their parent switch; there are no combined "modes".
+An independent on/off setting for one capability — a flat boolean under its parent switch.
 _Avoid_: mode, profile, sub-mode
 
 **Control Plane**:
@@ -48,33 +48,33 @@ Status queries and switch flips, accepted from every surface and never gated by 
 _Avoid_: admin commands, management interface
 
 **Control Panel**:
-The at-computer surface for seeing the system's current state and flipping switches directly. Runtime state only — not an editor for installation settings.
+The at-computer surface for seeing the system's current state — the Session roster included — and flipping switches. Runtime state only, not installation settings.
 _Avoid_: settings app, preferences window, config tool
 
 ### Reach and sessions
 
 **Companion Channel**:
-The pluggable channel that reaches the user when no Live Call is up, and accepts their inbound text.
+The pluggable text surface: it pushes the system's messages to the user and accepts their inbound text.
 _Avoid_: Telegram (one adapter, not the concept)
 
 **Session**:
-One terminal coding-agent run (Claude Code or Codex) that the system launches, watches, and Relays into.
-_Avoid_: task, job, window
+One interactive terminal run of Claude Code or Codex. The system sees every Session on the machine, reads what it stopped on, and Relays into it.
+_Avoid_: task, job, window, launched Session (the system launches nothing)
 
-**Session Launcher**:
-The capability that brings a Session into existence in a workspace.
-_Avoid_: terminal control, tmux (one optional way to launch, not the capability)
+**Child Process**:
+A process a Session spawns — a subagent, a review crew. It appears in the roster under its Session and nothing more: no Relay, no Stop Notice, no name.
+_Avoid_: child Session, subagent (the agent's mechanism word), crew
 
-**Opening Instruction**:
-The words a Session is launched to act on, carried by the launch itself and performed as that Session's first turn. Every launch has one: a Session brought into existence with nothing to do is not a supported state.
-_Avoid_: initial task (`task` is reserved against for a Session), prompt (the agent's word, not the product's), first message
+**Session Name**:
+What the user and the system call one Session — the agent's own name for it.
+_Avoid_: label, title
 
 **Relay**:
 Carrying words *into* a Session — the agent-ward direction.
 _Avoid_: injection (a mechanism, not the capability), push, channel (reserved for the Companion Channel)
 
 **Answer Relay**:
-A Relay of the user's own words — their spoken instructions and their answers to a Session's questions — carrying the user's authority.
+A Relay of the user's own words — their instructions and their answers to a Session's questions.
 _Avoid_: MCP Channel (one adapter, not the capability)
 
 **Approval Relay**:
@@ -82,5 +82,5 @@ A Relay of the user's verdict on a Session's pending permission request — one 
 _Avoid_: auto-approve (the user decides, the system only carries), permission bypass
 
 **Reply Window**:
-The state in which a Session can accept an inbound Relay as a user turn — open when the Session is awaiting input. While it is closed, Relays wait.
+The state in which a Session will act on the next Relay as its next turn. While it is closed, Relays wait.
 _Avoid_: idle state (a Session can be busy yet accepting), input prompt
