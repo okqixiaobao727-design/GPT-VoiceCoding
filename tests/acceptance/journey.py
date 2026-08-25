@@ -1,0 +1,887 @@
+"""The nine steps of the bridge journey, written once and walked by both lanes.
+
+## What changed, and why
+
+The journey this module used to hold walked the **launch** journey: `bridgectl
+launch` started a Session, the steps watched what the product had started, and
+`bridgectl close` ended it. Map #67 redrew the destination — v1.0 is a *bridge*
+over the Sessions the user starts — so a harness that starts its own Sessions
+through the product is measuring the wrong thing, and #72 has since parked the
+launcher out of the protocol entirely (`launch` and `close` are not actions on
+`main`). The harness now starts each Session **the way the user does**: the
+ordinary `claude` / `codex` binary, in a pty, no wrapper (`hand_started.py`).
+
+Steps `0c`, `1a`, `1b` and `8` are gone with the launcher. `0b` (the realtime
+contract probe) and the provenance compare stay where they were.
+
+## The nine names are a contract
+
+Every one of the build tickets #74–#80 cites a step name from `STEPS` verbatim in
+its "Red first" line. Renaming one here silently moves seven tickets' exit
+criteria, so the names are fixed and their spelling is the interface.
+
+## What the steps rest on, and what they never rest on
+
+Observations come from the agent's own roster or rollout, the filesystem, the
+engine's reply and log, and the real Telegram chat. **Never from the screen.**
+Measured on 2026-08-26: both TUIs redraw with cursor addressing, and `codex` in
+a pty interleaves to roughly one glyph per line once escapes are stripped. The
+raw stream is kept as an artifact for a human; nothing parses it.
+
+## The turns, and why there are five
+
+A step that needs a turn drives its own, because a turn shared between steps
+makes one step's failure look like another's. The one exception is stated where
+it happens: `relay` and `approval` observe the *same* turn from two ends — the
+words arriving and the permission that turn raises — because a relayed
+instruction that needs a permission is exactly the shape the product has to
+survive, and running it twice would prove less at twice the cost.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import hand_started
+import support
+from support import LaneBlocked, StepFailed
+
+#: The nine steps, in the order #73 fixed. Cited verbatim by #74–#80.
+STEPS = (
+    "roster",
+    "stable name",
+    "progress",
+    "stop notice",
+    "relay",
+    "approval",
+    "companion inbound",
+    "switches",
+    "child",
+)
+
+#: How many times `stable name` reads the roster. #73: "identical across three
+#: `status` calls and across a Stop".
+NAME_READS = 3
+
+#: How long the engine gets to notice a Session that is already running before an
+#: empty roster is taken as the answer. Not derived from the product, because on
+#: `main` there is no discovery to derive it from — #74 builds it. Chosen with the
+#: reason stated: long enough that any polling discovery has ticked at least once
+#: and a slow `codex` boot (MCP servers; measured at tens of seconds on this
+#: machine) is not read as a missing Session, short enough that a roster which is
+#: simply empty is an answer rather than a wait. Re-derive it from #74's own
+#: cadence once there is one.
+DISCOVERY_SECONDS = 30.0
+
+#: What the escalated permission announcement says (`core/approvals.py:43-46`).
+#: Matched rather than quoted whole: the tool name and the detail are the agent's,
+#: and this run does not get to predict them.
+APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
+
+
+# --- what the Sessions are asked to do --------------------------------------
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """One small, deterministic action, and the effect to read back.
+
+    The shape `docs/acceptance-design.md` prescribes: an effect the harness reads
+    off the filesystem, so "the Session acted on the words" is a fact from the far
+    side rather than a claim from the engine.
+    """
+
+    words: str
+    filename: str | None = None
+    content: str | None = None
+
+    def effect_in(self, workspace: Path) -> str | None:
+        if self.filename is None:
+            return None
+        text = support.read_if_exists(workspace / self.filename)
+        return text.strip() if text is not None else None
+
+    def performed_in(self, workspace: Path) -> bool:
+        return self.content is not None and self.effect_in(workspace) == self.content
+
+
+def writing(filename: str, content: str) -> Instruction:
+    """The wording, in one place, so both lanes ask for the same shape of thing."""
+    return Instruction(
+        words=(
+            f"Create a file named {filename} in the current directory whose entire "
+            f"contents are the single word {content}. Do nothing else, and do not "
+            f"ask any questions."
+        ),
+        filename=filename,
+        content=content,
+    )
+
+
+#: Turn 1 — `stable name`'s Stop. **No tool use**, on purpose: a turn that raises
+#: a permission would sit in `waiting` until something answered it, and nothing is
+#: supposed to answer one until `approval`. So the first turn is words only, it
+#: ends on its own, and the Stop it ends with is what `stop notice` observes.
+ACKNOWLEDGE = Instruction(
+    words="Reply with the single word READY. Do not use any tools, and do not ask anything."
+)
+
+#: Turn 2 — arrives by Relay, raises a permission on the way. Measured 2026-08-26
+#: on `claude` 2.1.246 at `--permission-mode default`: a Write of a new file
+#: raises `Do you want to create <name>?` and the roster's `status` goes to
+#: `waiting`. That is the permission `approval` answers.
+RELAYED = writing("relay.txt", "BRAVO")
+
+#: Turn 3 — arrives from Telegram.
+INBOUND = writing("inbound.txt", "CHARLIE")
+
+#: Turn 4 — `switches`. It has to end **waiting on the user**, because #80's rule
+#: is about Sessions that are still actionable when Duty comes back on.
+ASK_SOMETHING = Instruction(
+    words=(
+        "Ask me one short question about what to do next, then stop and wait for my "
+        "answer. Do not use any tools."
+    )
+)
+
+#: Turn 5 — `child`. The main Session is asked to do the one thing that produces a
+#: second agent process under it. What each lane calls that differs, so the words
+#: live on the lane.
+CHILD_FILE = "child.txt"
+
+
+# --- lanes ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Lane:
+    """Everything about a lane that is not the journey itself."""
+
+    name: str
+    agent: str
+    binary: str
+    #: Arguments the *person* would not normally type, and why each is here.
+    arguments: tuple[str, ...]
+    #: The words that make this lane's agent spawn a child process.
+    child_words: str
+
+    def ground_truth(
+        self, *, pid: int, workspace: Path, environment: dict[str, str], since: float
+    ) -> hand_started.GroundTruth | None:
+        if self.agent == "claude":
+            return hand_started.claude_ground_truth(pid, environment)
+        return hand_started.codex_ground_truth(pid, workspace, since)
+
+    def record_now(self, truth: hand_started.GroundTruth, *, since: float) -> Path | None:
+        """Where the agent's own record is **at this moment**, re-located each time.
+
+        Measured 2026-08-26, and the reason this is not a cached field on either
+        lane: **neither agent has a record until it has taken a turn.** A Claude
+        Session that has not been typed into has no transcript file, and `codex`
+        writes its rollout when the first turn starts, not when the Session does
+        — a full run watched it sit in `starting MCP servers` with an empty
+        workspace for 180s. Caching the `None` that resolves at Session start
+        would make every later turn look like a turn that never grew the record,
+        which is exactly how `_drive_turn` decides a turn is over. So both lanes
+        look again, every time.
+        """
+        if self.agent == "claude":
+            return hand_started.claude_transcript(truth.session_id)
+        return hand_started.codex_rollout(truth.workspace, since)
+
+
+#: `--permission-mode default` is not the person's own flag, and it is the one
+#: place this harness overrides what the machine would do. It has to: measured
+#: 2026-08-26, `~/.claude/settings.json` on this machine sets
+#: `permissions.defaultMode = "auto"` at user scope, so a bare hand-started
+#: `claude` auto-approves the Write and **no permission is ever raised**. The
+#: `approval` step would then have nothing to observe, and its silence would look
+#: like a pass. #60 ruled that neither lane may set a permission mode, on the
+#: grounds that overriding it would *pre-approve* the thing the step exists to
+#: observe; here the user's own setting is what pre-approves it, and the flag is
+#: what restores the observation. The rule is kept, its direction reversed, and
+#: the reason is recorded on the verdict rather than left in a diff.
+CLAUDE = Lane(
+    name="claude",
+    agent="claude",
+    binary="claude",
+    arguments=("--permission-mode", "default"),
+    child_words=(
+        "Use the Task tool to start one subagent that writes a file named "
+        f"{CHILD_FILE} containing the single word DELTA in the current directory. "
+        "Do nothing else yourself."
+    ),
+)
+
+#: Codex takes no flag here. Measured 2026-08-26: `~/.codex/config.toml` sets no
+#: `approval_policy`, so the lane runs on the product's own default — which is
+#: what #60 asked for and what this lane still gets.
+CODEX = Lane(
+    name="codex",
+    agent="codex",
+    binary="codex",
+    arguments=(),
+    child_words=(
+        "Start one sub-agent to write a file named "
+        f"{CHILD_FILE} containing the single word DELTA in the current directory. "
+        "Do nothing else yourself."
+    ),
+)
+
+
+# --- the walk ---------------------------------------------------------------
+
+
+@dataclass
+class Turn:
+    """One turn, timed. `docs/acceptance-design.md` § Still to measure wanted this."""
+
+    what: str
+    seconds: float
+    ended: bool
+
+
+class Walk:
+    """One lane's journey. Every method is one step; each returns its evidence."""
+
+    def __init__(
+        self,
+        *,
+        lane: Lane,
+        session: hand_started.HandStartedSession,
+        engine: support.Engine,
+        config: support.DerivedConfig,
+        bridgectl: support.Bridgectl,
+        person,  # telegram_person.TelegramPerson
+        journal: support.Journal,
+        verdict: support.Verdict,
+        far_side: support.FarSideDeadlines,
+        environment: dict[str, str],
+        started_at: float,
+    ) -> None:
+        self.lane = lane
+        self.session = session
+        self.engine = engine
+        self.config = config
+        self.bridgectl = bridgectl
+        self.person = person
+        self.journal = journal
+        self.far_side = far_side
+        self.environment = environment
+        self.started_at = started_at
+        self.journey = support.Journey(
+            lane=lane.name, verdict=verdict, journal=journal, steps=STEPS
+        )
+        self.truth: hand_started.GroundTruth | None = None
+        self.address: str | None = None
+        #: Held for `stop notice`: the chat's high-water mark from *before* the
+        #: first turn started, so the notice it looks for cannot predate the Stop.
+        self.before_first_turn: int | None = None
+        #: Held for `approval`: what `relay`'s turn raised and how it was answered.
+        self.approval_evidence: str | None = None
+        self.turns: list[Turn] = []
+
+    # --- the walk ---------------------------------------------------------
+
+    def walk(self) -> None:
+        self.journey.observe(
+            "workspace trust",
+            "arranged by the harness, not observed: both agents stop a run in a directory they "
+            "have never seen with a full-screen trust dialog and the Session never registers "
+            "(re-measured on claude 2.1.246, 2026-08-26). `journal.jsonl` carries the grant and "
+            "the revoke. It is not a step: the run cannot both arrange this and judge it.",
+        )
+        try:
+            self.arm_switches()
+        except LaneBlocked as unarmed:
+            self.journey.skip_rest(str(unarmed))
+            return
+        self.journey.run("roster", self.roster)
+        self.journey.run("stable name", self.stable_name)
+        self.journey.run("progress", self.progress)
+        self.journey.run("stop notice", self.stop_notice)
+        self.journey.run("relay", self.relay)
+        self.journey.run("approval", self.approval)
+        self.journey.run("companion inbound", self.companion_inbound)
+        self.journey.run("switches", self.switches)
+        self.journey.run("child", self.child)
+        self.journey.observe(
+            "turns measured",
+            "; ".join(f"{turn.what} {turn.seconds:.1f}s ended={turn.ended}" for turn in self.turns)
+            or "no turn ran",
+        )
+
+    def arm_switches(self) -> None:
+        """Voice off, Message on, Duty on — the text-only mode this whole run exercises.
+
+        Not a step, because it is the run's mode rather than a claim about the
+        product. Measured at build time on #60 and unchanged: a fresh engine
+        answers `switches: duty off, message off, voice off`, so an unarmed run
+        would see no push anywhere and read one cause as four failures.
+        """
+        for name, position in (("voice", "off"), ("message", "on"), ("duty", "on")):
+            answer = self.bridgectl("switch", name, position)
+            self.journal(
+                "switch.armed", lane=self.lane.name, switch=name, to=position, reply=answer.text
+            )
+            if not answer.ok:
+                raise LaneBlocked(f"`switch {name} {position}` refused: {answer.text}")
+
+    # --- roster -----------------------------------------------------------
+
+    def roster(self) -> str:
+        """The hand-started Session is in the roster, graded, and an unattached row is refused.
+
+        Three claims, and the first one blocks the lane because nothing after it
+        can be observed without a Session the product admits exists:
+
+        1. the Session the harness started by hand — identified from the agent's
+           own record, never from the engine — has a row;
+        2. that row carries a `provenance` and **two separate** reach grades
+           (#74 locks `Reach(relay, approval)`; one inferred bit is what it
+           exists to prevent);
+        3. a row whose Relay reach is not `attached` is refused as a Relay
+           target, with a reason.
+
+        The third is guaranteed a subject by the Codex lane rather than by
+        contrivance: with no shared daemon every Codex row is `unattached` by
+        construction (#82). If this lane presents no unattached row, the step
+        says so in its evidence instead of inventing one.
+        """
+        truth = self._ground_truth()
+        rows = self._roster_rows()
+        mine = self._row_for(rows, truth)
+        if mine is None:
+            # Give a polling discovery its tick before calling the roster empty.
+            deadline = time.monotonic() + DISCOVERY_SECONDS
+            while mine is None and time.monotonic() < deadline:
+                time.sleep(5.0)
+                rows = self._roster_rows()
+                mine = self._row_for(rows, truth)
+        if mine is None:
+            raise LaneBlocked(
+                f"the hand-started Session is not in the engine's roster. The agent itself "
+                f"reports {truth.describe()}; the engine reports "
+                f"{[support.flatten([row.get('target')]) for row in rows] or 'no sessions'}"
+            )
+        self.address = _address_of(mine)
+
+        missing = [field for field in ("provenance", "reach") if field not in mine]
+        if missing:
+            raise StepFailed(
+                f"the roster row for {self.address} carries no {' and no '.join(missing)}: "
+                f"#74 locks `SessionInspection.provenance` and `Reach(relay, approval)`, and the "
+                f"row has keys {sorted(mine)}"
+            )
+        reach = mine["reach"]
+        if not isinstance(reach, dict) or {"relay", "approval"} - set(reach):
+            raise StepFailed(
+                f"reach on {self.address} is {reach!r}, not two separately graded routes — "
+                f"#74: 'graded separately, never one inferred bit'"
+            )
+
+        refusal = self._unattached_refusal(rows)
+        return (
+            f"{self.address} present; provenance {mine['provenance']!r}; "
+            f"reach relay={reach['relay']!r} approval={reach['approval']!r}; "
+            f"agent's own record {truth.describe()}; {refusal}"
+        )
+
+    def _unattached_refusal(self, rows: list[dict]) -> str:
+        unattached = next(
+            (
+                row
+                for row in rows
+                if isinstance(row.get("reach"), dict) and row["reach"].get("relay") != "attached"
+            ),
+            None,
+        )
+        if unattached is None:
+            return "no unattached row was in the roster to refuse (the Codex lane supplies one)"
+        address = _address_of(unattached)
+        answer = self.bridgectl("relay", address, "this must be refused")
+        self.journal("roster.unattached", lane=self.lane.name, address=address, reply=answer.text)
+        if answer.ok:
+            raise StepFailed(
+                f"the unattached row {address} was accepted as a Relay target: {answer.text!r}"
+            )
+        return f"unattached {address} refused: {answer.text!r}"
+
+    # --- stable name ------------------------------------------------------
+
+    def stable_name(self) -> str:
+        """One name, unchanged across three reads and across a Stop (#78).
+
+        This is also the walk's **first turn**, and it is words-only by design —
+        see `ACKNOWLEDGE`. The chat is marked before it starts and the mark is
+        handed to `stop notice`, so what that step waits for cannot be a message
+        that predates the Stop it is about.
+        """
+        if self.address is None:
+            raise LaneBlocked("no Session in the roster to name")
+        before = [self._name_now() for _ in range(NAME_READS)]
+        if len(set(before)) != 1:
+            raise StepFailed(f"three consecutive reads gave {before!r}, not one name")
+        if before[0] is None:
+            official = self.truth.name if self.truth else None
+            raise StepFailed(
+                f"{self.address} has no name in the roster after {NAME_READS} reads — #78 "
+                f"requires the official one, and the agent's own record calls it {official!r}"
+            )
+
+        self.before_first_turn = self.person.latest_message_id()
+        turn = self._drive_turn("acknowledge", ACKNOWLEDGE)
+        after = self._name_now()
+        if after != before[0]:
+            raise StepFailed(f"the name was {before[0]!r} before the Stop and {after!r} after it")
+        if not turn.ended:
+            raise StepFailed(
+                f"the name held at {after!r}, but the turn never ended within "
+                f"{self.far_side.agent_turn_seconds:.0f}s so no Stop was crossed"
+            )
+        return f"{after!r} across {NAME_READS} reads and across a Stop ({turn.seconds:.1f}s turn)"
+
+    # --- progress ---------------------------------------------------------
+
+    def progress(self) -> str:
+        """Progress is readable without costing a turn (#76).
+
+        Two things have to hold at once: there is something to read, and reading
+        it does not make the Session work. The second is checked the only way it
+        can be from outside — the agent's own record does not grow across the
+        read, and the roster's state does not leave `idle`.
+        """
+        if self.address is None:
+            raise LaneBlocked("no Session to read progress from")
+        before_size = self._record_size()
+        before_state = self._roster_field("state")
+
+        row = self._roster_row()
+        if row is None:
+            raise StepFailed(f"{self.address} left the roster before progress could be read")
+        if "progress" not in row:
+            raise StepFailed(
+                f"the roster row carries no `progress`: #74 locks "
+                f"`Progress(recent, truncated, read_at)` on the inspection and #76 is the verb "
+                f"that fills it; the row has keys {sorted(row)}"
+            )
+        reported = row["progress"]
+        if not reported or not (reported.get("recent") if isinstance(reported, dict) else None):
+            raise StepFailed(f"progress for {self.address} is {reported!r} after a turn that ran")
+
+        time.sleep(2.0)
+        after_size = self._record_size()
+        after_state = self._roster_field("state")
+        if after_size != before_size:
+            raise StepFailed(
+                f"reading progress grew the Session's own record from {before_size} to "
+                f"{after_size} bytes — that is a turn, and #76 forbids one"
+            )
+        return (
+            f"progress read without a turn: {support.flatten(reported.get('recent'))[:160]!r}; "
+            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}"
+        )
+
+    # --- stop notice ------------------------------------------------------
+
+    def stop_notice(self) -> str:
+        """The Stop `stable name` crossed reached the chat, and it says what it stopped on.
+
+        #75's shape: the notice carries the question or the permission, not a
+        flattened sentence. What can be checked from the chat is that a message
+        arrived for that Stop and that it is not empty; whether it carries the
+        typed `WaitingFor` is #75's own exit and is read off the payload.
+        """
+        if self.before_first_turn is None:
+            raise LaneBlocked("no turn was driven, so no Stop was crossed to be announced")
+        message = self.person.await_message(
+            self.before_first_turn, deadline_seconds=self.far_side.telegram_round_trip_seconds
+        )
+        stop_lines = support.matching_lines(self.engine.log_lines(), r"(?i)stop|SessionStopped")
+        if message is None:
+            raise StepFailed(
+                f"no message reached the chat within "
+                f"{self.far_side.telegram_round_trip_seconds:.0f}s of the turn ending; "
+                f"engine.log stop lines: {stop_lines[-3:] or 'none'}"
+            )
+        waiting = self._roster_field("waiting_for")
+        return (
+            f"bot message {message.id}: {message.text!r}; roster waiting_for {waiting!r}; "
+            f"engine.log: {stop_lines[-1:] or 'none'}"
+        )
+
+    # --- relay ------------------------------------------------------------
+
+    def relay(self) -> str:
+        """Words go in through `bridgectl relay`, come out as a receipt and an effect.
+
+        **DELIVERED is never inferred from a write** (#71, carried into #77), so
+        this step wants two things the engine cannot fake: a reply that says
+        `delivered` rather than retained or unknown, and the file in the
+        workspace. The permission this turn raises on the Claude lane is answered
+        here — through `bridgectl approve`, so the *bridge* answers it — and the
+        evidence is handed to `approval`, which is the step that grades it.
+        """
+        if self.address is None:
+            raise LaneBlocked("no Session to relay to")
+        mark = self.person.latest_message_id()
+        started = time.monotonic()
+        answer = self.bridgectl(
+            "relay", self.address, RELAYED.words, timeout=support.RELAY_DEADLINE_SECONDS
+        )
+        if not answer.ok:
+            raise StepFailed(f"relay refused: {answer.text}")
+
+        self.approval_evidence = self._answer_pending_approval(mark)
+        performed = support.wait_for(
+            lambda: RELAYED.performed_in(self.config.workspace),
+            deadline_seconds=self.far_side.workspace_effect_seconds,
+        )
+        self.turns.append(Turn("relay", time.monotonic() - started, performed))
+        if "delivered" not in answer.text:
+            raise StepFailed(
+                f"relay answered {answer.text!r}, not `delivered` — and "
+                f"{RELAYED.filename} is {RELAYED.effect_in(self.config.workspace)!r}"
+            )
+        if not performed:
+            raise StepFailed(
+                f"relay answered {answer.text!r} but {RELAYED.filename} never appeared in "
+                f"{self.config.workspace} within "
+                f"{self.far_side.workspace_effect_seconds:.0f}s — a receipt without an effect"
+            )
+        return f"{answer.text}; {RELAYED.filename} contains {RELAYED.content}"
+
+    # --- approval ---------------------------------------------------------
+
+    def approval(self) -> str:
+        """A permission raised inside a Session round-trips through the bridge.
+
+        Graded here, observed during `relay` — the same turn, from the other end.
+        Splitting them into two turns would prove less: the shape the product has
+        to survive is a *relayed* instruction that needs a permission, and that is
+        one turn by definition.
+        """
+        if self.approval_evidence is None:
+            raise StepFailed(
+                "no permission was raised by the relayed instruction, so nothing round-tripped. "
+                "On the Claude lane that is a red: measured 2026-08-26 at "
+                "`--permission-mode default`, a Write of a new file asks "
+                "`Do you want to create <name>?` and the roster goes to `waiting`."
+            )
+        return self.approval_evidence
+
+    # --- companion inbound ------------------------------------------------
+
+    def companion_inbound(self) -> str:
+        """A typed `@<name>: words` becomes a delivered relay, with the line #48 requires."""
+        name = self._name_now()
+        if not name:
+            raise StepFailed("no Session name to address an inbound message to")
+        mark = self.person.latest_message_id()
+        sent = self.person.send(f"@{name}: {INBOUND.words}")
+        self._answer_pending_approval(mark)
+        performed = support.wait_for(
+            lambda: INBOUND.performed_in(self.config.workspace),
+            deadline_seconds=self.far_side.workspace_effect_seconds,
+        )
+        inbound_lines = support.matching_lines(self.engine.log_lines(), r"(?i)inbound")
+        if not performed:
+            raise StepFailed(
+                f"message {sent.id} addressed to @{name} was sent to the bot but "
+                f"{INBOUND.filename} never appeared in {self.config.workspace}; engine.log "
+                f"inbound lines: {inbound_lines[-3:] or 'none'}"
+            )
+        if not inbound_lines:
+            raise StepFailed(
+                f"{INBOUND.filename} was written, so the words arrived, but engine.log carries "
+                f"no inbound line — #48's requirement"
+            )
+        return (
+            f"message {sent.id} → @{name} → {INBOUND.filename} contains {INBOUND.content}; "
+            f"engine.log: {inbound_lines[-1]!r}"
+        )
+
+    # --- switches ---------------------------------------------------------
+
+    def switches(self) -> str:
+        """Duty off pushes nothing; Duty on reports only what is still actionable (#80).
+
+        The turn here ends **waiting on the user** rather than done, because that
+        is what makes a Session still actionable when Duty comes back on. Two
+        observations: silence over a derived window with Duty off, and — with
+        Duty back on — a notice naming this Session.
+        """
+        if self.address is None:
+            raise LaneBlocked("no Session to watch the switches over")
+        off = self.bridgectl("switch", "duty", "off")
+        if not off.ok:
+            raise StepFailed(f"`switch duty off` refused: {off.text}")
+
+        mark = self.person.latest_message_id()
+        turn = self._drive_turn("ask something", ASK_SOMETHING, expect_waiting=True)
+        status = self.bridgectl("status")
+        if not status.ok:
+            raise StepFailed(f"with Duty off, `status` refused: {status.text}")
+        intruder = self.person.await_message(
+            mark, deadline_seconds=self.far_side.absence_window_seconds
+        )
+        if intruder is not None:
+            self.bridgectl("switch", "duty", "on")
+            raise StepFailed(
+                f"with Duty off a message still reached the chat: {intruder.id} {intruder.text!r}"
+            )
+
+        mark = self.person.latest_message_id()
+        back_on = self.bridgectl("switch", "duty", "on")
+        if not back_on.ok:
+            raise StepFailed(f"`switch duty on` refused: {back_on.text}")
+        reconciled = self.person.await_message(
+            mark, deadline_seconds=self.far_side.telegram_round_trip_seconds
+        )
+        if reconciled is None:
+            waiting = self._roster_field("waiting_for")
+            raise StepFailed(
+                f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
+                f"(correct), but turning Duty back on reported nothing about a Session that "
+                f"stopped waiting on the user (turn ended={turn.ended}, "
+                f"roster waiting_for {waiting!r})"
+            )
+        return (
+            f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
+            f"still answered ({status.text.splitlines()[0]!r}); Duty on: message "
+            f"{reconciled.id} {reconciled.text!r}"
+        )
+
+    # --- child ------------------------------------------------------------
+
+    def child(self) -> str:
+        """A child process is seen, never announced, and never spoken to (#79).
+
+        Measured 2026-08-26 and the reason this step can exist at all: a `claude`
+        started with `CLAUDE_CODE_CHILD_SESSION` set is absent from `claude
+        agents --json` altogether. So "the child appears under its parent" is a
+        claim about a source the official roster does not serve, and the product
+        has to find it another way — which is what makes this #79's work rather
+        than a formality.
+        """
+        if self.address is None:
+            raise LaneBlocked("no parent Session to hang a child from")
+        mark = self.person.latest_message_id()
+        before = {_address_of(row) for row in self._roster_rows()}
+        turn = self._drive_turn("child", Instruction(words=self.lane.child_words))
+
+        rows = self._roster_rows()
+        children = [
+            row
+            for row in rows
+            if _address_of(row) not in before
+            and isinstance(row.get("child"), dict)
+            and row["child"].get("kind") == "child"
+        ]
+        if not children:
+            raise StepFailed(
+                f"no child row appeared under {self.address} within "
+                f"{self.far_side.agent_turn_seconds:.0f}s (turn ended={turn.ended}); the roster "
+                f"gained {sorted({_address_of(row) for row in rows} - before) or 'nothing'}. "
+                f"#74 locks `ChildClassification` and #79 fills it."
+            )
+        child_row = children[0]
+        parent = child_row["child"].get("parent")
+        if not parent:
+            raise StepFailed(f"the child row {_address_of(child_row)} names no parent")
+
+        announced = self.person.await_message(
+            mark, deadline_seconds=self.far_side.absence_window_seconds
+        )
+        if announced is not None:
+            raise StepFailed(
+                f"a child raised a Stop Notice: message {announced.id} {announced.text!r} — "
+                f"#79: children are seen, never announced"
+            )
+        refused = self.bridgectl("relay", _address_of(child_row), "this must be refused")
+        if refused.ok:
+            raise StepFailed(
+                f"the child {_address_of(child_row)} was accepted as a Relay target: "
+                f"{refused.text!r} — #79: seen, never spoken to"
+            )
+        return (
+            f"{_address_of(child_row)} listed under {support.flatten([parent])}; no notice in "
+            f"{self.far_side.absence_window_seconds:.0f}s; relay refused: {refused.text!r}"
+        )
+
+    # --- plumbing ---------------------------------------------------------
+
+    def _ground_truth(self) -> hand_started.GroundTruth:
+        """Who the harness started, according to the agent — the oracle, not the product."""
+        if self.truth is not None:
+            return self.truth
+        pid = self.session.pid
+        if pid is None:
+            raise LaneBlocked("the hand-started command never started")
+
+        def found() -> bool:
+            self.truth = self.lane.ground_truth(
+                pid=pid,
+                workspace=self.config.workspace,
+                environment=self.environment,
+                since=self.started_at,
+            )
+            return self.truth is not None
+
+        if not support.wait_for(found, deadline_seconds=self.far_side.agent_turn_seconds):
+            raise LaneBlocked(
+                f"the agent itself never recorded the Session the harness started (pid {pid}, "
+                f"{self.config.workspace}). Screen tail: {self.session.screen_tail()[-600:]!r}"
+            )
+        assert self.truth is not None
+        if not self.session.alive:
+            raise LaneBlocked(
+                f"the hand-started command exited before anything could be asked of it. "
+                f"Screen tail: {self.session.screen_tail()[-600:]!r}"
+            )
+        self.journal("ground.truth", lane=self.lane.name, **vars(self.truth))
+        return self.truth
+
+    def _roster_rows(self) -> list[dict]:
+        data = support.control_plane_payload(
+            support.Action.SESSIONS,
+            socket_path=self.config.socket_path,
+            journal=self.journal,
+            why="provenance and the two reach grades have no rendering yet (#74 locks no format)",
+        )
+        rows = data.get("sessions", [])
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _row_for(self, rows: list[dict], truth: hand_started.GroundTruth) -> dict | None:
+        """The roster row for the Session the harness started — by id, else by pid.
+
+        The session id is the exact key and is used whenever there is one. There
+        is not always one: `codex` writes the rollout that names it when the
+        first *turn* starts (measured 2026-08-26), so before that the only thing
+        either side can agree on is the process. `SessionTarget` carries the pid
+        (`seams/identity.py:8-10`) and #74's Codex process fallback discovers
+        rows by pid and cwd, so matching on it here is the same join the product
+        has to make — not a weaker one the harness invented for itself.
+        """
+        for row in rows:
+            target = row.get("target")
+            if not isinstance(target, dict):
+                continue
+            if truth.session_id and str(target.get("session_id")) == truth.session_id:
+                return row
+            if not truth.session_id and target.get("pid") == truth.pid:
+                return row
+        return None
+
+    def _roster_row(self) -> dict | None:
+        if self.truth is None:
+            return None
+        return self._row_for(self._roster_rows(), self.truth)
+
+    def _roster_field(self, field_name: str) -> object:
+        row = self._roster_row()
+        return row.get(field_name) if row else None
+
+    def _name_now(self) -> str | None:
+        row = self._roster_row()
+        if row is None:
+            return None
+        name = row.get("name")
+        return str(name) if name else None
+
+    def _record_size(self) -> int:
+        """How big the agent's own record is — the far side's own measure of work."""
+        if self.truth is None:
+            return 0
+        record = self.lane.record_now(self.truth, since=self.started_at)
+        return record.stat().st_size if record and record.exists() else 0
+
+    def _drive_turn(
+        self, what: str, instruction: Instruction, *, expect_waiting: bool = False
+    ) -> Turn:
+        """Type an instruction at the keyboard and wait for the turn to be over.
+
+        Over means one of two things, and the caller says which: the agent's own
+        record stopped growing (a turn that finished), or the roster says the
+        Session is waiting on the user. Both are read from outside; neither is
+        the screen.
+        """
+        started = time.monotonic()
+        self.session.submit(instruction.words)
+        settled_for = 0.0
+        last = self._record_size()
+        ended = False
+        deadline = started + self.far_side.agent_turn_seconds
+        while time.monotonic() < deadline:
+            time.sleep(3.0)
+            if expect_waiting and self._roster_field("state") == "waiting":
+                ended = True
+                break
+            size = self._record_size()
+            if size != last:
+                last, settled_for = size, 0.0
+                continue
+            settled_for += 3.0
+            # A record that has not grown for two polls after growing at all is a
+            # turn that is over; before it grows at all there is nothing to settle.
+            if size > 0 and settled_for >= 9.0:
+                ended = True
+                break
+        turn = Turn(what, time.monotonic() - started, ended)
+        self.turns.append(turn)
+        self.journal("turn", lane=self.lane.name, what=what, seconds=turn.seconds, ended=turn.ended)
+        return turn
+
+    def _answer_pending_approval(self, mark: int) -> str | None:
+        """Answer, through the bridge, whatever permission the current turn raises.
+
+        Journaled rather than asserted here: a lane that stalled on an unanswered
+        permission would report a missing file where the truth is a waiting
+        dialog, and that is a worse lie than a longer journal. `approval` grades
+        what this returns.
+        """
+        deadline = time.monotonic() + self.far_side.agent_turn_seconds
+        while time.monotonic() < deadline:
+            data = support.control_plane_status(self.config.socket_path, self.journal)
+            pending = list(data.get("pending_approvals", []))
+            if pending:
+                announced = self.person.await_message(
+                    mark,
+                    deadline_seconds=self.far_side.telegram_round_trip_seconds,
+                    matching=lambda seen: (
+                        seen.from_bot and bool(APPROVAL_ANNOUNCEMENT.search(seen.text))
+                    ),
+                )
+                approval_id = str(pending[0]["approval_id"])
+                answer = self.bridgectl("approve", approval_id, "allow")
+                self.journal(
+                    "approval.answered",
+                    lane=self.lane.name,
+                    approval_id=approval_id,
+                    announced=bool(announced),
+                    reply=answer.text,
+                )
+                where = (
+                    f"announced as chat message {announced.id}"
+                    if announced
+                    else "NOT announced in the chat"
+                )
+                if not answer.ok:
+                    raise StepFailed(f"`approve {approval_id} allow` refused: {answer.text}")
+                return f"approval {approval_id}: {where}; approve answered {answer.text!r}"
+            time.sleep(2.0)
+        self.journal("approval.none", lane=self.lane.name)
+        return None
+
+
+def _address_of(row: dict) -> str:
+    """`agent:session_id[:pid]`, the way `control_plane/commands.py:116` writes it."""
+    target = row.get("target")
+    if not isinstance(target, dict):
+        return "<no target>"
+    pid = target.get("pid")
+    tail = f":{pid}" if pid else ""
+    return f"{target.get('agent')}:{target.get('session_id')}{tail}"
