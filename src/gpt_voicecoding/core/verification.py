@@ -52,7 +52,6 @@ from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 #: single name, and the composition root appends the `AgentKind`.
 CALL_SEAM = "call"
 CHANNEL_SEAM = "companion_channel"
-LAUNCHER_SEAM = "session_launcher"
 AGENT_SEAM_PREFIX = "agent."
 
 

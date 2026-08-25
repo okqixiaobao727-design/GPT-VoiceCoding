@@ -232,16 +232,6 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
-            id="core.authority.owns-sessions-and-their-launcher",
-            audience=Audience.CORE,
-            source="skill/SKILL.md:73-83",
-            gist=(
-                "Bringing a Session into existence and closing one are Bridge Core's own "
-                "verbs, carried out through the Session Launcher seam."
-            ),
-            enforced_by="the hub's launch and close transactions — core/bridge.py",
-        ),
-        Rule(
             id="dropped.skill.frontmatter-and-trigger",
             audience=Audience.DROPPED,
             source="skill/SKILL.md:1-8",
@@ -471,85 +461,6 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         # --- skill/closing.md ----------------------------------------------
-        Rule(
-            id="voice.close.confirms-before-it-is-irreversible",
-            audience=Audience.VOICE,
-            source="skill/closing.md:1-24",
-            gist=(
-                "Closing cannot be undone, so exactly one Session is named back to the user "
-                "and closed only after they confirm that one in their own words."
-            ),
-        ),
-        Rule(
-            id="core.close.rejects-stale-or-ambiguous",
-            audience=Audience.CORE,
-            source="skill/closing.md:1-24",
-            gist="A close acts on one exact identity, and Bridge Core refuses any other.",
-            enforced_by="the hub's close transaction and its stale-target refusal — core/bridge.py",
-        ),
-        Rule(
-            id="delegated.close.acts-on-the-exact-session",
-            audience=Audience.DELEGATED,
-            source="skill/closing.md:25-34",
-            gist=(
-                "Close through the control plane, by exact identity, once — and never by "
-                "reaching for whatever terminal happens to be in front of you."
-            ),
-        ),
-        Rule(
-            id="adapter.launcher.pane-semantics-are-its-own",
-            audience=Audience.ADAPTER,
-            source="skill/closing.md:25-34",
-            gist=(
-                "What a close does below the Session — a pane, a window, a child process — "
-                "is the selected Launcher adapter's own meaning, and belongs to the tmux "
-                "adapter alone where it is about panes."
-            ),
-            enforced_by="the Session Launcher adapters' CloseOutcome — issue #9",
-        ),
-        Rule(
-            id="adapter.launcher.owns-what-it-closed",
-            audience=Audience.ADAPTER,
-            source="skill/closing.md:35-49",
-            gist=(
-                "Per-child outcomes are reported truthfully by the Launcher adapter that "
-                "actually owns those children, and by nothing else."
-            ),
-            enforced_by="the Session Launcher adapters — issue #9",
-        ),
-        Rule(
-            id="voice.close.reports-what-went-with-it",
-            audience=Audience.VOICE,
-            source="skill/closing.md:35-49",
-            gist=(
-                "Say truthfully what became of each thing that belonged to the Session, one "
-                "outcome at a time: it closed with it, it was already gone and leaves nothing "
-                "outstanding, or it is still running and has to be dealt with at the keyboard "
-                "— including when it is still running because it had been moved elsewhere. "
-                "When nothing was attached at all, say that, because then anything that "
-                "Session opened is still there."
-            ),
-        ),
-        Rule(
-            id="adapter.launcher.holds-the-recorded-destination",
-            audience=Audience.ADAPTER,
-            source="skill/closing.md:50-60",
-            gist=(
-                "The recorded terminal address is the adapter's own, and a Session it holds "
-                "no address for is one it says it cannot close, rather than guessing at."
-            ),
-            enforced_by="the Session Launcher adapters' close path — issue #9",
-        ),
-        Rule(
-            id="core.close.identity-is-the-only-selector",
-            audience=Audience.CORE,
-            source="skill/closing.md:50-60",
-            gist=(
-                "A missing or stale identity fails closed. A window name, a working "
-                "directory, a foreground window or recent activity never select a target."
-            ),
-            enforced_by="the hub's close transaction over the Session registry — core/bridge.py",
-        ),
         # --- skill/retrying.md ---------------------------------------------
         Rule(
             id="core.retry.owns-escalation-and-eligibility",
@@ -626,26 +537,6 @@ def _rules() -> tuple[Rule, ...]:
         ),
         # --- skill/starting.md ---------------------------------------------
         Rule(
-            id="voice.start.needs-an-explicit-agent-and-workspace",
-            audience=Audience.DROPPED,
-            source="skill/starting.md:1-24",
-            gist=(
-                "The old requirement to hear an explicit agent and absolute workspace. "
-                "The configured default agent and project catalogue replace both."
-            ),
-        ),
-        Rule(
-            id="voice.start.complete-request-launches-directly",
-            audience=Audience.VOICE,
-            source="issue/25",
-            gist=(
-                "A project reference and task are a complete launch request. Use the "
-                "configured default agent unless the user named one, and issue exactly one "
-                "launch action without help, roster or status preflight and without a "
-                "confirmation round. Ask only when project resolution is not unique."
-            ),
-        ),
-        Rule(
             id="voice.start.an-empty-read-is-not-a-failed-read",
             audience=Audience.VOICE,
             source="skill/starting.md:25-41",
@@ -664,84 +555,6 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
-            id="delegated.start.resolves-without-guessing",
-            audience=Audience.DELEGATED,
-            source="skill/starting.md:42-54",
-            gist=(
-                "Carry the user's project reference and task to the launch action. Bridge "
-                "Core resolves the workspace; the Delegated Turn never invents one."
-            ),
-        ),
-        Rule(
-            id="adapter.launcher.owns-its-workspace-contract",
-            audience=Audience.ADAPTER,
-            source="skill/starting.md:42-54",
-            gist=(
-                "What a workspace means, and which launch choices exist, belong to the "
-                "Launcher adapter's own typed request."
-            ),
-            enforced_by="the Session Launcher seam's LaunchRequest — seams/session_launcher.py",
-        ),
-        Rule(
-            id="adapter.launcher.tmux-destinations-are-tmux-only",
-            audience=Audience.ADAPTER,
-            source="skill/starting.md:55-69",
-            gist=(
-                "Confirming which window or pane a Session opens in exists only in the "
-                "optional tmux adapter, and must appear in no shared instruction set: a "
-                "rule about panes is a rule for whichever adapter is not loaded."
-            ),
-            enforced_by="the optional tmux Launcher adapter — issue #9",
-        ),
-        Rule(
-            id="delegated.start.launches-once-and-waits",
-            audience=Audience.DELEGATED,
-            source="skill/starting.md:70-96",
-            gist=(
-                "One spoken request is one launch, carrying one request identity, and its "
-                "outcome is waited for rather than assumed."
-            ),
-        ),
-        Rule(
-            id="delegated.start.complete-request-launches-directly",
-            audience=Audience.DELEGATED,
-            source="issue/25",
-            gist=(
-                "A complete project-and-task request is exactly one launch action. Do not "
-                "read help, sessions or status first and do not ask for confirmation."
-            ),
-        ),
-        Rule(
-            id="core.start.owns-the-launch-outcome",
-            audience=Audience.CORE,
-            source="skill/starting.md:70-96",
-            gist=(
-                "Bridge Core registers what the Launcher returned, and a repeated request "
-                "identity returns the first outcome instead of opening a second Session."
-            ),
-            enforced_by="the hub's launch transaction over the registry — core/bridge.py",
-        ),
-        Rule(
-            id="adapter.launcher.carries-the-resolved-fields",
-            audience=Audience.ADAPTER,
-            source="skill/starting.md:70-96",
-            gist=(
-                "The resolved launch fields travel as the selected adapter's typed request, "
-                "not as six loose values that could disagree."
-            ),
-            enforced_by="the Session Launcher seam's LaunchRequest — seams/session_launcher.py",
-        ),
-        Rule(
-            id="voice.start.started-is-not-named",
-            audience=Audience.VOICE,
-            source="skill/starting.md:108-126",
-            gist=(
-                "Report only what actually happened. A new Session has started and has not "
-                "named itself yet — say both, in that order, and describe it by the user's "
-                "own project reference and task until a label exists."
-            ),
-        ),
-        Rule(
             id="core.start.exact-identity-until-a-label-exists",
             audience=Audience.CORE,
             source="skill/starting.md:108-126",
@@ -750,37 +563,6 @@ def _rules() -> tuple[Rule, ...]:
                 "registers, whether or not it has a Session Label yet."
             ),
             enforced_by="the Session registry's label-independent targets — core/sessions.py",
-        ),
-        Rule(
-            id="voice.start.no-success-on-a-failure",
-            audience=Audience.VOICE,
-            source="skill/starting.md:127-138",
-            gist=(
-                "A launch that failed did not start anything; say so and name what failed. "
-                "Task text refused as given is repeated by the user, never repaired."
-            ),
-        ),
-        Rule(
-            id="adapter.launcher.launch-failures-are-its-own",
-            audience=Audience.ADAPTER,
-            source="skill/starting.md:127-138",
-            gist=(
-                "Why a launch failed is the selected Launcher adapter's own detail — its "
-                "destinations, its refusals — reported truthfully upward and never "
-                "generalised into a rule shared with the adapter that has none of them."
-            ),
-            enforced_by="the Session Launcher adapters' LaunchOutcome detail — issue #9",
-        ),
-        Rule(
-            id="adapter.launcher.read-failures-are-its-own",
-            audience=Audience.ADAPTER,
-            source="skill/starting.md:139-148",
-            gist=(
-                "Why reading a machine failed — a timeout, an unreachable terminal server — "
-                "is the same adapter's detail, carried up as the reason a read produced no "
-                "reading at all."
-            ),
-            enforced_by="the Session Launcher adapters' own failure detail — issue #9",
         ),
         Rule(
             id="dropped.starting.duty-gated-reads",

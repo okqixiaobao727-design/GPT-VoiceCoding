@@ -7,7 +7,9 @@ agents.
 > **Status: early build.** Every part is now built and tested — Bridge Core, the
 > control plane, the composition root, the Codex and Claude Agent adapters with
 > all three Relays, the bridge-owned Live Call, the Companion Channel, the
-> Session Launcher, the menu-bar shell, and the signed app bundle. It has not
+> menu-bar shell, and the signed app bundle. Starting and closing sessions are
+> deliberately not among them: v1.0 is a bridge over the sessions you start
+> yourself, and the Session Launcher is parked for a later release. It has not
 > been through a release. If you want software with users on it, the
 > first-generation implementation lives at
 > [GPT-VoiceCoding-legacy](https://github.com/okqixiaobao727-design/GPT-VoiceCoding-legacy).
@@ -16,9 +18,10 @@ agents.
 
 You are away from the keyboard. A Claude Code or Codex session stops and needs
 you. GPT-VoiceCoding tells you — out loud, in a voice call it holds open — and
-carries your spoken answer back into the session. It launches sessions, watches
-them, relays your words into them, and answers their permission prompts with your
-verdict.
+carries your spoken answer back into the session. It watches the sessions you
+start, relays your words into them, and answers their permission prompts with
+your verdict. It does not start them — you do, with your own `claude` or `codex`
+command, and the bridge covers whatever is running.
 
 The voice call is owned by this system directly, over `codex app-server`'s realtime
 route. There is no API key to supply.
@@ -27,8 +30,8 @@ route. There is no API key to supply.
 
 A thin Swift menu-bar app spawns a single Python asyncio engine from inside its own
 bundle. That engine is **Bridge Core**: it owns every policy and holds the single
-source of truth, and reaches everything else — the call, the coding agents, session
-launching, the Companion Channel — through seams with swappable adapters.
+source of truth, and reaches everything else — the call, the coding agents, the
+Companion Channel — through seams with swappable adapters.
 
 ```
 src/gpt_voicecoding/

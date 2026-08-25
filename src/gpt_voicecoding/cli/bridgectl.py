@@ -32,7 +32,7 @@ from gpt_voicecoding.control_plane.client import (
     timeout_for,
 )
 from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
-from gpt_voicecoding.seams.control_plane import Action, Request
+from gpt_voicecoding.seams.control_plane import Action
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -84,7 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         reply = asyncio.run(ask(request, path=socket_path, timeout=timeout))
     except EngineSilent as unanswered:
-        print(_still_in_flight(unanswered, request), file=sys.stderr)
+        print(str(unanswered), file=sys.stderr)
         return EXIT_UNREACHABLE
     except EngineUnreachable as down:
         print(str(down), file=sys.stderr)
@@ -96,29 +96,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     print(rendered, file=sys.stderr)
     return EXIT_REFUSED
-
-
-def _still_in_flight(unanswered: EngineSilent, request: Request) -> str:
-    """Say what a silent deadline actually means, and for a launch, what to do.
-
-    The engine said nothing, so there is no engine speech to relay and none is
-    invented here: the deadline is this surface's own, and so is the report of
-    it. What is added for a launch is a fact about the hub's behaviour — a
-    launch is held under its request id and a repeat of the identical request
-    joins it rather than starting a second one — so the safe recovery is the
-    one an operator is least likely to guess. The wrong guess is named too,
-    because telling someone only the right move still leaves the plausible
-    wrong one looking free.
-    """
-    if request.action is not Action.LAUNCH:
-        return str(unanswered)
-    request_id = request.payload.get("request_id")
-    return (
-        f"{unanswered}; the launch may still be in flight. Re-issue this exact "
-        f"command with the same --request-id {request_id} to join it and hear how "
-        "it ended — a fresh --request-id would start a second agent in the same "
-        "workspace."
-    )
 
 
 def _socket_path(arguments: argparse.Namespace) -> Path:

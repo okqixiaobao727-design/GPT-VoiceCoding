@@ -17,20 +17,17 @@ from typing import Any
 
 import pytest
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.config import ConfigError, of
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
-
-CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 #: What a factory that accepts a settings table was handed, per seam.
 handed: dict[str, Any] = {}
 
 
-def launcher_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeSessionLauncher:
-    handed["session_launcher"] = settings
-    return FakeSessionLauncher(targets=[CODEX], sink=sink)
+def channel_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeCompanionChannel:
+    handed["companion_channel"] = settings
+    return FakeCompanionChannel(sink=sink)
 
 
 def agent_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeAgent:
@@ -38,27 +35,22 @@ def agent_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeAgen
     return FakeAgent(sink=sink)
 
 
-def launcher_taking_only_the_sink(*, sink: Any = None) -> FakeSessionLauncher:
+def channel_taking_only_the_sink(*, sink: Any = None) -> FakeCompanionChannel:
     """The shape every adapter had before this table existed."""
-    return FakeSessionLauncher(targets=[CODEX], sink=sink)
+    return FakeCompanionChannel(sink=sink)
 
 
 def document(**adapters: Any) -> dict[str, Any]:
     """One whole configuration document, with the seams filled by fakes."""
     chosen: dict[str, Any] = {
         "call": "fakes:FakeCall",
-        "companion_channel": "fakes:FakeCompanionChannel",
-        "session_launcher": "test_adapter_settings:launcher_taking_only_the_sink",
+        "companion_channel": "test_adapter_settings:channel_taking_only_the_sink",
         "agents": {"codex": "fakes:FakeAgent"},
     }
     chosen.update(adapters)
     return {
         "engine": {},
         "adapters": chosen,
-        "launch": {
-            "default_agent": "codex",
-            "projects": [{"name": "adapter tests", "workspace": "/tmp"}],
-        },
         "delegate": {"model": "a-model"},
         "log": {"max_bytes": 1, "retained_files": 0, "stripped_environment_prefixes": []},
     }
@@ -99,12 +91,12 @@ class TestForwardingTheTable:
         Engine.assemble(
             of(
                 document(
-                    session_launcher="test_adapter_settings:launcher_taking_settings",
-                    settings={"session_launcher": {"pane": "left"}},
+                    companion_channel="test_adapter_settings:channel_taking_settings",
+                    settings={"companion_channel": {"chat_id": "left"}},
                 )
             )
         )
-        assert handed["session_launcher"] == {"pane": "left"}
+        assert handed["companion_channel"] == {"chat_id": "left"}
 
     def test_an_agent_seam_is_handed_its_own_table(self) -> None:
         handed.clear()
@@ -121,11 +113,10 @@ class TestForwardingTheTable:
     def test_a_seam_with_no_table_is_called_exactly_as_before(self) -> None:
         """The compatibility guarantee: an adapter taking only the sink still builds."""
         engine = Engine.assemble(of(document()))
-        assert isinstance(engine.adapters.launcher, FakeSessionLauncher)
         assert isinstance(engine.adapters.call, FakeCall)
         assert isinstance(engine.adapters.channel, FakeCompanionChannel)
 
     def test_a_table_for_an_adapter_that_takes_none_says_so_plainly(self) -> None:
         """Naming the settings in the refusal is what makes the mistake findable."""
         with pytest.raises(EngineAssemblyError, match="and its settings table"):
-            Engine.assemble(of(document(settings={"session_launcher": {"pane": "left"}})))
+            Engine.assemble(of(document(settings={"call": {"model": "a-model"}})))

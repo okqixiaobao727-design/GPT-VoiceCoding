@@ -99,6 +99,18 @@ of binaries the next build will sign.
 
 ## The v0 acceptance
 
+> **This procedure predates v1.0's scope cut and has not been reshaped yet.**
+> Launching and closing Sessions are parked
+> ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72));
+> `bridgectl launch` and `bridgectl close` no longer exist, so every step below
+> that runs one is unperformable as written. Read them as the record of the v0
+> run they are. The reshaped procedure — the harness starting Sessions through
+> the ordinary installed `claude` / `codex` path, the way a user does — is the
+> exit condition of
+> [#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67) and
+> is written there, not here. The findings in this section, including the
+> limitations below, are kept as measured.
+
 Everything above is machine-checked on every PR. What follows is not, and cannot
 be: it needs a microphone, a person to click a TCC prompt, a real Telegram bot
 and two real coding agents. Run it **once, in order, from a bundled build**, on a

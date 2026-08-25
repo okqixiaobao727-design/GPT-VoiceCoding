@@ -17,34 +17,26 @@ import asyncio
 import json
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-import textwrap
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from fakes import FakeAgent, FakeCall, FakeCompanionChannel, FakeSessionLauncher
-from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION, ClaudeAgentAdapter
+from fakes import FakeAgent, FakeCall, FakeCompanionChannel
+from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
-from gpt_voicecoding.adapters.session_launcher import direct_child_launcher
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
-from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.control_plane.server import AlreadyServing
-from gpt_voicecoding.core.lifecycle import Lifecycle
-from gpt_voicecoding.core.relay_queue import RelayKind
-from gpt_voicecoding.core.sessions import SessionState
+from gpt_voicecoding.core.sessions import Session, SessionState
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
 from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
-from gpt_voicecoding.seams.session_launcher import LaunchOutcome, LaunchRequest, LaunchStatus
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(
@@ -53,16 +45,6 @@ CLAUDE = SessionTarget(
     pid=os.getpid(),
 )
 EVENT_SETTLE_TIMEOUT_SECONDS = 10.0
-
-
-def one_session_launcher(*, sink: object = None) -> FakeSessionLauncher:
-    """A Launcher factory with exactly one Session to hand out.
-
-    Named in a configuration file the way a real adapter's factory will be —
-    which is the point: the composition root imports whatever the file names,
-    and a test's own module is as legitimate a source as a shipped adapter.
-    """
-    return FakeSessionLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
 
 
 class RidingCall(FakeCall):
@@ -90,191 +72,6 @@ def agent_that_owns_one(*, sink: object = None) -> ServerOwningAgent:
     return ServerOwningAgent(sink=sink)  # type: ignore[arg-type]
 
 
-class IntroducedLauncher(FakeSessionLauncher):
-    """A Launcher that asks to be introduced to the Agent adapters, as both real ones do.
-
-    A launch carries things only an Agent spoke can name — where this engine
-    parks permission dialogs, which byte budgets its Session Channel was
-    configured with — so the real launchers take those adapters and the root is
-    what hands them over.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.met_claude: object = None
-        self.met_codex: object = None
-
-    def use_claude(self, adapter: object) -> None:
-        self.met_claude = adapter
-
-    def use_codex(self, adapter: object) -> None:
-        self.met_codex = adapter
-
-
-def launcher_that_wants_introducing(*, sink: object = None) -> IntroducedLauncher:
-    return IntroducedLauncher(targets=[CODEX], sink=sink)  # type: ignore[arg-type]
-
-
-def scripted_codex(path: Path) -> Path:
-    """A process-level Codex stand-in for the assembled engine's launch path."""
-    driver = path.with_suffix(".py")
-    driver.write_text(
-        textwrap.dedent(
-            f"""\
-            import asyncio
-            import sys
-            from pathlib import Path
-
-            sys.path.insert(0, {str(Path(__file__).parent)!r})
-            sys.path.insert(0, {str(Path(__file__).parents[1] / "src")!r})
-
-            from codex_fake import FakeAppServer
-
-            THREAD_ID = "scripted-session"
-            TURN_ID = "scripted-turn"
-
-
-            async def serve() -> None:
-                listen = next(arg for arg in sys.argv if arg.startswith("unix://"))
-                socket_path = Path(listen.removeprefix("unix://"))
-                ready = socket_path.parent / "tui.ready"
-                open_window = Path.cwd() / "window.open"
-                delivered = []
-                server = FakeAppServer(socket_path)
-                server.answers("initialize", {{}})
-                server.answers(
-                    "thread/resume",
-                    lambda _params: {{
-                        "thread": {{"id": THREAD_ID, "status": {{"type": "active"}}}},
-                        "approvalPolicy": "on-request",
-                        "approvalsReviewer": "user",
-                    }},
-                )
-
-                def start_turn(params):
-                    delivered.append(params["clientUserMessageId"])
-                    return {{"turn": {{"id": TURN_ID, "status": "inProgress"}}}}
-
-                server.answers("turn/start", start_turn)
-                server.answers(
-                    "thread/read",
-                    lambda _params: {{
-                        "thread": {{
-                            "id": THREAD_ID,
-                            "turns": [
-                                {{
-                                    "items": [
-                                        {{"type": "userMessage", "clientId": request_id}}
-                                        for request_id in delivered
-                                    ]
-                                }}
-                            ],
-                        }}
-                    }},
-                )
-                server.answers("thread/loaded/list", {{"data": []}})
-                await server.start()
-                try:
-                    while not ready.exists() or server.connection_count == 0:
-                        await asyncio.sleep(0.01)
-                    await server.notify_all(
-                        "thread/started",
-                        {{
-                            "thread": {{
-                                "id": THREAD_ID,
-                                "cwd": str(Path.cwd()),
-                                "status": {{"type": "active"}},
-                                "turns": [],
-                            }}
-                        }},
-                    )
-                    while not open_window.exists():
-                        await asyncio.sleep(0.01)
-                    await server.notify_all(
-                        "thread/status/changed",
-                        {{"threadId": THREAD_ID, "status": {{"type": "idle"}}}},
-                    )
-                    await asyncio.Event().wait()
-                finally:
-                    await server.aclose()
-
-
-            async def tui() -> None:
-                remote = next(arg for arg in sys.argv if arg.startswith("unix://"))
-                ready = Path(remote.removeprefix("unix://")).parent / "tui.ready"
-                ready.touch()
-                await asyncio.Event().wait()
-
-
-            asyncio.run(serve() if "app-server" in sys.argv else tui())
-            """
-        ),
-        encoding="utf-8",
-    )
-    path.write_text(f'#!/bin/sh\nexec {sys.executable} "{driver}" "$@"\n', encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
-
-
-class ClaudeRegisteringLauncher(FakeSessionLauncher):
-    """A launch that registers its channel before it reports success, as Claude does.
-
-    **The task boundary is the faithful part, not a nicety (#27).** Every real
-    launch runs inside one: `LaunchRegistry.once` spawns the launching work with
-    `asyncio.ensure_future` and awaits it through `asyncio.shield`
-    (`session_launcher/lifecycle.py:55-59`), so the coroutine that resumes when a
-    launch finishes is *not* the one that ran it. It is woken by `call_soon`, on
-    a later turn of the loop, with `shield` adding a second hop on top.
-
-    That gap is where the defect lives. `register_session` puts the report on the
-    queue with `put_nowait`, which makes the dispatch loop — parked on
-    `queue.get()` — runnable immediately; the loop then services it while the
-    launch is handing its outcome back, which is *before* Bridge Core writes the
-    roster row. So the report arrives for a Session the hub does not yet hold and
-    is dropped as unknown.
-
-    Note where the gap is **not**: `ClaudeSessionPreparation.confirm` really does
-    register and return with nothing awaited after it, and reading only that call
-    stack suggests the loop can never interleave. It can, because `_launching` is
-    spawned rather than called. Reproducing the boundary rather than sleeping
-    past it is what keeps this helper honest about which mechanism it stands for.
-
-    Without it this fake registered and returned in one uninterrupted step, the
-    dispatch loop never ran in the gap, and the event waited harmlessly in the
-    queue until the roster row existed — production's ordering defect papered
-    over by the fake's own timing, which is why this helper passed a Session's
-    window through for as long as the defect was live.
-    """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        self.claude: ClaudeAgentAdapter | None = None
-
-    def use_claude(self, adapter: ClaudeAgentAdapter) -> None:
-        self.claude = adapter
-
-    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
-        # Spawned and shielded exactly as `LaunchRegistry.once` does it, so the
-        # scheduling boundary under test is production's own and not this
-        # helper's invention.
-        return await asyncio.shield(asyncio.ensure_future(self._launching(request)))
-
-    async def _launching(self, request: LaunchRequest) -> LaunchOutcome:
-        outcome = await super().launch(request)
-        if outcome.status is LaunchStatus.LAUNCHED:
-            assert outcome.target is not None
-            assert self.claude is not None
-            self.claude.register_session(
-                outcome.target,
-                Path(tempfile.gettempdir()) / f"gvc-test-{outcome.target.pid}.sock",
-            )
-        return outcome
-
-
-def claude_registering_launcher(*, sink: object = None) -> ClaudeRegisteringLauncher:
-    return ClaudeRegisteringLauncher(targets=[CLAUDE], sink=sink)  # type: ignore[arg-type]
-
-
 CONFIG = """
 [engine]
 socket_path = "{socket}"
@@ -283,18 +80,9 @@ state_path = "{state}"
 [adapters]
 call = "fakes:FakeCall"
 companion_channel = "fakes:FakeCompanionChannel"
-session_launcher = "test_engine:one_session_launcher"
 
 [adapters.agents]
 codex = "fakes:FakeAgent"
-
-[launch]
-default_agent = "codex"
-
-[[launch.projects]]
-name = "GPT-VoiceCoding"
-workspace = "{workspace}"
-spoken_aliases = ["GPT Live"]
 
 [delegate]
 model = "the-model-the-user-chose"
@@ -324,7 +112,6 @@ def configured(home: Path, text: str = CONFIG) -> Path:
             socket=home / "control.sock",
             state=home / "state.json",
             log=home / "engine.log",
-            workspace=home,
         ),
         encoding="utf-8",
     )
@@ -336,46 +123,34 @@ def assembled(home: Path, text: str = CONFIG) -> Engine:
 
 
 def with_idle_claude(home: Path, *, poll_seconds: float = 0.02) -> str:
-    """Use the real Claude spoke and the launch order that introduces a Session to it.
+    """Use the real Claude spoke rather than the fake one.
 
-    `poll_seconds` is normally fast enough for a test to watch a sweep work. Set
-    it long enough to outlive the test and the sweep provably cannot have run,
-    which is how #27's requirement — reachable *without* waiting for a
-    subsequent window transition — is asserted rather than assumed.
+    `poll_seconds` is the Reply-Window sweep's interval; a test that needs the
+    sweep provably not to have run sets it longer than the test lives.
     """
-    return (
-        CONFIG.replace(
-            'session_launcher = "test_engine:one_session_launcher"',
-            'session_launcher = "test_engine:claude_registering_launcher"',
-        )
-        .replace(
-            'codex = "fakes:FakeAgent"',
-            'claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"',
-        )
-        .replace('default_agent = "codex"', 'default_agent = "claude"')
-        .replace(
-            "[delegate]",
-            "\n".join(
-                (
-                    '[adapters.settings."agent.claude"]',
-                    f'registry_directory = "{home / "sessions"}"',
-                    f'socket_directory = "{home / "sockets"}"',
-                    f"reply_window_poll_seconds = {poll_seconds}",
-                    "",
-                    "[delegate]",
-                )
-            ),
-        )
+    return CONFIG.replace(
+        'codex = "fakes:FakeAgent"',
+        'claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"',
+    ).replace(
+        "[delegate]",
+        "\n".join(
+            (
+                '[adapters.settings."agent.claude"]',
+                f'registry_directory = "{home / "sessions"}"',
+                f'socket_directory = "{home / "sockets"}"',
+                f"reply_window_poll_seconds = {poll_seconds}",
+                "",
+                "[delegate]",
+            )
+        ),
     )
 
 
 def write_idle_claude_record(home: Path, *, status: str = "idle") -> None:
     """Write the registry level the real Claude Reply-Window watcher reads.
 
-    `status` exists so a test can stand the already-idle case next to the
-    busy-at-registration control (#27). The control matters because it is the
-    case that passed even with the defect present — the dropped report happened
-    to carry CLOSED, which is what Bridge Core defaults to anyway.
+    `status` is the level the record carries, so a test can stand an idle
+    Session next to a busy one.
     """
     sessions = home / "sessions"
     sessions.mkdir()
@@ -429,6 +204,26 @@ def write_state_holding_a_live_session(home: Path, *, pid: int) -> None:
     )
 
 
+def put_on_the_roster(engine: Engine, target: SessionTarget = CODEX) -> None:
+    """Seed one Session row on a running engine.
+
+    There is no public verb for this. The launch transaction that used to write
+    the roster is parked (#72) and the discovery path that replaces it is not
+    built yet, so a test that needs a row reaches past `BridgeCore` to put one
+    there. What these tests are about is what happens once a row exists, not
+    how it arrived — and the reach is written here once so #74 has one call
+    site to replace.
+    """
+    engine.core._state.sessions.register(
+        Session(
+            target=target,
+            label=SessionLabel(project="GPT-VoiceCoding", task="t"),
+            workspace=Path("/tmp/workspace"),
+            registered_at=0.0,
+        )
+    )
+
+
 async def running(engine: Engine, work) -> object:
     """Run the engine, do one thing against it, and shut it down."""
     await engine.start()
@@ -439,39 +234,6 @@ async def running(engine: Engine, work) -> object:
 
 
 class TestAssembly:
-    def test_generated_instructions_receive_the_launch_parsers_usage(self, home: Path) -> None:
-        instructions = assembled(home).core.instructions
-
-        assert instructions is not None
-        assert USAGE[Action.LAUNCH] in instructions.voice.text
-        assert USAGE[Action.LAUNCH] in instructions.delegated.text
-
-    def test_launch_configuration_reaches_bridge_core(self, home: Path) -> None:
-        engine = assembled(home)
-        request = Request(
-            action=Action.LAUNCH,
-            payload={
-                "request_id": new_request_id(),
-                "project": "GPT Live",
-                "task": "prove configuration composition",
-            },
-        )
-
-        async def scenario() -> Reply:
-            return await running(engine, lambda: ask(request, path=engine.socket_path))
-
-        reply = asyncio.run(scenario())
-
-        assert reply.ok
-        launcher = engine.adapters.launcher
-        assert isinstance(launcher, FakeSessionLauncher)
-        assert len(launcher.requests) == 1
-        launched = launcher.requests[0]
-        assert launched.agent is AgentKind.CODEX
-        assert launched.workspace == home
-        assert launched.label.project == "GPT-VoiceCoding"
-        assert launched.label.task == "prove configuration composition"
-
     def test_the_engine_serves_the_control_plane_it_was_configured_with(self, home: Path) -> None:
         engine = assembled(home)
 
@@ -496,7 +258,7 @@ class TestAssembly:
 
         seams = {row["seam"]: row for row in asyncio.run(scenario()).data["seams"]}
 
-        assert set(seams) == {"call", "companion_channel", "session_launcher", "agent.codex"}
+        assert set(seams) == {"call", "companion_channel", "agent.codex"}
         assert seams["call"]["configured"] == "fakes:FakeCall"
         # The adapter names itself; the engine never echoes the file back at you.
         assert seams["call"]["loaded"] == "tests.fakes.FakeCall"
@@ -654,41 +416,14 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
     Both of the ticket's consequences are exercised here against the real Claude
     spoke and the real state file: the Session whose process is gone, and the
     Session whose process is perfectly healthy.
+
+    The rows are written straight into the state file. They used to be made by
+    launching one and stopping the engine, which is parked (#72) — and the file
+    is the more faithful input anyway, because it is what a restart really
+    reads. What went with the launch is the *premise* test, which proved a live
+    Session is persisted as `live`; #74 owns proving that again once something
+    registers a Session.
     """
-
-    def a_launched_session(self, home: Path) -> str:
-        """Launch one real Claude Session, stop the engine, and leave state behind."""
-        write_idle_claude_record(home)
-        text = with_idle_claude(home)
-        engine = assembled(home, text)
-
-        async def scenario() -> Reply:
-            return await running(
-                engine,
-                lambda: ask(
-                    Request(
-                        action=Action.LAUNCH,
-                        payload={
-                            "request_id": new_request_id(),
-                            "agent": "claude",
-                            "project": "GPT Live",
-                            "task": "t",
-                        },
-                    ),
-                    path=engine.socket_path,
-                ),
-            )
-
-        assert asyncio.run(scenario()).ok
-        return text
-
-    def test_a_live_session_is_what_the_stopped_engine_really_wrote_down(self, home: Path) -> None:
-        """The premise of the rest: a Session that was live is persisted as live."""
-        self.a_launched_session(home)
-
-        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
-
-        assert [row["state"] for row in persisted["sessions"]] == ["live"]
 
     def test_a_restored_session_whose_process_is_alive_is_not_left_claiming_to_be_live(
         self, home: Path
@@ -700,7 +435,8 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
         holds no channel to it and Bridge Core would queue the user's own words
         against a Reply Window nothing observes.
         """
-        text = self.a_launched_session(home)
+        write_state_holding_a_live_session(home, pid=os.getpid())
+        text = with_idle_claude(home)
         restarted = assembled(home, text)
 
         async def read() -> Reply:
@@ -716,7 +452,8 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
 
     def test_the_roster_says_only_what_the_adapter_can_back_up(self, home: Path) -> None:
         """The point of the fix: core state and the adapter's real reach agree."""
-        text = self.a_launched_session(home)
+        write_state_holding_a_live_session(home, pid=os.getpid())
+        text = with_idle_claude(home)
         restarted = assembled(home, text)
         claude = restarted.adapters.agents[AgentKind.CLAUDE]
 
@@ -765,164 +502,14 @@ class TestARestoredSessionIsOneTheEngineCanHonour:
         assert state.read_text(encoding="utf-8") == once
 
 
-class TestTheStartingReplyWindow:
-    """A Session's *first* Reply Window, established when the roster learns of it (#27).
-
-    Every test here runs the assembled engine over the real Claude spoke and the
-    real launch/registration order — the adapter registered before Bridge Core
-    holds the Session, which is the ordering that made the starting level
-    undeliverable as an event.
-
-    They run with the sweep parked beyond the life of the test, so nothing here
-    can pass on the back of a later transition. What is asserted is what the
-    launch itself established.
-    """
-
-    #: Longer than any test here lives, so a passing assertion cannot be the
-    #: sweep having quietly fixed things up a poll interval later.
-    NO_SWEEP = 3600.0
-
-    async def _launch(self, engine: Engine) -> Reply:
-        return await ask(
-            Request(
-                action=Action.LAUNCH,
-                payload={
-                    "request_id": new_request_id(),
-                    "agent": "claude",
-                    "project": "GPT Live",
-                    "task": "t",
-                },
-            ),
-            path=engine.socket_path,
-        )
-
-    def _launched_window(self, home: Path, *, status: str) -> Reply:
-        write_idle_claude_record(home, status=status)
-        engine = assembled(home, with_idle_claude(home, poll_seconds=self.NO_SWEEP))
-
-        async def scenario() -> Reply:
-            await engine.start()
-            try:
-                assert (await self._launch(engine)).ok
-                return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
-            finally:
-                await engine.aclose()
-
-        return asyncio.run(scenario())
-
-    def test_a_session_already_idle_at_registration_is_reachable_at_once(self, home: Path) -> None:
-        """#27's defect, at the case that exposes it.
-
-        The Session is idle *before* its launch confirms, which is the ordinary
-        case — a Session is usually registered the moment it comes up. Its
-        starting window was announced by the adapter at registration and dropped,
-        because Bridge Core did not hold the Session yet, and the announcement
-        was never repeated because the watcher had recorded it as sent. The
-        Session sat CLOSED, unreachable while perfectly healthy.
-
-        With the sweep parked for an hour, an OPEN here can only have come from
-        the level Bridge Core pulled the instant its roster held the Session.
-        """
-        sessions = self._launched_window(home, status="idle").data["sessions"]
-
-        assert sessions[0]["reply_window"] == "open"
-        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
-        assert persisted["sessions"][0]["reply_window"] == "open"
-
-    def test_a_session_still_busy_at_registration_starts_closed(self, home: Path) -> None:
-        """The control — and the reason the acceptance run's checkpoint proved nothing.
-
-        A Session busy at registration is the case that passed *even with the
-        defect present*: the report that got dropped carried CLOSED, which is
-        what Bridge Core fails closed to anyway. So this asserts the fix did not
-        buy reachability by starting Sessions open, and on its own it would be
-        no evidence at all — it earns its place only standing next to the idle
-        case above.
-        """
-        sessions = self._launched_window(home, status="busy").data["sessions"]
-
-        assert sessions[0]["reply_window"] == "closed"
-
-    def test_a_healthy_launch_never_reports_a_window_on_an_unknown_session(
-        self, home: Path, caplog
-    ) -> None:
-        """Keeps one log line load-bearing.
-
-        "a Reply Window changed on an unknown Session" was decisive evidence in
-        #21 and again in #27. Before the fix it was printed by *every* launch,
-        healthy or not, which is precisely what a line has to stop doing to mean
-        anything. Registration is silent now, so this asserts the line is absent
-        from a launch that went perfectly — and that the level was established by
-        the pull instead, stated as a fact rather than as a change.
-        """
-        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
-
-        self._launched_window(home, status="idle")
-
-        logged = [record.getMessage() for record in caplog.records]
-        assert not [line for line in logged if "unknown Session" in line], logged
-        assert [line for line in logged if line.startswith("established Reply Window")] == [
-            f"established Reply Window at registration agent={CLAUDE.agent} "
-            f"session_id={CLAUDE.session_id} pid={CLAUDE.pid} window=open"
-        ]
-
-
 class TestEventsReachTheHub:
-    def test_an_idle_claude_session_opens_its_reply_window_in_core_state(self, home: Path) -> None:
-        """The hub establishes the level at registration; the sweep keeps it current."""
-        write_idle_claude_record(home)
-        engine = assembled(home, with_idle_claude(home))
-
-        async def scenario() -> Reply:
-            await engine.start()
-            try:
-                launched = await ask(
-                    Request(
-                        action=Action.LAUNCH,
-                        payload={
-                            "request_id": new_request_id(),
-                            "agent": "claude",
-                            "project": "GPT Live",
-                            "task": "t",
-                        },
-                    ),
-                    path=engine.socket_path,
-                )
-                assert launched.ok
-                observed = await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
-                for _ in range(100):
-                    if observed.data["sessions"][0]["reply_window"] == "open":
-                        break
-                    await asyncio.sleep(0.01)
-                    observed = await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
-                return observed
-            finally:
-                await engine.aclose()
-
-        sessions = asyncio.run(scenario()).data["sessions"]
-
-        assert sessions[0]["reply_window"] == "open"
-        persisted = json.loads((home / "state.json").read_text(encoding="utf-8"))
-        assert persisted["sessions"][0]["reply_window"] == "open"
-
     def test_an_adapter_event_is_dispatched_while_the_engine_runs(self, home: Path) -> None:
         engine = assembled(home)
 
         async def scenario() -> Reply:
             await engine.start()
             try:
-                await ask(
-                    Request(
-                        action=Action.LAUNCH,
-                        payload={
-                            "request_id": new_request_id(),
-                            "agent": "codex",
-                            "project": "GPT Live",
-                            "task": "t",
-                        },
-                    ),
-                    path=engine.socket_path,
-                )
+                put_on_the_roster(engine)
                 engine.core.events.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
                 await asyncio.sleep(0.05)  # the dispatch loop is the thing under test
                 return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
@@ -1004,44 +591,6 @@ class TestSharingTheOneAppServer:
 
         assert engine.adapters.call.riding is not None, "wired only at start would be too late"
 
-    def test_a_launcher_is_introduced_to_the_agent_adapters_it_launches_for(
-        self, home: Path
-    ) -> None:
-        """The launcher meets the spokes before anything opens, not at launch time."""
-        introduced = CONFIG.replace(
-            'session_launcher = "test_engine:one_session_launcher"',
-            'session_launcher = "test_engine:launcher_that_wants_introducing"',
-        )
-
-        engine = assembled(home, introduced)
-
-        assert engine.adapters.launcher.met_codex is engine.adapters.agents[AgentKind.CODEX]
-
-    def test_a_launcher_is_not_introduced_to_an_agent_this_engine_has_none_of(
-        self, home: Path
-    ) -> None:
-        """Per-agent rather than fatal.
-
-        An engine configured for Codex only is a legitimate engine, and it must
-        start. The launcher refuses a Claude launch by name when one is asked
-        for, which is where that refusal belongs — the assembly is not the place
-        to decide that half a configuration is no configuration.
-        """
-        introduced = CONFIG.replace(
-            'session_launcher = "test_engine:one_session_launcher"',
-            'session_launcher = "test_engine:launcher_that_wants_introducing"',
-        )
-
-        engine = assembled(home, introduced)
-
-        assert engine.adapters.launcher.met_claude is None
-
-    def test_a_launcher_that_wants_no_introduction_is_left_alone(self, home: Path) -> None:
-        """A fake or null launcher needs to know nothing about any of this."""
-        engine = assembled(home)
-
-        assert not hasattr(engine.adapters.launcher, "use_codex")
-
     def test_a_call_adapter_with_no_provider_refuses_to_assemble(self, home: Path) -> None:
         """Named by seam, not degraded silently: the voice surface could never come up."""
         orphaned = self.RIDING.replace(
@@ -1058,114 +607,6 @@ class TestSharingTheOneAppServer:
         engine = assembled(home)
 
         assert not hasattr(engine.adapters.call, "riding")
-
-
-class TestALaunchedCodexSessionIsReachable:
-    """#39 through the production composition and both real adapter factories."""
-
-    def test_a_launcher_without_a_codex_agent_does_not_claim_success(self, home: Path) -> None:
-        binary = scripted_codex(home / "codex")
-        launcher = direct_child_launcher(
-            settings={"codex_binary": str(binary), "runtime_directory": str(home / "runtime")}
-        )
-        request = LaunchRequest(
-            request_id=new_request_id(),
-            agent=AgentKind.CODEX,
-            workspace=home,
-            label=SessionLabel(project="GPT-VoiceCoding", task="accept a relay"),
-        )
-
-        async def scenario() -> LaunchOutcome:
-            try:
-                return await launcher.launch(request)
-            finally:
-                await launcher.aclose()
-
-        outcome = asyncio.run(scenario())
-
-        assert outcome.status is LaunchStatus.FAILED
-        assert "Codex Agent adapter" in outcome.detail
-
-    def test_the_engine_attaches_opens_the_window_and_delivers_the_relay(self, home: Path) -> None:
-        binary = scripted_codex(home / "codex")
-        real = (
-            CONFIG.replace(
-                'session_launcher = "test_engine:one_session_launcher"',
-                'session_launcher = "gpt_voicecoding.adapters.session_launcher:'
-                'direct_child_launcher"',
-            )
-            .replace(
-                'codex = "fakes:FakeAgent"',
-                'codex = "gpt_voicecoding.adapters.agent.codex:codex_agent"',
-            )
-            .replace(
-                "[delegate]",
-                "\n".join(
-                    (
-                        "[adapters.settings.session_launcher]",
-                        f'codex_binary = "{binary}"',
-                        f'runtime_directory = "{home / "runtime"}"',
-                        "",
-                        '[adapters.settings."agent.codex"]',
-                        f'executable = "{binary}"',
-                        f'socket_directory = "{home / "agent"}"',
-                        "startup_timeout_seconds = 5",
-                        "request_timeout_seconds = 5",
-                        "receipt_timeout_seconds = 2",
-                        "receipt_poll_seconds = 0.01",
-                        "verdict_timeout_seconds = 1",
-                        "",
-                        "[delegate]",
-                    )
-                ),
-            )
-        )
-        engine = assembled(home, real)
-
-        async def scenario():
-            await engine.start()
-            target = None
-            try:
-                launched = await engine.core.launch_session(
-                    request_id=new_request_id(),
-                    agent=AgentKind.CODEX,
-                    project="GPT-VoiceCoding",
-                    task="accept a relay",
-                )
-                assert launched.status is LaunchStatus.LAUNCHED
-                assert launched.target is not None
-                target = launched.target
-                codex = engine.adapters.agents[AgentKind.CODEX]
-                relayed = await engine.core.relay(target, "inert instruction")
-                window_before = engine.core.status().sessions[0].reply_window
-                (home / "window.open").touch()
-                async with asyncio.timeout(EVENT_SETTLE_TIMEOUT_SECONDS):
-                    status = engine.core.status()
-                    while True:
-                        answers = [
-                            pending
-                            for pending in status.pending_relays
-                            if pending.kind is RelayKind.ANSWER
-                        ]
-                        if status.sessions[0].reply_window is ReplyWindow.OPEN and not answers:
-                            break
-                        await asyncio.sleep(0.01)
-                        status = engine.core.status()
-                return target in codex.watching(), window_before, relayed, status
-            finally:
-                await engine.adapters.launcher.aclose()
-                await engine.aclose()
-
-        attached, window_before, relayed, status = asyncio.run(scenario())
-
-        assert attached
-        assert window_before is ReplyWindow.CLOSED
-        assert relayed.state is Lifecycle.RETAINED
-        assert relayed.outcome is Delivery.UNKNOWN
-        assert status.sessions[0].reply_window is ReplyWindow.OPEN
-        assert [
-            pending for pending in status.pending_relays if pending.kind is RelayKind.ANSWER
-        ] == []
 
 
 class TestTheTick:

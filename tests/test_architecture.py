@@ -40,16 +40,6 @@ TELEGRAM_WIRE_MODULE = ADAPTERS / "companion_channel" / "telegram" / "api.py"
 #: The Companion Channel subpackage, whose other modules must stay wireless.
 COMPANION_CHANNEL = ADAPTERS / "companion_channel"
 
-#: Where tmux is allowed to exist, and nowhere else. tmux is one optional *way*
-#: to launch a Session, never the capability — the decoupling verdict took it off
-#: the control path entirely, and the failure mode being guarded against is the
-#: reference implementation's, where a tmux pane leaked into everything and the
-#: system could not run without one.
-TMUX_MODULE = ADAPTERS / "session_launcher" / "tmux.py"
-
-#: The Session Launcher subpackage, whose other modules must know no tmux.
-SESSION_LAUNCHER = ADAPTERS / "session_launcher"
-
 # Top-level distribution names that carry a wire, terminal or transport protocol.
 # Adding to this list is cheap; removing from it needs a new ADR.
 PROTOCOL_LIBRARIES = frozenset(
@@ -306,84 +296,60 @@ def _code_without_documentation(path: Path) -> str:
     return ast.unparse(ast.fix_missing_locations(tree))
 
 
-#: The two modules outside the adapter that may say the word in code, and why.
-#: Both are the seam's configuration surface rather than its mechanism: an
-#: operator has to be able to name the tmux binary and the session in one
-#: settings table, and the composition root has to be able to name the factory.
-#: Neither knows a single tmux *command*, which is what the guard is really for.
-TMUX_NAMING_ALLOWED = frozenset({"settings.py", "__init__.py"})
+def test_no_module_knows_tmux_at_all() -> None:
+    """tmux was one optional *way* to launch a Session, and launching is parked (#72).
 
-#: The rule catalogue is prose held in data rather than in docstrings, and one of
-#: the rules it records *is* "pane semantics belong to the tmux adapter alone".
-#: Exempting the file that states the rule is not a hole in it.
-RULE_CATALOGUE = PACKAGE / "core" / "instructions" / "catalogue.py"
+    Confinement to one adapter module became absence when that module went, so
+    the guard reads the stronger way round: nothing in the composed tree may
+    know tmux. The failure mode is the reference implementation's, where a tmux
+    pane leaked into everything and the system could not run without one — and
+    the coupling arrived as `TMUX` environment checks and pane ids scattered
+    through ordinary code, with no import anywhere a dependency rule could have
+    caught. So it is checked by reading the source, not the imports.
 
-
-def test_tmux_lives_in_exactly_one_file() -> None:
-    """tmux is one optional way to launch, so exactly one module may know how.
-
-    The `libtmux` distribution is already forbidden everywhere by
-    `PROTOCOL_LIBRARIES`, and this repository would not take that dependency
-    anyway — the adapter shells out to the binary. So the rule that actually
-    binds is about knowledge rather than imports, and it has to be checked by
-    reading the source: the reference implementation's coupling arrived as `TMUX`
-    environment checks and pane ids scattered through ordinary code, with no
-    import anywhere that a dependency rule could have caught.
-
-    This is the guard the issue's Done-when names, stated the way it can be true.
+    Documentation is stripped first: prose may still explain why tmux is not
+    here, which is a different thing from code knowing about it.
     """
     offences = [
         str(path.relative_to(PACKAGE))
         for path in _sources(PACKAGE)
-        if path not in (TMUX_MODULE, RULE_CATALOGUE)
-        if not (path.parent == SESSION_LAUNCHER and path.name in TMUX_NAMING_ALLOWED)
         if "tmux" in _code_without_documentation(path).lower()
     ]
     named = "; ".join(offences)
-    assert not offences, f"tmux belongs in {TMUX_MODULE.name} alone, and is also in: {named}"
+    assert not offences, f"no module may know tmux, and these do: {named}"
 
 
-def test_no_module_but_the_tmux_adapter_runs_a_tmux_command() -> None:
+def test_no_module_runs_a_tmux_command() -> None:
     """The stronger half of the rule, and the one with no exceptions at all.
 
-    Naming the binary in a settings field is configuration. Knowing that
-    `new-window` exists, or that a pane has an id, is the coupling itself — and
-    no module outside the adapter may have it, including the two the rule above
-    lets name a path.
+    Knowing that `new-window` exists, or that a pane has an id, is the coupling
+    itself, and it may not appear anywhere — documentation included, because a
+    command spelled out in prose is a command somebody can copy.
     """
     commands = ("new-window", "new-session", "kill-window", "capture-pane", "display-message")
     offences = [
         f"{path.relative_to(PACKAGE)} knows {command!r}"
         for path in _sources(PACKAGE)
-        if path != TMUX_MODULE
         for command in commands
         if command in path.read_text(encoding="utf-8")
     ]
     named = "; ".join(offences)
-    assert not offences, f"only {TMUX_MODULE.name} may know a tmux command: {named}"
+    assert not offences, f"no module may know a tmux command: {named}"
 
 
-def test_the_tmux_module_is_where_it_says_it_is() -> None:
-    """A guard that silently stops guarding is worse than no guard."""
-    assert TMUX_MODULE.is_file(), f"{TMUX_MODULE} is not there, so nothing is confined"
+def test_nothing_allocates_a_pseudo_terminal() -> None:
+    """`pty` came with the headless launcher, and it went with it (#72).
 
-
-def test_the_launcher_allocates_a_terminal_in_exactly_one_file() -> None:
-    """The pseudo-terminal is the headless adapter's whole mechanism, and it is confined.
-
-    `pty` is what makes a Session real without anybody watching it, and it comes
-    with an obligation — whoever opens the master end must drain it forever, or
-    the Session blocks the moment the buffer fills (ADR 0008). One module carries
-    that obligation, and a second `pty.openpty()` elsewhere would be a second
-    master nobody drains.
+    Whoever opens the master end must drain it forever or the Session blocks the
+    moment the buffer fills. Nothing carries that obligation now, so nothing may
+    open one — a `pty.openpty()` that reappeared outside a launcher would be a
+    master with no owner at all.
     """
-    console = SESSION_LAUNCHER / "console.py"
     offences = [
         f"{path.relative_to(PACKAGE)} imports {module}"
         for path in _sources(PACKAGE)
-        if path != console
         for module in _imported_modules(path.read_text(encoding="utf-8"))
         if module.split(".")[0] == "pty"
     ]
     named = "; ".join(offences)
-    assert not offences, f"the pseudo-terminal belongs in {console.name} alone: {named}"
+    assert not offences, f"nothing may allocate a pseudo-terminal: {named}"

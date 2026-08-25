@@ -39,8 +39,6 @@ The ones that decide — the policy, all of it:
 - ``approvals`` — the Approval Relay budget, its never-deny fallback, and the
   notice that closes the loop.
 - ``router`` — what inbound text means. Unknown or ambiguous fails closed.
-- ``projects`` — configured project names and spoken lookup, resolved internally
-  before the existing Session Launcher seam is called.
 - ``verification`` — what configuration named against what the engine loaded
   (ADR 0003); only the hub knows the configured side.
 - ``bridge`` — the five of them assembled, and the one dispatch that feeds them.

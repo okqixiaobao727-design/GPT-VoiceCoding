@@ -6,11 +6,11 @@ process to reap. Bridge Core never calls any of it — the composition root does
 once at start and once at shutdown — but it is declared here, with the seams,
 because it is a promise both sides need to agree on and no single seam owns.
 
-**It is optional, and deliberately so.** A Session Launcher that spawns children
-on demand has nothing to open, and forcing it to implement two empty methods
-would be a contract that lies about what varies (ADR 0001, principle 2). The
-composition root asks whether an adapter is `Connectable` and leaves the rest
-alone.
+**It is optional, and deliberately so.** An adapter that holds nothing of its
+own — the null Companion Channel is the plain case — has nothing to open, and
+forcing it to implement two empty methods would be a contract that lies about
+what varies (ADR 0001, principle 2). The composition root asks whether an
+adapter is `Connectable` and leaves the rest alone.
 
 Both verbs are idempotent and neither may raise on a second call: a shutdown
 that is already under way must not be made worse by an adapter objecting to

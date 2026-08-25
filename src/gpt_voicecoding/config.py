@@ -17,9 +17,9 @@ with the privileges of the user who wrote it, and is exactly as trusted as the
 engine itself*. It lives in that user's own application-support directory for
 the same reason.
 
-**Some things have no default.** An unconfigured Call, Companion Channel or
-Session Launcher seam refuses to start, because an engine that silently loaded
-nothing behind one is precisely ADR 0003's outage. The Delegated Turn's model is
+**Some things have no default.** An unconfigured Call or Companion Channel
+seam refuses to start, because an engine that silently loaded nothing behind one
+is precisely ADR 0003's outage. The Delegated Turn's model is
 a user-facing setting — the cost lever — so a default here would be the
 hard-coding this repository forbids. And ADR 0004's three log *decisions* — the
 cap, the retained generations, the stripped environment prefixes — are numbers a
@@ -53,8 +53,7 @@ from typing import Any
 
 from gpt_voicecoding.core.persistence import default_state_path
 from gpt_voicecoding.core.policy import CorePolicy
-from gpt_voicecoding.core.projects import Project
-from gpt_voicecoding.seams.identity import LABEL_SEPARATOR, AgentKind
+from gpt_voicecoding.seams.identity import AgentKind
 
 #: Where the engine looks when nothing tells it otherwise.
 CONFIG_FILE_NAME = "config.toml"
@@ -68,7 +67,7 @@ SOCKET_FILE_NAME = "control.sock"
 LOG_FILE_NAME = "engine.log"
 
 #: Every seam the composition root must fill before the engine may serve.
-REQUIRED_SEAMS = ("call", "companion_channel", "session_launcher")
+REQUIRED_SEAMS = ("call", "companion_channel")
 
 #: The adapter an engine with no text reach names for itself. Written out as a
 #: string rather than imported: this module reads configuration, and importing an
@@ -112,7 +111,6 @@ class AdapterSelection:
 
     call: str
     companion_channel: str
-    session_launcher: str
     agents: dict[AgentKind, str] = field(default_factory=dict)
     #: `[adapters.settings.<seam>]`, forwarded to that seam's factory untouched.
     #: The root never reads a key: only the adapter knows what its own keys mean,
@@ -130,7 +128,6 @@ class AdapterSelection:
         named = {
             "call": self.call,
             "companion_channel": self.companion_channel,
-            "session_launcher": self.session_launcher,
         }
         named.update({f"agent.{agent}": reference for agent, reference in self.agents.items()})
         return named
@@ -157,14 +154,6 @@ class LogConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class LaunchConfig:
-    """The global launch choice and the projects Bridge Core may resolve."""
-
-    default_agent: AgentKind
-    projects: tuple[Project, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class EngineConfig:
     """Everything the composition root needs, and nothing it does not."""
 
@@ -174,7 +163,6 @@ class EngineConfig:
     #: Where the control-plane CLI really is, when this installation moved it.
     #: None means the engine derives it from its own interpreter's scripts.
     control_plane_cli: Path | None
-    launch: LaunchConfig
     socket_path: Path
     state_path: Path
     policy: CorePolicy
@@ -203,12 +191,6 @@ def of(document: dict[str, Any], *, source: Path | None = None) -> EngineConfig:
     where = f" in {source}" if source is not None else ""
     engine = _section(document, "engine", where)
     adapters = _adapters(_section(document, "adapters", where), where)
-    launch = _launch(_section(document, "launch", where), where)
-    if launch.default_agent not in adapters.agents:
-        raise ConfigError(
-            f"[launch] default_agent{where} names {launch.default_agent}, but "
-            "[adapters.agents] configures no adapter for it"
-        )
     delegate = _section(document, "delegate", where)
 
     model = delegate.get("model")
@@ -222,72 +204,11 @@ def of(document: dict[str, Any], *, source: Path | None = None) -> EngineConfig:
         adapters=adapters,
         delegated_turn_model=model.strip(),
         control_plane_cli=_optional_path(delegate, "cli", where),
-        launch=launch,
         socket_path=_path(engine, "socket_path", default_socket_path(), where),
         state_path=_path(engine, "state_path", default_state_path(), where),
         policy=_policy(_section(document, "policy", where), where),
         log=_log(_section(document, "log", where), where),
     )
-
-
-def _launch(section: dict[str, Any], where: str) -> LaunchConfig:
-    raw_default = section.get("default_agent")
-    try:
-        default_agent = AgentKind(raw_default)
-    except (TypeError, ValueError):
-        known = ", ".join(str(kind) for kind in AgentKind)
-        raise ConfigError(
-            f"[launch] default_agent{where} must name an agent this system runs: {known}"
-        ) from None
-
-    raw_projects = section.get("projects")
-    if not isinstance(raw_projects, list) or not raw_projects:
-        raise ConfigError(f"[launch]{where} must contain at least one [[launch.projects]] entry")
-
-    projects: list[Project] = []
-    for index, raw in enumerate(raw_projects, start=1):
-        key = f"[[launch.projects]] entry {index}"
-        if not isinstance(raw, dict):
-            raise ConfigError(f"{key}{where} must be a table")
-        unknown = sorted(set(raw) - {"name", "workspace", "spoken_aliases"})
-        if unknown:
-            raise ConfigError(
-                f"{key}{where} has fields that are not project lookup information: "
-                + ", ".join(unknown)
-            )
-        name = raw.get("name")
-        workspace = raw.get("workspace")
-        aliases = raw.get("spoken_aliases", [])
-        if not isinstance(name, str) or not name.strip():
-            raise ConfigError(f"{key} name{where} must be non-empty text")
-        if LABEL_SEPARATOR.strip() in name:
-            raise ConfigError(
-                f"{key} name{where} cannot contain {LABEL_SEPARATOR.strip()!r}; "
-                "the canonical name must fit in a Session Label"
-            )
-        if not isinstance(workspace, str) or not workspace.strip():
-            raise ConfigError(f"{key} workspace{where} must be an absolute path")
-        project_workspace = Path(workspace.strip()).expanduser()
-        if not project_workspace.is_absolute():
-            raise ConfigError(f"{key} workspace{where} must be an absolute path")
-        if not isinstance(aliases, list) or any(
-            not isinstance(alias, str) or not alias.strip() for alias in aliases
-        ):
-            raise ConfigError(f"{key} spoken_aliases{where} must be a list of non-empty text")
-        project = Project(
-            name=name.strip(),
-            workspace=project_workspace,
-            spoken_aliases=tuple(alias.strip() for alias in aliases),
-        )
-        if any(
-            held.name == project.name
-            and held.workspace == project.workspace
-            and frozenset(held.spoken_aliases) == frozenset(project.spoken_aliases)
-            for held in projects
-        ):
-            raise ConfigError(f"{key}{where} is a wholly duplicated project: {project.name!r}")
-        projects.append(project)
-    return LaunchConfig(default_agent=default_agent, projects=tuple(projects))
 
 
 def _section(document: dict[str, Any], name: str, where: str) -> dict[str, Any]:
@@ -328,7 +249,6 @@ def _adapters(section: dict[str, Any], where: str) -> AdapterSelection:
     chosen = AdapterSelection(
         call=filled["call"],
         companion_channel=filled["companion_channel"],
-        session_launcher=filled["session_launcher"],
         agents=agents,
     )
     return replace(chosen, settings=_adapter_settings(section, chosen, where))

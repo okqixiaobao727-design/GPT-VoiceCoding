@@ -123,57 +123,19 @@ class StateFormatError(BridgeCoreError):
 class SeamUnavailableError(BridgeCoreError):
     """Something was asked for that needs a seam this engine has nothing behind.
 
-    Raised rather than answered with a hopeful default: an engine assembled
-    without a Session Launcher cannot launch, and the honest answer to "launch
-    this" is that this engine cannot, not a failure that reads like the
-    Launcher tried.
+    Raised rather than answered with a hopeful default: "this engine cannot"
+    and "it tried and failed" are different news, and a hopeful default is how
+    the second gets reported as the first.
+
+    Nothing raises it while every seam a hub verb reaches is one configuration
+    requires. It stays because the distinction is the wire's, not one caller's
+    — it is a code the closed error set carries and `actions.py` maps, so the
+    first optional seam to arrive travels correctly rather than as `refused`.
     """
 
     def __init__(self, seam: str) -> None:
         super().__init__(f"this engine has nothing loaded behind the {seam} seam")
         self.seam = seam
-
-
-class ConflictingLaunchError(BridgeCoreError):
-    """One launch identity was reused for a different resolved launch intent."""
-
-    def __init__(self, request_id: RequestId) -> None:
-        super().__init__(
-            f"launch request identity {request_id!r} is already bound to a different intent"
-        )
-        self.request_id = request_id
-
-
-class ProjectMatchError(BridgeCoreError):
-    """A spoken project reference did not resolve to exactly one configured project."""
-
-
-class UnknownProjectError(ProjectMatchError):
-    """No configured canonical name or spoken alias matched."""
-
-    def __init__(self, query: str, available: tuple[str, ...]) -> None:
-        names = ", ".join(repr(name) for name in available)
-        super().__init__(f"no configured project matches {query!r}; configured projects: {names}")
-        self.query = query
-        self.available = available
-
-
-class AmbiguousProjectError(ProjectMatchError):
-    """More than one configured project matched, so Bridge Core refuses to choose."""
-
-    def __init__(self, query: str, candidates: tuple[str, ...]) -> None:
-        names = ", ".join(repr(name) for name in candidates)
-        super().__init__(f"{len(candidates)} configured projects match {query!r}: {names}")
-        self.query = query
-        self.candidates = candidates
-
-
-class InvalidLaunchLabelError(BridgeCoreError):
-    """The resolved project and supplied task cannot form the canonical Session Label."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(f"cannot construct the Session Label: {reason}")
-        self.reason = reason
 
 
 class SecondCallRefused(BridgeCoreError):

@@ -113,6 +113,15 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     ),
                 ),
                 Block(
+                    covers=("voice.start.an-empty-read-is-not-a-failed-read",),
+                    text=(
+                        "A read that worked and found nothing is a fact about their machine. A "
+                        "read that failed is no reading at all. Never say nothing is there when "
+                        "you could not look: they can see their own screen, and that answer "
+                        "sends them to fix the wrong thing."
+                    ),
+                ),
+                Block(
                     covers=("voice.roster.withheld-sessions-are-real",),
                     text=(
                         "Some running sessions are held back from the roster and cannot be "
@@ -220,77 +229,8 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
             ),
         ),
         Section(
-            title="Starting a session",
+            title="What to do when something fails",
             blocks=(
-                Block(
-                    covers=("voice.start.complete-request-launches-directly",),
-                    text=(
-                        "A project reference and task are a complete request to start one "
-                        "session. Use the configured default agent unless the user explicitly "
-                        "named Claude or Codex. Use this exact command form, replacing each "
-                        "placeholder with the user's request:\n\n"
-                        f"    {context.launch_invocation}\n\n"
-                        "Make exactly one launch action immediately. "
-                        "Do not read help, sessions or status first, and do not add a confirmation "
-                        "round. Ask only when the project reference is unknown or non-unique; "
-                        "while it is unsettled, nothing starts."
-                    ),
-                ),
-                Block(
-                    covers=("voice.start.an-empty-read-is-not-a-failed-read",),
-                    text=(
-                        "A read that worked and found nothing is a fact about their machine. A "
-                        "read that failed is no reading at all. Never say nothing is there when "
-                        "you could not look: they can see their own screen, and that answer "
-                        "sends them to fix the wrong thing."
-                    ),
-                ),
-                Block(
-                    covers=("voice.start.started-is-not-named",),
-                    text=(
-                        "Report only what actually happened. A session that started has "
-                        "started and has not named itself yet — say both, in that order, as one "
-                        "piece of finished news: it is up and working on their task, and will "
-                        "report its own name shortly. Until it does, describe it by their "
-                        "project reference and the task they gave it. They can talk to it straight "
-                        "away."
-                    ),
-                ),
-                Block(
-                    covers=("voice.start.no-success-on-a-failure",),
-                    text=(
-                        "A launch that failed started nothing. Say so and name what failed. If "
-                        "the task text itself was refused, ask them to say it again — you never "
-                        "repair, trim or rewrite their words to make a command acceptable."
-                    ),
-                ),
-            ),
-        ),
-        Section(
-            title="Closing, and what to do when something fails",
-            blocks=(
-                Block(
-                    covers=("voice.close.confirms-before-it-is-irreversible",),
-                    text=(
-                        "Closing cannot be undone and mishearing is cheap to prevent. Name the "
-                        "one session about to be closed and its workspace, wait for the user to "
-                        "confirm that one in their own words, and until they do, close nothing. "
-                        "If they name something different, start again from the roster."
-                    ),
-                ),
-                Block(
-                    covers=("voice.close.reports-what-went-with-it",),
-                    text=(
-                        "Afterwards, say what became of everything that belonged to it, taking "
-                        "each outcome as it comes. One closed along with the session. One was "
-                        "already gone before the close, which leaves nothing outstanding — do "
-                        "not call that one still running. One that did not close is still "
-                        "running, and you name it as still running, including when the reason "
-                        "is that it had been moved somewhere else and so nothing closed it. "
-                        "And when nothing was attached to that session at all, say that "
-                        "plainly: whatever it opened is still there, at the keyboard."
-                    ),
-                ),
                 Block(
                     covers=("voice.retry.failed-delivery-is-not-a-retry",),
                     text=(
@@ -320,8 +260,9 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     text=(
                         "That rule is general. Once you have told the user something failed, "
                         "there is no automatic second attempt and no substitute action: not "
-                        "another workspace, not another agent, not another session standing in "
-                        "for the one that did not start. Tell them, and let them decide."
+                        "another session spoken to instead, not another route tried behind "
+                        "their back, nothing done to make up for it. Tell them, and let them "
+                        "decide."
                     ),
                 ),
             ),

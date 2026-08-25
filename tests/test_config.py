@@ -32,19 +32,10 @@ COMPLETE = """
 [adapters]
 call = "tests.fakes:FakeCall"
 companion_channel = "tests.fakes:FakeCompanionChannel"
-session_launcher = "tests.fakes:FakeSessionLauncher"
 
 [adapters.agents]
 claude = "tests.fakes:FakeAgent"
 codex = "tests.fakes:FakeAgent"
-
-[launch]
-default_agent = "claude"
-
-[[launch.projects]]
-name = "GPT-VoiceCoding"
-workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"
-spoken_aliases = ["Voice Coding", "GPT Live"]
 
 [delegate]
 model = "a-model-the-user-chose"
@@ -73,16 +64,6 @@ class TestACompleteConfiguration:
             AgentKind.CODEX: "tests.fakes:FakeAgent",
         }
         assert config.delegated_turn_model == "a-model-the-user-chose"
-
-    def test_it_carries_the_launch_catalogue_into_composition(self, tmp_path: Path) -> None:
-        config = load(written(tmp_path, COMPLETE))
-
-        assert config.launch.default_agent is AgentKind.CLAUDE
-        assert len(config.launch.projects) == 1
-        project = config.launch.projects[0]
-        assert project.name == "GPT-VoiceCoding"
-        assert project.workspace == Path("/Users/simon/Documents/coding/GPT-VoiceCoding")
-        assert project.spoken_aliases == ("Voice Coding", "GPT Live")
 
     def test_the_durations_are_the_locked_defaults_until_configured(self, tmp_path: Path) -> None:
         config = load(written(tmp_path, COMPLETE))
@@ -244,7 +225,7 @@ class TestWhatItRefuses:
 
         assert "model" in str(refusal.value)
 
-    @pytest.mark.parametrize("seam", ["call", "companion_channel", "session_launcher"])
+    @pytest.mark.parametrize("seam", ["call", "companion_channel"])
     def test_a_seam_with_nothing_behind_it(self, tmp_path: Path, seam: str) -> None:
         text = "\n".join(line for line in COMPLETE.splitlines() if not line.startswith(seam))
 
@@ -278,80 +259,6 @@ class TestWhatItRefuses:
             load(written(tmp_path, text))
 
         assert "agent" in str(refusal.value)
-
-    def test_the_default_agent_must_have_an_adapter(self, tmp_path: Path) -> None:
-        text = COMPLETE.replace('claude = "tests.fakes:FakeAgent"', "")
-
-        with pytest.raises(ConfigError) as refusal:
-            load(written(tmp_path, text))
-
-        assert "default_agent" in str(refusal.value)
-        assert "claude" in str(refusal.value)
-
-    def test_a_project_workspace_must_be_absolute(self, tmp_path: Path) -> None:
-        text = COMPLETE.replace(
-            'workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"',
-            'workspace = "relative/project"',
-        )
-
-        with pytest.raises(ConfigError) as refusal:
-            load(written(tmp_path, text))
-
-        assert "workspace" in str(refusal.value)
-        assert "absolute" in str(refusal.value)
-
-    def test_spoken_aliases_are_optional_and_workspace_existence_is_deferred(
-        self, tmp_path: Path
-    ) -> None:
-        text = COMPLETE.replace(
-            'workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"',
-            'workspace = "/definitely/offline/project volume"',
-        ).replace('spoken_aliases = ["Voice Coding", "GPT Live"]\n', "")
-
-        config = load(written(tmp_path, text))
-
-        assert config.launch.projects[0].workspace == Path("/definitely/offline/project volume")
-        assert config.launch.projects[0].spoken_aliases == ()
-
-    def test_a_wholly_duplicated_project_entry_is_invalid_configuration(
-        self, tmp_path: Path
-    ) -> None:
-        project = """
-[[launch.projects]]
-name = "GPT-VoiceCoding"
-workspace = "/Users/simon/Documents/coding/GPT-VoiceCoding"
-spoken_aliases = ["GPT Live", "Voice Coding"]
-"""
-        text = COMPLETE.replace("\n[delegate]", project + "\n[delegate]")
-
-        with pytest.raises(ConfigError) as refusal:
-            load(written(tmp_path, text))
-
-        assert "duplicated" in str(refusal.value)
-        assert "GPT-VoiceCoding" in str(refusal.value)
-
-    def test_a_canonical_project_name_must_be_usable_in_a_session_label(
-        self, tmp_path: Path
-    ) -> None:
-        text = COMPLETE.replace('name = "GPT-VoiceCoding"', 'name = "GPT · Voice Coding"')
-
-        with pytest.raises(ConfigError) as refusal:
-            load(written(tmp_path, text))
-
-        assert "name" in str(refusal.value)
-        assert "Session Label" in str(refusal.value)
-
-    def test_a_project_entry_carries_lookup_information_only(self, tmp_path: Path) -> None:
-        text = COMPLETE.replace(
-            'spoken_aliases = ["Voice Coding", "GPT Live"]',
-            'spoken_aliases = ["Voice Coding", "GPT Live"]\nagent = "codex"',
-        )
-
-        with pytest.raises(ConfigError) as refusal:
-            load(written(tmp_path, text))
-
-        assert "agent" in str(refusal.value)
-        assert "project" in str(refusal.value)
 
     def test_an_agent_this_system_does_not_run(self, tmp_path: Path) -> None:
         text = COMPLETE.replace("codex =", "emacs =")

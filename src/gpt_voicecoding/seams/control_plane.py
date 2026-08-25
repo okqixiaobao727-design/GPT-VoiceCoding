@@ -33,7 +33,10 @@ from typing import Any
 
 #: Bumped when the shapes below change incompatibly. Carried on every reply so a
 #: surface can tell an engine that disagrees from one too old to have been asked.
-PROTOCOL_VERSION = 3
+#: 4 dropped `launch` and `close` from the action set, and their two error codes
+#: with them: a surface built against 3 would send an action this engine no
+#: longer has, so the disagreement has to be visible before the request is made.
+PROTOCOL_VERSION = 4
 
 #: The longest line either side will read. Generous for a roster, small enough
 #: that a peer cannot make the engine hold an unbounded buffer.
@@ -56,10 +59,6 @@ class Action(StrEnum):
     SESSIONS = "sessions"
     #: The Live Toggle: end the call the system owns, or start one if none is up.
     LIVE = "live"
-    #: Bring exactly one Session into existence in a workspace.
-    LAUNCH = "launch"
-    #: Close exactly one Session, by exact identity.
-    CLOSE = "close"
     #: An Answer Relay — the user's own words, for one exact Session.
     RELAY = "relay"
     #: The user's verdict on one pending permission request.
@@ -92,10 +91,6 @@ class ErrorCode(StrEnum):
     UNKNOWN_PENDING = "unknown_pending"
     #: Something asked to open a voice surface while the system owns one.
     SECOND_CALL_REFUSED = "second_call_refused"
-    #: The Launcher tried and could not — the real error travels in `message`.
-    LAUNCH_FAILED = "launch_failed"
-    #: The close was attempted and failed. An idempotent repeat is a success.
-    CLOSE_FAILED = "close_failed"
     #: Nothing is loaded behind the seam this action needs.
     SEAM_UNAVAILABLE = "seam_unavailable"
     #: Any other refusal Bridge Core raised. Still carries its own words.

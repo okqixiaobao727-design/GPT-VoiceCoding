@@ -6,8 +6,7 @@ that fake set, kept honest rather than convenient:
 
 - they answer with the same four-state vocabulary a real adapter must use;
 - they refuse what a real adapter must refuse (an unsupported route, speaking
-  into a call that is not up, a repeated launch request id, closing an identity
-  that was never launched);
+  into a call that is not up, a Relay into a Session nothing registered);
 - they record what they were asked to do, so a policy test can assert that Bridge
   Core actually called out rather than merely deciding to.
 
@@ -19,10 +18,9 @@ adapter's issue.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from gpt_voicecoding.control_plane.commands import USAGE
 from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -31,18 +29,9 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
-from gpt_voicecoding.seams.control_plane import Action
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
-from gpt_voicecoding.seams.session_launcher import (
-    CloseOutcome,
-    CloseRequest,
-    CloseStatus,
-    LaunchOutcome,
-    LaunchRequest,
-    LaunchStatus,
-)
 from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 
 
@@ -282,74 +271,6 @@ class FakeCompanionChannel:
         return self.verify_result
 
 
-@dataclass
-class FakeSessionLauncher:
-    """A Launcher that mints one child per request id and closes idempotently."""
-
-    targets: list[SessionTarget] = field(default_factory=list)
-    available: bool = True
-    verify_result: VerifyResult | None = None
-    sink: EventSink | None = None
-
-    def __post_init__(self) -> None:
-        self.launched: dict[RequestId, LaunchOutcome] = {}
-        self.requests: list[LaunchRequest] = []
-        self.opened: set[SessionTarget] = set()
-        self.closed: set[SessionTarget] = set()
-        self.environments: list[dict[str, str]] = []
-
-    async def launch(self, request: LaunchRequest) -> LaunchOutcome:
-        self.requests.append(request)
-        if not self.available:
-            return LaunchOutcome(
-                request_id=request.request_id,
-                status=LaunchStatus.UNAVAILABLE,
-                detail="this fake launcher was told it cannot run here",
-            )
-        if request.request_id in self.launched:
-            return self.launched[request.request_id]
-        if not self.targets:
-            outcome = LaunchOutcome(
-                request_id=request.request_id,
-                status=LaunchStatus.FAILED,
-                detail="this fake launcher has no target left to hand out",
-            )
-        else:
-            self.environments.append(dict(request.env))
-            target = self.targets.pop(0)
-            self.opened.add(target)
-            outcome = LaunchOutcome(
-                request_id=request.request_id,
-                status=LaunchStatus.LAUNCHED,
-                target=target,
-            )
-        self.launched[request.request_id] = outcome
-        return outcome
-
-    async def close(self, request: CloseRequest) -> CloseOutcome:
-        if not self.available:
-            return CloseOutcome(
-                request_id=request.request_id,
-                status=CloseStatus.UNAVAILABLE,
-                detail="this fake launcher was told it cannot run here",
-            )
-        if request.target in self.closed:
-            return CloseOutcome(request_id=request.request_id, status=CloseStatus.ALREADY_CLOSED)
-        if request.target not in self.opened:
-            return CloseOutcome(
-                request_id=request.request_id,
-                status=CloseStatus.FAILED,
-                detail=f"this launcher never launched {request.target}",
-            )
-        self.closed.add(request.target)
-        return CloseOutcome(request_id=request.request_id, status=CloseStatus.CLOSED)
-
-    async def verify(self) -> VerifyResult:
-        return self.verify_result or VerifyResult(
-            outcome=VerifyOutcome.PASS, loaded="tests.fakes.FakeSessionLauncher"
-        )
-
-
 #: What a test passes where Bridge Core would pass generated house rules. Any
 #: non-empty string will do: what the Call seam promises about instructions is
 #: that they arrive from the hub at the call site, not what they say.
@@ -370,5 +291,4 @@ def instruction_context(
     """
     return InstructionContext(
         cli=ControlPlaneCli(command=command, version="0", socket_path=socket_path),
-        launch_usage=USAGE[Action.LAUNCH],
     )

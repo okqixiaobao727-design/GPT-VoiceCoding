@@ -7,10 +7,14 @@ public let maxRequestBytes = 65536
 
 /// The control-plane protocol this shell can interpret. Held to the engine's
 /// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
-public let controlPlaneProtocolVersion = 3
+public let controlPlaneProtocolVersion = 4
 
-/// Every action this engine has. Nine, and the set is closed — adding one is a
+/// Every action this engine has. Seven, and the set is closed — adding one is a
 /// contract change, so the shell names them rather than composing strings.
+///
+/// `launch` and `close` were here until protocol 4, and are parked with the code
+/// behind them: the engine answers `unknown_action` for either now, so naming
+/// them here would let this shell offer an action nothing can carry out.
 public enum Action: String, Sendable, CaseIterable {
     case status
     case sessions
@@ -18,8 +22,6 @@ public enum Action: String, Sendable, CaseIterable {
     /// The Live Toggle. One action: it ends the call the system owns, or starts
     /// one if none is up. Bridge Core owns that policy; no surface holds call state.
     case live
-    case launch
-    case close
     case relay
     case approve
     case verify
@@ -68,8 +70,6 @@ public enum ErrorCode: Equatable, Sendable {
     case staleSession
     case unknownPending
     case secondCallRefused
-    case launchFailed
-    case closeFailed
     case seamUnavailable
     case refused
     /// A code this shell does not know. Still carried, because an engine that
@@ -86,8 +86,6 @@ public enum ErrorCode: Equatable, Sendable {
         case "stale_session": self = .staleSession
         case "unknown_pending": self = .unknownPending
         case "second_call_refused": self = .secondCallRefused
-        case "launch_failed": self = .launchFailed
-        case "close_failed": self = .closeFailed
         case "seam_unavailable": self = .seamUnavailable
         case "refused": self = .refused
         default: self = .other(wire)
