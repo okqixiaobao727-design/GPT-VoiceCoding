@@ -72,6 +72,53 @@ STATUS_TYPES: Final = {
     "systemError": SessionState.IDLE,
 }
 
+#: The fields the daemon uses to say a thread is its own errand rather than a
+#: person's, and the values of the second that leave a thread a Session (#112).
+#:
+#: **Both are on the cheap read already.** `Thread` is one struct — `ephemeral`
+#: is a plain `bool` and `thread_source` a plain optional string; only `turns`
+#: is gated on `includeTurns` (`rust-v0.149.1:codex-rs/app-server-protocol/src/
+#: protocol/v2/thread_data.rs:196-266`). So this costs no round trip: `_threads`
+#: already reads every id.
+#:
+#: **A keep-list, because the far side's is not a closed set.** `ThreadSource`
+#: parses any unrecognised word into `Feature(word)` — `FromStr`'s last arm,
+#: `rust-v0.150.0:codex-rs/protocol/src/protocol.rs:2604-2657` — so naming the
+#: one value seen so far would leave the next feature string to be found the way
+#: this one was: as a phantom Session in somebody's roster (#79's measurement).
+#: 0.150.0's title generation starts its thread with exactly `ephemeral: true`
+#: and `thread_source: Feature("system")` (`rust-v0.150.0:codex-rs/tui/src/
+#: temporary_structured_request.rs:103-104`), and it is the reason this exists.
+#:
+#: **`subagent` and `guardian_review` are kept on purpose, and this list is
+#: #79's vocabulary too** (Advisor, 2026-08-27). They are one delegate class
+#: split by a boolean (`rust-v0.150.0:codex-rs/core/src/codex_delegate.rs:111`),
+#: and they are #79's Child Process rows — which it cannot classify if this
+#: module deletes them first. The two rules meet here and nowhere else.
+#:
+#: **A thread that names no source is kept**, because absent is not a claim: an
+#: older daemon says nothing about any thread, and nothing about that machine
+#: changes. `null` reads the same way as omitted, and deliberately: the field is
+#: an `Option` that is always serialised, so a 0.149.1 daemon spells "no source
+#: recorded" as `"threadSource": null` and a 0.130-era one spells it by leaving
+#: the key out. Two spellings, one absence of a claim — dropping on `null` would
+#: empty the roster of every thread whose source the daemon never recorded.
+#:
+#: **Legacy has no filter of this kind, and that is the citation.** Its Codex
+#: roster was the rollout index (`legacy@1d32845:bridge/codex.py:1020-1026`,
+#: `:1063-1129`), and an ephemeral thread writes no rollout — the phantom is a
+#: creature of *this* generation's daemon-first roster and could not have
+#: appeared there. What is **adapted** from legacy is the technique and not the
+#: rule: deciding what a thread is from its own `thread_source`, which
+#: `realtime_thread_ids` (`:1020-1026`) does as a keep-list of one value. The
+#: nearest legacy *rule*, `thread_source == "subagent"` blocking registration
+#: (`legacy@1d32845:bridge/__main__.py:893-898`), belongs to #79 rather than
+#: here — and it **excludes** `subagent`, which this keeps, which is exactly why
+#: the two are not the same behaviour.
+EPHEMERAL: Final = "ephemeral"
+THREAD_SOURCE: Final = "threadSource"
+SESSION_THREAD_SOURCES: Final = frozenset({"user", "subagent", "guardian_review"})
+
 #: How much of a thread id stands in for a name the daemon does not have. Eight
 #: characters of a UUID, which is what `codex` itself shows and short enough to
 #: say out loud — the fallback task of every unnamed thread (#78). It is
@@ -221,19 +268,26 @@ async def discover(
     turns: TurnCache | None = None,
     daemon_note: str = "",
     projects: ProjectNames | None = None,
+    reported_non_sessions: set[str] | None = None,
 ) -> LaneDiscovery:
     """Every Codex Session on this machine, however well it can be described.
 
     The process table is read first and always: it is the only source that sees
     a Session the daemon has never heard of, and #82 proved that is not a corner
     case but the ordinary result of starting a TUI while the daemon is down.
+
+    `reported_non_sessions` holds the ids this lane has already said are not
+    Sessions, and it is what makes that sentence one per thread rather than one
+    every five seconds. The caller keeps it across ticks; this call prunes it
+    back to what the daemon still holds. Given nothing, each pass says it once,
+    which is what a one-shot reading wants anyway.
     """
     try:
         candidates = await processes()
     except (OSError, TimeoutError) as unreadable:
         return LaneDiscovery(error=f"the process table could not be read: {unreadable}")
 
-    threads, daemon_error = await _threads(client)
+    threads, daemon_error = await _threads(client, reported_non_sessions)
     names = projects or ProjectNames()
     rows: list[SessionInspection] = []
     claimed: set[int] = set()
@@ -291,7 +345,9 @@ def _degraded(daemon_error: str | None, note: str) -> str | None:
     return "; ".join(reasons) or None
 
 
-async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], str | None]:
+async def _threads(
+    client: DaemonClient | None, reported_non_sessions: set[str] | None = None
+) -> tuple[list[dict[str, Any]], str | None]:
     """Every thread the daemon holds, or the reason there are none to hold.
 
     A daemon that is absent, refusing or answering nonsense all mean one thing
@@ -318,13 +374,46 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
         return [], UNREADABLE_ROSTER
 
     found: list[dict[str, Any]] = []
-    for thread_id in ids:
-        if not isinstance(thread_id, str) or not thread_id.strip():
+    reported = reported_non_sessions if reported_non_sessions is not None else set()
+    held: set[str] = set()
+    for listed in ids:
+        if not isinstance(listed, str) or not listed.strip():
             continue
-        described = await read_thread(client, thread_id.strip())
-        if described is not None:
+        thread_id = listed.strip()
+        held.add(thread_id)
+        described = await read_thread(client, thread_id)
+        if described is None:
+            continue
+        errand = _errand_of(described)
+        if errand is None:
             found.append(described)
+        elif thread_id not in reported:
+            reported.add(thread_id)
+            _log.info("thread %s is not a Session: %s", thread_id, errand)
+    reported &= held
     return found, None
+
+
+def _errand_of(thread: Mapping[str, Any]) -> str | None:
+    """Why this thread is the daemon's own errand, or `None` if it is a Session.
+
+    The reason is carried back rather than a bare `False` because a row that
+    stops appearing is a row somebody comes looking for, and "dropped" is not
+    an answer to that question. Read before the workspace join, so a thread that
+    is not a Session cannot take the pid of one that is: both threads of #79's
+    measurement named the same `cwd`, and `_pid_for` gives it to whichever is
+    listed first.
+    """
+    if thread.get(EPHEMERAL) is True:
+        return f"{EPHEMERAL}, so the daemon will not even write it to disk"
+    # Only a word disqualifies a thread. `null`, a missing key, and a shape this
+    # build has never seen are all the daemon declining to classify it, and a
+    # roster that deletes rows over a value it cannot read is worse than one
+    # that lists a thread it should not have.
+    source = thread.get(THREAD_SOURCE)
+    if isinstance(source, str) and source not in SESSION_THREAD_SOURCES:
+        return f"{THREAD_SOURCE} is {source!r}, which is codex's own errand"
+    return None
 
 
 async def read_thread(

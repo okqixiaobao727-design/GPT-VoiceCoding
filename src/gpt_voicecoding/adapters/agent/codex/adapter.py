@@ -187,6 +187,11 @@ class CodexAgentAdapter:
         )
         #: What each loaded thread last said, read at most once per change.
         self._turns = codex_discovery.TurnCache()
+        #: Which of the daemon's threads this lane has already said are not
+        #: Sessions (#112). Kept here rather than in `discovery.py` for the
+        #: reason `_turns` is: the cadence calls `discover` every five seconds,
+        #: and "once per thread id" needs something that outlives one call.
+        self._reported_non_sessions: set[str] = set()
         #: The project half of every Session Name this lane composes, read once
         #: per workspace and kept for the life of the adapter (#78).
         self._projects = ProjectNames()
@@ -353,6 +358,7 @@ class CodexAgentAdapter:
             turns=self._turns,
             daemon_note=self._daemon.note,
             projects=self._projects,
+            reported_non_sessions=self._reported_non_sessions,
         )
         if not lane.enumerated:
             return lane
