@@ -488,7 +488,23 @@ class BridgeCore:
                 _log.info("no pipeline consumes %s here", type(event).__name__)
 
     async def _session_stopped(self, event: SessionStopped) -> None:
+        """A Session stopped. Say so in the log, then announce it.
+
+        **The log line is the run's only way to attribute a notice to this
+        engine.** Until #75 the escalation path wrote nothing when it *worked* —
+        only when a notice was retained, retired or failed — so a Stop Notice
+        that reached the user left no trace at all, and the acceptance's
+        `stop notice` step could satisfy its attribution check only on the
+        failure path. An engine silent about the one event it exists to produce
+        is the gap #48 named on the inbound side, on the outbound side.
+        """
         session = self._known(event.target)
+        _log.info(
+            "Session stopped: %s waiting on %s%s",
+            event.target,
+            event.waiting_for.kind,
+            f" ({event.waiting_for.tool_name})" if event.waiting_for.tool_name else "",
+        )
         await self.escalation.escalate(
             Notice(
                 request_id=new_request_id(),
