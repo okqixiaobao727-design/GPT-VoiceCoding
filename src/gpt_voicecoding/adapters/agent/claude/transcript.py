@@ -115,9 +115,18 @@ def _parse(text: str) -> tuple[Record, ...]:
     A line that does not parse is the record being written right now far more
     often than it is a broken file, so it costs itself and nothing else. Anything
     that parses to something other than an object is not a record either.
+
+    **Split on `"\n"` and on nothing else.** JSONL is newline-delimited, while
+    `str.splitlines` also breaks on U+2028, U+2029 and U+0085 — and
+    `JSON.stringify`, which writes these files, leaves all three raw inside a
+    string. A record carrying one would be cut in two, neither half would parse,
+    and "costs itself and nothing else" would quietly cost the whole record: a
+    dropped `tool_result` leaves the call it closes outstanding, which reads as a
+    permanent false `PERMISSION`. Measured on 2026-08-26 over the 200 most recent
+    transcripts on this machine: 4 files, 31 records (#98).
     """
     records: list[Record] = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if not line.strip():
             continue
         try:
