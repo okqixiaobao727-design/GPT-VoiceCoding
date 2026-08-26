@@ -43,6 +43,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
 
+from gpt_voicecoding.adapters.agent import _summary
 from gpt_voicecoding.seams.agent import Option, WaitingFor, WaitingKind
 
 #: The one tool whose call is part of the visible conversation, and the only one
@@ -56,20 +57,17 @@ QUESTION_TOOL: Final = "AskUserQuestion"
 #: this marker has no recommendation to report.
 RECOMMENDED_MARKER: Final = "(recommended)"
 
-#: The input fields a permission request may be summarised from, in the order
-#: they are preferred. Each is a short human-facing string the product already
-#: writes for a person to read. The arguments proper — `command`, `content`,
-#: `old_string` — are **deliberately absent**: they are the code and shell text
-#: the reference implementation always excluded, and reading them aloud into a
-#: Live Call or pushing them to a phone is neither safe nor useful
-#: (`legacy@1d32845:bridge/transcript.py:1779-1790`).
+#: The input fields a Claude permission request may be summarised from, in the
+#: order they are preferred. Each is a short human-facing string the product
+#: already writes for a person to read. The arguments proper — `command`,
+#: `content`, `old_string` — are **deliberately absent**, and that rule lives in
+#: `_summary` now rather than here: the Codex lane needs the same one, and while
+#: it lived here that lane read the shell command verbatim.
 SUMMARY_FIELDS: Final = ("description", "file_path", "path", "notebook_path")
 
-#: Longer than any of those fields as the product writes them. Something over
-#: this is not the one-line summary this reads for, so it is passed over whole
-#: rather than cut: half a sentence read aloud says less than the tool's name
-#: does, and a cut lands mid-secret as readily as mid-word.
-SUMMARY_MAX_CHARS: Final = 200
+#: Re-exported, not redefined. `_progress.bounded` cites this name for the rule
+#: it follows, and `tests/test_progress_bound.py` holds the two together.
+SUMMARY_MAX_CHARS: Final = _summary.SUMMARY_MAX_CHARS
 
 #: The wrappers Claude Code writes around the two local-command pipeline records,
 #: and the opening line of an expanded skill body. All three are `user` records
@@ -116,27 +114,15 @@ def analyse(records: Sequence[Mapping[str, Any]]) -> WaitingFor:
 
 
 def summarise(tool_input: Any) -> str:
-    """The one readable thing a tool call says about itself, or nothing.
+    """The one readable thing a Claude tool call says about itself, or nothing.
 
-    P5, and the **only** extractor of this field in the product: the Approval
-    Relay builds its own `detail` with it (`approval.request_from`), so one safety
-    rule cannot be enforced on one path and not the other.
-
-    Empty is the honest answer for an input carrying none of these fields — the
-    announcement then names the tool and nothing more, rather than describing an
-    action from a guess, and `ApprovalVerdict.ASK` is how the user hands a dialog
-    they cannot judge from that back to the screen in front of them.
+    P5. This lane's fields, the shared rule (`_summary`): description-class text
+    only, whole or not at all, and empty is an answer. The Approval Relay builds
+    its `detail` with this too (`approval.request_from`), so a rule enforced here
+    and not there would be no rule — which is exactly what the Codex lane's own
+    extractor turned out to be.
     """
-    if not isinstance(tool_input, Mapping):
-        return ""
-    for field in SUMMARY_FIELDS:
-        value = tool_input.get(field)
-        if not isinstance(value, str):
-            continue
-        summary = value.strip()
-        if summary and len(summary) <= SUMMARY_MAX_CHARS:
-            return summary
-    return ""
+    return _summary.summarise(tool_input, SUMMARY_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
