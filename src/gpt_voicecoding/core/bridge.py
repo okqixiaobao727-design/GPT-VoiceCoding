@@ -117,10 +117,19 @@ def stop_notice_for(
     """
     stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
     tail = f" — {stopped_on}" if stopped_on else ""
-    # What to call it is `core/sessions.py`'s answer, and its floor is the
-    # address: a notice that names nothing is a notice the user cannot answer.
-    called = spoken_name(session) if session is not None else spoken_target(target)
-    return f"{called} stopped and may need you{tail}"
+    return f"{called_for(session, target)} stopped and may need you{tail}"
+
+
+def called_for(session: Session | None, target: SessionTarget) -> str:
+    """What a notice about this Session calls it.
+
+    What to call it is `core/sessions.py`'s answer, and its floor is the address:
+    a notice that names nothing is a notice the user cannot answer. Both notices
+    Bridge Core composes ask this question — the Stop Notice and, since #109, the
+    Approval Relay's announcement — so it is one expression rather than the same
+    line twice, which is how one of them came to have it and the other not.
+    """
+    return spoken_name(session) if session is not None else spoken_target(target)
 
 
 def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
@@ -532,7 +541,7 @@ class BridgeCore:
             case SessionEnded():
                 await self._session_ended(event)
             case AwaitingApproval():
-                await self.approvals.opened(event.request)
+                await self.approvals.opened(event.request, self._called(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
@@ -725,3 +734,7 @@ class BridgeCore:
             return self._state.sessions.resolve(target)
         except BridgeCoreError:
             return None
+
+    def _called(self, target: SessionTarget) -> str:
+        """What to call this Session in a notice, whether or not the roster knows it."""
+        return called_for(self._known(target), target)

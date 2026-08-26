@@ -41,6 +41,7 @@ from gpt_voicecoding.core.clock import Clock, default_clock
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, Reach
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
+from gpt_voicecoding.core.sessions import spoken_target
 from gpt_voicecoding.seams.agent import AgentAdapter, ApprovalRequest, ApprovalVerdict
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, new_request_id
@@ -48,10 +49,31 @@ from gpt_voicecoding.seams.identity import AgentKind, RequestId, new_request_id
 _log = logging.getLogger(__name__)
 
 
-def announcement_for(request: ApprovalRequest) -> str:
-    """What the user is told is waiting. Names the tool, never guesses the answer."""
+def announcement_for(request: ApprovalRequest, called: str) -> str:
+    """What the user is told is waiting. Names the Session and the tool, never the answer.
+
+    **`called` is the Session, said the way the user names it**, and it is a
+    required argument rather than an optional flourish. This sentence used to
+    open "a session is waiting…", which is the one thing the user cannot act on:
+    the bridge covers every Session on the machine, so on any real machine
+    several of them can be waiting at once, and this is the notice that carries a
+    budget and a `bridgectl approve` — the *most* answerable thing the product
+    says, and the only one that did not say which Session it was about (#109,
+    found on a run where a stranger's permission prompt was indistinguishable
+    from the lane's own).
+
+    Bridge Core composes `called` at the call site from the same two lines
+    `stop_notice_for` uses — `spoken_name` where the Session is known, its
+    address as the floor — because "what to call it" has one answer
+    (`core/sessions.py`) and this is not a second one.
+
+    Legacy: **ported**. `legacy@1d32845:bridge/host.py:213-235` rendered
+    `Session: {session_label}` above "This session is waiting for permission.";
+    gen-1 named the Session on its permission notice and the rewrite dropped it,
+    which is the class of loss ADR 0010 exists for.
+    """
     detail = f" — {request.detail}" if request.detail.strip() else ""
-    return f"a session is waiting for your permission to use {request.tool_name}{detail}"
+    return f"{called} is waiting for your permission to use {request.tool_name}{detail}"
 
 
 #: What closes the loop when the adapter **proved** the verdict arrived, per
@@ -150,13 +172,20 @@ class ApprovalPipeline:
         """Every request still inside its budget, in the order they arrived."""
         return tuple(self._pending.values())
 
-    async def opened(self, request: ApprovalRequest) -> PendingApproval:
+    async def opened(self, request: ApprovalRequest, called: str | None = None) -> PendingApproval:
         """A dialog is on screen. Start the budget and announce it everywhere.
 
         The budget starts here and ticks regardless of whether any outlet took
         the announcement: the dialog is stalled either way, and a budget that
         only ran when someone was listening would never expire on the one path
         where the fallback matters most.
+
+        `called` is what the announcement calls the Session (#109). It is the
+        caller's because the Session *registry* is not this pipeline's — the
+        dialog arrives as an `ApprovalRequest`, which carries a target and no
+        name — and it is optional because the address is a complete answer on its
+        own: `spoken_target` is the floor `spoken_name` itself falls back to, so
+        a caller with nothing better to say still names the Session.
         """
         now = self._clock()
         waiting = PendingApproval(
@@ -171,7 +200,7 @@ class ApprovalPipeline:
             Notice(
                 request_id=waiting.request_id,
                 target=request.target,
-                text=announcement_for(request),
+                text=announcement_for(request, called or spoken_target(request.target)),
             ),
             reach=Reach.EVERY_OUTLET,
         )

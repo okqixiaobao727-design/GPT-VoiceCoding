@@ -1,0 +1,198 @@
+"""The acceptance harness's attribution rule, held against the product's own words.
+
+`tests/acceptance/journey.py` states one rule for every step that reads the chat:
+**a step only ever attributes what names its own target.** The rule exists because
+the engine bridges every Session on the machine, so the chat is a shared surface —
+on run `20260826T213402Z` the `stop notice` step passed on a permission prompt
+belonging to a stale `/tmp/vcprobe` thread (#109).
+
+The rule rests on the harness knowing what the product would call a Session, and
+`_naming_forms` mirrors `core/sessions.py:spoken_name`/`spoken_target` rather than
+importing them — a harness that asked the product what it had said would agree
+with the product by construction. Mirrors drift, and an acceptance run is an
+expensive place to find out. So the tests below compose the product's **real**
+notices, off a **real** roster row, and assert the harness attributes them.
+
+The acceptance run itself never reaches CI. This does, and it is what makes the
+mirror a thing that breaks loudly rather than an acceptance step that goes quiet.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import journey
+
+from gpt_voicecoding.control_plane.payloads import session_document
+from gpt_voicecoding.core.approvals import announcement_for
+from gpt_voicecoding.core.bridge import stop_notice_for
+from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.seams.agent import ApprovalRequest
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
+
+MINE = SessionTarget(agent=AgentKind.CLAUDE, session_id="6f723f5c", pid=64312)
+A_STRANGER = SessionTarget(agent=AgentKind.CODEX, session_id="01a04001", pid=95827)
+
+#: The message that made #109: a permission prompt from somebody else's Session,
+#: taken verbatim off run `20260826T213402Z`'s journal.
+THE_STRANGERS_PROMPT = (
+    "a session is waiting for your permission to use a shell command — Do you want to "
+    "allow me to run exactly this one write command to create /tmp/vcprobe/approval-probe.txt?"
+)
+
+
+def session(target: SessionTarget = MINE, *, task: str | None = "port the log") -> Session:
+    return Session(
+        target=target,
+        name=SessionName("workspace-claude", task) if task is not None else None,
+        workspace=Path("/tmp/workspace"),
+        first_seen=0.0,
+    )
+
+
+def row(one: Session) -> dict:
+    """The roster row a surface reads, built the way the control plane builds it."""
+    return session_document(one)
+
+
+class TestWhatTheHarnessThinksNamesASession:
+    def test_a_named_session_is_named_by_its_session_name(self) -> None:
+        assert "workspace-claude · port the log" in journey._naming_forms(row(session()))
+
+    def test_a_session_with_no_name_yet_falls_back_to_its_address(self) -> None:
+        """Measured: a Codex Session has no name until its first turn."""
+        assert journey._naming_forms(row(session(task=None))) == ("claude 6f723f5c",)
+
+    def test_a_session_with_no_id_yet_falls_back_to_its_pid(self) -> None:
+        """`spoken_target`'s own second fallback, mirrored — codex before its rollout."""
+        bare = {"target": {"agent": "codex", "session_id": None, "pid": 95827}, "name": None}
+
+        assert journey._naming_forms(bare) == ("codex pid 95827",)
+
+    def test_a_row_that_names_nothing_yields_nothing_to_attribute_with(self) -> None:
+        """Not an empty pass: `_await_message_naming` refuses on this rather than waiting."""
+        assert journey._naming_forms({}) == ()
+        assert journey._naming_forms({"target": "not a mapping", "name": ""}) == ()
+
+
+class TestTheProductsOwnNoticesAreAttributable:
+    """Both notices Bridge Core composes, matched by the forms the harness derives."""
+
+    def test_a_stop_notice_names_the_session_it_is_about(self) -> None:
+        mine = session()
+
+        notice = stop_notice_for(mine, mine.target)
+
+        assert journey._named_in(notice, journey._naming_forms(row(mine)))
+
+    def test_an_approval_announcement_names_the_session_it_is_about(self) -> None:
+        """#109's product half: until it, this sentence named only the tool."""
+        mine = session()
+
+        announcement = announcement_for(
+            ApprovalRequest("a1", mine.target, "Write", detail="relay.txt"),
+            called="workspace-claude · port the log",
+        )
+
+        assert journey._named_in(announcement, journey._naming_forms(row(mine)))
+
+    def test_an_unnamed_session_is_still_attributable_by_its_address(self) -> None:
+        anonymous = session(task=None)
+
+        notice = stop_notice_for(anonymous, anonymous.target)
+
+        assert journey._named_in(notice, journey._naming_forms(row(anonymous)))
+
+
+class TestWhatTheHarnessMustNotAttributeToItself:
+    def test_the_message_that_made_109_is_not_this_lanes_stop(self) -> None:
+        assert not journey._named_in(THE_STRANGERS_PROMPT, journey._naming_forms(row(session())))
+
+    def test_another_sessions_stop_notice_is_not_this_lanes_either(self) -> None:
+        """The shape a quieter machine produces: a real notice, about someone else."""
+        theirs = Session(
+            target=A_STRANGER,
+            name=SessionName("workspace-codex", "some other work"),
+            workspace=Path("/tmp/elsewhere"),
+            first_seen=0.0,
+        )
+
+        notice = stop_notice_for(theirs, theirs.target)
+
+        assert journey._named_in(notice, journey._naming_forms(row(theirs)))
+        assert not journey._named_in(notice, journey._naming_forms(row(session())))
+
+    def test_a_child_and_its_parent_are_told_apart(self) -> None:
+        """#79's step asserts an absence about the child while the parent is announced."""
+        parent = session()
+        child = session(
+            target=SessionTarget(agent=AgentKind.CLAUDE, session_id="9a11bd2e", pid=64399),
+            task=None,
+        )
+
+        parents_notice = stop_notice_for(parent, parent.target)
+
+        assert not journey._named_in(parents_notice, journey._naming_forms(row(child)))
+
+
+class TestTwoSessionsTheChatCannotTellApart:
+    """Nothing makes a Session Name unique, so the harness has to notice when one is not.
+
+    `adapters/agent/_naming.py` composes `<project> · <task>` from a project and a
+    task and checks neither against the other rows. Two Sessions in one workspace
+    doing one thing therefore share a name, and the likeliest such pair is a Child
+    Process and its parent — which is #79's step, where the parent is announced
+    while the child must not be.
+    """
+
+    def test_a_name_two_sessions_share_is_refused_rather_than_guessed(self) -> None:
+        parent = session()
+        twin = session(
+            target=SessionTarget(agent=AgentKind.CLAUDE, session_id="9a11bd2e", pid=64399)
+        )
+        rows = [row(parent), row(twin)]
+
+        shared = journey._indistinguishable_from(
+            journey._naming_forms(row(parent)), rows, journey._address_of(row(parent))
+        )
+
+        assert shared is not None and "claude:9a11bd2e" in shared
+
+    def test_a_name_that_is_a_prefix_of_another_is_shared_too(self) -> None:
+        """Matching is substring, so `· port` is inside `· port the log`."""
+        short = session(task="port")
+        long = session(target=SessionTarget(agent=AgentKind.CODEX, session_id="abc"))
+        rows = [row(short), row(long)]
+
+        shared = journey._indistinguishable_from(
+            journey._naming_forms(row(short)), rows, journey._address_of(row(short))
+        )
+
+        assert shared is not None
+
+    def test_distinct_sessions_are_not_refused(self) -> None:
+        mine = session()
+        theirs = Session(
+            target=A_STRANGER,
+            name=SessionName("workspace-codex", "some other work"),
+            workspace=Path("/tmp/elsewhere"),
+            first_seen=0.0,
+        )
+        rows = [row(mine), row(theirs)]
+
+        assert (
+            journey._indistinguishable_from(
+                journey._naming_forms(row(mine)), rows, journey._address_of(row(mine))
+            )
+            is None
+        )
+
+    def test_a_session_is_never_indistinguishable_from_itself(self) -> None:
+        mine = session()
+
+        assert (
+            journey._indistinguishable_from(
+                journey._naming_forms(row(mine)), [row(mine)], journey._address_of(row(mine))
+            )
+            is None
+        )

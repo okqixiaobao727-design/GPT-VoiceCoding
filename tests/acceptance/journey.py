@@ -28,6 +28,26 @@ Measured on 2026-08-26: both TUIs redraw with cursor addressing, and `codex` in
 a pty interleaves to roughly one glyph per line once escapes are stripped. The
 raw stream is kept as an artifact for a human; nothing parses it.
 
+## What a step may attribute to itself
+
+The engine this run spawns bridges **every** Session on the machine, so the chat
+is a shared surface: at any moment it may carry a notice about somebody's open
+work that has nothing to do with the lane being walked. The rule that follows
+from that is one line, and it is stated here so no step has to relearn it —
+
+> **A step only ever attributes what names its own target.**
+
+Every chat read in this module goes through `Walk._await_message_naming`, which
+is where the rule is enforced; `_naming_forms` is what "names" means. That
+includes the two reads that assert *absence*, where an unattributed message is a
+false red rather than a false green, and `drain_boot_notice`, which is neither —
+a stranger's notice accepted there ends the drain early and lets the real boot
+notice land where `stop notice` is looking. Learned on run `20260826T213402Z`, where
+`stop notice` passed on a permission prompt belonging to a stale `/tmp/vcprobe`
+thread, and on a quieter machine would have failed for a reason equally
+unrelated to the lane (#109). The sibling lesson had already been learned once,
+one method over, for `pending_approvals` (`_answer_pending_approval`).
+
 ## The turns, and why there are five
 
 A step that needs a turn drives its own, because a turn shared between steps
@@ -49,13 +69,20 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import hand_started
 import support
 from support import LaneBlocked, StepFailed
+
+if TYPE_CHECKING:
+    # Named for a type and never imported at runtime: telethon lives behind this
+    # module (`telegram_person.py`, "Telethon lives here and nowhere else"), and
+    # the fast suite imports this file to test its attribution rule without it.
+    import telegram_person
 
 #: The nine steps, in the order #73 fixed. Cited verbatim by #74–#80.
 STEPS = (
@@ -100,9 +127,11 @@ BOOT_TURN_ALLOWANCE = 2.0
 #: is exactly the question it is asking.
 ENGINE_STOP_LINE = r"(?i)Session stopped:"
 
-#: What the escalated permission announcement says (`core/approvals.py:43-46`).
+#: What the escalated permission announcement says (`core/approvals.py:52-76`).
 #: Matched rather than quoted whole: the tool name and the detail are the agent's,
-#: and this run does not get to predict them.
+#: and this run does not get to predict them. **Which Session it is about is not
+#: this pattern's business either** — the sentence opens with the Session's name
+#: since #109, and the attribution rule is what reads it.
 APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
 
 
@@ -561,12 +590,31 @@ class Walk:
         (`adapters/agent/codex/adapter.py:965-985`). An engine that first saw this
         thread already idle raised nothing for the boot turn, and there is nothing
         to drain — which is also the case that pays the full window.
+
+        **It reads the chat, so it obeys the attribution rule** (#109), and here
+        that is load-bearing rather than tidy. A stranger's notice taken as the
+        boot turn's would end this wait early and leave the *real* boot notice
+        still in flight, to land after `stable name`'s mark — re-creating exactly
+        the false green this drain exists to prevent, and writing a sentence about
+        someone else's Session into the verdict on the way. This is the one chat
+        read that runs before `roster`, so the naming forms may come from the
+        agent's own record rather than the roster row (`_own_row`).
         """
         if mark is None or self.boot_turn is None:
             return
-        arrived = self.person.await_message(
-            mark, deadline_seconds=self.far_side.telegram_round_trip_seconds
-        )
+        try:
+            arrived = self._await_own_message(
+                mark, deadline_seconds=self.far_side.telegram_round_trip_seconds
+            )
+        except StepFailed as unattributable:
+            # Arrangement, not judgement: this method has no step to fail. A lane
+            # whose messages cannot be told from another Session's is a lane none
+            # of the nine steps could read either, so it is blocked here rather
+            # than walked into nine reds with one cause.
+            raise LaneBlocked(
+                f"the boot turn's notice could not be attributed, and neither could anything "
+                f"a later step reads: {unattributable}"
+            ) from unattributable
         announced = support.matching_lines(self.engine.log_lines(), ENGINE_STOP_LINE)
         boot = self.lane.boot
         assert boot is not None  # there is no mark to spend without one
@@ -576,7 +624,8 @@ class Walk:
             f"`stable name` types anyway — because a non-empty prompt is what skips Codex's "
             f"update gate (#110). Waited out on Codex's own `task_started`/`task_complete` "
             f"bracketing, with every outlet still off: {self.boot_turn.seconds:.1f}s. Its Stop "
-            f"Notice was then drained behind chat mark {mark} so that nothing after "
+            f"Notice was then drained behind chat mark {mark} — only a message naming this "
+            f"Session counting as it (#109) — so that nothing after "
             f"`stable name`'s later mark can be it: "
             + (
                 f"chat message {arrived.id} ({arrived.text[:80]!r})"
@@ -781,18 +830,24 @@ class Walk:
         flattened sentence. What can be checked from the chat is that a message
         arrived for that Stop and that it is not empty; whether it carries the
         typed `WaitingFor` is #75's own exit and is read off the payload.
+
+        **The message has to name this Session**, which is the module's
+        attribution rule and not a nicety of this step: until #109 this took the
+        next bot message after its mark, and on run `20260826T213402Z` that was a
+        stranger's permission prompt.
         """
         if self.before_first_turn is None:
             raise LaneBlocked("no turn was driven, so no Stop was crossed to be announced")
-        message = self.person.await_message(
+        message = self._await_own_message(
             self.before_first_turn, deadline_seconds=self.far_side.telegram_round_trip_seconds
         )
         stop_lines = support.matching_lines(self.engine.log_lines(), r"(?i)stop|SessionStopped")
         if message is None:
             raise StepFailed(
-                f"no message reached the chat within "
-                f"{self.far_side.telegram_round_trip_seconds:.0f}s of the turn ending; "
-                f"engine.log stop lines: {stop_lines[-3:] or 'none'}"
+                f"no message naming {self.address} reached the chat within "
+                f"{self.far_side.telegram_round_trip_seconds:.0f}s of the turn ending. The bot "
+                f"said {self._other_traffic(self.before_first_turn)} in that window, none of it "
+                f"about this Session; engine.log stop lines: {stop_lines[-3:] or 'none'}"
             )
         if not message.text.strip():
             raise StepFailed(f"the Stop reached the chat as an empty message ({message.id})")
@@ -812,8 +867,8 @@ class Walk:
                 f"this engine's own Stop"
             )
         return (
-            f"bot message {message.id}: {message.text!r}; roster waiting_for kind {kind!r}; "
-            f"engine.log: {stop_lines[-1]!r}"
+            f"bot message {message.id}, naming this Session: {message.text!r}; roster "
+            f"waiting_for kind {kind!r}; engine.log: {stop_lines[-1]!r}"
         )
 
     # --- relay ------------------------------------------------------------
@@ -958,6 +1013,13 @@ class Walk:
         is what makes a Session still actionable when Duty comes back on. Two
         observations: silence over a derived window with Duty off, and — with
         Duty back on — a notice naming this Session.
+
+        Both observations are about *this* Session, under the module's
+        attribution rule. The silence one is where that matters most and reads
+        least obviously: Duty is a global switch, so a stranger's notice arriving
+        with Duty off would be a real product bug — but it would be a bug about
+        somebody else's Session, and failing this lane on it is the mirror image
+        of the #109 pass.
         """
         if self.address is None:
             raise LaneBlocked("no Session to watch the switches over")
@@ -970,20 +1032,21 @@ class Walk:
         status = self.bridgectl("status")
         if not status.ok:
             raise StepFailed(f"with Duty off, `status` refused: {status.text}")
-        intruder = self.person.await_message(
+        intruder = self._await_own_message(
             mark, deadline_seconds=self.far_side.absence_window_seconds
         )
         if intruder is not None:
             self.bridgectl("switch", "duty", "on")
             raise StepFailed(
-                f"with Duty off a message still reached the chat: {intruder.id} {intruder.text!r}"
+                f"with Duty off a message about this Session still reached the chat: "
+                f"{intruder.id} {intruder.text!r}"
             )
 
         mark = self.person.latest_message_id()
         back_on = self.bridgectl("switch", "duty", "on")
         if not back_on.ok:
             raise StepFailed(f"`switch duty on` refused: {back_on.text}")
-        reconciled = self.person.await_message(
+        reconciled = self._await_own_message(
             mark, deadline_seconds=self.far_side.telegram_round_trip_seconds
         )
         if reconciled is None:
@@ -992,7 +1055,8 @@ class Walk:
                 f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
                 f"(correct), but turning Duty back on reported nothing about a Session that "
                 f"stopped waiting on the user (turn ended={turn.ended}, "
-                f"roster waiting_for {waiting!r})"
+                f"roster waiting_for {waiting!r}). The bot said "
+                f"{self._other_traffic(mark)} in that window, none of it about this Session"
             )
         return (
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
@@ -1011,6 +1075,14 @@ class Walk:
         claim about a source the official roster does not serve, and the product
         has to find it another way — which is what makes this #79's work rather
         than a formality.
+
+        **"Never announced" is a claim about the child**, so the module's
+        attribution rule is applied to the *child's* names here, not the parent's
+        — the one place in this walk where the target of a read is not the
+        Session under test. It has to be: the parent's own turn ends inside this
+        step's window, and the parent's Stop Notice is the product working. A
+        read that took the next bot message would have called that notice the
+        child's and failed #79 for the one thing #79 does not forbid.
         """
         if self.address is None:
             raise LaneBlocked("no parent Session to hang a child from")
@@ -1034,9 +1106,10 @@ class Walk:
                 f"#74 locks `ChildClassification` and #79 fills it."
             )
         child_row = children[0]
+        child_address = _address_of(child_row)
         parent = child_row["child"].get("parent")
         if not parent:
-            raise StepFailed(f"the child row {_address_of(child_row)} names no parent")
+            raise StepFailed(f"the child row {child_address} names no parent")
         # "Listed **under its parent**" is the claim, and any non-empty parent
         # satisfied it before — including one naming some other Session, which is
         # precisely the bug a roster of several Sessions would produce and a
@@ -1044,19 +1117,21 @@ class Walk:
         parent_address = _address_of({"target": parent})
         if parent_address != self.address:
             raise StepFailed(
-                f"the child row {_address_of(child_row)} is listed under {parent_address}, not "
+                f"the child row {child_address} is listed under {parent_address}, not "
                 f"under the Session that started it ({self.address})"
             )
 
-        announced = self.person.await_message(
-            mark, deadline_seconds=self.far_side.absence_window_seconds
+        announced = self._await_message_naming(
+            child_row,
+            mark,
+            deadline_seconds=self.far_side.absence_window_seconds,
+            whose=f"the child {child_address}",
         )
         if announced is not None:
             raise StepFailed(
                 f"a child raised a Stop Notice: message {announced.id} {announced.text!r} — "
                 f"#79: children are seen, never announced"
             )
-        child_address = _address_of(child_row)
         refused = self.bridgectl("relay", child_address, "this must be refused")
         if refused.ok:
             raise StepFailed(
@@ -1074,7 +1149,7 @@ class Walk:
                 f"the child rule being applied"
             )
         return (
-            f"{_address_of(child_row)} listed under {support.flatten([parent])}; no notice in "
+            f"{child_address} listed under {support.flatten([parent])}; no notice naming it in "
             f"{self.far_side.absence_window_seconds:.0f}s; relay refused: {refused.text!r}"
         )
 
@@ -1155,6 +1230,117 @@ class Walk:
         name = row.get("name")
         return str(name) if name else None
 
+    def _own_row(self) -> dict:
+        """The roster's row for the Session under test, or the agent's own account of it.
+
+        The engine is not the only thing that knows which Session this is, and
+        the walk reads the chat before `roster` has established that it does:
+        `drain_boot_notice` runs seconds after the launch turn (#110), where the
+        engine's discovery may not have listed the Session yet — `roster` itself
+        allows it `DISCOVERY_SECONDS` to.
+
+        Ground truth is the fallback and it is not a weaker one for this
+        question. A Session the engine holds no Session Name for is announced by
+        its address (`core/sessions.py:529-546`), and the address is exactly what
+        the agent's own record gives. `{}` — no roster row and no ground truth —
+        is the honest empty answer, and `_await_message_naming` refuses on it.
+        """
+        row = self._roster_row()
+        if row is not None:
+            return row
+        if self.truth is None:
+            return {}
+        return {
+            "target": {
+                "agent": self.lane.agent,
+                "session_id": self.truth.session_id or None,
+                "pid": self.truth.pid,
+            },
+            "name": None,
+        }
+
+    def _await_message_naming(
+        self,
+        row: dict | None,
+        mark: int,
+        *,
+        deadline_seconds: float,
+        whose: str,
+        matching: Callable[..., bool] | None = None,
+    ) -> telegram_person.PersonMessage | None:
+        """Wait for a bot message that names *that* Session, and never any other.
+
+        The one door every chat read in this walk goes through — the module's
+        attribution rule, enforced. `None` stays a legitimate answer, because two
+        of this walk's reads assert an absence.
+
+        `matching` narrows what a caller will take **on top of** the rule, never
+        instead of it: it is `and`-ed, so no caller can widen its way back to the
+        message that made #109.
+
+        The naming forms are resolved **once**, before the wait, and not inside
+        the predicate: they come off the control plane, and re-deriving them per
+        message per poll would ask the engine for the roster a hundred times over
+        a two-minute absence window.
+        """
+        forms = _naming_forms(row or {})
+        if not forms:
+            # Nothing to attribute *with*. Louder than a silent `None`, which two
+            # of the three callers would read as the absence they wanted.
+            raise StepFailed(
+                f"nothing in the roster names {whose}, so no message in the chat could be "
+                f"attributed to it either way: the row is {row!r}"
+            )
+        shared = _indistinguishable_from(forms, self._roster_rows(), _address_of(row or {}))
+        if shared is not None:
+            raise StepFailed(
+                f"{whose} is named {list(forms)}, and so is {shared} — a message naming one "
+                f"names both, so this run cannot attribute anything in the chat to either"
+            )
+        self.journal("chat.attribution", lane=self.lane.name, whose=whose, names=list(forms))
+        return self.person.await_message(
+            mark,
+            deadline_seconds=deadline_seconds,
+            matching=lambda seen: (
+                seen.from_bot
+                and _named_in(seen.text, forms)
+                and (matching is None or matching(seen))
+            ),
+        )
+
+    def _await_own_message(
+        self,
+        mark: int,
+        *,
+        deadline_seconds: float,
+        matching: Callable[..., bool] | None = None,
+    ) -> telegram_person.PersonMessage | None:
+        """The same, for the Session this walk is walking."""
+        row = self._own_row()
+        return self._await_message_naming(
+            row,
+            mark,
+            deadline_seconds=deadline_seconds,
+            # `roster` is what sets `self.address`, and one caller runs before it
+            # (`drain_boot_notice`), so the row says who this is when it cannot.
+            whose=f"the Session under test ({self.address or _address_of(row)})",
+            matching=matching,
+        )
+
+    def _other_traffic(self, mark: int) -> str:
+        """What else the bot said in the window, for a human reading a red step.
+
+        A step that failed to find its own message is worth telling apart from a
+        step that found nothing at all, and on a machine the bridge covers wholly
+        those are different situations with different causes.
+        """
+        others = [
+            f"{message.id}: {message.text!r}"
+            for message in self.person.messages_after(mark)
+            if message.from_bot
+        ]
+        return support.flatten(others) if others else "nothing"
+
     def _record_now(self) -> Path | None:
         """Where the agent's own record of this Session is, at this moment."""
         if self.truth is None:
@@ -1224,6 +1410,15 @@ class Walk:
         command approved by the harness and this lane's Write answered four
         minutes late, which failed `relay` and `companion inbound` downstream.
         The address is the filter, exactly as it is everywhere else here.
+
+        **And the announcement it waits for is filtered the same way** (#109).
+        Filtering the dialog and then taking any Session's announcement as proof
+        that this one reached the Companion Channel is the same defect one clause
+        later: on a machine bridging six Sessions the round trip could read green
+        while this lane's own announcement never went out. That the check is
+        possible at all is a product change #109 made — until then the
+        announcement named the tool and never the Session
+        (`core/approvals.py:51-56`).
         """
         deadline = time.monotonic() + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
@@ -1234,12 +1429,10 @@ class Walk:
                 if _address_of(waiting) == self.address
             ]
             if pending:
-                announced = self.person.await_message(
+                announced = self._await_own_message(
                     mark,
                     deadline_seconds=self.far_side.telegram_round_trip_seconds,
-                    matching=lambda seen: (
-                        seen.from_bot and bool(APPROVAL_ANNOUNCEMENT.search(seen.text))
-                    ),
+                    matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
                 )
                 approval_id = str(pending[0]["approval_id"])
                 answer = self.bridgectl("approve", approval_id, "allow")
@@ -1282,3 +1475,74 @@ def _address_of(row: dict) -> str:
     pid = target.get("pid")
     tail = f":{pid}" if pid else ""
     return f"{target.get('agent')}:{target.get('session_id')}{tail}"
+
+
+def _naming_forms(row: dict) -> tuple[str, ...]:
+    """Every string the product would name one Session by, from its roster row.
+
+    Mirrors `core/sessions.py:529-546` rather than importing it: a harness that
+    asked the product what it had said would agree with the product by
+    construction, and the whole point of reading the chat is that it might not.
+
+    Both forms are kept because the product chooses between them by what it holds
+    *at the moment it speaks* — `spoken_name` where the Session has a Session
+    Name, `spoken_target` where it does not — and the roster read that answers
+    this question is a different moment from the one the message was composed in.
+    A Codex Session, in particular, has no name until its first turn.
+    """
+    target = row.get("target")
+    target = target if isinstance(target, dict) else {}
+    forms: list[str] = []
+    name = row.get("name")
+    if name:
+        forms.append(str(name))
+    agent = target.get("agent")
+    session_id = target.get("session_id")
+    pid = target.get("pid")
+    if agent and session_id:
+        forms.append(f"{agent} {session_id}")
+    elif agent and pid:
+        forms.append(f"{agent} pid {pid}")
+    return tuple(forms)
+
+
+def _named_in(text: str, forms: Sequence[str]) -> bool:
+    """Does this message name one of these Sessions? The attribution rule's whole test.
+
+    Substring, not equality: the product's own words wrap the name in a sentence
+    it composes (`core/bridge.py:107-123`, `core/approvals.py:51-56`), and which
+    sentence is the product's business rather than this harness's.
+    """
+    return any(form in text for form in forms)
+
+
+def _indistinguishable_from(forms: Sequence[str], rows: Sequence[dict], mine: str) -> str | None:
+    """Another Session in the roster that a message naming *this* one would also name.
+
+    A Session Name is `<project> · <task>` and **nothing makes it unique**
+    (`adapters/agent/_naming.py:39-62` composes it from a project and a task and
+    checks neither against the other rows). So two Sessions on one machine can be
+    called the same thing, and the product already knows it: `match_name` refuses
+    with `AmbiguousNameError` rather than picking one of them
+    (`core/sessions.py:456-463`). This is that same fact, met from the chat.
+
+    **The pair it is not is a Child Process and its parent.** A child carries no
+    Session Name at all — `core/sessions.py:225` keeps `name` for main Sessions
+    and gives a child `None` — so its only naming form is its address, which is
+    unique by construction. The `child` step is therefore safe from this by
+    #78/#79's own design rather than by luck, which is worth saying because a
+    parent announced *while* the child must not be is exactly the shape a
+    collision would ruin.
+
+    Where that happens the run cannot attribute either way, and the honest answer
+    is to say so rather than pick: a message accepted would be a guess and a
+    message rejected would be a guess too. That is the whole lesson of #109 —
+    a step that passes for a reason it cannot name has not passed.
+    """
+    for other in rows:
+        if _address_of(other) == mine:
+            continue
+        theirs = _naming_forms(other)
+        if any(form in one for form in forms for one in theirs):
+            return f"{_address_of(other)}, which the roster names {list(theirs)}"
+    return None
