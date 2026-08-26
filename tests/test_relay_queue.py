@@ -83,10 +83,16 @@ class TestEnqueueing:
         with pytest.raises(DuplicateRelayError):
             queue.enqueue(answer(request_id=request_id))
 
-    def test_an_entry_starts_unknown_because_nothing_has_been_attempted(self) -> None:
+    def test_an_entry_starts_ungraded_because_nothing_has_been_attempted(self) -> None:
+        """`None`, not `UNKNOWN` — P9 turns on telling those two apart.
+
+        `UNKNOWN` is a positive observation: something went on the wire and
+        proved nothing, so sending it again risks a duplicate. An entry queued
+        against a closed Reply Window went nowhere and carries no such risk.
+        """
         queue = RelayQueue()
         queued = queue.enqueue(answer())
-        assert queued.outcome is Delivery.UNKNOWN
+        assert queued.outcome is None
 
     def test_something_already_delivered_cannot_wait_in_the_undelivered_queue(self) -> None:
         queue = RelayQueue()

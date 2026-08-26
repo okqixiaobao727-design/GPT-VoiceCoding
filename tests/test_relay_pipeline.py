@@ -26,7 +26,16 @@ from gpt_voicecoding.core.escalation import NO_DEADLINE
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
-from gpt_voicecoding.core.relays import RelayPipeline
+from gpt_voicecoding.core.relays import (
+    CEILING_REPORT,
+    CEILING_UNPROVEN_REPORT,
+    DUPLICATE_RISK_CONFIRMATION,
+    HELD_CONFIRMATION,
+    QUEUED_CONFIRMATION,
+    SESSION_GONE_REPORT,
+    SESSION_GONE_UNPROVEN_REPORT,
+    RelayPipeline,
+)
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.delivery import Delivery
@@ -381,3 +390,185 @@ class TestFailingClosedOnTheTarget:
 
         assert [one.state for one in dropped] == [Lifecycle.REPORTED_FAILED]
         assert harness.relays.pending() == ()
+
+
+class TestDuplicateSafety:
+    """P9: a second attempt is permitted only for **proven** non-delivery.
+
+    The rule is the reference implementation's, and the 539 lines behind it prove
+    it rather than authorise porting them (`legacy@1d32845:bridge/delivery.py:
+    28-75`; `legacy@1d32845:bridge/coordinator.py:1075-1109`;
+    `legacy@1d32845:bridge/store.py:964-1035,3394-3555,3653-3874`): the ledger
+    recorded a terminal grade, permitted a new attempt only where non-delivery
+    was proven, and **never** turned indeterminate into an automatic resend.
+    Ported whole; its storage is left behind (#61 R1).
+
+    v1 enqueued every non-delivered outcome and retried all of them on the next
+    Reply Window, which is exactly how the reference implementation produced
+    duplicates before it learned this rule. #71 makes it concrete on the Claude
+    lane: an accepted socket write proves nothing, so an `UNKNOWN` there is a
+    Relay that very likely *did* arrive.
+    """
+
+    def unknown(self) -> Harness:
+        return Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.UNKNOWN, reason="no readback"),
+        )
+
+    def held(self) -> Harness:
+        return Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.HELD, reason="parked in front of the human"),
+        )
+
+    def test_an_unknown_attempt_is_never_sent_again_on_the_next_window(self) -> None:
+        harness = self.unknown()
+        harness.relay("ship it")
+
+        harness.window_opened()
+
+        assert len(harness.agent.calls) == 1
+
+    def test_a_held_relay_is_never_sent_again_either(self) -> None:
+        """It is parked in front of a person and will settle. Sending twice duplicates it."""
+        harness = self.held()
+        harness.relay("ship it")
+
+        harness.window_opened()
+
+        assert len(harness.agent.calls) == 1
+
+    def test_a_proven_failure_is_tried_again_when_the_window_opens(self) -> None:
+        """Proven non-delivery carries no duplicate risk, so the ceiling policy applies."""
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
+        )
+        harness.relay("ship it")
+
+        harness.window_opened()
+
+        assert len(harness.agent.calls) == 2
+
+    def test_words_that_were_never_attempted_are_delivered_as_before(self) -> None:
+        """Nothing went on the wire, so there is nothing that could arrive twice."""
+        harness = Harness()
+        harness.relay("ship it")
+
+        harness.window_opened()
+
+        assert len(harness.agent.calls) == 1
+        assert harness.relays.pending() == ()
+
+    def test_the_unknown_relay_is_kept_rather_than_dropped(self) -> None:
+        """Retained as duplicate-risk information: the user may still authorise another."""
+        harness = self.unknown()
+
+        harness.relay("ship it")
+        harness.window_opened()
+
+        assert [waiting.text for waiting in harness.relays.pending()] == ["ship it"]
+
+    def test_the_user_is_warned_rather_than_promised_a_delivery(self) -> None:
+        harness = self.unknown()
+
+        outcome = harness.relay("ship it")
+
+        assert outcome.confirmation == DUPLICATE_RISK_CONFIRMATION
+        assert outcome.confirmation != QUEUED_CONFIRMATION
+
+    def test_a_held_relay_says_it_is_parked_rather_than_waiting_for_a_turn(self) -> None:
+        harness = self.held()
+
+        outcome = harness.relay("ship it")
+
+        assert outcome.confirmation == HELD_CONFIRMATION
+
+    def test_a_proven_failure_still_promises_the_next_turn(self) -> None:
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
+        )
+
+        assert harness.relay("ship it").confirmation == QUEUED_CONFIRMATION
+
+    def test_the_user_may_authorise_another_attempt_by_saying_it_again(self) -> None:
+        """The explicit authority P9 asks for is the user relaying the words again."""
+        harness = self.unknown()
+        harness.relay("ship it")
+
+        harness.relay("ship it")
+
+        assert len(harness.agent.calls) == 2
+
+    def test_an_unknown_relay_that_is_later_proven_delivered_leaves_the_ledger(self) -> None:
+        """The receipt that arrives late is the other way a duplicate is avoided."""
+        harness = self.unknown()
+        outcome = harness.relay("ship it")
+
+        harness.relays.classify(outcome.request_id, Delivery.DELIVERED)
+
+        assert harness.relays.pending() == ()
+
+
+class TestWhatTheCeilingSaysAboutAnUnprovenRelay:
+    """A ceiling report is rendered verbatim, so it may not claim non-delivery.
+
+    "It never reached the session" is true of words that were never attempted and
+    of a proven failure. It is a **guess** about an `UNKNOWN`, which is precisely
+    the grade that means the far side may well have them.
+    """
+
+    def test_an_unproven_relay_is_reported_without_claiming_it_never_arrived(self) -> None:
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.UNKNOWN, reason="no readback"),
+        )
+        harness.relay("ship it")
+
+        harness.now += TEN_MINUTES
+        (outcome,) = harness.sweep()
+
+        assert outcome.report == CEILING_UNPROVEN_REPORT
+        assert outcome.state is Lifecycle.REPORTED_FAILED
+
+    def test_words_that_never_went_are_reported_as_never_having_gone(self) -> None:
+        harness = Harness()
+        harness.relay("ship it")
+
+        harness.now += TEN_MINUTES
+        (outcome,) = harness.sweep()
+
+        assert outcome.report == CEILING_REPORT
+
+    def test_a_proven_failure_is_reported_as_never_having_gone_too(self) -> None:
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
+        )
+        harness.relay("ship it")
+
+        harness.now += TEN_MINUTES
+        (outcome,) = harness.sweep()
+
+        assert outcome.report == CEILING_REPORT
+
+    def test_a_session_that_ends_under_an_unproven_relay_says_so_honestly(self) -> None:
+        harness = Harness(
+            window=ReplyWindow.OPEN,
+            agent=FakeAgent(outcome=Delivery.UNKNOWN, reason="no readback"),
+        )
+        harness.relay("ship it")
+
+        (outcome,) = harness.pipeline.session_ended(CODEX)
+
+        assert outcome.report == SESSION_GONE_UNPROVEN_REPORT
+
+    def test_a_session_that_ends_under_words_that_never_went_says_that(self) -> None:
+        harness = Harness()
+        harness.relay("ship it")
+
+        (outcome,) = harness.pipeline.session_ended(CODEX)
+
+        assert outcome.report == SESSION_GONE_REPORT
