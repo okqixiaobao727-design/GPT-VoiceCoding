@@ -301,11 +301,32 @@ CLAUDE = Lane(
 #: a trusted workspace already gives (measured 2026-08-26 on the failing run's
 #: own rollout, `turn_context.sandbox_policy = workspace-write`), so the flag
 #: fixes the ground rather than moving it.
+#:
+#: The last argument is the **initial prompt**, and it is here to get past the
+#: update gate rather than to ask for anything (#110; the measurement is in
+#: `hand_started`'s module docstring). `codex [OPTIONS] [PROMPT]` — the prompt is
+#: positional, so it goes after the flags and stays last. Two things follow, and
+#: both are stated because a reader will otherwise meet them as surprises:
+#:
+#: * **It is an extra turn, not a replacement.** `stable name` still types
+#:   `ACKNOWLEDGE` itself, because it requires a name held across a Stop it
+#:   drives, and `stop notice` marks the chat immediately before that turn — a
+#:   Stop crossed at launch would predate the mark and the notice would be
+#:   unfindable. The words are `ACKNOWLEDGE`'s so the boot turn asks the Session
+#:   nothing the run does not already ask, and it uses no tools, so it cannot
+#:   raise a permission before `approval` is there to answer it, and it leaves
+#:   `codex_turn_policy` reading the same ground: the sandbox is this lane's pin
+#:   and the `turn_context` that step grades is `relay`'s, the last one written.
+#: * **The rollout now exists before `roster` runs.** Codex writes its rollout
+#:   when the first *turn* starts, so this lane's `ground_truth` carries a real
+#:   `session_id` at the first read instead of the `""` it used to carry — the
+#:   evidence line `roster` prints changes shape, and the pid join it rests on
+#:   does not.
 CODEX = Lane(
     name="codex",
     agent="codex",
     binary="codex",
-    arguments=("--sandbox", "workspace-write"),
+    arguments=("--sandbox", "workspace-write", ACKNOWLEDGE.words),
     # Measured 2026-08-27 through the shared daemon with the product's own pin
     # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a
     # 0.149.1 app-server: a write to a path outside the workspace raises

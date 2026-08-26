@@ -33,6 +33,35 @@ against `claude` 2.1.246 and `codex-cli` 0.149.1):
   written to the run's artifacts as evidence a human can read; every assertion in
   `journey.py` rests on the roster, the rollout, the filesystem, `engine.log` or
   the chat.
+
+A fourth, measured on #110 (2026-08-27, `codex-cli` 0.150.0):
+
+* **The Codex lane launches with an initial prompt, and that argument is the
+  whole update gate.** From the instant `~/.codex/version.json` learns of a
+  release, every hand-started `codex` stops at `1. Update now / 2. Skip / 3. Skip
+  until next version` **before the Session registers** — no thread on the daemon,
+  no rollout, indefinitely; #105 watched one probe boot normally and the three
+  that started after the check landed die there, 90 seconds apart. Codex skips
+  that prompt outright when it is handed a non-empty `PROMPT` argument
+  (`codex [OPTIONS] [PROMPT]`), decided at `tui/src/lib.rs:995-996` and
+  byte-identical at 0.149.1 and 0.150.0 (read on #107):
+
+      let skip_update_prompt = cli.prompt.as_ref().is_some_and(|p| !p.is_empty());
+
+  So `journey.CODEX` passes the words its first turn would have typed anyway.
+  **The emptiness test is the mechanism** — an empty string is not a skip — which
+  is why the argument is the journey's own instruction and not a placeholder that
+  could quietly shrink to `""`.
+
+  The alternative, `-c check_for_update_on_startup=false`, suppresses the prompt
+  *and* makes the TUI refuse the shared daemon (`can_reuse_implicit_local_daemon`
+  requires `cli_kv_overrides.is_empty()`, `tui/src/lib.rs:919-921`): it would
+  silently destroy the attachment the run exists to measure. **Never reach for
+  `-c` to solve a boot gate.**
+
+  This gate is *skipped*, not arranged, and that is what makes it unlike
+  `TrustGate`: nothing of the user's is edited, `version.json` is not written, and
+  there is nothing for the run to revoke afterwards.
 """
 
 from __future__ import annotations
