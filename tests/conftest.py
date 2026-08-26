@@ -13,6 +13,15 @@ that forgets does not fail — it silently changes the machine and passes. So th
 real runner is taken away from the whole suite here, and a test that wants a
 subprocess has to say so by supplying its own.
 
+**The real shared Codex daemon.** `shared_daemon.locate` shells out to `codex
+app-server daemon version` to find the socket the machine's daemon is listening
+on, and #77 put that lookup on the path every Relay and every Approval now
+takes. A test that reached it would not merely read: it would attach to the
+daemon holding the Sessions the person running the tests has open, and a Relay
+is a `turn/start`. Injecting a `locate` or a `run` is the design; taking the
+real runner away is what makes forgetting it fail loudly instead of quietly
+starting a turn in somebody's work.
+
 **This file holds fixtures and nothing else.** The fake and the helpers it needs
 live in `launchd_fake.py`, because a test module that imports a `conftest` by
 name is importing whichever `conftest` reached `sys.path` first — and with the
@@ -27,6 +36,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from gpt_voicecoding.adapters.agent.codex import shared_daemon
 from gpt_voicecoding.installation import codex_launch_agent
 from launchd_fake import FakeLaunchd
 
@@ -43,6 +53,32 @@ def _no_real_launchctl(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(codex_launch_agent, "_run", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_codex_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one lookup that leads to the machine's own Codex Sessions, refused.
+
+    **Scoped to that command rather than to the runner**, and the distinction is
+    the hazard rather than a convenience. `_run` is a general subprocess helper
+    whose own timeout is proved against `/bin/sleep`, which names no daemon and
+    reaches nobody's Sessions. What must never happen is the *lookup* —
+    `codex app-server daemon version` answers with the socket the machine's
+    daemon is listening on, and from there a Relay is a `turn/start` in somebody's
+    open work.
+    """
+    real = shared_daemon._run  # noqa: SLF001
+
+    async def refuse(arguments: list[str]) -> tuple[int, str]:
+        if tuple(arguments[1:]) == shared_daemon.DAEMON_VERSION_ARGUMENTS:
+            raise AssertionError(
+                "a test looked for the machine's own Codex daemon through "
+                f"gpt_voicecoding.adapters.agent.codex.shared_daemon: {arguments}. "
+                "Pass a SharedDaemon with a `locate`/`attach` of its own, or a `run=` to locate."
+            )
+        return await real(arguments)
+
+    monkeypatch.setattr(shared_daemon, "_run", refuse)
 
 
 @pytest.fixture

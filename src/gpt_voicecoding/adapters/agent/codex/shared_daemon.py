@@ -191,6 +191,17 @@ class SharedDaemon:
         self._attach = attach
         self._connection: AppServerConnection | None = None
         self._note = ""
+        #: Where the last accepted dial landed. A caller that has to name the
+        #: wire one thread rides on asks here rather than locating again.
+        self._socket_path: Path | None = None
+        #: Where this connection's inbound traffic goes. **The daemon's
+        #: notifications and its permission requests are what make Relay and
+        #: Approval possible on this lane at all** (#77), and this is the one
+        #: connection to it — so they are routed through here rather than by a
+        #: second dial the daemon would have to hold and nobody would close.
+        self._on_notification: Callable[[Any], None] | None = None
+        self._on_server_request: Callable[[Any], Any] | None = None
+        self._on_closed: Callable[[str], None] | None = None
         #: Held across the whole dial, because the dial is where the race is.
         #: The engine has two callers that arrive independently — the five-second
         #: discovery cadence and a control-plane `progress` ask — and the check
@@ -202,6 +213,32 @@ class SharedDaemon:
         #: rather than writing it back. This is what lets `aclose` skip the lock
         #: instead of waiting behind a dial — see its docstring for why it must.
         self._generation = 0
+
+    def route_to(
+        self,
+        *,
+        notifications: Callable[[Any], None] | None = None,
+        requests: Callable[[Any], Any] | None = None,
+        closed: Callable[[str], None] | None = None,
+    ) -> None:
+        """Say where this connection's inbound traffic goes, before it is dialled.
+
+        **Set rather than taken in the constructor**, so that injecting a
+        `SharedDaemon` and wiring its traffic stay separable: a test that only
+        wants to watch the dial does not have to supply three handlers, and the
+        adapter wires the daemon it was handed exactly as it wires the one it
+        made. It is called once, from the adapter's constructor, before anything
+        has asked for a client — so "takes effect on the next dial" is every
+        dial there will be.
+        """
+        self._on_notification = notifications
+        self._on_server_request = requests
+        self._on_closed = closed
+
+    @property
+    def socket_path(self) -> Path | None:
+        """Where the last accepted dial landed, or `None` if none has been."""
+        return self._socket_path
 
     @property
     def note(self) -> str:
@@ -247,7 +284,12 @@ class SharedDaemon:
                 return None
             try:
                 connection = await self._attach(
-                    address.socket_path, version=self._version, settings=self._settings
+                    address.socket_path,
+                    version=self._version,
+                    settings=self._settings,
+                    on_notification=self._on_notification,
+                    on_server_request=self._on_server_request,
+                    on_closed=self._on_closed,
                 )
             except (WireError, AppServerError, OSError) as unreachable:
                 self._note = (
@@ -263,6 +305,7 @@ class SharedDaemon:
                 return None
             _log.info("joined the shared Codex daemon at %s", address.socket_path)
             self._connection = connection
+            self._socket_path = address.socket_path
             self._note = address.note
             return connection
 
@@ -285,6 +328,7 @@ class SharedDaemon:
         self._generation += 1
         connection, self._connection = self._connection, None
         self._note = ""
+        self._socket_path = None
         if connection is not None:
             await connection.aclose()
 

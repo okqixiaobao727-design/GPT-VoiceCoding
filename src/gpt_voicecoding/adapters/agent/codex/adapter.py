@@ -19,11 +19,26 @@ its fallback for an adapter with no supplement at all, so implementing it here
 would put Core's policy inside a spoke.
 
 **This adapter owns no Session's process.** A Codex TUI is a thin client of an
-app-server, so the app-server the user's session runs on is spawned by the launch
-wrapper in the user's own terminal, and this engine attaches to it as one more
-client. The engine spawns exactly one app-server of its own — the one the Call
-seam and the Delegated Turn ride on — and never a Session's. An engine restart
-must not close the user's coding sessions.
+app-server, and the app-server the user's Sessions run on is the **shared
+daemon** — started at login by `installation/codex_launch_agent.py` and joined by
+this engine as one more client (`shared_daemon.py`, ADR 0012). The engine spawns
+exactly one app-server of its own, the one the Call seam and the Delegated Turn
+ride on (`engine/composition.py:418`, `adapters/call/realtime/adapter.py:174`),
+and never a Session's. An engine restart must not close the user's coding
+sessions, and a shutdown must not close the daemon they are attached to.
+
+**Every Relay and every verdict goes over that one joined connection** (#77).
+`register_session` — attaching to a per-Session app-server at an address a launch
+wrapper supplied — is called by nothing in `src/`, because v1.0 launches no
+Session (#72). It is kept for the launcher that does not exist yet; the route the
+product actually has is `_reachable`, and `None` from `SharedDaemon.client()` is
+a **pre-wire** `FAILED` naming the daemon's own reason, before a byte is sent.
+
+**Threads are subscribed on the discovery cadence, not at the first Relay.** A
+permission prompt is fanned out to every *subscribed* client, and the turn that
+raises one is usually a turn the user started in their own TUI. Waiting for a
+Relay would mean this bridge could only ever be called about work it had itself
+asked for, which is the opposite of what it is for.
 
 **Approvals fan out; `ask` is silence.** Codex delivers one permission prompt to
 every subscribed client under the same id, first answer wins, and the losers get
@@ -70,6 +85,7 @@ from gpt_voicecoding.seams.agent import (
     AwaitingApproval,
     LaneDiscovery,
     LaneUnavailable,
+    Option,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
@@ -92,6 +108,23 @@ _log = logging.getLogger(__name__)
 #: has no rollout file yet, so there is nothing to resume — a state the thread
 #: grows out of the moment it does any work.
 NO_ROLLOUT_YET = "no rollout found"
+
+#: What a Relay or a verdict is told when no shared daemon answered (#83's
+#: advisor note, ruled onto #77). It is a **pre-wire** refusal: nothing was sent,
+#: so `FAILED` is the honest grade rather than the `UNKNOWN` a spent attempt
+#: earns. The daemon's own words are appended, because "the daemon is not up" and
+#: "`codex` is not on the PATH" send a person to different places.
+PRE_WIRE_UNREACHABLE = "nothing was sent: this Session is reached through the shared Codex daemon"
+
+#: What a Relay is told for a TUI that has not taken a turn yet. #73: a Codex
+#: Session gains its thread id at its first turn, and until then there is no
+#: thread for anything to be resumed or started on. The row is still listed —
+#: that is #74's rule — and this is the receipt that says why it cannot be
+#: spoken to yet.
+NO_THREAD_YET = (
+    "that Session has not started a thread yet, so there is nothing for codex to resume; "
+    "it gains one at its first turn"
+)
 
 
 def default_own_socket_path(settings: CodexSettings) -> Path:
@@ -141,6 +174,16 @@ class CodexAgentAdapter:
         #: the app-server's socket path is: a test that dialled the real one
         #: would be a test talking to the Sessions of whoever ran it.
         self._daemon = daemon or SharedDaemon(settings=self._settings, version=__version__)
+        # Wired here whether the daemon was made or handed over, because without
+        # it the connection is read-only: `thread/status/changed` would reach
+        # nobody and a permission prompt would be answered by the on-screen
+        # dialog alone. This is what makes Relay and Approval possible on a
+        # Session the user started (#77).
+        self._daemon.route_to(
+            notifications=self._heard,
+            requests=self._asked,
+            closed=self._daemon_let_go,
+        )
         #: What each loaded thread last said, read at most once per change.
         self._turns = codex_discovery.TurnCache()
         #: How the machine's own process table is read. Injected for the reason
@@ -199,7 +242,15 @@ class CodexAgentAdapter:
         self._opened = False
 
     async def _detached(self, watched: WatchedThread) -> None:
-        """Let go of one Session, saying so if it objects. Never raises."""
+        """Let go of one Session, saying so if it objects. Never raises.
+
+        **A shared connection is not this thread's to close.** Every thread on
+        the shared daemon rides one connection, so closing it here would let go
+        of every other Session at the same time — and it is closed exactly once,
+        by the component that opened it (`SharedDaemon.aclose`).
+        """
+        if watched.shared:
+            return
         try:
             await watched.connection.aclose()
         except Exception:  # a connection objecting must not strand the rest
@@ -266,10 +317,15 @@ class CodexAgentAdapter:
         return watched.reply_window
 
     async def forget_session(self, target: SessionTarget) -> None:
-        """Stop watching one Session. The Session itself is left running."""
+        """Stop watching one Session. The Session itself is left running.
+
+        The connection goes with it only if this adapter opened it *for* this
+        thread. A thread on the shared daemon shares its connection with every
+        other, so closing it here would forget nine Sessions to forget one.
+        """
         watched = self._threads.pop(target, None)
         if watched is not None:
-            await watched.connection.aclose()
+            await self._detached(watched)
 
     def watching(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter currently holds a connection for."""
@@ -287,12 +343,20 @@ class CodexAgentAdapter:
         one fails at the wire with its reason (#82).
         """
         client = await self._shared_daemon()
-        return await codex_discovery.discover(
+        lane = await codex_discovery.discover(
             client,
             processes=self._processes,
             turns=self._turns,
             daemon_note=self._daemon.note,
         )
+        if not lane.enumerated:
+            return lane
+        # Subscribing is what makes a Session's permission prompts reach this
+        # adapter at all, and a prompt is raised by whatever turn the *user*
+        # started — so it has to have happened before, not at the first Relay.
+        for row in lane.rows:
+            await self._adopt(row)
+        return replace(lane, rows=tuple(self._stopped_on(row) for row in lane.rows))
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
         """One Session, freshly read from the same sources `discover` reads.
@@ -352,6 +416,134 @@ class CodexAgentAdapter:
         """
         return await self._daemon.client()
 
+    async def _adopt(self, row: SessionInspection) -> None:
+        """Start watching one discovered thread on the shared daemon, once.
+
+        **Why this happens on the cadence rather than on the first Relay.** A
+        permission prompt is delivered to every *subscribed* client, so a thread
+        nothing has resumed raises a dialog this adapter never sees — and the
+        turn that raises it is usually one the user started in their own TUI,
+        not one this engine sent. Waiting for a Relay would mean the bridge could
+        only ever be called about work it had itself asked for, which is the
+        opposite of #67's destination.
+
+        **Once per thread, not once per tick.** `thread/resume` is what
+        subscribes, and it answers with the thread's whole turn history — the
+        half-megabyte read `TurnCache` exists to avoid repeating. The entry in
+        `_threads` is what makes this idempotent.
+
+        **A thread that cannot be resumed is not an error here.** A TUI the user
+        started a moment ago has no rollout on disk (`NO_ROLLOUT_YET`), and
+        `_subscribe` already records that as a *not yet* and leaves the thread
+        watched, so the next status notification retries it. Anything else is
+        logged and costs this one thread: a discovery tick answers about the
+        whole machine, and one thread refusing must not empty the roster.
+        """
+        target = row.target
+        if target.session_id is None or target in self._threads:
+            return
+        client = await self._shared_daemon()
+        if client is None:
+            return
+        watched = WatchedThread(
+            target=target,
+            socket_path=self._daemon.socket_path or Path(),
+            connection=client,
+            shared=True,
+        )
+        self._threads[target] = watched
+        try:
+            await self._subscribe(watched)
+        except (WireError, AppServerError, RemoteError) as refused:
+            # Left in `_threads` deliberately: the connection is the daemon's and
+            # is still good, `subscribed` is False, and `thread/status/changed`
+            # retries it. Dropping the row here would re-resume on every tick.
+            _log.info("could not resume %s on the shared daemon: %s", target.session_id, refused)
+
+    async def _reachable(self, target: SessionTarget) -> tuple[WatchedThread | None, str]:
+        """The thread this adapter can speak to, or the reason it cannot.
+
+        **This is the pre-wire refusal** (#83's advisor note): a Relay or an
+        Approval against a Codex Session with no shared daemon is answered
+        `FAILED`, with the daemon's own reason, before a byte is sent. `None`
+        from `_shared_daemon` is exactly that fact — #76 builds the client, so
+        something was always attempted and `SharedDaemon.note` is the dial's own
+        words rather than a sentence invented here.
+        """
+        watched = self._threads.get(target)
+        if watched is not None and watched.connection.is_open:
+            return watched, ""
+        if target.session_id is None:
+            return None, NO_THREAD_YET
+        if watched is not None:
+            # Its connection went away. Drop it so the adoption below re-keys
+            # the row onto whatever the daemon is answering on now.
+            self._threads.pop(target, None)
+        await self._adopt(SessionInspection(target=target, workspace=Path()))
+        watched = self._threads.get(target)
+        if watched is None:
+            note = self._daemon.note or "nothing answered where the shared Codex daemon should be"
+            return None, f"{PRE_WIRE_UNREACHABLE} — {note}"
+        return watched, ""
+
+    def _stopped_on(self, row: SessionInspection) -> SessionInspection:
+        """One roster row, carrying the dialog this adapter is holding for it.
+
+        **The projection the Codex lane never had** (#77, from #75's review).
+        `_asked` raised `AwaitingApproval` and stopped there, so a Codex row and
+        a Codex `SessionStopped` could not say what the Session had stopped on
+        while the Claude lane could. The request is already parsed into an
+        `ApprovalRequest`; this is that same fact in the seam's one inspection
+        vocabulary.
+
+        **No transcript parser for Codex, ever.** The rollout on disk is a second
+        source answering the same question with worse evidence, and the port
+        table left exactly that behind (P6, P13). What this projects is the
+        request the app-server handed us, which is the thing itself.
+        """
+        watched = self._threads.get(row.target)
+        if watched is None or not watched.pending:
+            return row
+        held = next(iter(watched.pending.values()))
+        request = held.request
+        if request is None:
+            return row
+        return replace(
+            row,
+            waiting_for=WaitingFor(
+                kind=WaitingKind.PERMISSION,
+                tool_name=request.tool_name or None,
+                detail=request.detail or None,
+                approval_id=request.approval_id,
+                options=tuple(Option(text=one) for one in request.options),
+            ),
+        )
+
+    def _daemon_let_go(self, reason: str) -> None:
+        """The shared daemon's connection went away. Forget what rode on it.
+
+        **No `SessionEnded`.** A per-Session app-server going away really is its
+        Session going away — there is no surviving process for it to be a session
+        of — but the shared daemon is a different fact: it can be restarted under
+        a running engine, its own updater does exactly that, and the roster is
+        the authority on which Codex rows exist. Ending every row here would end
+        rows the very next discovery re-adds, and the news of a death is not
+        free: it terminates every Relay queued for that target.
+
+        What is dropped is this adapter's *watch*, so the next discovery re-
+        adopts each thread onto whatever the daemon is answering on now.
+        """
+        gone = [target for target, watched in self._threads.items() if watched.shared]
+        for target in gone:
+            del self._threads[target]
+        if gone:
+            _log.info(
+                "the shared Codex daemon let go (%s); %d watched thread(s) will be picked up "
+                "again by the next discovery",
+                reason,
+                len(gone),
+            )
+
     async def _turns_into(self, row: SessionInspection) -> SessionInspection:
         """One row with its turns read live, for the verb that asks about one Session.
 
@@ -408,9 +600,9 @@ class CodexAgentAdapter:
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:
         """Carry one verdict — or, for `ask`, deliberately carry nothing."""
-        watched = self._threads.get(request.target)
+        watched, unreachable = await self._reachable(request.target)
         if watched is None:
-            return _failed(request_id, f"no Codex Session is registered as {request.target}")
+            return _failed(request_id, unreachable)
 
         refusal = self._misrouted(watched)
         if refusal:
@@ -498,9 +690,9 @@ class CodexAgentAdapter:
         self, target: SessionTarget, text: str, *, request_id: RequestId, route: RelayRoute
     ) -> DeliveryReceipt:
         """One attempt, classified into the hub's four states and nothing else."""
-        watched = self._threads.get(target)
+        watched, unreachable = await self._reachable(target)
         if watched is None:
-            return _failed(request_id, f"no Codex Session is registered as {target}")
+            return _failed(request_id, unreachable)
 
         refusal = self._misrouted(watched)
         if refusal:
@@ -766,7 +958,10 @@ class CodexAgentAdapter:
 
         request = approval_wire.request_from(method, params, target=watched.target)
         watched.pending[request.approval_id] = PendingApproval(
-            approval_id=request.approval_id, wire_id=message.get("id"), method=str(method)
+            approval_id=request.approval_id,
+            wire_id=message.get("id"),
+            method=str(method),
+            request=request,
         )
         self._emit(AwaitingApproval(request=request))
 

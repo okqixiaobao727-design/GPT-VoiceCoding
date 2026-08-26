@@ -248,6 +248,10 @@ class _HeldDaemon:
     def __init__(self, client: object | None) -> None:
         self._client = client
         self.note = ""
+        self.socket_path = None
+
+    def route_to(self, **_handlers: object) -> None:
+        """Where inbound traffic would go. Nothing here sends any."""
 
     async def client(self) -> object | None:
         return self._client
