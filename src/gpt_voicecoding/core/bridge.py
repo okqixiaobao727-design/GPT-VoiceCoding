@@ -65,7 +65,10 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionState,
     SessionStopped,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.call import (
     CallAdapter,
@@ -92,15 +95,71 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def stop_notice_for(session: Session | None, target: SessionTarget, detail: str = "") -> str:
+def name_for(session: Session | None, target: SessionTarget) -> str:
+    """What to call one Session out loud, best name first.
+
+    The Session Label if the user has one for it, else the agent's own Session
+    Name, else the address — because a notice that names nothing is a notice the
+    user cannot answer. #78 stabilises the middle one.
+    """
+    if session is not None and session.label is not None:
+        return str(session.label)
+    if session is not None and session.name:
+        return session.name
+    return f"{target.agent} {target.session_id or f'pid {target.pid}'}"
+
+
+def stop_notice_for(
+    session: Session | None, target: SessionTarget, waiting_for: WaitingFor | None = None
+) -> str:
     """The words a stopped Session is announced with.
 
-    Names the Session the way the user named it, because a Session Label is what
-    they will say back when they answer.
+    Names the Session the way the user names it, because that is what they will
+    say back when they answer, and carries **what it stopped on** — the question
+    with its options and any recommendation, or the tool awaiting permission.
+    Rendering happens here rather than in the adapter because the words are
+    Bridge Core's policy; the adapter's job was to keep the structure.
     """
-    named = str(session.label) if session is not None else f"{target.agent} {target.session_id}"
-    tail = f" — {detail}" if detail.strip() else ""
-    return f"{named} stopped and may need you{tail}"
+    stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
+    tail = f" — {stopped_on}" if stopped_on else ""
+    return f"{name_for(session, target)} stopped and may need you{tail}"
+
+
+def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
+    """The Session state a Reply Window report implies, given what we already hold.
+
+    An open window is a Session that will take the next turn, which is `IDLE`.
+    A closed one has two causes and the report cannot tell them apart — mid-turn,
+    or holding a dialog — so a Session already known to be `WAITING` keeps that,
+    and anything else becomes `RUNNING`. Guessing the other way would erase a
+    permission dialog from the roster while it is still on the user's screen.
+    """
+    if window is ReplyWindow.OPEN:
+        return SessionState.IDLE
+    return held if held is SessionState.WAITING else SessionState.RUNNING
+
+
+def _stopped_on(waiting_for: WaitingFor) -> str:
+    """One line describing what a Session is waiting for, or nothing to add."""
+    match waiting_for.kind:
+        case WaitingKind.QUESTION:
+            parts = [waiting_for.prompt or "it asked you something"]
+            if waiting_for.options:
+                parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
+            if waiting_for.recommendation:
+                parts.append(f"it recommends {waiting_for.recommendation}")
+            return "; ".join(parts)
+        case WaitingKind.PERMISSION:
+            named = waiting_for.tool_name or "a tool"
+            return f"{named} needs your permission" + (
+                f": {waiting_for.detail}" if waiting_for.detail else ""
+            )
+        case WaitingKind.UNKNOWN:
+            # The honest answer while the record has not flushed (#73): say that
+            # rather than invent a reason the Session never gave.
+            return "it has not said what it is waiting for yet"
+        case _:
+            return waiting_for.detail or ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +168,17 @@ class Status:
 
     switches: SwitchSnapshot
     sessions: tuple[Session, ...]
+    #: Why a lane could not be enumerated at its last attempt, by agent. Empty
+    #: is the ordinary case. It is here and not on a row because it is news
+    #: about the lane: an unavailable lane's Sessions are not *missing*, they
+    #: are unknown, and a roster that showed nothing without saying so would be
+    #: claiming the machine is empty.
+    lanes: Mapping[AgentKind, str]
+    #: Which lanes are reading from a weaker source than usual, and which source.
+    #: Distinct from `lanes`: these lanes *do* have Sessions to show, so folding
+    #: the two together would hide a working lane behind a warning shaped like
+    #: an outage. The Codex lane sits here whenever no shared daemon is up.
+    degraded_lanes: Mapping[AgentKind, str]
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
@@ -209,6 +279,8 @@ class BridgeCore:
         return Status(
             switches=self._state.switches.snapshot(),
             sessions=self._state.sessions.all(),
+            lanes=self._state.sessions.lane_errors(),
+            degraded_lanes=self._state.sessions.lane_degradations(),
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
             pending_approvals=self.approvals.pending(),
@@ -337,6 +409,48 @@ class BridgeCore:
             await self._announce(outcome.target, outcome.report)
         return expired, await self.approvals.sweep_expired()
 
+    async def discover(self) -> tuple[SessionTarget, ...]:
+        """Ask every lane what Sessions exist, and make the roster agree.
+
+        **This is how a Session gets onto the roster at all.** v1.0 bridges the
+        Sessions the *user* starts (#68), so nothing announces one — the hub
+        goes and looks, on the cadence the composition root sets, and each lane
+        answers for itself.
+
+        **One lane raising does not stop the others.** A lane is supposed to
+        report its own trouble as `LaneDiscovery(error=...)`; one that raises
+        instead is a defect in that adapter, and the answer to a defective lane
+        is to leave its rows alone and keep asking the other one — which is
+        exactly what the seam's own contract already says an error means.
+
+        Returns the Sessions that ended on this pass, having already answered
+        whatever was queued for them: a Session that disappears between two
+        ticks owes the user the same news as one that reported its own death,
+        and the roster is the only witness to the first kind.
+
+        **Which rows ended is the registry's answer, not a diff taken here.** A
+        Codex row is re-keyed when its Session takes its first turn and gains a
+        thread id, and again when the user types `/new` (#73) — the same row,
+        under a new `SessionTarget`. Comparing the roster before and after would
+        read both as a departure and terminate the Relays queued for a Session
+        that is sitting there waiting for them, so the question is asked of the
+        one component that can tell a re-keying from a death.
+        """
+        gone: list[SessionTarget] = []
+        for kind, adapter in self._agents.items():
+            try:
+                lane = await adapter.discover()
+            except Exception:  # noqa: BLE001 - a defective lane must not stop the rest
+                _log.exception("the %s lane raised instead of reporting its trouble", kind)
+                continue
+            gone.extend(self._state.sessions.observe(kind, lane, now=self._stamp()))
+
+        for target in gone:
+            _log.info("Session %s is no longer running", target)
+            for outcome in self.relays.session_ended(target):
+                await self._announce(outcome.target, outcome.report)
+        return tuple(gone)
+
     async def dispatch(self, event: Event) -> None:
         """Turn one event into a call on whichever pipeline owns the decision."""
         match event:
@@ -379,7 +493,7 @@ class BridgeCore:
             Notice(
                 request_id=new_request_id(),
                 target=event.target,
-                text=stop_notice_for(session, event.target, event.detail),
+                text=stop_notice_for(session, event.target, event.waiting_for),
             )
         )
 
@@ -393,12 +507,19 @@ class BridgeCore:
             await self._announce(outcome.target, outcome.report)
 
     async def _reply_window_changed(self, event: ReplyWindowChanged) -> None:
+        """An adapter saw the window move between two discoveries. Land it on the state.
+
+        The window is derived, so there is nothing here to set directly: this
+        event is a coarser reading of the same fact and it lands on the field
+        the fine-grained one lands on. The next discovery overwrites both, which
+        is what makes this a shortcut rather than a second source of truth.
+        """
         try:
-            self._state.sessions.set_reply_window(event.target, event.window)
+            held = self._state.sessions.resolve(event.target)
+            self._state.sessions.set_state(event.target, _state_behind(event.window, held.state))
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
-        self._state.persist()
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
 

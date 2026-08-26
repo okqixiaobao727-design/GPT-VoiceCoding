@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -26,14 +25,17 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel
-from gpt_voicecoding.adapters.agent.claude import PROVEN_AGAINST_VERSION
-from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.server import AlreadyServing
-from gpt_voicecoding.core.sessions import Session, SessionState
+from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
-from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
+from gpt_voicecoding.seams.agent import (
+    LaneDiscovery,
+    ReplyWindow,
+    ReplyWindowChanged,
+    SessionInspection,
+)
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
@@ -122,88 +124,6 @@ def assembled(home: Path, text: str = CONFIG) -> Engine:
     return Engine.assemble(load(configured(home, text)))
 
 
-def with_idle_claude(home: Path, *, poll_seconds: float = 0.02) -> str:
-    """Use the real Claude spoke rather than the fake one.
-
-    `poll_seconds` is the Reply-Window sweep's interval; a test that needs the
-    sweep provably not to have run sets it longer than the test lives.
-    """
-    return CONFIG.replace(
-        'codex = "fakes:FakeAgent"',
-        'claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"',
-    ).replace(
-        "[delegate]",
-        "\n".join(
-            (
-                '[adapters.settings."agent.claude"]',
-                f'registry_directory = "{home / "sessions"}"',
-                f'socket_directory = "{home / "sockets"}"',
-                f"reply_window_poll_seconds = {poll_seconds}",
-                "",
-                "[delegate]",
-            )
-        ),
-    )
-
-
-def write_idle_claude_record(home: Path, *, status: str = "idle") -> None:
-    """Write the registry level the real Claude Reply-Window watcher reads.
-
-    `status` is the level the record carries, so a test can stand an idle
-    Session next to a busy one.
-    """
-    sessions = home / "sessions"
-    sessions.mkdir()
-    (sessions / f"{CLAUDE.pid}.json").write_text(
-        json.dumps(
-            {
-                "pid": CLAUDE.pid,
-                "sessionId": CLAUDE.session_id,
-                "cwd": str(home),
-                "version": PROVEN_AGAINST_VERSION,
-                "peerProtocol": PEER_PROTOCOL,
-                "messagingSocketPath": str(home / "claude.sock"),
-                "status": status,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-def a_dead_pid() -> int:
-    """A pid that really is gone: one this process started and has already reaped."""
-    child = subprocess.Popen([sys.executable, "-c", ""])
-    child.wait()
-    return child.pid
-
-
-def write_state_holding_a_live_session(home: Path, *, pid: int) -> None:
-    """The shape #26 captured: a state file whose Session says `live`."""
-    (home / "state.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "switches": {"duty": True, "message": False, "voice": True},
-                "sessions": [
-                    {
-                        "target": {
-                            "agent": "claude",
-                            "session_id": CLAUDE.session_id,
-                            "pid": pid,
-                        },
-                        "label": {"project": "GPT-VoiceCoding", "task": "acceptance step 3"},
-                        "workspace": str(home),
-                        "registered_at": 1787302123.276521,
-                        "state": "live",
-                        "reply_window": "closed",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
 def put_on_the_roster(engine: Engine, target: SessionTarget = CODEX) -> None:
     """Seed one Session row on a running engine.
 
@@ -219,7 +139,7 @@ def put_on_the_roster(engine: Engine, target: SessionTarget = CODEX) -> None:
             target=target,
             label=SessionLabel(project="GPT-VoiceCoding", task="t"),
             workspace=Path("/tmp/workspace"),
-            registered_at=0.0,
+            first_seen=0.0,
         )
     )
 
@@ -403,105 +323,6 @@ class TestTruthAcrossARestart:
         assert asyncio.run(read()).data["switches"]["duty"] is True
 
 
-class TestARestoredSessionIsOneTheEngineCanHonour:
-    """#26, through the production wiring: assemble, restore, and ask the engine.
-
-    `state.restore()` repopulates Bridge Core's roster only. Nothing on that path
-    calls the Agent adapter's `register_session()`, which is the sole place a
-    Session's channel *and* its Reply Window watch are established — and the
-    channel's address arrives from the launch that minted it, so it cannot come
-    back. A row that returned LIVE would claim a reachability the engine has no
-    way to honour, and — being unwatched — could never be reported dead either.
-
-    Both of the ticket's consequences are exercised here against the real Claude
-    spoke and the real state file: the Session whose process is gone, and the
-    Session whose process is perfectly healthy.
-
-    The rows are written straight into the state file. They used to be made by
-    launching one and stopping the engine, which is parked (#72) — and the file
-    is the more faithful input anyway, because it is what a restart really
-    reads. What went with the launch is the *premise* test, which proved a live
-    Session is persisted as `live`; #74 owns proving that again once something
-    registers a Session.
-    """
-
-    def test_a_restored_session_whose_process_is_alive_is_not_left_claiming_to_be_live(
-        self, home: Path
-    ) -> None:
-        """Consequence 2, isolated: the agent never died — the restart is the whole cause.
-
-        `CLAUDE.pid` is this test process, so the Session is genuinely healthy
-        across the restart. It still may not come back LIVE, because the engine
-        holds no channel to it and Bridge Core would queue the user's own words
-        against a Reply Window nothing observes.
-        """
-        write_state_holding_a_live_session(home, pid=os.getpid())
-        text = with_idle_claude(home)
-        restarted = assembled(home, text)
-
-        async def read() -> Reply:
-            return await running(
-                restarted,
-                lambda: ask(Request(action=Action.SESSIONS), path=restarted.socket_path),
-            )
-
-        sessions = asyncio.run(read()).data["sessions"]
-
-        assert [session["state"] for session in sessions] == ["ended"]
-        assert [session["reply_window"] for session in sessions] == ["closed"]
-
-    def test_the_roster_says_only_what_the_adapter_can_back_up(self, home: Path) -> None:
-        """The point of the fix: core state and the adapter's real reach agree."""
-        write_state_holding_a_live_session(home, pid=os.getpid())
-        text = with_idle_claude(home)
-        restarted = assembled(home, text)
-        claude = restarted.adapters.agents[AgentKind.CLAUDE]
-
-        assert restarted.core.status().sessions[0].state is SessionState.ENDED
-        assert claude.reachable() == ()  # type: ignore[attr-defined]
-
-    def test_a_restored_session_whose_process_is_dead_does_not_live_forever(
-        self, home: Path
-    ) -> None:
-        """Consequence 1, from the captured shape: an unwatched row survived every restart.
-
-        Nothing but the Reply Window sweep ever reports a Claude Session's death,
-        and the sweep only ever visits Sessions `register_session()` entered into
-        it. A restored row was in nobody's population, so `live` outlived the
-        process by days. Ending it on the restore path is what stops that.
-        """
-        write_state_holding_a_live_session(home, pid=a_dead_pid())
-        text = with_idle_claude(home)
-
-        async def read(engine: Engine) -> Reply:
-            return await running(
-                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
-            )
-
-        first = asyncio.run(read(assembled(home, text))).data["sessions"]
-        second = asyncio.run(read(assembled(home, text))).data["sessions"]
-
-        assert [session["state"] for session in first] == ["ended"]
-        assert [session["state"] for session in second] == ["ended"]
-
-    def test_repeated_restarts_do_not_rewrite_a_row_that_is_already_ended(self, home: Path) -> None:
-        """Idempotent: an ended Session is never ended a second time."""
-        write_state_holding_a_live_session(home, pid=a_dead_pid())
-        text = with_idle_claude(home)
-        state = home / "state.json"
-
-        async def read(engine: Engine) -> Reply:
-            return await running(
-                engine, lambda: ask(Request(action=Action.SESSIONS), path=engine.socket_path)
-            )
-
-        asyncio.run(read(assembled(home, text)))
-        once = state.read_text(encoding="utf-8")
-        asyncio.run(read(assembled(home, text)))
-
-        assert state.read_text(encoding="utf-8") == once
-
-
 class TestEventsReachTheHub:
     def test_an_adapter_event_is_dispatched_while_the_engine_runs(self, home: Path) -> None:
         engine = assembled(home)
@@ -632,6 +453,65 @@ class TestTheTick:
         asyncio.run(scenario())
 
         assert ticks
+
+
+class TestTheDiscoveryLoop:
+    """How a Session gets onto the roster at all: nobody announces one (#68)."""
+
+    def test_the_engine_asks_the_lanes_on_its_own(self, home: Path) -> None:
+        engine = assembled(home)
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert engine.adapters.agents[AgentKind.CODEX].discoveries  # type: ignore[union-attr]
+
+    def test_what_a_lane_reports_reaches_the_roster(self, home: Path) -> None:
+        engine = assembled(home)
+        agent = engine.adapters.agents[AgentKind.CODEX]
+        agent.discovery = LaneDiscovery(  # type: ignore[union-attr]
+            rows=(SessionInspection(target=CODEX, workspace=Path("/tmp/workspace")),)
+        )
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert [held.target for held in engine.core.status().sessions] == [CODEX]
+
+    def test_a_lane_that_raises_does_not_stop_the_loop(self, home: Path) -> None:
+        """An adapter is meant to report its trouble; one that raises is a defect."""
+        engine = assembled(home)
+        agent = engine.adapters.agents[AgentKind.CODEX]
+        calls: list[int] = []
+
+        async def raising() -> LaneDiscovery:
+            calls.append(1)
+            raise RuntimeError("this lane is broken")
+
+        agent.discover = raising  # type: ignore[union-attr,method-assign]
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert len(calls) > 1
 
 
 def with_cli(stated: Path) -> str:

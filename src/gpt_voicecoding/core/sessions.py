@@ -3,18 +3,29 @@
 Conversing with a Session is the Agent seam; what Sessions *exist* is held here,
 in the hub, and every surface queries it rather than keeping a copy (ADR 0001).
 
-Three refusals are the point of this file, and each one is a defect the
-reference implementation carried:
+**Rows arrive by observation, not by registration.** A Session is one the *user*
+started (#68), so nothing tells this registry a Session exists — a lane goes and
+looks, on a cadence, and hands back everything it can see as a `LaneDiscovery`.
+`observe` makes the roster agree with that answer. The reference implementation
+had it the other way round: a Session existed because a hook had announced it,
+so a Session started before the engine, or one whose hook failed, was invisible
+forever while its process ran.
+
+Four refusals are the point of this file, and each one is a defect the reference
+implementation carried:
 
 - **An unknown identity fails closed.** Nothing resolves to "probably that one".
 - **A stale identity is not an unknown one.** A wrong pid under a known session
   id means the Session forked — `--resume` starts a second process under the
   same session id — so the refusal names the pids that *are* live instead of
   pretending the session id was never seen.
+- **A Child Process is seen, not spoken to.** It is listed like any other row and
+  refused as a Relay target, by the registry rather than by a caller's memory.
 - **A label disambiguates or asks.** Labels are for matching and for speech; two
   candidates are answered by refusing and naming both, never by picking.
 
-There is one registry and one Reply Window state per Session. The reference
+There is one registry and one Reply Window per Session — and the Reply Window is
+**derived**, so there is no second copy to disagree with the first. The reference
 implementation ran two live ledgers and rendered both; nothing here may grow a
 second.
 """
@@ -22,50 +33,122 @@ second.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
-from enum import StrEnum
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from gpt_voicecoding.core.errors import (
     AmbiguousLabelError,
+    ChildSessionError,
     DuplicateSessionError,
     NoLabelMatchError,
     StaleSessionError,
     UnknownSessionError,
 )
-from gpt_voicecoding.seams.agent import ReplyWindow
-from gpt_voicecoding.seams.identity import SessionLabel, SessionTarget
+from gpt_voicecoding.seams.agent import (
+    MAIN_SESSION,
+    ChildClassification,
+    LaneDiscovery,
+    Progress,
+    ReplyWindow,
+    SessionInspection,
+    SessionLifecycle,
+    SessionState,
+    WaitingFor,
+    derive_reply_window,
+)
+from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 _log = logging.getLogger(__name__)
-
-#: Why a Session that was LIVE when the engine stopped comes back ENDED. Said in
-#: the log rather than kept on the row: the reason is a fact about this restart,
-#: not a property of the Session, and persisting it would make the durable subset
-#: carry an explanation nothing reads back.
-RESTORED_SESSION_ENDED = (
-    "the engine restarted, and nothing on the restore path re-establishes the route or "
-    "the Reply Window watch this Session would need to be Relayed into"
-)
-
-
-class SessionState(StrEnum):
-    """Whether this Session can still be Relayed into."""
-
-    LIVE = "live"
-    ENDED = "ended"
 
 
 @dataclass(frozen=True, slots=True)
 class Session:
-    """One terminal coding-agent run the user started, that this system watches and Relays into."""
+    """One coding-agent run the user started, as the roster holds it.
+
+    Every field but `first_seen` and `label` is a fact one lane observed, carried
+    from `SessionInspection` unchanged. `first_seen` is this registry's own —
+    when *we* first saw it, which no agent knows — and `label` is the user's name
+    for it, which #78 fills.
+    """
 
     target: SessionTarget
-    label: SessionLabel
     workspace: Path
-    registered_at: float
-    state: SessionState = SessionState.LIVE
-    reply_window: ReplyWindow = ReplyWindow.CLOSED
+    first_seen: float
+    #: The user's name for this Session. `None` is ordinary: an unnamed row is
+    #: listed like any other (#78 stabilises naming).
+    label: SessionLabel | None = None
+    #: The agent's own name for this Session, straight off its roster.
+    name: str | None = None
+    lifecycle: SessionLifecycle = SessionLifecycle.LIVE
+    state: SessionState = SessionState.RUNNING
+    waiting_for: WaitingFor = field(default_factory=WaitingFor)
+    progress: Progress | None = None
+    last_activity: datetime | None = None
+    child: ChildClassification = MAIN_SESSION
+
+    @property
+    def reply_window(self) -> ReplyWindow:
+        """Derived, never stored — see `seams.agent.derive_reply_window`.
+
+        An ended Session accepts nothing, whatever it was doing when it went.
+        """
+        if self.lifecycle is not SessionLifecycle.LIVE:
+            return ReplyWindow.CLOSED
+        return derive_reply_window(self.state, self.child)
+
+    @property
+    def is_live(self) -> bool:
+        return self.lifecycle is SessionLifecycle.LIVE
+
+    def observed(self, row: SessionInspection) -> Session:
+        """This same Session, as a lane has just seen it again.
+
+        Keeps what the registry knows and the lane does not — `first_seen`, and
+        the user's `label` — and takes everything else from the reading, because
+        the reading is the newer truth.
+        """
+        return replace(
+            self,
+            target=row.target,
+            workspace=row.workspace,
+            name=row.name,
+            lifecycle=row.lifecycle,
+            state=row.state,
+            waiting_for=row.waiting_for,
+            progress=row.progress,
+            last_activity=row.last_activity,
+            child=row.child,
+        )
+
+
+def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
+    """The identity to keep when one process has been named two ways.
+
+    Three cases, and the rule is one sentence: **`None` never overwrites a known
+    session id; a different known id does.**
+
+    - The reading names a Session we held anonymously — it has taken its first
+      turn and written the rollout that names it (#73). Take the new name.
+    - The reading is anonymous and we hold a name — this tick had only process
+      evidence, because the shared daemon is not answering. Keep the name; a
+      Session cannot un-know its own id, and dropping it would make the row
+      look like a different Session to everything that addresses it.
+    - The reading names a *different* Session on the same process — the user
+      typed `/new` in that TUI, so the process is the same one and the thread
+      is not. Take the new name: whoever could read an id is the authority on
+      which one it is.
+    """
+    if seen.session_id is None:
+        if held.session_id is not None:
+            _log.info(
+                "%s was read with process evidence only this tick; keeping its known session id",
+                held,
+            )
+        return held
+    if held.session_id is not None and held.session_id != seen.session_id:
+        _log.info("pid %s moved from thread %s to %s", held.pid, held.session_id, seen.session_id)
+    return seen
 
 
 def _normalise(text: str) -> str:
@@ -73,18 +156,167 @@ def _normalise(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+def session_from(row: SessionInspection, *, first_seen: float) -> Session:
+    """A row a lane just saw, as a roster entry seen for the first time."""
+    return Session(
+        target=row.target,
+        workspace=row.workspace,
+        first_seen=first_seen,
+        name=row.name,
+        lifecycle=row.lifecycle,
+        state=row.state,
+        waiting_for=row.waiting_for,
+        progress=row.progress,
+        last_activity=row.last_activity,
+        child=row.child,
+    )
+
+
 class SessionRegistry:
     """What Sessions exist. Holds state; decides no policy about them."""
 
     def __init__(self) -> None:
         self._sessions: dict[SessionTarget, Session] = {}
+        #: Why a lane could not enumerate, per agent. `status` shows it; nothing
+        #: else reads it, because it is news about the lane and not about a row.
+        self._lane_errors: dict[AgentKind, str] = {}
+        #: Why a lane's rows came from a weaker source than usual, per agent.
+        #: Kept apart from `_lane_errors` rather than folded in, because the two
+        #: are different news: one lane has rows that are true and thin, the
+        #: other has no news at all. Collapsing them would repeat the two-field
+        #: encoding `LaneDiscovery` exists to avoid.
+        self._lane_degradations: dict[AgentKind, str] = {}
+
+    # -- observation ----------------------------------------------------
+
+    def observe(
+        self, agent: AgentKind, lane: LaneDiscovery, *, now: float
+    ) -> tuple[SessionTarget, ...]:
+        """Make this lane's rows the roster's truth about this lane, and say what went.
+
+        Returns the Sessions that ended on *this* observation, as they were last
+        addressed. **Only this class can answer that**, and the answer is not
+        recoverable by comparing the roster before and after: a Codex row gains
+        its thread id at its first turn (#73) and so changes `SessionTarget`
+        without anything having ended, and a `/new` does the same. A caller
+        diffing targets would read both as a death — and the news of a death is
+        not free, because it terminates every Relay queued for that target.
+
+        **A lane that could not look changes nothing.** `LaneDiscovery.error`
+        means the roster has no newer information, not that the machine emptied:
+        reading a failed enumeration as an empty one would end every Session on
+        that lane every time a daemon restarted. The error is recorded for
+        `status` and the rows are left exactly as they were.
+
+        **A lane that looked found what it found — even if it found nothing, and
+        even if it looked with something weaker than usual.** An empty
+        enumeration ends rows, because a Session that is gone must stop being
+        offered as a target. `LaneDiscovery.degraded` says the rows came from a
+        weaker source; it does not make them less true.
+
+        **A Session that stopped being seen ends once, then is forgotten.** It
+        goes `LIVE → ENDED` on the first discovery that does not contain it, so
+        a surface can still say what happened to it, and is dropped on the next
+        one. Forgetting immediately would make a Session that ended between two
+        ticks indistinguishable from one that never existed.
+
+        The other lane's rows are untouched in every case: two agents fail
+        independently, and one of them being down is not news about the other.
+        """
+        if not lane.enumerated:
+            assert lane.error is not None  # `enumerated` is exactly this test
+            self._lane_errors[agent] = lane.error
+            _log.info("the %s lane could not enumerate: %s", agent, lane.error)
+            return ()
+        self._lane_errors.pop(agent, None)
+        if lane.degraded is None:
+            self._lane_degradations.pop(agent, None)
+        else:
+            self._lane_degradations[agent] = lane.degraded
+            _log.info("the %s lane is reading from a weaker source: %s", agent, lane.degraded)
+
+        seen: set[SessionTarget] = set()
+        for row in lane.rows:
+            if row.target.agent is not agent:
+                _log.warning(
+                    "the %s lane returned a %s row (%s); ignored, because a lane speaks "
+                    "only for its own agent",
+                    agent,
+                    row.target.agent,
+                    row.target,
+                )
+                continue
+            seen.add(self._admit(row, now=now).target)
+
+        ended: list[SessionTarget] = []
+        for held in [row for row in self._of(agent) if row.target not in seen]:
+            if held.is_live:
+                self._sessions[held.target] = replace(held, lifecycle=SessionLifecycle.ENDED)
+                ended.append(held.target)
+            else:
+                del self._sessions[held.target]
+        return tuple(ended)
+
+    def lane_errors(self) -> dict[AgentKind, str]:
+        """Which lanes could not be enumerated at their last attempt, and why."""
+        return dict(self._lane_errors)
+
+    def lane_degradations(self) -> dict[AgentKind, str]:
+        """Which lanes have rows read by something weaker than usual, and which.
+
+        The rows are true; this says what read them. Separate from
+        `lane_errors` because a user reading `status` needs to tell "Codex is
+        running on the process table because the shared daemon is not up" from
+        "nobody could look at Codex at all" — the first still lists Sessions.
+
+        A lane that could not look leaves this alone, for the same reason it
+        leaves its rows alone: the note describes rows that did not change.
+        """
+        return dict(self._lane_degradations)
+
+    def _admit(self, row: SessionInspection, *, now: float) -> Session:
+        """Fold one freshly-read row into the roster, in place where it belongs."""
+        held = self._same_row(row)
+        if held is None:
+            fresh = session_from(row, first_seen=now)
+            self._sessions[fresh.target] = fresh
+            return fresh
+
+        target = _better_known(held.target, row.target)
+        updated = replace(held.observed(row), target=target)
+        if target != held.target:
+            del self._sessions[held.target]
+        self._sessions[target] = updated
+        return updated
+
+    def _same_row(self, row: SessionInspection) -> Session | None:
+        """The roster entry this reading is *about*, whatever it happens to name it.
+
+        **The process is the identity; the session id is a field on it.** A
+        Codex TUI exists before it has a session id (#73) and keeps its pid
+        across `/new`, so keying on the id would make one process come and go
+        from the roster every time it was read by a different source. Where
+        there is no pid — a daemon thread nobody could tie to a TUI — the id is
+        all there is, and it is the key.
+        """
+        exact = self._sessions.get(row.target)
+        if exact is not None:
+            return exact
+        if row.target.pid is None:
+            return None
+        return next(
+            (held for held in self._of(row.target.agent) if held.target.pid == row.target.pid),
+            None,
+        )
+
+    # -- addressing -----------------------------------------------------
 
     def register(self, session: Session) -> Session:
         """Record a Session that was found to exist. Refuses to register truth twice."""
         target = session.target
         if target in self._sessions:
             raise DuplicateSessionError(target)
-        if not target.agent.addressed_by_pid and self._by_session_id(target):
+        if target.named and not target.agent.addressed_by_pid and self._by_session_id(target):
             raise DuplicateSessionError(target)
         self._sessions[target] = session
         return session
@@ -95,7 +327,7 @@ class SessionRegistry:
         if not candidates:
             raise UnknownSessionError(target)
 
-        if target.agent.addressed_by_pid:
+        if target.agent.addressed_by_pid or not target.named:
             matched = [held for held in candidates if held.target.pid == target.pid]
             if not matched:
                 raise StaleSessionError(
@@ -104,23 +336,26 @@ class SessionRegistry:
                     live_pids=tuple(
                         held.target.pid
                         for held in candidates
-                        if held.state is SessionState.LIVE and held.target.pid is not None
+                        if held.is_live and held.target.pid is not None
                     ),
                 )
             session = matched[0]
         else:
             session = candidates[0]
 
-        if session.state is not SessionState.LIVE:
-            raise StaleSessionError(target, reason=f"that Session is {session.state}")
+        if not session.is_live:
+            raise StaleSessionError(target, reason=f"that Session is {session.lifecycle}")
+        if not session.child.is_main:
+            raise ChildSessionError(target, session.child.parent)
         return session
 
     def match_label(self, query: str) -> Session:
-        """Find the one live Session a spoken label names, or refuse.
+        """Find the one live Session a spoken name names, or refuse.
 
-        The query is matched as a fragment, and **more than one match refuses**,
-        with every candidate named. An exact label is deliberately *not* given
-        precedence, for three reasons:
+        The query is matched as a fragment against the Session Label if the user
+        has given one and against the agent's own Session Name otherwise, and
+        **more than one match refuses**, with every candidate named. An exact
+        label is deliberately *not* given precedence, for three reasons:
 
         - The costs are asymmetric. A refusal costs one spoken round trip; a
           wrong pick delivers the user's own words into the wrong Session,
@@ -133,13 +368,17 @@ class SessionRegistry:
           promotes it to a target by right, which is the first step back toward
           addressing by label.
 
-        The collision only exists while two live labels stand in a fragment
-        relation. That is worth fixing where labels are minted — by keeping a
+        The collision only exists while two live names stand in a fragment
+        relation. That is worth fixing where names are minted — by keeping a
         fresh title word-level distinct from the live ones — rather than by
         making matching cleverer here.
         """
         wanted = _normalise(query)
-        candidates = [held for held in self.live() if wanted in _normalise(str(held.label))]
+        candidates = [
+            held
+            for held in self.live()
+            if held.child.is_main and wanted in _normalise(spoken_name(held))
+        ]
 
         if not candidates:
             raise NoLabelMatchError(query)
@@ -147,16 +386,43 @@ class SessionRegistry:
             raise AmbiguousLabelError(query, tuple(candidates))
         return candidates[0]
 
-    def set_reply_window(self, target: SessionTarget, window: ReplyWindow) -> Session:
-        """Record what the Agent adapter observed about this Session's willingness."""
-        return self._replace(target, reply_window=window)
+    def set_state(self, target: SessionTarget, state: SessionState) -> Session:
+        """Record what a lane observed this Session to be doing.
+
+        The Reply Window follows from it and is never set directly — there is
+        one field, so there is nothing for a second writer to disagree with.
+        """
+        held = self._live_row(target)
+        updated = replace(held, state=state)
+        self._sessions[held.target] = updated
+        return updated
 
     def mark_ended(self, target: SessionTarget) -> Session:
-        """A Session is gone. Its Reply Window closes with it."""
-        session = self.resolve(target)
-        ended = replace(session, state=SessionState.ENDED, reply_window=ReplyWindow.CLOSED)
-        self._sessions[session.target] = ended
+        """A Session is gone. Its Reply Window closes with it, by derivation.
+
+        Deliberately not routed through `resolve`: a Child Process ends like
+        anything else, and refusing to record that because it may not be
+        Relayed into would leave the roster claiming a dead process is running.
+        `resolve` guards *addressing*; this records *what happened*.
+        """
+        held = self._live_row(target)
+        ended = replace(held, lifecycle=SessionLifecycle.ENDED)
+        self._sessions[held.target] = ended
         return ended
+
+    def _live_row(self, target: SessionTarget) -> Session:
+        """The held row for that identity, whatever it is — or why there is none."""
+        candidates = self._by_session_id(target)
+        if not candidates:
+            raise UnknownSessionError(target)
+        if target.agent.addressed_by_pid or not target.named:
+            matched = [held for held in candidates if held.target.pid == target.pid]
+            if not matched:
+                raise StaleSessionError(
+                    target, reason="that session id runs under a different process"
+                )
+            return matched[0]
+        return candidates[0]
 
     def forget(self, target: SessionTarget) -> None:
         """Drop a Session entirely. Resolving it afterwards is unknown, not stale."""
@@ -165,54 +431,15 @@ class SessionRegistry:
             raise UnknownSessionError(target)
 
     def live(self) -> tuple[Session, ...]:
-        """The roster, in registration order."""
-        return tuple(held for held in self._sessions.values() if held.state is SessionState.LIVE)
+        """The roster, in the order the Sessions were first seen."""
+        return tuple(held for held in self._sessions.values() if held.is_live)
 
     def all(self) -> tuple[Session, ...]:
-        """Every Session held, ended ones included, in registration order."""
+        """Every Session held, ended ones included, in the order first seen."""
         return tuple(self._sessions.values())
 
-    def restore(self, sessions: tuple[Session, ...]) -> None:
-        """Adopt a persisted roster, replacing whatever is held — and end what was live.
-
-        **A restored Session is ENDED, and that is this method's whole subtlety.**
-        A row is adopted with everything the file said about it except its state:
-        anything the stopped engine held as LIVE comes back finished, with the
-        reason stated once in the log.
-
-        LIVE is not a description of a process; it is this enum's claim that the
-        Session *can still be Relayed into*. Nothing on the restore path can make
-        that true. A Session's channel and its Reply Window watch are established
-        in exactly one place — the Agent adapter's `register_session` — and the
-        restore path does not go through it, so a restart comes back holding a
-        row and no route. Restoring LIVE would therefore claim, in the enum's own
-        terms, precisely the capability the restart took away (#26).
-
-        Both of that lie's consequences are closed by ending the row. A LIVE
-        Session nothing watches can never be reported dead, because the only
-        observer of a Claude Session's death sweeps the population `register_
-        session` built — so before this, a `live` row outlived its process by
-        days and survived every subsequent restart. And a LIVE Session with no
-        channel is one Bridge Core queues the user's own words against, holding
-        them at the fail-closed default window forever.
-
-        Ending is done through `mark_ended` rather than by building a finished
-        row here, so there stays exactly one way a Session ends and its window
-        closes with it. Nothing is dropped: an ended row is still the roster's
-        record that this Session existed, which a surface may still read.
-        """
-        self._sessions = {}
-        for session in sessions:
-            self.register(session)
-            if session.state is SessionState.LIVE:
-                self.mark_ended(session.target)
-                _log.info(
-                    "restored Session ended agent=%s session_id=%s pid=%s: %s",
-                    session.target.agent,
-                    session.target.session_id,
-                    session.target.pid,
-                    RESTORED_SESSION_ENDED,
-                )
+    def _of(self, agent: AgentKind) -> tuple[Session, ...]:
+        return tuple(held for held in self._sessions.values() if held.target.agent is agent)
 
     def _by_session_id(self, target: SessionTarget) -> list[Session]:
         return [
@@ -221,8 +448,9 @@ class SessionRegistry:
             if held.target.agent is target.agent and held.target.session_id == target.session_id
         ]
 
-    def _replace(self, target: SessionTarget, **changes: Any) -> Session:
-        session = self.resolve(target)
-        updated = replace(session, **changes)
-        self._sessions[session.target] = updated
-        return updated
+
+def spoken_name(session: Session) -> str:
+    """What to match a spoken fragment against: the user's name, else the agent's."""
+    if session.label is not None:
+        return str(session.label)
+    return session.name or ""

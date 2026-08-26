@@ -28,7 +28,7 @@ from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.core.relays import RelayPipeline
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
-from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow
+from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
 
@@ -50,14 +50,17 @@ class Harness:
     ) -> None:
         self.now = 1_000.0
         self.sessions = SessionRegistry()
+        # The Reply Window is derived from what the Session is doing, so a test
+        # that wants one open says the Session is idle.
+        state = SessionState.IDLE if window is ReplyWindow.OPEN else SessionState.RUNNING
         for target in targets:
             self.sessions.register(
                 Session(
                     target=target,
                     label=SessionLabel("GPT-VoiceCoding", f"task {target.session_id}"),
                     workspace=Path("/tmp/workspace"),
-                    registered_at=0.0,
-                    reply_window=window,
+                    first_seen=0.0,
+                    state=state,
                 )
             )
         self.agent = agent or FakeAgent(routes=frozenset(RelayRoute))
@@ -74,7 +77,7 @@ class Harness:
         return asyncio.run(self.pipeline.relay(CODEX, text, **kwargs))  # type: ignore[arg-type]
 
     def window_opened(self, target: SessionTarget = CODEX) -> object:
-        self.sessions.set_reply_window(target, ReplyWindow.OPEN)
+        self.sessions.set_state(target, SessionState.IDLE)
         return asyncio.run(self.pipeline.reply_window_opened(target))
 
     def sweep(self) -> object:

@@ -43,9 +43,20 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
-from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
+from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
+from gpt_voicecoding.adapters.agent.claude.approval import (
+    CWD_FIELD,
+    MESSAGING_SOCKET_FIELD,
+    MESSAGING_TOKEN_FIELD,
+    PID_FIELD,
+    SESSION_ID_FIELD,
+    TRANSCRIPT_PATH_FIELD,
+    ApprovalError,
+    ApprovalListener,
+)
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     bootstrap_value,
     publish_address,
@@ -70,9 +81,14 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
+    LaneDiscovery,
+    LaneUnavailable,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
+    SessionInspection,
+    SessionLifecycle,
+    SessionState,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -95,6 +111,47 @@ SUPPLEMENT_UNAVAILABLE = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionReport:
+    """What one Session's own `SessionStart` hook said about where it can be reached.
+
+    Every field but the id is optional, because every one of them can honestly
+    be absent: a build that does not export the messaging variables, a Session
+    whose first turn has not created a transcript, a payload without a cwd. A
+    partial report is worth keeping — the fields that did arrive are still the
+    ones nothing else carries.
+    """
+
+    session_id: str
+    #: The `claude` process this Session runs as. Not optional in practice and
+    #: optional in the type: it comes from `CLAUDE_PID`, which every build
+    #: measured so far exports, and a report without it cannot be turned into a
+    #: `SessionTarget` at all (`seams/identity.py:124`).
+    pid: int | None = None
+    workspace: Path | None = None
+    transcript_path: Path | None = None
+    messaging_socket: Path | None = None
+    messaging_token: str | None = None
+
+    @property
+    def target(self) -> SessionTarget | None:
+        """The exact Session this report is about, when it said enough to say."""
+        if self.pid is None:
+            return None
+        return SessionTarget(agent=AgentKind.CLAUDE, session_id=self.session_id, pid=self.pid)
+
+
+def _pid_in(payload: dict[str, object], field: str) -> int | None:
+    """A pid off the registration wire. Anything that is not a live pid is `None`."""
+    value = payload.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _path_in(payload: dict[str, object], field: str) -> Path | None:
+    value = payload.get(field)
+    return Path(value) if isinstance(value, str) and value.strip() else None
+
+
 class ClaudeAgentAdapter:
     """Claude, behind the Agent seam. Implements `AgentAdapter` and `Connectable`."""
 
@@ -111,8 +168,16 @@ class ClaudeAgentAdapter:
         #: The socket this adapter owns: hook processes dial in here holding a
         #: dialog open, so this adapter is the server on this route.
         self._approvals = ApprovalListener(
-            settings=self._settings, resolve=self._registered_as, emit=self._emit
+            settings=self._settings,
+            resolve=self._registered_as,
+            emit=self._emit,
+            register=self._session_started,
         )
+        #: What each Session's own `SessionStart` hook reported, by session id.
+        #: **Not a roster**: `claude agents --json` is the roster, and it sees
+        #: Sessions whose hook never ran. This is the two things that command
+        #: does not carry — the inbox socket, and the transcript path (#71).
+        self._reported: dict[SessionTarget, SessionReport] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -182,8 +247,10 @@ class ClaudeAgentAdapter:
         """Record where one Session's channel listens.
 
         The path is the registration this adapter needs and cannot discover: the
-        channel is spawned by Claude Code from an environment variable the
-        launch wrapper generated, so its address arrives from the launcher.
+        channel is spawned by Claude Code inside the Session's own process, so
+        its address exists nowhere outside it. It arrives from that Session's
+        `SessionStart` hook (`_session_started`) — the reference implementation
+        got it from a launch wrapper it owned, and v1.0 launches nothing (#72).
         """
         if target.agent is not AgentKind.CLAUDE:
             raise ValueError(f"{target.agent} sessions are not this adapter's to reach")
@@ -200,10 +267,75 @@ class ClaudeAgentAdapter:
             socket_path,
         )
 
+    def _session_started(self, payload: dict[str, object]) -> None:
+        """One Session's `SessionStart` hook reported where it can be reached.
+
+        **This adds no roster row.** A Session appears in the roster because
+        `claude agents --json` lists it, which it does whether or not this hook
+        ran — including for every Session that started before this engine did.
+        What lands here is what that command cannot say: the Session's own inbox
+        socket, and the `transcript_path` #75 and #76 read.
+
+        **This is where a Session becomes reachable**, and it is the only place
+        left that can be. The address of a Session's inbox is generated by
+        Claude Code inside that Session's own process, so nothing outside it can
+        discover one; the reference implementation learned it from a launch
+        wrapper it owned, and v1.0 does not launch Sessions (#72). The hook is
+        the Session telling us itself.
+
+        **Keyed by the exact target, never by the session id.** `--resume` forks
+        a second process under one session id, and those two processes have two
+        inbox sockets. Storing the last report to arrive under the shared id
+        would put one process's socket behind the other's pid — a Relay
+        delivered, successfully, into the wrong conversation. The pid arrives
+        from `CLAUDE_PID` (`registration.PID_VARIABLE`) for exactly this reason.
+        """
+        session_id = payload.get(SESSION_ID_FIELD)
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        report = SessionReport(
+            session_id=session_id.strip(),
+            pid=_pid_in(payload, PID_FIELD),
+            workspace=_path_in(payload, CWD_FIELD),
+            transcript_path=_path_in(payload, TRANSCRIPT_PATH_FIELD),
+            messaging_socket=_path_in(payload, MESSAGING_SOCKET_FIELD),
+            messaging_token=payload.get(MESSAGING_TOKEN_FIELD)
+            if isinstance(payload.get(MESSAGING_TOKEN_FIELD), str)
+            else None,
+        )
+        target = report.target
+        if target is None:
+            # Nothing can be done with it: a Claude target needs a pid, so this
+            # report cannot be attached to a Session even to record its
+            # transcript path. Said out loud because it means a build that does
+            # not export `CLAUDE_PID`, which is news about the far side.
+            _log.warning(
+                "a registration for session_id=%s carried no pid, so it names no Session; "
+                "the Session stays listed and unreachable",
+                report.session_id,
+            )
+            return
+        self._reported[target] = report
+        _log.info(
+            "registration received for session_id=%s pid=%s workspace=%s transcript=%s socket=%s",
+            report.session_id,
+            report.pid,
+            report.workspace,
+            report.transcript_path,
+            report.messaging_socket,
+        )
+        if report.messaging_socket is not None:
+            self.register_session(target, report.messaging_socket)
+
+    def reported(self, target: SessionTarget) -> SessionReport | None:
+        """What that Session's own hook said about itself, if it ever ran."""
+        return self._reported.get(target)
+
     def forget_session(self, target: SessionTarget) -> None:
         """Stop holding a route to one Session. The Session itself is untouched."""
         self._channels.pop(target, None)
         self._windows.forget(target)
+        self._reported.pop(target, None)
 
     def reachable(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter holds a channel address for."""
@@ -226,6 +358,42 @@ class ClaudeAgentAdapter:
         return self._windows.level(target)
 
     # -- the seam ---------------------------------------------------------
+
+    async def discover(self) -> LaneDiscovery:
+        """Every Claude Session running, from Claude Code's own roster.
+
+        Delegated whole to `discovery.py`, which owns the command and the
+        mapping. Nothing about being *reachable* enters here: a Session is
+        listed because it exists, and whether this adapter holds a channel to it
+        is a question `answer_relay` answers with a receipt (#68).
+        """
+        return await claude_discovery.discover()
+
+    async def inspect(self, target: SessionTarget) -> SessionInspection:
+        """One Session, freshly read from the same roster `discover` reads.
+
+        Answering from the roster rather than from anything held here is what
+        keeps this the *same* value `discover` yields — one reader, one shape.
+        A Session the roster no longer lists reads as `ENDED`, which is the
+        honest answer to "what is it doing" for a Session that is not there.
+
+        **A roster that could not be read is not a roster that lists nothing.**
+        The two are one value apart here and a whole verdict apart for the
+        caller, so a failed enumeration raises rather than answering `ENDED`.
+        """
+        lane = await self.discover()
+        if not lane.enumerated:
+            assert lane.error is not None  # `enumerated` is exactly this test
+            raise LaneUnavailable(AgentKind.CLAUDE, lane.error)
+        for row in lane.rows:
+            if row.target == target:
+                return row
+        return SessionInspection(
+            target=target,
+            workspace=Path(),
+            lifecycle=SessionLifecycle.ENDED,
+            state=SessionState.IDLE,
+        )
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Deliver only, and honestly so: the channel is refused mid-turn."""
@@ -300,11 +468,12 @@ class ClaudeAgentAdapter:
     def _registered_as(self, session_id: str) -> SessionTarget | None:
         """The authority check behind the approval socket, in this adapter's own terms.
 
-        A Claude target is addressed by pid and the hook payload carries only a
-        session id, so the two are matched here against the roster the launcher
-        registered — the same roster every other verb addresses. A session id
-        this adapter holds no channel for is not this engine's Session, and its
-        dialog is not this engine's to answer.
+        A Claude target is addressed by pid and an *approval* payload carries
+        only a session id, so the two are matched here against the channels the
+        Sessions' own `SessionStart` hooks registered — the same roster every
+        other verb addresses. A session id this adapter holds no channel for is
+        not this engine's Session, and its dialog is not this engine's to
+        answer.
 
         **An ambiguous session id is refused rather than guessed.** `--resume`
         forks a second process under one session id, which is the whole reason a

@@ -121,6 +121,17 @@ def hook_decision(verdict: ApprovalVerdict) -> dict[str, Any] | None:
 #: process Claude Code starts, and a generic request channel there would be a
 #: second control plane nobody designed.
 REQUEST_TYPE: Final = "approval_request"
+
+#: The `SessionStart` hook's one line. It rides **this** socket rather than one
+#: of its own: ADR 0011 installs two hooks and the engine publishes one address,
+#: so a second listener would be a second address to publish, a second thing to
+#: fail to bind, and a second place a Session could be half-known.
+REGISTRATION_TYPE: Final = "session_registration"
+
+#: What the registration acknowledges with. The hook does not wait for it — a
+#: `SessionStart` hook that blocked would delay every Session in the config
+#: directory — but the engine sends it so a probe can prove the line landed.
+REGISTERED_TYPE: Final = "session_registered"
 VERDICT_TYPE: Final = "approval_verdict"
 REFUSAL_TYPE: Final = "approval_refused"
 
@@ -150,6 +161,21 @@ TOOL_NAME_FIELD: Final = "tool_name"
 TOOL_INPUT_FIELD: Final = "tool_input"
 VERDICT_FIELD: Final = "verdict"
 REASON_FIELD: Final = "reason"
+
+#: The registration's own fields. `transcript_path` is the one that earns this
+#: hook its place (#71): Claude Code's own registry does not carry it, and it
+#: cannot be derived without guessing at the directory-name flattening — which
+#: replaces `/`, `.` **and** `_` with `-` (#73, measured the hard way).
+#: The pid of the `claude` process this hook ran under. Load-bearing rather than
+#: informational: a Claude `SessionTarget` needs a pid (`seams/identity.py:124`)
+#: because `--resume` forks a second process under one session id, and the hook
+#: payload has never carried one. Measured 2026-08-26: Claude Code exports it as
+#: `CLAUDE_PID`, and it is the same number the official roster reports and the
+#: same number the Session's inbox socket is named after.
+PID_FIELD: Final = "pid"
+TRANSCRIPT_PATH_FIELD: Final = "transcript_path"
+MESSAGING_SOCKET_FIELD: Final = "messaging_socket"
+MESSAGING_TOKEN_FIELD: Final = "messaging_token"
 
 #: The directory the approval socket lives in, one per engine process. It has to
 #: be a directory of our own because `privacy.py` requires the parent to be
@@ -255,8 +281,12 @@ class ApprovalListener:
         resolve: Callable[[str], SessionTarget | None],
         emit: Callable[[AgentEvent], None],
         pid: int | None = None,
+        register: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._settings = settings
+        #: What to do with a `SessionStart` line. `None` drops it, which is what
+        #: an engine assembled without a Claude adapter should do with one.
+        self._register = register
         #: Session id, as the hook payload reports it, to the target this engine
         #: holds a registration for — or `None`, which is the authority check.
         self._resolve = resolve
@@ -432,6 +462,9 @@ class ApprovalListener:
             payload = await self._read_request(reader)
             if payload is None:
                 return
+            if payload.get(TYPE_FIELD) == REGISTRATION_TYPE:
+                await self._registered(payload, writer)
+                return
             target = self._target_for(payload)
             if target is None:
                 await self._refuse(writer, "no Session this engine holds reported that dialog")
@@ -528,10 +561,26 @@ class ApprovalListener:
         except (UnicodeDecodeError, json.JSONDecodeError) as unreadable:
             _log.info("the approval socket was sent invalid JSON: %s", unreadable)
             return None
-        if not isinstance(document, dict) or document.get(TYPE_FIELD) != REQUEST_TYPE:
+        if not isinstance(document, dict) or document.get(TYPE_FIELD) not in (
+            REQUEST_TYPE,
+            REGISTRATION_TYPE,
+        ):
             _log.info("the approval socket was sent something it does not speak")
             return None
         return document
+
+    async def _registered(self, payload: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        """Record one Session's own report of where it can be reached.
+
+        **It adds no row.** The roster comes from `claude agents --json`, which
+        sees every Session in this config directory whether or not its hook ran
+        — including the ones that started before this engine did. What this adds
+        is the two things that command does not carry: the Session's inbox
+        socket, and the `transcript_path` #75 and #76 read.
+        """
+        if self._register is not None:
+            self._register(payload)
+        await self._reply(writer, {TYPE_FIELD: REGISTERED_TYPE})
 
     async def _refuse(self, writer: asyncio.StreamWriter, reason: str) -> None:
         await self._reply(writer, {TYPE_FIELD: REFUSAL_TYPE, REASON_FIELD: reason})

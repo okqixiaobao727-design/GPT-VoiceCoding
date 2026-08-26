@@ -7,6 +7,7 @@ and a stale identity fails closed rather than resolving to something plausible.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,14 @@ from gpt_voicecoding.core.errors import (
     StaleSessionError,
     UnknownSessionError,
 )
-from gpt_voicecoding.core.sessions import Session, SessionRegistry, SessionState
-from gpt_voicecoding.seams.agent import ReplyWindow
+from gpt_voicecoding.core.sessions import Session, SessionRegistry
+from gpt_voicecoding.seams.agent import (
+    ChildClassification,
+    ChildKind,
+    ReplyWindow,
+    SessionLifecycle,
+    SessionState,
+)
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -30,7 +37,7 @@ def claude(session_id: str, pid: int, task: str = "a task") -> Session:
         target=SessionTarget(agent=AgentKind.CLAUDE, session_id=session_id, pid=pid),
         label=SessionLabel("GPT-VoiceCoding", task),
         workspace=WORKSPACE,
-        registered_at=1_000.0,
+        first_seen=1_000.0,
     )
 
 
@@ -39,7 +46,7 @@ def codex(session_id: str, task: str = "a task") -> Session:
         target=SessionTarget(agent=AgentKind.CODEX, session_id=session_id),
         label=SessionLabel("GPT-VoiceCoding", task),
         workspace=WORKSPACE,
-        registered_at=1_000.0,
+        first_seen=1_000.0,
     )
 
 
@@ -194,32 +201,54 @@ class TestReplyWindow:
         registry.register(session)
         assert registry.resolve(session.target).reply_window is ReplyWindow.CLOSED
 
-    def test_the_window_can_be_opened_and_closed(self) -> None:
+    def test_the_window_follows_what_the_session_is_doing(self) -> None:
+        """Derived, never set: one field, so nothing can disagree with it."""
         registry = SessionRegistry()
         session = codex("abc")
         registry.register(session)
 
-        registry.set_reply_window(session.target, ReplyWindow.OPEN)
+        registry.set_state(session.target, SessionState.IDLE)
         assert registry.resolve(session.target).reply_window is ReplyWindow.OPEN
 
-        registry.set_reply_window(session.target, ReplyWindow.CLOSED)
+        registry.set_state(session.target, SessionState.RUNNING)
         assert registry.resolve(session.target).reply_window is ReplyWindow.CLOSED
 
-    def test_opening_the_window_on_an_unknown_session_fails_closed(self) -> None:
+    def test_a_session_waiting_on_a_dialog_is_closed(self) -> None:
+        """`AwaitingApproval` locks it: a dialog blocks every other Relay."""
+        registry = SessionRegistry()
+        session = codex("abc")
+        registry.register(session)
+
+        registry.set_state(session.target, SessionState.WAITING)
+        assert registry.resolve(session.target).reply_window is ReplyWindow.CLOSED
+
+    def test_a_child_process_is_never_open_however_idle_it_is(self) -> None:
+        """Seen, not spoken to (#68) — and the window says so, not just `resolve`."""
+        registry = SessionRegistry()
+        session = replace(
+            codex("abc"),
+            state=SessionState.IDLE,
+            child=ChildClassification(kind=ChildKind.CHILD),
+        )
+        registry.register(session)
+
+        assert registry.all()[0].reply_window is ReplyWindow.CLOSED
+
+    def test_setting_the_state_of_an_unknown_session_fails_closed(self) -> None:
         registry = SessionRegistry()
         with pytest.raises(UnknownSessionError):
-            registry.set_reply_window(
-                SessionTarget(agent=AgentKind.CODEX, session_id="nope"), ReplyWindow.OPEN
+            registry.set_state(
+                SessionTarget(agent=AgentKind.CODEX, session_id="nope"), SessionState.IDLE
             )
 
     def test_ending_a_session_closes_its_reply_window(self) -> None:
         registry = SessionRegistry()
         session = codex("abc")
         registry.register(session)
-        registry.set_reply_window(session.target, ReplyWindow.OPEN)
+        registry.set_state(session.target, SessionState.IDLE)
 
         ended = registry.mark_ended(session.target)
-        assert ended.state is SessionState.ENDED
+        assert ended.lifecycle is SessionLifecycle.ENDED
         assert ended.reply_window is ReplyWindow.CLOSED
 
 

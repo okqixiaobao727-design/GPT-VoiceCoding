@@ -74,6 +74,22 @@ _log = logging.getLogger(__name__)
 #: durations themselves are configuration, this is only how finely they are read.
 DEFAULT_TICK_SECONDS = 1.0
 
+#: How often the hub asks every lane what Sessions exist.
+#:
+#: Derived from what the answer costs and from what being late costs. One pass
+#: is a `claude agents --json` (one process), one `ps`, and one `lsof` per Codex
+#: TUI — cheap, but not free, and paid whether or not anything changed. Being
+#: late costs the user a Session that is running and not yet listed, which is
+#: the whole product being briefly wrong about the machine.
+#:
+#: Five seconds is a Session appearing within one breath of being started, at a
+#: cost the machine does not notice. The real-environment acceptance gives an
+#: empty roster 30 s before it takes that as the answer
+#: (`tests/acceptance/journey.py`, `DISCOVERY_SECONDS`), which is six passes of
+#: headroom — enough that a slow pass, or one that overlapped and was skipped,
+#: cannot be read as a Session that is not there.
+DEFAULT_DISCOVERY_SECONDS = 5.0
+
 #: The console script `pyproject.toml` installs beside the interpreter.
 CONTROL_PLANE_CLI_NAME = "bridgectl"
 
@@ -218,7 +234,12 @@ class Engine:
             server=ControlPlaneServer(plane=plane, path=config.socket_path),
         )
 
-    async def start(self, *, tick_seconds: float = DEFAULT_TICK_SECONDS) -> None:
+    async def start(
+        self,
+        *,
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
+        discovery_seconds: float = DEFAULT_DISCOVERY_SECONDS,
+    ) -> None:
         """Connect the adapters, serve the control plane, and start the two loops.
 
         Adapters open before the socket does, so a surface that reaches a
@@ -246,11 +267,17 @@ class Engine:
         self._loops = [
             asyncio.create_task(self._dispatching(), name="bridge-core-dispatch"),
             asyncio.create_task(self._ticking(tick_seconds), name="bridge-core-tick"),
+            asyncio.create_task(self._discovering(discovery_seconds), name="bridge-core-discovery"),
         ]
 
-    async def run(self, *, tick_seconds: float = DEFAULT_TICK_SECONDS) -> None:
+    async def run(
+        self,
+        *,
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
+        discovery_seconds: float = DEFAULT_DISCOVERY_SECONDS,
+    ) -> None:
         """Serve until cancelled. What `python -m gpt_voicecoding.engine` runs."""
-        await self.start(tick_seconds=tick_seconds)
+        await self.start(tick_seconds=tick_seconds, discovery_seconds=discovery_seconds)
         try:
             await asyncio.gather(*self._loops)
         except asyncio.CancelledError:
@@ -294,13 +321,35 @@ class Engine:
                 _log.exception("dispatching %s raised", type(event).__name__)
 
     async def _ticking(self, seconds: float) -> None:
-        """The only time-driven thing here: the Relay ceiling and the approval budget."""
+        """One of two time-driven things here: the Relay ceiling and the approval budget."""
         while True:
             await asyncio.sleep(seconds)
             try:
                 await self.core.tick()
             except Exception:
                 _log.exception("advancing the ceilings raised")
+
+    async def _discovering(self, seconds: float) -> None:
+        """The other: ask every lane what Sessions exist, one pass at a time.
+
+        A loop of its own rather than a counter inside the tick, because the two
+        cadences answer to different things — one to the ceilings the user
+        configured, one to how fast a Session should appear — and a loop that
+        did both would tie them together at whichever is finer.
+
+        **Never two passes at once.** `await` here can outlast the interval: a
+        `claude` that is slow to answer, or a machine with many Codex TUIs to
+        `lsof`. Overlapping passes would have two readings of one machine racing
+        to write the same rows, so a pass that is still running simply means the
+        next one does not start — the sleep happens first, and this loop is the
+        only caller.
+        """
+        while True:
+            await asyncio.sleep(seconds)
+            try:
+                await self.core.discover()
+            except Exception:
+                _log.exception("a discovery pass raised")
 
 
 async def _answer_text(plane: ControlPlane, found: Classification) -> str:

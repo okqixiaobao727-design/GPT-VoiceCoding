@@ -14,6 +14,7 @@ all of it while the control plane keeps answering.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -23,20 +24,24 @@ from gpt_voicecoding.core.bridge import (
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.router import Classification
-from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.core.switches import SwitchName
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    LaneDiscovery,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionInspection,
+    SessionLifecycle,
     SessionStopped,
+    WaitingFor,
 )
 from gpt_voicecoding.seams.call import CallDropped, CallStarted, CallState, UserSpeech
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
 
 
@@ -172,7 +177,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.emit(SessionEnded(target=CODEX))
 
         assert hub.state.relays.pending() == ()
-        assert hub.state.sessions.all()[0].state is SessionState.ENDED
+        assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
 
 
 class TestTheInboundRouterEndToEnd:
@@ -478,9 +483,61 @@ class TestEventsThatDecideNothing:
         hub = Hub(voice=False)
 
         hub.emit(
-            SessionStopped(target=CODEX, detail="first"),
-            SessionStopped(target=CODEX, detail="second"),
+            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="first", detail="first")),
+            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="second", detail="second")),
         )
 
         assert [sent.endswith("first") for sent in hub.channel.sent] == [True, False]
         assert hub.channel.sent[1].endswith("second")
+
+
+class TestWhatDiscoveryCallsAnEnding:
+    """The hub announces a death, and the announcement is not free.
+
+    `discover` returning a target ends every Relay queued for it. So the hub may
+    only report a Session that really went — and the two readings that look like
+    a departure without being one are the ordinary Codex path, not an edge: a
+    TUI has no thread id until its first turn (#73), and `/new` gives a running
+    TUI a different one.
+    """
+
+    def seeing(self, *rows: SessionInspection) -> Hub:
+        hub = Hub(sessions=())
+        hub.agent.discovery = LaneDiscovery(rows=rows)
+        asyncio.run(hub.core.discover())
+        return hub
+
+    def again(self, hub: Hub, *rows: SessionInspection) -> tuple[object, ...]:
+        hub.agent.discovery = LaneDiscovery(rows=rows)
+        return asyncio.run(hub.core.discover())
+
+    def codex(self, *, session_id: str | None, pid: int) -> SessionInspection:
+        return SessionInspection(
+            target=SessionTarget(agent=AgentKind.CODEX, session_id=session_id, pid=pid),
+            workspace=Path("/tmp/workspace"),
+        )
+
+    def test_a_session_that_stopped_being_seen_is_announced(self) -> None:
+        hub = self.seeing(self.codex(session_id="abc", pid=10))
+
+        assert [target.session_id for target in self.again(hub)] == ["abc"]
+
+    def test_one_that_took_its_first_turn_and_gained_a_thread_id_is_not(self) -> None:
+        hub = self.seeing(self.codex(session_id=None, pid=10))
+
+        assert self.again(hub, self.codex(session_id="abc", pid=10)) == ()
+        assert len(hub.state.sessions.live()) == 1
+
+    def test_nor_is_one_whose_user_typed_new_into_it(self) -> None:
+        hub = self.seeing(self.codex(session_id="abc", pid=10))
+
+        assert self.again(hub, self.codex(session_id="xyz", pid=10)) == ()
+        assert len(hub.state.sessions.live()) == 1
+
+    def test_a_lane_that_could_not_look_announces_nothing(self) -> None:
+        hub = self.seeing(self.codex(session_id="abc", pid=10))
+
+        hub.agent.discovery = LaneDiscovery(error="the shared daemon is not answering")
+
+        assert asyncio.run(hub.core.discover()) == ()
+        assert len(hub.state.sessions.live()) == 1

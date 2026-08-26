@@ -40,7 +40,7 @@ def registry_of(*sessions: tuple[SessionTarget, str]) -> SessionRegistry:
                 target=target,
                 label=SessionLabel("GPT-VoiceCoding", task),
                 workspace=Path("/tmp/workspace"),
-                registered_at=0.0,
+                first_seen=0.0,
             )
         )
     return registry

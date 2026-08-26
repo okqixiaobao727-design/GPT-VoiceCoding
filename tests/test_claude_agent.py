@@ -45,6 +45,7 @@ from gpt_voicecoding.seams.agent import (
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
+    SessionState,
 )
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionLabel, SessionTarget
@@ -644,8 +645,8 @@ class TestTheHubStopsHoldingWhatArrived:
                         target=TARGET,
                         label=SessionLabel("GPT-VoiceCoding", "port the log"),
                         workspace=Path("/tmp/workspace"),
-                        registered_at=0.0,
-                        reply_window=ReplyWindow.OPEN,
+                        first_seen=0.0,
+                        state=SessionState.IDLE,
                     )
                 )
                 queue = RelayQueue()

@@ -6,8 +6,9 @@ queries the hub.
 
 This object exists to make "one persistence path" structural. The store is
 reachable from here and from nothing else, so there is exactly one place that
-decides what is durable, and the answer is: switch state and the Session
-registry. The Relay queue is deliberately not persisted — see `relay_queue`.
+decides what is durable, and the answer is: switch state, and nothing else. The
+Relay queue is deliberately not persisted — see `relay_queue` — and neither is
+the Session roster, which discovery re-reads on a cadence (#74).
 
 Policy lives in the pipelines, not here. This holds truth and writes it down.
 """
@@ -53,20 +54,19 @@ class BridgeState:
         """Write the durable subset down. A no-op when running without a store."""
         if self._store is None:
             return
-        self._store.save(
-            PersistedState(
-                switches=self._switches.snapshot(),
-                sessions=self._sessions.all(),
-            )
-        )
+        self._store.save(PersistedState(switches=self._switches.snapshot()))
 
     def restore(self) -> bool:
         """Adopt what was written down. False means first run, not failure.
 
         Anything the file describes that this engine cannot honour — a switch
-        configuration no longer declares, a Session row that is unaddressable —
-        fails closed. Starting blank would look identical to the system quietly
-        deciding to stop speaking.
+        configuration no longer declares — fails closed. Starting blank would
+        look identical to the system quietly deciding to stop speaking.
+
+        **The Session roster is not adopted, because it is not written** (#74).
+        A restart comes back with an empty roster and fills it from the first
+        discovery, which is the only source that can be right about what is
+        running now.
         """
         if self._store is None:
             return False
@@ -76,7 +76,6 @@ class BridgeState:
 
         try:
             self._switches.restore(state.switches)
-            self._sessions.restore(state.sessions)
         except BridgeCoreError as error:
             raise StateFormatError(self._store.path, str(error)) from error
         return True

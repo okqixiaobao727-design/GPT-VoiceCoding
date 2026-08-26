@@ -34,12 +34,12 @@ from gpt_voicecoding.adapters.agent.claude.window import (
     death_for,
     window_for,
 )
-from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionLifecycle,
     SessionStopped,
 )
 from gpt_voicecoding.seams.companion_channel import InboundText
@@ -644,7 +644,7 @@ class TestDeathReachesBridgeCoreEndToEnd:
         watcher.poll_once()
         hub.emit(*sink.events)
 
-        assert hub.state.sessions.all()[0].state is SessionState.ENDED
+        assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
         assert hub.state.relays.pending() == ()
         assert hub.agent.calls == []
         assert any("never reached the session" in spoken for spoken in hub.call.spoken)

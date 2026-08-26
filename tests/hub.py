@@ -20,7 +20,7 @@ from gpt_voicecoding.core.router import TextGrammar
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
-from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow
+from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -52,14 +52,17 @@ class Hub:
         switches.flip(SwitchName.MESSAGE, message)
 
         registry = SessionRegistry()
+        # The Reply Window is derived, so a test that wants one open says what
+        # the Session is *doing* — which is the only thing an adapter can see.
+        state = SessionState.IDLE if window is ReplyWindow.OPEN else SessionState.RUNNING
         for target, task in sessions:
             registry.register(
                 Session(
                     target=target,
                     label=SessionLabel("GPT-VoiceCoding", task),
                     workspace=Path("/tmp/workspace"),
-                    registered_at=0.0,
-                    reply_window=window,
+                    first_seen=0.0,
+                    state=state,
                 )
             )
 

@@ -1,9 +1,17 @@
 """The durable subset of Bridge Core's truth, and the only path it travels.
 
+**The Session roster is not durable, and that is #74's decision.** A Session is
+one the *user* started, so the roster is whatever is running on this machine
+right now — a fact discovery re-reads every few seconds, and one no file can be
+right about. Persisting it bought a restart a roster of rows it had no route to,
+which is how a `live` row outlived its process by days (#26). What survives a
+restart is switch state, and the first discovery after start-up rebuilds the
+rest.
+
 **Format: one JSON file, replaced atomically.** The alternative considered was
 SQLite, which the reference implementation used. Every advantage SQLite brings —
 concurrent writers, indexed queries, a schema — is something this architecture
-has already ruled out: the durable subset is switch state plus a Session roster,
+has already ruled out: the durable subset is switch state alone,
 there is exactly one writer because persistence is an internal component only
 Bridge Core touches, and nothing queries it. What SQLite would add is a
 migration story, a file nobody can read during an outage, and the standing
@@ -33,11 +41,8 @@ from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding.core.errors import BridgeCoreError, StateFormatError
-from gpt_voicecoding.core.sessions import Session, SessionState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.locations import engine_directory
-from gpt_voicecoding.seams.agent import ReplyWindow
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 #: Kept apart from the first-generation bridge's `runtime/` in the same directory.
 STATE_FILE_NAME = "state.json"
@@ -50,14 +55,25 @@ def default_state_path(base_dir: Path | None = None) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class PersistedState:
-    """Exactly what survives a restart: switch state and the Session registry."""
+    """Exactly what survives a restart: switch state, and nothing else.
+
+    The Session roster used to be here. It was removed with the restore path it
+    fed (#74): the roster is what is running right now, discovery re-reads it on
+    a cadence, and a file cannot be right about it.
+    """
 
     #: Bumped when the shape below changes incompatibly. An unrecognised version
     #: fails closed rather than being read optimistically.
+    #:
+    #: **Unchanged when the Session roster left** (#74). Dropping a key is not an
+    #: incompatible change for a reader: a file this engine wrote before the
+    #: roster left still carries every switch, and its `sessions` key is simply
+    #: not read. Bumping would have refused the switch state of every engine
+    #: already installed on the user's machine — the master switch among it —
+    #: over a key that no longer matters.
     VERSION = 1
 
     switches: SwitchSnapshot
-    sessions: tuple[Session, ...] = ()
 
 
 class StateStore:
@@ -96,21 +112,16 @@ class StateStore:
 
         try:
             switches = _read_switches(document["switches"])
-            rows = document["sessions"]
-            if not isinstance(rows, list):
-                raise TypeError("sessions must be a list")
-            sessions = tuple(_read_session(row) for row in rows)
         except (BridgeCoreError, KeyError, TypeError, ValueError) as error:
             raise StateFormatError(self._path, str(error)) from error
 
-        return PersistedState(switches=switches, sessions=sessions)
+        return PersistedState(switches=switches)
 
     def save(self, state: PersistedState) -> None:
         """Replace the state file atomically. A reader never sees a half-written file."""
         document = {
             "version": PersistedState.VERSION,
             "switches": state.switches.as_mapping(),
-            "sessions": [_write_session(session) for session in state.sessions],
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_name(f".{self._path.name}.writing")
@@ -146,34 +157,3 @@ def _read_switches(raw: Any) -> SwitchSnapshot:
         if not isinstance(state, bool):
             raise TypeError(f"switch {name!r} is {state!r}, which is not on or off")
     return SwitchSnapshot.of(dict(raw))
-
-
-def _write_session(session: Session) -> dict[str, Any]:
-    return {
-        "target": {
-            "agent": str(session.target.agent),
-            "session_id": session.target.session_id,
-            "pid": session.target.pid,
-        },
-        "label": {"project": session.label.project, "task": session.label.task},
-        "workspace": str(session.workspace),
-        "registered_at": session.registered_at,
-        "state": str(session.state),
-        "reply_window": str(session.reply_window),
-    }
-
-
-def _read_session(row: Any) -> Session:
-    target = row["target"]
-    return Session(
-        target=SessionTarget(
-            agent=AgentKind(target["agent"]),
-            session_id=target["session_id"],
-            pid=target["pid"],
-        ),
-        label=SessionLabel(project=row["label"]["project"], task=row["label"]["task"]),
-        workspace=Path(row["workspace"]),
-        registered_at=float(row["registered_at"]),
-        state=SessionState(row["state"]),
-        reply_window=ReplyWindow(row["reply_window"]),
-    )
