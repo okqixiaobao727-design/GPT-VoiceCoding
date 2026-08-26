@@ -65,6 +65,17 @@ _log = logging.getLogger(__name__)
 #: owner of a lifecycle it is forbidden to own.
 DAEMON_VERSION_ARGUMENTS: Final = ("app-server", "daemon", "version")
 
+#: How long that one command gets before it is given up on. Measured at 139 ms
+#: against a daemon that is up, so this is not a budget the ordinary case spends
+#: — it is the bound on the case that has no ordinary one, a `codex` that never
+#: answers. Without it, `communicate()` waits forever and the five-second
+#: discovery cadence waits with it: `core/bridge.py:505` awaits `discover()` with
+#: no deadline of its own, and it is one loop over the adapters, so one hung
+#: subprocess here stops the **Claude** lane's roster too. The number is the
+#: lane's other subprocess reader's (`codex/processes.py:138`), because it is the
+#: same risk read off the same machine.
+COMMAND_TIMEOUT_SECONDS: Final = 10.0
+
 #: How much of an unreadable answer is quoted back in the reason. Long enough to
 #: recognise what came out — a shell banner, an HTML error page, a stack trace's
 #: first line — and short enough that a daemon answering megabytes cannot put
@@ -122,6 +133,15 @@ async def locate(executable: str, *, run: Runner | None = None) -> tuple[DaemonA
     """
     try:
         status, said = await (run or _run)([executable, *DAEMON_VERSION_ARGUMENTS])
+    except TimeoutError:
+        # Before `OSError`, and that ordering is the behaviour rather than a
+        # style: `TimeoutError` **is** an `OSError`, so caught second a daemon
+        # that hung would be reported as a `codex` that is not installed — the
+        # one reason that sends somebody looking in the wrong place.
+        return None, (
+            f"{executable} did not answer where the shared Codex daemon is within "
+            f"{COMMAND_TIMEOUT_SECONDS:.0f} seconds"
+        )
     except OSError as unrunnable:
         return None, f"{executable} could not be run: {unrunnable}"
     if status != 0:
@@ -171,6 +191,12 @@ class SharedDaemon:
         self._attach = attach
         self._connection: AppServerConnection | None = None
         self._note = ""
+        #: Held across the whole dial, because the dial is where the race is.
+        #: The engine has two callers that arrive independently — the five-second
+        #: discovery cadence and a control-plane `progress` ask — and the check
+        #: for a live connection is separated from writing the new one by two
+        #: awaits, which is room enough for both to find none and both to attach.
+        self._dialling = asyncio.Lock()
 
     @property
     def note(self) -> str:
@@ -190,34 +216,55 @@ class SharedDaemon:
         restarted under a running engine — its own updater does exactly that —
         and an engine that kept a dead handle would report an empty roster for
         the rest of its life.
-        """
-        if self._connection is not None and self._connection.is_open:
-            return self._connection
-        self._connection = None
 
-        address, reason = await self._locate(self._settings.executable)
-        if address is None:
-            self._note = reason
-            return None
-        try:
-            connection = await self._attach(
-                address.socket_path, version=self._version, settings=self._settings
-            )
-        except (WireError, AppServerError, OSError) as unreachable:
-            self._note = (
-                f"the shared Codex daemon at {address.socket_path} did not accept a "
-                f"connection: {unreachable}"
-            )
-            return None
-        _log.info("joined the shared Codex daemon at %s", address.socket_path)
-        self._connection = connection
-        self._note = address.note
-        return connection
+        **One dial at a time, and the answer is asked for twice.** A live
+        connection is answered without taking the lock, which is the ordinary
+        case and stays free; a caller that finds none waits, and then asks again
+        — because what it was waiting on is very likely the dial that answers its
+        own question. Without this, two callers arriving together both attached,
+        the daemon held two clients of an engine that is meant to be one of them,
+        and the loser was dropped with nothing left to close it.
+        """
+        held = self._connection
+        if held is not None and held.is_open:
+            return held
+
+        async with self._dialling:
+            held = self._connection
+            if held is not None and held.is_open:
+                return held
+            self._connection = None
+
+            address, reason = await self._locate(self._settings.executable)
+            if address is None:
+                self._note = reason
+                return None
+            try:
+                connection = await self._attach(
+                    address.socket_path, version=self._version, settings=self._settings
+                )
+            except (WireError, AppServerError, OSError) as unreachable:
+                self._note = (
+                    f"the shared Codex daemon at {address.socket_path} did not accept a "
+                    f"connection: {unreachable}"
+                )
+                return None
+            _log.info("joined the shared Codex daemon at %s", address.socket_path)
+            self._connection = connection
+            self._note = address.note
+            return connection
 
     async def aclose(self) -> None:
-        """Let go of this engine's end. The daemon and its Sessions carry on."""
-        connection, self._connection = self._connection, None
-        self._note = ""
+        """Let go of this engine's end. The daemon and its Sessions carry on.
+
+        Behind the same lock as the dial, so shutdown waits for a dial in flight
+        rather than racing it: clearing the field while one was running would
+        have that dial write its connection back afterwards, and this engine
+        would walk away from a client it had just made.
+        """
+        async with self._dialling:
+            connection, self._connection = self._connection, None
+            self._note = ""
         if connection is not None:
             await connection.aclose()
 
@@ -233,11 +280,24 @@ async def _run(arguments: list[str]) -> tuple[int, str]:
     `stderr` is folded into `stdout` because a `codex` that refuses writes its
     reason to one and its document to the other, and the caller wants whichever
     turned up.
+
+    **The bound lives here, in the runner, rather than at the call site**, so a
+    caller injecting a `Runner` of its own is the only thing that can be
+    unbounded — and the only callers that do are tests. Raises `TimeoutError`,
+    which `locate` turns into a reason like every other way this can fail.
     """
     process = await asyncio.create_subprocess_exec(
         *arguments,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    said, _ = await process.communicate()
+    try:
+        said, _ = await asyncio.wait_for(process.communicate(), COMMAND_TIMEOUT_SECONDS)
+    except TimeoutError:
+        # Killed rather than left, because the wait ending is not the command
+        # ending: a `codex` abandoned here would go on holding whatever it was
+        # stuck on, and the next tick would start another one beside it.
+        process.kill()
+        await process.wait()
+        raise
     return process.returncode or 0, said.decode("utf-8", errors="replace")

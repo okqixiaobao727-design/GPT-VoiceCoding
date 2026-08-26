@@ -11,6 +11,25 @@ minute running tools has moved without saying anything a reader would show, so a
 stalled. The time therefore comes off any record in the file, and the entries
 come only off the conversation.
 
+**Including a sidechain record, and that is a departure from #76's own
+sentence.** The ticket says the helper excludes "child/sidechain, system and
+command-plumbing records as legacy does", and `recent`'s *entries* do exactly
+that. `last_activity` deliberately does not, ruled on #76 by the Advisor, for
+three reasons worth keeping together:
+
+* The field means *this Session moved* (`seams/agent.py:314-316`). A Task
+  subagent writes into **this** transcript and has no roster row of its own, so
+  no other row could own that time; excluding it would report a Session four
+  minutes into a subagent as one nobody has heard from, which is the exact
+  failure the field was split off from `progress` to prevent.
+* Two lanes, one meaning. The Codex lane's `last_activity` is the thread's own
+  `updatedAt`, which moves for any work at all (`codex/thread_tail.py`), and the
+  Claude lane must not say something narrower under the same name.
+* A sidechain record is **not** #68's Child Process. That rule is about a
+  separate `claude` *process*, which gets a row of its own and is never spoken
+  to; a sidechain record is one Session's own subagent, in one Session's own
+  file. Conflating them is what makes this look like an oversight.
+
 **The visibility rules are not restated here.** `is_visible`,
 `is_pipeline_noise` and `visible_text` live in `stop_analysis` and are consumed,
 not re-implemented — the same records, the same exclusions, one reading. Legacy
@@ -21,7 +40,12 @@ different moments of a file the Session is still appending to
 **Against legacy** (ADR 0010, `CLAUDE.md`). The read is **ported** from
 `legacy@1d32845:bridge/transcript.py:1184-1246` (walk the records, keep what the
 user can see, bound the tail) with its text extraction at `:1568-1607` and its
-bounding walk at `:2828-2860`. **Adapted**: legacy's entry was
+bounding walk at `:2828-2860`. **Adapted**: legacy's sidechain exclusion
+(`_top_level_records`, `:1125-1142`) is a **visibility** rule — what to show, and
+what counts as a stop — and it is ported whole into `recent`'s entries and into
+`stop_analysis.analyse`. `last_activity` is not a visibility fact, and legacy is
+not a citation for it either way: gen 1 had no such field at all. **Adapted**:
+legacy's entry was
 `TranscriptMessage(role, text)` and this is the seam's `ProgressEntry`, which
 carries the same two facts; legacy's bounds were a per-Session verb's (12
 entries / 32 KB, `config.plist:449-452`) and these are a roster row's, for the
@@ -75,9 +99,11 @@ def recent(
             continue
         when = _moment(record.get(_TIMESTAMP))
         if when is not None:
-            # Any record at all, this Session's child processes included: a
-            # subagent writing here is this Session running, and the field
-            # exists to say so when nothing was said.
+            # Any record at all, this Session's own subagents included: a
+            # subagent writing here is this Session running, the field exists
+            # to say so when nothing was said, and no other row could own that
+            # time. Deliberately wider than the entries below — the module
+            # docstring says why, and #76's Advisor ruling is what settled it.
             moved = when
         entry = _entry(record)
         if entry is not None:

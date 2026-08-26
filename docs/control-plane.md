@@ -165,6 +165,15 @@ something older was dropped, and entries are dropped whole, never cut.
 without saying anything a reader would show, and this is the field that says so.
 It is `null` when nothing read one.
 
+It is deliberately **wider than `progress`**: it counts any work in the Session,
+its own subagents included, where `progress` carries only what the user would be
+shown. On the Claude lane that means a sidechain record advances it even though
+such a record never becomes an entry; on the Codex lane it is the thread's own
+`updatedAt`, which moves for any work at all. One meaning on both lanes — and a
+Session four minutes into a subagent is not a Session nobody has heard from. A
+subagent is not a Child Process: that is a separate agent process, and it has a
+row of its own.
+
 `reply_window` is derived on the row and rendered here, so no surface re-derives
 it and no two surfaces can disagree about one Session.
 
