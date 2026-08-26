@@ -225,11 +225,12 @@ class Lane:
     #: the two agents' policies refuse different actions, and an instruction that
     #: asks one of them for permission asks the other for nothing (#105).
     relayed: Callable[[Path], Instruction]
-    #: How this lane names the policy the permission was measured at, given the
-    #: agent's own record of the Session. `approval`'s evidence line says it, so
-    #: a green step states the ground it was measured on rather than implying
-    #: some default.
-    policy_at: Callable[[Path | None], str]
+    #: The ground the permission was measured on, given the agent's own record of
+    #: the Session. `approval` says its `named` half in the evidence line, so a
+    #: green step states the ground it stood on rather than implying some
+    #: default — and fails on the `unsound` half, because a step that cannot
+    #: stand on its own ground has not proved what it claims.
+    policy_at: Callable[[Path | None], hand_started.Policy]
     #: What that policy is measured to ask about. Said by the step that finds no
     #: permission at all, so a silent lane reports the measurement it contradicts
     #: instead of the other lane's.
@@ -267,7 +268,11 @@ CLAUDE = Lane(
     binary="claude",
     arguments=("--permission-mode", "default"),
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
-    policy_at=lambda record: "`--permission-mode default`",
+    # The flag the harness passes *is* the whole policy on this lane, and Claude
+    # publishes no per-turn readback of it, so there is nothing to read back and
+    # nothing that can disagree. Sound by construction, and said out loud here so
+    # the asymmetry with the Codex lane is a measurement rather than an oversight.
+    policy_at=lambda record: hand_started.Policy("`--permission-mode default`"),
     asks_about=(
         "a Write of a new file asks `Do you want to create <name>?` and the roster's "
         "`status` goes to `waiting` (measured 2026-08-26 on claude 2.1.246)"
@@ -734,9 +739,18 @@ class Walk:
             # (#105): true, and about the other lane.
             raise StepFailed(
                 f"no permission was raised by the relayed instruction, so nothing "
-                f"round-tripped. Measured at {policy}: {self.lane.asks_about}"
+                f"round-tripped. Measured at {policy.named}: {self.lane.asks_about}"
             )
-        return f"{self.approval_evidence}; measured at {policy}"
+        if policy.unsound:
+            # A round trip that happened is not the whole claim. #105 asks this
+            # step to *name* the policy it was measured at, and a green line
+            # reading `no policy` — or naming ground on which no permission could
+            # have been raised — is the same silent pass in a new costume.
+            raise StepFailed(
+                f"a permission did round-trip ({self.approval_evidence}), but the ground it was "
+                f"measured on is not the ground this lane stands on: {policy.unsound}"
+            )
+        return f"{self.approval_evidence}; measured at {policy.named}"
 
     # --- companion inbound ------------------------------------------------
 

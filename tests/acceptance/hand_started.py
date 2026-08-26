@@ -489,22 +489,56 @@ def codex_rollout(workspace: Path, since: float) -> Path | None:
     return None
 
 
-def codex_turn_policy(rollout: Path | None) -> str:
+@dataclass(frozen=True)
+class Policy:
+    """The ground a permission was measured on, and whether it is the right ground.
+
+    Two fields rather than one string, because the `approval` step has to do two
+    different things with them. `named` is what its evidence line says. `unsound`
+    is empty when the ground is the one the lane meant, and otherwise says what is
+    wrong with it — and a step that cannot stand on its own ground has not proved
+    what it claims, however green the round trip looked.
+    """
+
+    named: str
+    unsound: str = ""
+
+
+#: What the Codex lane's `approval` step must be standing on for its green to
+#: mean what it says. The sandbox is the harness's own pin — without it the write
+#: it relays is not refused and no permission is raised at all. The policy and
+#: the reviewer are the **product's** pin, asserted on every turn it starts
+#: (`agent/codex/threads.py:36-40`): `never` would mean no prompt could exist,
+#: and any reviewer but `user` means prompts are answered by a subagent and never
+#: reach the person — the product's own `MISROUTED`.
+WANTED_SANDBOX = "workspace-write"
+FORBIDDEN_APPROVAL_POLICY = "never"
+WANTED_REVIEWER = "user"
+
+
+def codex_turn_policy(rollout: Path | None) -> Policy:
     """What Codex says the last turn ran under, in Codex's own words.
 
     Every turn appends a `turn_context` record carrying `approval_policy`,
     `approvals_reviewer` and `sandbox_policy` (measured 2026-08-27 on codex-cli
-    0.149.1 and 0.150.0, including on the run that opened #105). The `approval` step names
-    this rather than the flag the harness passed, because two of the three are
-    not the harness's to claim: the **product** pins the policy and the reviewer
-    on every turn it starts (`agent/codex/threads.py:36-40`), so reading them
-    back off the far side is the difference between a run that says the pin was
-    applied and a run that assumes it.
+    0.149.1 and 0.150.0, including on the run that opened #105). The `approval`
+    step names this rather than the flag the harness passed, because two of the
+    three are not the harness's to claim: the **product** pins the policy and the
+    reviewer on every turn it starts, so reading them back off the far side is
+    the difference between a run that says the pin was applied and a run that
+    assumes it.
+
+    **A policy that cannot be read is a failure, not a footnote.** Returning the
+    words "no policy" and letting the step pass would leave exactly the hole
+    #105 was opened on: a green `approval` that never says which ground it stood
+    on reads the same as one standing on ground where no permission could have
+    been raised. So every unreadable case, and every case that contradicts the
+    ground this lane pinned, comes back `unsound`.
 
     The last record wins: it is the turn whose permission the step just graded.
     """
     if rollout is None:
-        return "no policy: codex has written no record of this Session yet"
+        return Policy("no policy", "codex has written no record of this Session to read one from")
     latest: dict | None = None
     try:
         with rollout.open() as lines:
@@ -516,16 +550,36 @@ def codex_turn_policy(rollout: Path | None) -> str:
                 if record.get("type") == "turn_context" and isinstance(record.get("payload"), dict):
                     latest = record["payload"]
     except OSError as unreadable:
-        return f"no policy: {rollout.name} could not be read ({unreadable})"
+        return Policy("no policy", f"{rollout.name} could not be read ({unreadable})")
     if latest is None:
-        return f"no policy: {rollout.name} carries no turn_context record"
+        return Policy("no policy", f"{rollout.name} carries no turn_context record")
+
     sandbox = latest.get("sandbox_policy")
     sandbox_kind = sandbox.get("type") if isinstance(sandbox, dict) else sandbox
-    return (
-        f"sandbox {sandbox_kind!r}, approval_policy {latest.get('approval_policy')!r}, "
-        f"approvals_reviewer {latest.get('approvals_reviewer')!r} "
+    approval_policy = latest.get("approval_policy")
+    reviewer = latest.get("approvals_reviewer")
+    named = (
+        f"sandbox {sandbox_kind!r}, approval_policy {approval_policy!r}, "
+        f"approvals_reviewer {reviewer!r} "
         f"(codex's own `turn_context`, {rollout.name})"
     )
+    wrong = []
+    if sandbox_kind != WANTED_SANDBOX:
+        wrong.append(
+            f"the sandbox is {sandbox_kind!r}, not the {WANTED_SANDBOX!r} this lane pins — "
+            f"the write it relays is only refused, and a permission only raised, inside that one"
+        )
+    if approval_policy == FORBIDDEN_APPROVAL_POLICY:
+        wrong.append(
+            f"approval_policy is {FORBIDDEN_APPROVAL_POLICY!r}, so no prompt could be raised at "
+            f"all; the product pins `on-request` on every turn it starts and this says it did not"
+        )
+    if reviewer != WANTED_REVIEWER:
+        wrong.append(
+            f"approvals_reviewer is {reviewer!r}, not {WANTED_REVIEWER!r} — prompts from this "
+            f"thread are answered by a subagent and never reach the person"
+        )
+    return Policy(named, "; ".join(wrong))
 
 
 def _first_session_meta(rollout: Path) -> dict | None:
