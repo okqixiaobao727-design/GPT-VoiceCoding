@@ -489,6 +489,45 @@ def codex_rollout(workspace: Path, since: float) -> Path | None:
     return None
 
 
+def codex_turn_policy(rollout: Path | None) -> str:
+    """What Codex says the last turn ran under, in Codex's own words.
+
+    Every turn appends a `turn_context` record carrying `approval_policy`,
+    `approvals_reviewer` and `sandbox_policy` (measured 2026-08-27 on codex-cli
+    0.149.1 and 0.150.0, including on the run that opened #105). The `approval` step names
+    this rather than the flag the harness passed, because two of the three are
+    not the harness's to claim: the **product** pins the policy and the reviewer
+    on every turn it starts (`agent/codex/threads.py:36-40`), so reading them
+    back off the far side is the difference between a run that says the pin was
+    applied and a run that assumes it.
+
+    The last record wins: it is the turn whose permission the step just graded.
+    """
+    if rollout is None:
+        return "no policy: codex has written no record of this Session yet"
+    latest: dict | None = None
+    try:
+        with rollout.open() as lines:
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") == "turn_context" and isinstance(record.get("payload"), dict):
+                    latest = record["payload"]
+    except OSError as unreadable:
+        return f"no policy: {rollout.name} could not be read ({unreadable})"
+    if latest is None:
+        return f"no policy: {rollout.name} carries no turn_context record"
+    sandbox = latest.get("sandbox_policy")
+    sandbox_kind = sandbox.get("type") if isinstance(sandbox, dict) else sandbox
+    return (
+        f"sandbox {sandbox_kind!r}, approval_policy {latest.get('approval_policy')!r}, "
+        f"approvals_reviewer {latest.get('approvals_reviewer')!r} "
+        f"(codex's own `turn_context`, {rollout.name})"
+    )
+
+
 def _first_session_meta(rollout: Path) -> dict | None:
     try:
         with rollout.open() as lines:

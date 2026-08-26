@@ -97,13 +97,20 @@ class Instruction:
     """
 
     words: str
+    #: Where the effect lands. A bare name is read inside the workspace; an
+    #: absolute path is read where it says, which is how the Codex lane asks for
+    #: a file its sandbox will not let it write (`writing_at`).
     filename: str | None = None
     content: str | None = None
 
+    def path_in(self, workspace: Path) -> Path | None:
+        return workspace / self.filename if self.filename is not None else None
+
     def effect_in(self, workspace: Path) -> str | None:
-        if self.filename is None:
+        target = self.path_in(workspace)
+        if target is None:
             return None
-        text = support.read_if_exists(workspace / self.filename)
+        text = support.read_if_exists(target)
         return text.strip() if text is not None else None
 
     def performed_in(self, workspace: Path) -> bool:
@@ -123,6 +130,24 @@ def writing(filename: str, content: str) -> Instruction:
     )
 
 
+def writing_at(path: Path, content: str) -> Instruction:
+    """The same action, named by absolute path, so the sandbox is what decides.
+
+    Identical to `writing` in everything the steps read back — one file, one word,
+    read off the filesystem. The only difference is *where*, and on the Codex lane
+    that is the whole point: the path is outside the Session's writable roots, so
+    the action cannot be taken without asking.
+    """
+    return Instruction(
+        words=(
+            f"Create a file at the absolute path {path} whose entire contents are the "
+            f"single word {content}. Do nothing else, and do not ask any questions."
+        ),
+        filename=str(path),
+        content=content,
+    )
+
+
 #: Turn 1 — `stable name`'s Stop. **No tool use**, on purpose: a turn that raises
 #: a permission would sit in `waiting` until something answered it, and nothing is
 #: supposed to answer one until `approval`. So the first turn is words only, it
@@ -131,11 +156,21 @@ ACKNOWLEDGE = Instruction(
     words="Reply with the single word READY. Do not use any tools, and do not ask anything."
 )
 
-#: Turn 2 — arrives by Relay, raises a permission on the way. Measured 2026-08-26
-#: on `claude` 2.1.246 at `--permission-mode default`: a Write of a new file
-#: raises `Do you want to create <name>?` and the roster's `status` goes to
-#: `waiting`. That is the permission `approval` answers.
-RELAYED = writing("relay.txt", "BRAVO")
+#: Turn 2 — arrives by Relay and raises a permission on the way. The file and the
+#: word are one shape for both lanes; **where** it is written is the lane's, and
+#: that is what `Lane.relayed` holds. One instruction for both lanes is what left
+#: the codex `approval` step silent (#105): at its own sandbox a Codex writes
+#: inside its workspace without asking anybody, so there was nothing to
+#: round-trip. See `CLAUDE` and `CODEX` for each lane's measurement.
+RELAY_FILE = "relay.txt"
+RELAY_WORD = "BRAVO"
+
+#: Where the Codex lane's relayed instruction writes: beside the workspace, under
+#: the same run directory, and outside the Session's writable roots. Kept inside
+#: the run directory so the design's rule still holds — nothing outside it is
+#: written by the agents — and kept out of the workspace because being outside is
+#: the entire reason Codex has to ask before writing there.
+OUTSIDE_THE_SANDBOX = "outside-the-sandbox"
 
 #: Turn 3 — arrives from Telegram.
 INBOUND = writing("inbound.txt", "CHARLIE")
@@ -182,6 +217,20 @@ class Lane:
     #: the instruction work. Everywhere the harness speaks about the concept, it
     #: is a Child Process (`CONTEXT.md`).
     child_words: str
+    #: The instruction `relay` carries and `approval` grades, given the lane's
+    #: workspace. It is the lane's because *what a permission is* is the lane's:
+    #: the two agents' policies refuse different actions, and an instruction that
+    #: asks one of them for permission asks the other for nothing (#105).
+    relayed: Callable[[Path], Instruction]
+    #: How this lane names the policy the permission was measured at, given the
+    #: agent's own record of the Session. `approval`'s evidence line says it, so
+    #: a green step states the ground it was measured on rather than implying
+    #: some default.
+    policy_at: Callable[[Path | None], str]
+    #: What that policy is measured to ask about. Said by the step that finds no
+    #: permission at all, so a silent lane reports the measurement it contradicts
+    #: instead of the other lane's.
+    asks_about: str
     #: What the agent itself says about a Session the harness started, or None
     #: when it says nothing yet. Takes the pid, the workspace, the environment to
     #: read a roster with, and the moment the harness started looking.
@@ -214,6 +263,12 @@ CLAUDE = Lane(
     agent="claude",
     binary="claude",
     arguments=("--permission-mode", "default"),
+    relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
+    policy_at=lambda record: "`--permission-mode default`",
+    asks_about=(
+        "a Write of a new file asks `Do you want to create <name>?` and the roster's "
+        "`status` goes to `waiting` (measured 2026-08-26 on claude 2.1.246)"
+    ),
     ground_truth=lambda pid, workspace, environment, since: hand_started.claude_ground_truth(
         pid, environment
     ),
@@ -225,14 +280,42 @@ CLAUDE = Lane(
     ),
 )
 
-#: Codex takes no flag here. Measured 2026-08-26: `~/.codex/config.toml` sets no
-#: `approval_policy`, so the lane runs on the product's own default — which is
-#: what #60 asked for and what this lane still gets.
+#: `--sandbox workspace-write` pins the **sandbox**, and nothing else. It is the
+#: Codex config surface #105 asks this lane to name, and it is chosen because it
+#: is the one thing here the product never asserts: `turn/start` pins
+#: `approvalPolicy` and `approvalsReviewer` on every relayed turn
+#: (`agent/codex/threads.py:36-40`), so pinning those at the keyboard too would
+#: pre-arrange the very assertion #77's approval route has to make for itself.
+#: What the sandbox *allows* is nobody's assertion, and until this flag it came
+#: from `~/.codex/config.toml` — a file the user owns, where one
+#: `sandbox_mode = "danger-full-access"` would silence this step exactly as
+#: `permissions.defaultMode = "auto"` silenced the Claude one. The value is what
+#: a trusted workspace already gives (measured 2026-08-26 on the failing run's
+#: own rollout, `turn_context.sandbox_policy = workspace-write`), so the flag
+#: fixes the ground rather than moving it.
 CODEX = Lane(
     name="codex",
     agent="codex",
     binary="codex",
-    arguments=(),
+    arguments=("--sandbox", "workspace-write"),
+    # Measured 2026-08-27 through the shared daemon with the product's own pin
+    # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a
+    # 0.149.1 app-server: a write to a path outside the workspace raises
+    # `item/fileChange/requestApproval`, the thread goes to `waitingOnApproval`,
+    # and **the file does not appear until the approval is answered**. The same
+    # instruction aimed *inside* the workspace raised nothing, both times, which
+    # is what `approval.none` was reporting on run `20260826T122216Z`. The
+    # directory is made by the harness, so the one refused action is the write.
+    relayed=lambda workspace: writing_at(
+        workspace.parent / OUTSIDE_THE_SANDBOX / RELAY_FILE, RELAY_WORD
+    ),
+    policy_at=lambda record: hand_started.codex_turn_policy(record),
+    asks_about=(
+        "a write to a path outside the Session's writable roots raises "
+        "`item/fileChange/requestApproval` and the thread goes to `waitingOnApproval` "
+        "(measured 2026-08-27 on codex-cli 0.149.1 and 0.150.0); a write *inside* the "
+        "workspace raises nothing, which is the silence #105 was opened for"
+    ),
     ground_truth=lambda pid, workspace, environment, since: hand_started.codex_ground_truth(
         pid, workspace, since
     ),
@@ -566,24 +649,36 @@ class Walk:
 
         **DELIVERED is never inferred from a write** (#71, carried into #77), so
         this step wants two things the engine cannot fake: a reply that says
-        `delivered` rather than retained or unknown, and the file in the
-        workspace. The permission this turn raises on the Claude lane is answered
-        here — through `bridgectl approve`, so the *bridge* answers it — and the
-        evidence is handed to `approval`, which is the step that grades it.
+        `delivered` rather than retained or unknown, and the file the words asked
+        for. The permission this turn raises is answered here — through
+        `bridgectl approve`, so the *bridge* answers it — and the evidence is
+        handed to `approval`, which is the step that grades it.
+
+        **The words are the lane's** (`Lane.relayed`). Both lanes ask for one
+        file containing one word; only the path differs, because only the path
+        decides whether the agent has to ask permission first (#105).
         """
         if self.address is None:
             raise LaneBlocked("no Session to relay to")
+        relayed = self.lane.relayed(self.config.workspace)
+        # The directory the effect lands in is the harness's to make. On the
+        # Codex lane it is outside the sandbox, and an agent that had to create
+        # it as well would be asking permission twice for one instruction — two
+        # permissions where the step grades one.
+        target = relayed.path_in(self.config.workspace)
+        if target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
         mark = self.person.latest_message_id()
         started = time.monotonic()
         answer = self.bridgectl(
-            "relay", self.address, RELAYED.words, timeout=support.RELAY_DEADLINE_SECONDS
+            "relay", self.address, relayed.words, timeout=support.RELAY_DEADLINE_SECONDS
         )
         if not answer.ok:
             raise StepFailed(f"relay refused: {answer.text}")
 
         self.approval_evidence = self._answer_pending_approval(mark)
         performed = support.wait_for(
-            lambda: RELAYED.performed_in(self.config.workspace),
+            lambda: relayed.performed_in(self.config.workspace),
             deadline_seconds=self.far_side.workspace_effect_seconds,
         )
         self.turns.append(Turn("relay", time.monotonic() - started, performed))
@@ -603,15 +698,14 @@ class Walk:
                     else "; AND no reason travelled with it — #68 requires a delivery failure "
                     "to carry one, and `seams/delivery.py:47-49` cannot construct one without"
                 )
-                + f". {RELAYED.filename} is {RELAYED.effect_in(self.config.workspace)!r}"
+                + f". {target} is {relayed.effect_in(self.config.workspace)!r}"
             )
         if not performed:
             raise StepFailed(
-                f"relay answered {answer.text!r} but {RELAYED.filename} never appeared in "
-                f"{self.config.workspace} within "
+                f"relay answered {answer.text!r} but {target} never appeared within "
                 f"{self.far_side.workspace_effect_seconds:.0f}s — a receipt without an effect"
             )
-        return f"{answer.text}; {RELAYED.filename} contains {RELAYED.content}"
+        return f"{answer.text}; {target} contains {relayed.content}"
 
     # --- approval ---------------------------------------------------------
 
@@ -622,15 +716,24 @@ class Walk:
         Splitting them into two turns would prove less: the shape the product has
         to survive is a *relayed* instruction that needs a permission, and that is
         one turn by definition.
+
+        The evidence names the policy the permission was measured at, read from
+        the agent's own record where the agent records one. A green step that did
+        not say which ground it stood on is a step that would read the same on
+        ground where the permission could not have been raised at all — which is
+        the run #105 was opened on.
         """
+        policy = self.lane.policy_at(self._record_now())
         if self.approval_evidence is None:
+            # Each lane reports the measurement its own silence contradicts. One
+            # shared sentence here is how the codex step spent a run explaining
+            # what a Claude at `--permission-mode default` would have done
+            # (#105): true, and about the other lane.
             raise StepFailed(
-                "no permission was raised by the relayed instruction, so nothing round-tripped. "
-                "On the Claude lane that is a red: measured 2026-08-26 at "
-                "`--permission-mode default`, a Write of a new file asks "
-                "`Do you want to create <name>?` and the roster goes to `waiting`."
+                f"no permission was raised by the relayed instruction, so nothing "
+                f"round-tripped. Measured at {policy}: {self.lane.asks_about}"
             )
-        return self.approval_evidence
+        return f"{self.approval_evidence}; measured at {policy}"
 
     # --- companion inbound ------------------------------------------------
 
@@ -869,11 +972,15 @@ class Walk:
         name = row.get("name")
         return str(name) if name else None
 
+    def _record_now(self) -> Path | None:
+        """Where the agent's own record of this Session is, at this moment."""
+        if self.truth is None:
+            return None
+        return self.lane.record_now(self.truth, self.started_at)
+
     def _record_size(self) -> int:
         """How big the agent's own record is — the far side's own measure of work."""
-        if self.truth is None:
-            return 0
-        record = self.lane.record_now(self.truth, self.started_at)
+        record = self._record_now()
         return record.stat().st_size if record and record.exists() else 0
 
     def _drive_turn(
