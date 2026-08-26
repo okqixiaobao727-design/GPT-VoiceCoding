@@ -83,6 +83,7 @@ import termios
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -146,7 +147,65 @@ def resolve(binary: str, path_value: str) -> Path | None:
     return Path(found) if found else None
 
 
-def launch_arguments(flags: tuple[str, ...], boot_prompt: str | None) -> tuple[str, ...]:
+@dataclass(frozen=True)
+class BootPrompt:
+    """Words a lane's TUI is *launched* with, and how to know that turn is over.
+
+    The two travel together because either alone is a trap. A prompt on the
+    command line is what carries the Codex lane past the update gate (#110), and
+    it is also a **turn**, running before the walk has asked for anything; the
+    reading is how `journey.Walk.settle_boot_turn` knows it may stop waiting. A
+    lane that gained the first without the second is exactly the false green the
+    Codex review of #110 found, so the type does not let it.
+    """
+
+    words: str
+    #: Whether the agent's own record shows **no turn in flight**, given where
+    #: that record is now (or None when there is not one yet).
+    turn_over: Callable[[Path | None], bool]
+
+
+#: How Codex brackets a turn in its own record. Measured 2026-08-27 against a
+#: real rollout on this machine (`rollout-2026-08-27T10-17-38-01a04026…jsonl`,
+#: codex-cli 0.150.0): two turns, two `task_started`, two `task_complete`, and
+#: the file's last record is the second `task_complete`.
+TURN_STARTED = "task_started"
+TURN_COMPLETE = "task_complete"
+
+
+def codex_turn_over(rollout: Path | None) -> bool:
+    """Whether Codex's own record shows no turn in flight: all started, all complete.
+
+    **Not** "the record stopped growing for a while", which is what `_drive_turn`
+    settles for and what the Codex review of #110 rejected for this use: a turn
+    waiting on the model appends nothing, so silence is a turn that may be over
+    and may be thinking. For a graded turn that ambiguity costs a slow reading;
+    for the boot turn it costs the run its meaning, because a boot turn wrongly
+    called over is a Stop landing where a later step is looking for a different
+    one. Codex says which it is, so this asks Codex.
+    """
+    if rollout is None:
+        return False
+    started = complete = 0
+    try:
+        with rollout.open() as lines:
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # a line half-written while this read it
+                if record.get("type") != "event_msg":
+                    continue
+                payload = record.get("payload")
+                kind = payload.get("type") if isinstance(payload, dict) else None
+                started += kind == TURN_STARTED
+                complete += kind == TURN_COMPLETE
+    except OSError:
+        return False
+    return started > 0 and complete >= started
+
+
+def launch_arguments(flags: tuple[str, ...], boot: BootPrompt | None) -> tuple[str, ...]:
     """A lane's argv: its flags, then its boot prompt — last, and never empty.
 
     The two rules this holds are both load-bearing and neither is visible in a
@@ -162,14 +221,14 @@ def launch_arguments(flags: tuple[str, ...], boot_prompt: str | None) -> tuple[s
     Claude lane, and it is the ordinary case: a Session nobody has typed into is
     what the walk's first step wants to find.
     """
-    if boot_prompt is None:
+    if boot is None:
         return flags
-    if not boot_prompt.strip():
+    if not boot.words.strip():
         raise ValueError(
             "a boot prompt must be non-empty: an empty PROMPT is not a skipped update gate, "
             "it is a launch that stops at the gate with nothing to show for it"
         )
-    return (*flags, boot_prompt)
+    return (*flags, boot.words)
 
 
 class SessionRefused(RuntimeError):

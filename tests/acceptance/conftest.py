@@ -398,7 +398,7 @@ def hand_started_session(  # noqa: ANN201
     session = hand_started.HandStartedSession(
         lane=lane.name,
         binary=binary,
-        arguments=hand_started.launch_arguments(lane.arguments, lane.boot_prompt),
+        arguments=hand_started.launch_arguments(lane.arguments, lane.boot),
         workspace=config.workspace,
         environment=terminal_environment,
         journal=journal,
