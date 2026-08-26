@@ -117,10 +117,21 @@ def stop_notice_for(
     """
     stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
     tail = f" — {stopped_on}" if stopped_on else ""
-    # What to call it is `core/sessions.py`'s answer, and its floor is the
-    # address: a notice that names nothing is a notice the user cannot answer.
-    called = spoken_name(session) if session is not None else spoken_target(target)
-    return f"{called} stopped and may need you{tail}"
+    return f"{spoken_reference(session, target)} stopped and may need you{tail}"
+
+
+def spoken_reference(session: Session | None, target: SessionTarget) -> str:
+    """The string a notice refers to this Session by — its name, else its address.
+
+    Third of the `spoken_*` family and the one that chooses between the other
+    two: what to call a Session is `core/sessions.py`'s answer, and its floor is
+    the address, because a notice that names nothing is a notice the user cannot
+    answer. Both notices Bridge Core composes ask this question — the Stop Notice
+    and, since #109, the Approval Relay's announcement — so it is one expression
+    rather than the same line twice, which is how one of them came to have it and
+    the other not.
+    """
+    return spoken_name(session) if session is not None else spoken_target(target)
 
 
 def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
@@ -532,7 +543,7 @@ class BridgeCore:
             case SessionEnded():
                 await self._session_ended(event)
             case AwaitingApproval():
-                await self.approvals.opened(event.request)
+                await self.approvals.opened(event.request, self._spoken_as(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
@@ -725,3 +736,7 @@ class BridgeCore:
             return self._state.sessions.resolve(target)
         except BridgeCoreError:
             return None
+
+    def _spoken_as(self, target: SessionTarget) -> str:
+        """What a notice refers to this Session by, whether or not the roster knows it."""
+        return spoken_reference(self._known(target), target)

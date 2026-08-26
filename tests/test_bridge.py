@@ -466,7 +466,9 @@ class TestSwitchAdjudicationEndToEnd:
             await escalating
             return pushed
 
-        assert asyncio.run(watch()) == ["a session is waiting for your permission to use Bash"]
+        assert asyncio.run(watch()) == [
+            "GPT-VoiceCoding \u00b7 port the log is waiting for your permission to use Bash"
+        ]
 
 
 class TestEventsThatDecideNothing:
@@ -659,7 +661,8 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
         )
 
         assert hub.channel.sent == [
-            "a session is waiting for your permission to use Bash — push the branch"
+            "GPT-VoiceCoding \u00b7 port the log is waiting for your permission to use Bash "
+            "\u2014 push the branch"
         ]
 
     def test_the_suppressed_stop_is_written_down_rather_than_dropped_silently(self, caplog) -> None:
@@ -726,3 +729,61 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
         hub.emit(SessionStopped(target=CODEX))
 
         assert len(hub.channel.sent) == 1
+
+
+class TestEveryNoticeNamesTheSessionItIsAbout:
+    """#109: on a machine bridging every Session, an unnamed notice is unanswerable.
+
+    The Stop Notice always named its Session; the Approval Relay's announcement
+    opened "a session is waiting…" and named only the tool. That is the notice
+    carrying a budget and a `bridgectl approve` — the *most* answerable thing the
+    product says, and the only one that did not say which Session it was about.
+    It cost an acceptance run (`20260826T213402Z`), where a stranger's permission
+    prompt was indistinguishable from the lane's own.
+
+    Legacy: **ported** from `legacy@1d32845:bridge/host.py:213-235`, which
+    rendered `Session: {session_label}` above "This session is waiting for
+    permission."
+    """
+
+    #: The one target the Hub does not register, so `_known` answers None and the
+    #: address floor is what the notice has to fall back on.
+    STRANGER = SessionTarget(agent=AgentKind.CODEX, session_id="not-in-the-roster")
+
+    def test_the_announcement_names_the_session_the_way_the_user_does(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+
+        (announcement,) = hub.channel.sent
+        assert announcement.startswith("GPT-VoiceCoding · port the log is waiting")
+
+    def test_both_notices_call_one_session_the_same_thing(self) -> None:
+        """One answer to "what is this called", or the user hears two Sessions."""
+        hub = Hub(voice=False)
+
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+        hub.emit(SessionStopped(target=CODEX))
+
+        announcement, stop_notice = hub.channel.sent
+        called = "GPT-VoiceCoding · port the log"
+        assert announcement.startswith(called) and stop_notice.startswith(called)
+
+    def test_a_session_the_roster_does_not_hold_is_named_by_its_address(self) -> None:
+        """The floor `spoken_name` itself falls back to — never "a session"."""
+        hub = Hub(voice=False)
+
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", self.STRANGER, "Bash")))
+
+        (announcement,) = hub.channel.sent
+        assert announcement.startswith("codex not-in-the-roster is waiting")
+
+    def test_the_detail_still_travels_after_the_name(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(
+            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", detail="push the branch"))
+        )
+
+        (announcement,) = hub.channel.sent
+        assert announcement.endswith("your permission to use Bash — push the branch")

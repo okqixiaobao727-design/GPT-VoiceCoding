@@ -90,8 +90,8 @@ class Harness:
             clock=lambda: self.now,
         )
 
-    def opened(self, req: ApprovalRequest | None = None) -> object:
-        return asyncio.run(self.pipeline.opened(req or request()))
+    def opened(self, req: ApprovalRequest | None = None, spoken_as: str | None = None) -> object:
+        return asyncio.run(self.pipeline.opened(req or request(), spoken_as))
 
     def answer(self, verdict: ApprovalVerdict, approval_id: str = "approval-1") -> object:
         return asyncio.run(self.pipeline.answer(approval_id, verdict))
@@ -119,6 +119,28 @@ class TestAnnouncingAPendingDialog:
         harness.opened()
 
         assert "Bash" in harness.call.spoken[0]
+
+    def test_the_announcement_names_the_session_its_caller_gave_it(self) -> None:
+        """#109. Bridge Core holds the roster; this pipeline is handed the answer."""
+        harness = Harness()
+
+        harness.opened(spoken_as="GPT-VoiceCoding \u00b7 port the log")
+
+        assert harness.call.spoken[0].startswith("GPT-VoiceCoding \u00b7 port the log is waiting")
+
+    def test_a_caller_with_no_name_to_give_still_names_the_session(self) -> None:
+        """The address is the floor `spoken_name` itself falls back to.
+
+        The parameter is optional, and what makes that safe is that its default
+        is not "say nothing": a notice reading "a session is waiting for your
+        permission" is the one this pipeline may never send, because it is the
+        one the user cannot act on (#109).
+        """
+        harness = Harness()
+
+        harness.opened()
+
+        assert harness.call.spoken[0].startswith("codex abc is waiting")
 
     def test_it_rides_the_escalation_pipeline_rather_than_its_own_flow(self) -> None:
         """With no outlet at all it is retained, exactly like any other notice."""

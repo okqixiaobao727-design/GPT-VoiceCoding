@@ -69,7 +69,13 @@ markers = [
 # Test modules import the shared fakes bare (`from fakes import ...`); this pins that path.
 # The repository root is here for `app_bundle`, the build pipeline, which lives
 # outside `src/` on purpose: the product does not ship its own build system.
-pythonpath = ["tests", "."]
+# `tests/acceptance` is here so the *fast* suite can import the harness's own
+# pure logic. The acceptance run itself never reaches CI — it needs this machine,
+# these credentials and that bot — but a rule the harness applies to the chat is
+# ordinary code, and #109 is what a rule with no test at CI speed costs. The
+# import is safe from here: `journey` reaches only `support` and `hand_started`,
+# and telethon lives behind `telegram_person`, which neither imports.
+pythonpath = ["tests", "tests/acceptance", "."]
 
 [tool.ruff]
 src = ["src", "tests", "app_bundle"]

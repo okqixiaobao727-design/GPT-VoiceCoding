@@ -29,16 +29,37 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpt_voicecoding.adapters.agent import _summary
 from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict
 from gpt_voicecoding.seams.identity import SessionTarget
 
 #: The permission prompts this adapter consumes, and the tool name each is
 #: announced under. The legacy pair is absent on purpose — see the module note.
+COMMAND_EXECUTION = "item/commandExecution/requestApproval"
 APPROVAL_METHODS: dict[str, str] = {
-    "item/commandExecution/requestApproval": "a shell command",
+    COMMAND_EXECUTION: "a shell command",
     "item/fileChange/requestApproval": "a file change",
     "item/permissions/requestApproval": "extra permissions",
 }
+
+#: The `kind` a `commandExecution` approval carries when what is being approved
+#: is **text typed into an already-running process** rather than a command being
+#: started. Added at codex-cli 0.150.0 with `#[serde(default)] = "command"` for
+#: older servers (`v2/item.rs:1495-1512`), so an absent `kind` is a command and
+#: this lane still reads a 0.149.1 daemon correctly. Announced apart because
+#: "a shell command" describes the parent it points at, not the stdin under
+#: review, and a user answering by voice has only the sentence to go on
+#: (`docs/research/2026-08-27-codex-0150-probe.md` § 4).
+WRITE_STDIN = "writeStdin"
+WRITE_STDIN_NAME = "input to a running command"
+
+#: The approval-params fields a Codex prompt may be summarised from. One field,
+#: and `command` is **not** in it: `reason` is a sentence Codex writes for a human
+#: to read, and the command is the shell text `_summary` exists to keep out of a
+#: notice that is read aloud into a Live Call and pushed to a phone. Until #109
+#: this lane read `command` and the Claude lane did not, which is a safety rule
+#: enforced on one path and not the other.
+SUMMARY_FIELDS: tuple[str, ...] = ("reason",)
 
 #: What each verdict answers on the wire. `ASK` is absent because it answers
 #: nothing at all; a mapping entry for it would be the denial this must never be.
@@ -70,18 +91,49 @@ def voice_menu(available: Any) -> tuple[str, ...]:
     )
 
 
+def tool_name_for(method: str, params: dict[str, Any]) -> str:
+    """What the announcement calls the thing being approved.
+
+    The method decides it, with one exception the method cannot express: a
+    `commandExecution` prompt whose `kind` is `writeStdin` is not a command being
+    started but text being fed to one already running, and it points at the
+    *parent* command's `itemId`. Announcing it as "a shell command" describes
+    something else that is genuinely happening, which is worse than vague.
+    """
+    if method == COMMAND_EXECUTION and params.get("kind") == WRITE_STDIN:
+        return WRITE_STDIN_NAME
+    return APPROVAL_METHODS.get(method, method)
+
+
 def summary_of(method: str, params: dict[str, Any]) -> str:
     """One line describing what is waiting, taken from Codex's own words.
 
-    `reason` is a sentence Codex wrote for a human to read, so it is preferred
-    over anything assembled here; the command is the fallback because it is the
-    only other thing that says what is actually about to happen.
+    The shared rule (`adapters/agent/_summary`): description-class text only,
+    whole or not at all. `reason` is the one such field Codex offers — a sentence
+    it wrote for a human to read.
+
+    **`command` used to be the fallback and is now excluded**, which is a
+    behaviour change and the point of it. It is shell text, and the reference
+    implementation kept exactly that out of a summary because reading it aloud is
+    neither safe nor useful (`legacy@1d32845:bridge/transcript.py:1779-1790`).
+    The Claude lane had always obeyed that rule; this one never had (#109).
+
+    Naming the prompt is what is left when there is nothing readable to say. It
+    repeats the tool name, so `a file change — a file change` is what a prompt
+    with no `reason` reads as; the payload carries no path to do better with, and
+    that is recorded on #109 rather than papered over.
+
+    Whitespace is collapsed **after** the ceiling is applied, not before, and
+    this lane collapses where the Claude one does not: Codex writes `reason` as
+    prose that can wrap, and a field that is over-long before collapsing is not
+    the one-line summary this reads for either way. Erring towards naming the
+    prompt is the safe direction; erring the other way is what reads a wrapped
+    paragraph into a Live Call.
     """
-    for key in ("reason", "command"):
-        value = params.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())
-    return APPROVAL_METHODS.get(method, "a permission request")
+    summary = _summary.summarise(params, SUMMARY_FIELDS)
+    if summary:
+        return " ".join(summary.split())
+    return tool_name_for(method, params)
 
 
 def approval_id_of(method: str, params: dict[str, Any]) -> str:
@@ -102,7 +154,7 @@ def request_from(method: str, params: dict[str, Any], *, target: SessionTarget) 
     return ApprovalRequest(
         approval_id=approval_id_of(method, params),
         target=target,
-        tool_name=APPROVAL_METHODS.get(method, method),
+        tool_name=tool_name_for(method, params),
         detail=summary_of(method, params),
         options=voice_menu(params.get("availableDecisions")),
     )
