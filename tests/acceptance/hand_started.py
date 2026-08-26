@@ -508,11 +508,14 @@ class Policy:
 #: mean what it says. The sandbox is the harness's own pin — without it the write
 #: it relays is not refused and no permission is raised at all. The policy and
 #: the reviewer are the **product's** pin, asserted on every turn it starts
-#: (`agent/codex/threads.py:36-40`): `never` would mean no prompt could exist,
-#: and any reviewer but `user` means prompts are answered by a subagent and never
-#: reach the person — the product's own `MISROUTED`.
+#: (`agent/codex/threads.py:36-40`), and both are checked for *equality* rather
+#: than against a list of known-bad values: refusing only `never` would pass
+#: `None`, `on-failure` and `untrusted` alike, and none of those is the pin #77
+#: built — a step that cannot tell them apart cannot claim the pin was applied.
+#: Any reviewer but `user` means prompts are answered by a subagent and never
+#: reach the person, which is the product's own `MISROUTED`.
 WANTED_SANDBOX = "workspace-write"
-FORBIDDEN_APPROVAL_POLICY = "never"
+WANTED_APPROVAL_POLICY = "on-request"
 WANTED_REVIEWER = "user"
 
 
@@ -569,10 +572,11 @@ def codex_turn_policy(rollout: Path | None) -> Policy:
             f"the sandbox is {sandbox_kind!r}, not the {WANTED_SANDBOX!r} this lane pins — "
             f"the write it relays is only refused, and a permission only raised, inside that one"
         )
-    if approval_policy == FORBIDDEN_APPROVAL_POLICY:
+    if approval_policy != WANTED_APPROVAL_POLICY:
         wrong.append(
-            f"approval_policy is {FORBIDDEN_APPROVAL_POLICY!r}, so no prompt could be raised at "
-            f"all; the product pins `on-request` on every turn it starts and this says it did not"
+            f"approval_policy is {approval_policy!r}, not the {WANTED_APPROVAL_POLICY!r} the "
+            f"product pins on every turn it starts — so this turn does not show that pin being "
+            f"applied, and `never` among those values would mean no prompt could exist at all"
         )
     if reviewer != WANTED_REVIEWER:
         wrong.append(
