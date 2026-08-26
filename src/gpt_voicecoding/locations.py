@@ -34,6 +34,11 @@ ENGINE_DIR_NAME: Final = "engine"
 #: not state — an address, true only while the engine that wrote it is serving.
 ADDRESS_FILE_NAME: Final = "address.json"
 
+#: Where the Codex login `LaunchAgent` sends the job's output. Not the engine's
+#: log and never `bridge.logFile`: ADR 0004's rotation is rename-and-reopen and
+#: this descriptor is held by launchd, which cannot be told to reopen anything.
+CODEX_DAEMON_LOG_NAME: Final = "codex-daemon.log"
+
 #: Whether the user wants the installation. Beside the engine's directory rather
 #: than inside it, because it outlives any one engine and is not the engine's.
 INSTALLATION_FILE_NAME: Final = "installation.json"
@@ -51,6 +56,11 @@ def engine_directory(base_dir: Path | None = None) -> Path:
 def address_path(base_dir: Path | None = None) -> Path:
     """Where the engine says it is, for a process nobody could hand a variable to."""
     return engine_directory(base_dir) / ADDRESS_FILE_NAME
+
+
+def codex_daemon_log_path(base_dir: Path | None = None) -> Path:
+    """Where the login job says why it could not start Codex's shared daemon."""
+    return product_directory(base_dir) / CODEX_DAEMON_LOG_NAME
 
 
 def installation_path(base_dir: Path | None = None) -> Path:

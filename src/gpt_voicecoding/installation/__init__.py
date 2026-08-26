@@ -42,6 +42,7 @@ __all__ = [
     "Outcome",
     "State",
     "read_intent",
+    "remove_file",
     "replace_text",
     "write_intent",
 ]
@@ -119,6 +120,26 @@ def replace_text(path: Path, contents: str) -> str:
             f"{path}: another process wrote this file at the same time, so what is "
             "there now is not what this run wrote. Nothing was retried."
         )
+    return ""
+
+
+def remove_file(path: Path) -> str:
+    """Take a file this product wrote back off the disk, and check it is gone.
+
+    The Claude item never needs this: its artifact is a block *inside* a file the
+    user owns, so taking it back is a rewrite. The Codex item's artifact **is** a
+    file, wholly ours, so taking it back is a removal — and the read-back that
+    `replace_text` does after a write is an existence check after this one, for
+    the same reason. Returns the empty string when nothing of ours is left.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return ""
+    except OSError as refusal:
+        return f"{path}: {refusal}"
+    if path.exists():
+        return f"{path}: removed, and still there immediately after. Nothing was retried."
     return ""
 
 

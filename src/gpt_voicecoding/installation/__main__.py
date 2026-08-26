@@ -13,8 +13,14 @@ Nothing here dials a socket, reads engine state, or asks Bridge Core anything.
 
 **The items are named here, one line each.** That is what stands in for a
 registry: with two artifacts and no plugin story, a list of two calls *is* the
-boundary, and adding a third is adding a line. The Codex login ``LaunchAgent``
-joins these lists with #83.
+boundary, and adding a third is adding a line. Both of v1.0's items are on it —
+ADR 0011's Claude hook block (#86) and the Codex login ``LaunchAgent`` (#83).
+
+**Where things go is resolved once, here, and passed down.** Each item knows how
+to find its own default, and nothing below this file reads ``os.environ`` or
+``Path.home``: an item that resolved its own paths could not be run against a
+temporary directory, and a boundary whose tests cannot avoid the real
+``~/Library/LaunchAgents`` is one whose tests load real login jobs.
 
 **The interpreter is ``sys.executable`` and is never written down.** Inside the
 bundle that is the bundled python beside this console script, which is the whole
@@ -28,6 +34,7 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from gpt_voicecoding.installation import (
@@ -35,9 +42,11 @@ from gpt_voicecoding.installation import (
     Outcome,
     State,
     claude_hooks,
+    codex_launch_agent,
     read_intent,
     write_intent,
 )
+from gpt_voicecoding.locations import codex_daemon_log_path
 
 #: Everything went as asked.
 EXIT_OK = 0
@@ -52,16 +61,64 @@ VERBS = ("reconcile", "install", "uninstall", "status")
 RECORD_NAME = "installation-record"
 
 
-def _inspect_all(config_directory: Path, interpreter: Path) -> list[Outcome]:
-    return [claude_hooks.inspect(config_directory, interpreter)]
+@dataclass(frozen=True, slots=True)
+class Placement:
+    """Where this run puts things, resolved once from the environment it runs in.
+
+    Nothing in here is a decision — every field is an answer some item already
+    knows how to work out for itself. It exists so the answers are worked out in
+    one place, at the top, where a test can supply a different environment
+    instead of the machine's own.
+    """
+
+    claude_config_directory: Path
+    interpreter: Path
+    launch_agents_directory: Path
+    codex_home: Path
+    codex_log_path: Path
+    launchd: codex_launch_agent.Launchd
 
 
-def _install_all(config_directory: Path, interpreter: Path) -> list[Outcome]:
-    return [claude_hooks.install(config_directory, interpreter)]
+def _resolve(
+    environ: Mapping[str, str],
+    interpreter: Path,
+    base_dir: Path | None,
+    home: Path | None,
+    launchd: codex_launch_agent.Launchd | None,
+) -> Placement:
+    return Placement(
+        claude_config_directory=claude_hooks.default_config_directory(environ, home),
+        interpreter=interpreter,
+        launch_agents_directory=codex_launch_agent.default_launch_agents_directory(home),
+        codex_home=codex_launch_agent.default_codex_home(environ, home),
+        codex_log_path=codex_daemon_log_path(base_dir),
+        launchd=launchd or codex_launch_agent.default_launchd(),
+    )
 
 
-def _uninstall_all(config_directory: Path) -> list[Outcome]:
-    return [claude_hooks.uninstall(config_directory)]
+def _inspect_all(where: Placement) -> list[Outcome]:
+    return [
+        claude_hooks.inspect(where.claude_config_directory, where.interpreter),
+        codex_launch_agent.inspect(
+            where.launch_agents_directory, where.codex_home, where.codex_log_path, where.launchd
+        ),
+    ]
+
+
+def _install_all(where: Placement) -> list[Outcome]:
+    return [
+        claude_hooks.install(where.claude_config_directory, where.interpreter),
+        codex_launch_agent.install(
+            where.launch_agents_directory, where.codex_home, where.codex_log_path, where.launchd
+        ),
+    ]
+
+
+def _uninstall_all(where: Placement) -> list[Outcome]:
+    return [
+        claude_hooks.uninstall(where.claude_config_directory),
+        codex_launch_agent.uninstall(where.launch_agents_directory),
+    ]
 
 
 def parse(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -89,22 +146,28 @@ def main(
     environ: Mapping[str, str] | None = None,
     base_dir: Path | None = None,
     interpreter: Path | None = None,
+    home: Path | None = None,
+    launchd: codex_launch_agent.Launchd | None = None,
 ) -> int:
     """Entry point for the ``bridge-install`` console script.
 
-    The three keyword arguments exist so a test can run the whole verb without
-    installing this product on the machine running the test.
+    The keyword arguments exist so a test can run the whole verb without
+    installing this product on the machine running the test. ``home`` and
+    ``launchd`` are the two that matter most: the Codex item's directory is
+    macOS's own and has no variable that moves it, and its ``launchctl`` would
+    otherwise be the real one, loading a real login job into a real session.
     """
     verb = parse(argv).verb
     environ = os.environ if environ is None else environ
     interpreter = Path(sys.executable) if interpreter is None else interpreter
-    config_directory = claude_hooks.default_config_directory(environ)
+    where = _resolve(environ, interpreter, base_dir, home, launchd)
 
     if verb == "status":
-        outcomes = _inspect_all(config_directory, interpreter)
+        outcomes = _inspect_all(where)
         print(_intent_line(read_intent(base_dir)))
+        print(_daemon_line(where))
     elif verb == "uninstall":
-        outcomes = _uninstall_all(config_directory)
+        outcomes = _uninstall_all(where)
         # Only when it really came back out. `wanted: false` is what stops every
         # later reconcile from touching this machine, so recording it over an
         # uninstall that failed would leave our hooks in the user's settings file
@@ -115,14 +178,14 @@ def main(
         # Recorded whether or not the artifacts landed, and that asymmetry is the
         # honest one: this file holds what the user *wants*, and a failed install
         # is a want that the next reconcile should retry rather than forget.
-        outcomes = _install_all(config_directory, interpreter)
+        outcomes = _install_all(where)
         outcomes = _with_intent(outcomes, wanted=True, base_dir=base_dir)
     else:
         intent = read_intent(base_dir)
         if not intent.install_wanted:
             print("uninstalled on this machine — reconcile leaves it alone")
             return EXIT_OK
-        outcomes = _install_all(config_directory, interpreter)
+        outcomes = _install_all(where)
         if intent.first_run and all(outcome.ok for outcome in outcomes):
             outcomes = _with_intent(outcomes, wanted=True, base_dir=base_dir)
 
@@ -141,6 +204,19 @@ def _with_intent(outcomes: list[Outcome], *, wanted: bool, base_dir: Path | None
     if not failure:
         return outcomes
     return [*outcomes, Outcome(RECORD_NAME, State.ABSENT, ok=False, note=failure)]
+
+
+def _daemon_line(where: Placement) -> str:
+    """What the running Codex daemon says about itself, for the `status` verb only.
+
+    Never on the install path. This is a subprocess to a control socket that is
+    absent whenever the daemon is not running, which is most of the time; a
+    reconcile runs before the engine at every launch and has no business paying
+    for it. A person typing `status` is asking exactly this question.
+    """
+    if not codex_launch_agent.managed_binary(where.codex_home).exists():
+        return f"{codex_launch_agent.NAME}: no managed Codex binary, so no daemon to ask"
+    return f"{codex_launch_agent.NAME}: {codex_launch_agent.daemon_versions(where.codex_home)}"
 
 
 def _intent_line(intent: Intent) -> str:
