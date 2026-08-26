@@ -59,7 +59,7 @@ import secrets
 import subprocess
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
@@ -190,17 +190,32 @@ def own_process_start() -> str:
     """This process's start time, in the shape Claude Code publishes it.
 
     The receiver checks a reply address's key file against the real start time of
-    the pid that published it, because a pid outlives nothing but a pid. Matching
-    the shape matters twice over and both differences were found by comparing
-    against a live Session's own key file rather than assumed: `ps` prints
-    `Tue 25 Aug` under this machine's locale but `Tue Aug 25` under C, and 2.1.245
-    writes the hour on a **12-hour clock with no AM/PM** — a Session started at
-    21:57 is published as `09:57:51`.
+    the pid that published it, because a pid outlives nothing but a pid. A key
+    whose `procStart` does not match is a key it will not trust, and nothing says
+    so: the message goes and no receipt ever comes back. So every character here
+    is load-bearing, and every one of them was **measured on 2026-08-26 against
+    the eleven live Sessions' own key files on this machine**, not assumed.
 
-    What was compared was a two-digit day, so the single-digit case is unmeasured:
-    `ps` pads it with a space and `strftime("%d")` pads it with a zero. It is
-    written the way the #71 probe wrote it rather than guessed at, and if
-    receipts stop for the first nine days of a month this line is where to look.
+    Three things, and the first corrects the record:
+
+    * **The time is UTC.** #71 recorded a "12-hour clock with no AM/PM" from a
+      Session started at 21:57 appearing as `09:57:51`. It is not a 12-hour
+      clock — this machine is UTC+12, and what it saw was the offset. The two
+      readings are indistinguishable for a local afternoon and differ by a whole
+      *day* for a local morning: a Session started at 11:15 on the 26th publishes
+      `Tue Aug 25 23:15:21`, which no 12-hour clock produces. Formatting a local
+      morning with `%I` would therefore have been wrong on the hour and the date
+      at once, and silently.
+    * **The order is the C locale's.** `ps` prints `Tue 25 Aug` under this
+      machine's locale and `Tue Aug 25` under C.
+    * **The shape is `asctime`'s**, which is what all eleven samples are, so the
+      day is space-padded in a three-wide field (`%e`) rather than zero-padded.
+      Identical on every sample, because every one fell on the 25th or 26th; a
+      single-digit day is the one character here that inference rather than
+      measurement chose, and it is inferred from `asctime` rather than guessed.
+
+    Verified by reconstructing all eleven published keys from `ps` and comparing:
+    eleven matches, no mismatches.
     """
     printed = subprocess.run(
         ["ps", "-p", str(os.getpid()), "-o", "lstart="],
@@ -209,8 +224,12 @@ def own_process_start() -> str:
         env={**os.environ, "LC_ALL": "C"},
         check=False,
     ).stdout.strip()
-    started = datetime.strptime(printed, "%a %b %d %H:%M:%S %Y")
-    return started.strftime("%a %b %d %I:%M:%S %Y")
+    # Naive, and read as local because that is what `ps` prints. `astimezone`
+    # applies the offset in force *at that moment* rather than today's, so a
+    # process started on the other side of a daylight-saving change converts
+    # correctly.
+    started = datetime.strptime(printed, "%a %b %d %H:%M:%S %Y").astimezone()
+    return started.astimezone(UTC).strftime("%a %b %e %H:%M:%S %Y")
 
 
 class ReplyInbox:

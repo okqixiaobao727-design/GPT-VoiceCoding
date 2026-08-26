@@ -118,6 +118,21 @@ SUPPLEMENT_UNAVAILABLE = (
 
 
 @dataclass(frozen=True, slots=True)
+class _Outstanding:
+    """One Relay on the wire, and everything a receipt for it is correlated by.
+
+    The four travelled together through every step of the settlement — the wait,
+    the grading, the late listener — because they are one thing: which words went
+    where, under which id, and on which socket an answer about them may arrive.
+    """
+
+    target: SessionTarget
+    replies: ReplyInbox
+    msg_id: str
+    request_id: RequestId
+
+
+@dataclass(frozen=True, slots=True)
 class SessionReport:
     """What one Session's own `SessionStart` hook said about where it can be reached.
 
@@ -761,9 +776,12 @@ class ClaudeAgentAdapter:
             # Past the connection: the line may or may not have been read.
             return _unknown(request_id, f"the write to the Session's inbox failed: {broken}")
 
-        receipt = await self._await_receipt(target, replies, msg_id, request_id)
+        outstanding = _Outstanding(
+            target=target, replies=replies, msg_id=msg_id, request_id=request_id
+        )
+        receipt = await self._await_receipt(outstanding)
         if receipt.outcome in (Delivery.HELD, Delivery.UNKNOWN):
-            self._listen_late(target, replies, msg_id, request_id)
+            self._listen_late(outstanding)
         return receipt
 
     def _messaging_token(self, target: SessionTarget) -> str | None:
@@ -790,13 +808,7 @@ class ClaudeAgentAdapter:
             _log.info("reply inbox bound at %s", replies.address)
             return replies
 
-    async def _await_receipt(
-        self,
-        target: SessionTarget,
-        replies: ReplyInbox,
-        msg_id: str,
-        request_id: RequestId,
-    ) -> DeliveryReceipt:
+    async def _await_receipt(self, outstanding: _Outstanding) -> DeliveryReceipt:
         """Wait, bounded, for one of the two things that prove this Relay arrived.
 
         Polled rather than awaited on an event, because the two sources are not
@@ -809,41 +821,35 @@ class ClaudeAgentAdapter:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settings.ack_timeout_seconds
         while True:
-            graded = self._graded(target, replies, msg_id, request_id)
+            graded = self._graded(outstanding)
             if graded is not None:
                 return graded
             if loop.time() >= deadline:
                 return _unknown(
-                    request_id,
+                    outstanding.request_id,
                     "nothing proved the words arrived within "
                     f"{self._settings.ack_timeout_seconds:.0f}s: no receipt, and the "
                     "Session's own record does not carry them yet",
                 )
             await asyncio.sleep(self._settings.receipt_poll_seconds)
 
-    def _graded(
-        self,
-        target: SessionTarget,
-        replies: ReplyInbox,
-        msg_id: str,
-        request_id: RequestId,
-    ) -> DeliveryReceipt | None:
+    def _graded(self, outstanding: _Outstanding) -> DeliveryReceipt | None:
         """What the two sources say right now, or `None` for "keep waiting".
 
         A settlement wins over the transcript, and the transcript wins over
         `held` — which is upstream saying it has not finished happening.
         """
-        settled = self._settled(replies, msg_id, request_id)
+        settled = self._settled(outstanding)
         if settled is not None and settled.outcome is not Delivery.HELD:
             return settled
-        records = self._transcripts.records(self._transcript_path(target))
-        if inbox.correlated(records, msg_id=msg_id, address=replies.address):
-            return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
+        records = self._transcripts.records(self._transcript_path(outstanding.target))
+        if inbox.correlated(
+            records, msg_id=outstanding.msg_id, address=outstanding.replies.address
+        ):
+            return DeliveryReceipt(request_id=outstanding.request_id, outcome=Delivery.DELIVERED)
         return settled
 
-    def _settled(
-        self, replies: ReplyInbox, msg_id: str, request_id: RequestId
-    ) -> DeliveryReceipt | None:
+    def _settled(self, outstanding: _Outstanding) -> DeliveryReceipt | None:
         """What upstream's own status frames say about this message, ranked.
 
         **Ranked, not taken in arrival order**, because one message's statuses are
@@ -857,44 +863,34 @@ class ClaudeAgentAdapter:
         that has a better source may still prefer it.
         """
         parked = False
-        for frame in replies.statuses(msg_id):
+        for frame in outstanding.replies.statuses(outstanding.msg_id):
             status = frame.get("status")
             if status == inbox.DELIVERED_STATUS:
-                return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
+                return DeliveryReceipt(
+                    request_id=outstanding.request_id, outcome=Delivery.DELIVERED
+                )
             if status in inbox.REFUSED_STATUSES:
                 return DeliveryReceipt(
-                    request_id=request_id,
+                    request_id=outstanding.request_id,
                     outcome=Delivery.FAILED,
                     reason=f"the Session's inbox settled this message as {status}",
                 )
             parked = parked or status == inbox.HELD_STATUS
         if parked:
             return DeliveryReceipt(
-                request_id=request_id,
+                request_id=outstanding.request_id,
                 outcome=Delivery.HELD,
                 reason="the words are parked for the person at that Session to release",
             )
         return None
 
-    def _listen_late(
-        self,
-        target: SessionTarget,
-        replies: ReplyInbox,
-        msg_id: str,
-        request_id: RequestId,
-    ) -> None:
+    def _listen_late(self, outstanding: _Outstanding) -> None:
         """Keep watching a Relay whose grade was not terminal, so its end is heard."""
-        task = asyncio.ensure_future(self._late(target, replies, msg_id, request_id))
+        task = asyncio.ensure_future(self._late(outstanding))
         self._listening.add(task)
         task.add_done_callback(self._listening.discard)
 
-    async def _late(
-        self,
-        target: SessionTarget,
-        replies: ReplyInbox,
-        msg_id: str,
-        request_id: RequestId,
-    ) -> None:
+    async def _late(self, outstanding: _Outstanding) -> None:
         """One unsettled Relay's second budget, which is the hold's own lifetime.
 
         Started only for HELD and UNKNOWN, and those are the two grades that have
@@ -902,13 +898,15 @@ class ClaudeAgentAdapter:
         expires after about five minutes, or is dropped when the hold queue passes
         a hundred — so `late_ack_timeout_seconds` is that lifetime and not a guess.
 
-        **It watches the status frames and not the transcript**, which is not a
-        shortcut. The `origin` record is written when the message is *injected*,
-        so it is there within a moment or it is never coming — a message still
-        outstanding after the first wait is one a person is holding, and only a
-        status can settle that. Reading the file instead would re-parse a
-        transcript the Session is appending to, four times a second for five
-        minutes, on the event loop.
+        **It watches both sources, not only the receipts.** An earlier draft here
+        read the status frames alone, on the argument that the `origin` record is
+        written at injection and so arrives at once or never. That is true only of
+        a Session that was idle: a Relay sent into one that has since started a
+        turn is injected when the turn *ends*, which can be minutes — and on an
+        accepting receiver there are no status frames at all, so dropping the
+        transcript would leave those UNKNOWN for ever and the hub would say the
+        words again. The read is the shared one, cached on the file's own
+        identity, so a poll that finds the transcript unchanged costs one `stat`.
 
         **Both directions are raised, and that is the point.** A late `delivered`
         stops the hub re-sending words that provably arrived; a late `denied` or
@@ -923,10 +921,10 @@ class ClaudeAgentAdapter:
         try:
             while loop.time() < deadline:
                 await asyncio.sleep(self._settings.receipt_poll_seconds)
-                settled = self._settled(replies, msg_id, request_id)
+                settled = self._graded(outstanding)
                 if settled is None or settled.outcome is Delivery.HELD:
                     continue
-                self._emit(RelayReceipt(target=target, receipt=settled))
+                self._emit(RelayReceipt(target=outstanding.target, receipt=settled))
                 return
         except asyncio.CancelledError:
             raise

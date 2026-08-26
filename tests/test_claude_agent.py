@@ -451,6 +451,32 @@ class TestCarryingTheUsersWords:
         assert [event.receipt.outcome for event in late] == [Delivery.FAILED]
         assert "expired" in late[0].receipt.reason
 
+    def test_a_record_written_after_the_wait_is_still_raised(self, socket_path: Path) -> None:
+        """The late path watches the transcript too, and it has to.
+
+        A Relay into a Session that has started a turn is injected when the turn
+        *ends*, which can be minutes — and on an accepting receiver there is no
+        status frame to settle it. Watching only the receipts would leave those
+        UNKNOWN for ever, and the hub would say the words a second time.
+        """
+        transcript_path = socket_path.parent / "session.jsonl"
+
+        async def scenario():
+            sink = Sink()
+            async with FakeInbox(socket_path) as session:
+                adapter = reaching(socket_path, sink, transcript_path=transcript_path)
+                try:
+                    receipt = await adapter.answer_relay(TARGET, "ship it", request_id=rid())
+                    arriving(transcript_path, session)
+                    await _until(lambda: bool(sink.of(RelayReceipt)))
+                    return receipt, sink.of(RelayReceipt)
+                finally:
+                    await adapter.aclose()
+
+        receipt, late = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.UNKNOWN, "the wait was spent before it arrived"
+        assert [event.receipt.outcome for event in late] == [Delivery.DELIVERED]
+
     def test_a_status_about_another_message_settles_nothing(self, socket_path: Path) -> None:
         """Correlated by `orig_msg_id`, so somebody else's receipt is not ours."""
 

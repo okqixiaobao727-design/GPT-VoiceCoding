@@ -906,6 +906,10 @@ class TestAQuestionIsNotAPermission:
         assert parked is not None
         assert parked.kind is WaitingKind.QUESTION
         assert [option.text for option in parked.options] == ["Spaces", "Tabs"]
+        # Through the real hook process, because the request it sends is a copy
+        # rather than a forward: a field the hook does not name is absent on this
+        # side and nothing errors. The projector's own test cannot see that.
+        assert parked.approval_id == "p-1", "the dialog's correlator crossed the wire"
 
     def test_a_permission_still_raises_awaiting_approval(self, socket_root: Path) -> None:
         """The control: nothing about the ordinary dialog changed."""
