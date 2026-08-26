@@ -501,23 +501,8 @@ class CodexAgentAdapter:
         table left exactly that behind (P6, P13). What this projects is the
         request the app-server handed us, which is the thing itself.
         """
-        watched = self._threads.get(row.target)
-        if watched is None or not watched.pending:
-            return row
-        held = next(iter(watched.pending.values()))
-        request = held.request
-        if request is None:
-            return row
-        return replace(
-            row,
-            waiting_for=WaitingFor(
-                kind=WaitingKind.PERMISSION,
-                tool_name=request.tool_name or None,
-                detail=request.detail or None,
-                approval_id=request.approval_id,
-                options=tuple(Option(text=one) for one in request.options),
-            ),
-        )
+        waiting = _dialog_waiting(self._threads.get(row.target))
+        return row if waiting is None else replace(row, waiting_for=waiting)
 
     def _daemon_let_go(self, reason: str) -> None:
         """The shared daemon's connection went away. Forget what rode on it.
@@ -994,10 +979,18 @@ class CodexAgentAdapter:
             return
         if was_running:
             watched.active_turn_id = None
+            # **The same projection the roster row gets, on the same fact.** A
+            # Stop that could not say what it stopped on was the Claude lane's
+            # gap too (#75) and it is worse here, because a Codex permission
+            # already reaches the user as `AwaitingApproval`: without the
+            # `approval_id` on this event Bridge Core cannot recognise the two as
+            # one dialog, so it announces the Stop as well and asks the user
+            # twice for one decision (`core/bridge.py:_session_stopped`).
             self._emit(
                 SessionStopped(
                     target=watched.target,
-                    waiting_for=(
+                    waiting_for=_dialog_waiting(watched)
+                    or (
                         WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
                         if kind == "systemError"
                         else WaitingFor()
@@ -1110,6 +1103,35 @@ def _receipts_in(readback: Message, thread_id: str, request_id: str) -> int | No
         )
     return found
 
+
+
+def _dialog_waiting(watched: WatchedThread | None) -> WaitingFor | None:
+    """The dialog this adapter is holding for one thread, in the seam's vocabulary.
+
+    **The projection the Codex lane never had** (#77, from #75's review).
+    `_asked` raised `AwaitingApproval` and stopped there, so a Codex row and a
+    Codex `SessionStopped` could not say what the Session had stopped on while
+    the Claude lane could. The request is already parsed into an
+    `ApprovalRequest`; this is that same fact, read once and shared by both, so
+    the row and the Stop can never describe one dialog differently.
+
+    **No transcript parser for Codex, ever.** The rollout on disk is a second
+    source answering the same question with worse evidence, and the port table
+    left exactly that behind (P6, P13). What this projects is the request the
+    app-server handed us, which is the thing itself.
+    """
+    if watched is None or not watched.pending:
+        return None
+    request = next(iter(watched.pending.values())).request
+    if request is None:
+        return None
+    return WaitingFor(
+        kind=WaitingKind.PERMISSION,
+        tool_name=request.tool_name or None,
+        detail=request.detail or None,
+        approval_id=request.approval_id,
+        options=tuple(Option(text=one) for one in request.options),
+    )
 
 def _failed(request_id: RequestId, reason: str) -> DeliveryReceipt:
     return DeliveryReceipt(request_id=request_id, outcome=Delivery.FAILED, reason=reason)

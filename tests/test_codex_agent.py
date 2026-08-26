@@ -1330,6 +1330,69 @@ class TestWhatACodexRowSaysItStoppedOn:
         assert row.waiting_for.approval_id == request.approval_id
         assert row.waiting_for.as_approval_request(row.target) is not None
 
+    def test_the_stop_says_what_it_stopped_on_too(self, socket_path: Path) -> None:
+        """The row and the Stop are one reading, not two that agree most of the time.
+
+        It matters more here than on the roster: a Codex permission already
+        reaches the user through `AwaitingApproval`, so a `SessionStopped` with
+        no `approval_id` is one Bridge Core cannot recognise as the same dialog —
+        it announces that too, and the user is asked twice for one decision.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _settled()
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+        (stopped,) = sink.of(SessionStopped)
+        assert stopped.waiting_for.kind is WaitingKind.PERMISSION
+        assert stopped.waiting_for.tool_name == "a shell command"
+        assert stopped.waiting_for.approval_id == sink.of(AwaitingApproval)[0].request.approval_id
+        assert stopped.waiting_for.as_approval_request(stopped.target) is not None
+
+    def test_a_stop_with_no_dialog_still_says_it_stopped_on_nothing(
+        self, socket_path: Path
+    ) -> None:
+        """The control: the projection fills a gap and never invents one."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _settled()
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+        (stopped,) = sink.of(SessionStopped)
+        assert stopped.waiting_for.kind is WaitingKind.NONE
+
     def test_a_row_with_no_dialog_is_left_exactly_as_the_roster_read_it(
         self, socket_path: Path
     ) -> None:
