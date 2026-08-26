@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding.adapters.codex_app_server.wire import AppServerConnection
-from gpt_voicecoding.seams.agent import ReplyWindow
+from gpt_voicecoding.seams.agent import ApprovalRequest, ReplyWindow
 from gpt_voicecoding.seams.identity import SessionTarget
 
 #: What the approval policy may not be if a permission prompt is ever to appear.
@@ -60,6 +60,16 @@ class WatchedThread:
     target: SessionTarget
     socket_path: Path
     connection: AppServerConnection
+    #: Whether this thread rides a connection somebody else owns — the shared
+    #: daemon's, which every thread on the machine shares (#77).
+    #:
+    #: **It exists so that letting go of one thread does not let go of all of
+    #: them.** `forget_session` and `aclose` close the connection a thread was
+    #: watched on, which is right for the per-Session app-server this adapter
+    #: dialled itself and catastrophic for one connection shared by nine
+    #: Sessions. The shared connection is closed exactly once, by the component
+    #: that opened it (`SharedDaemon.aclose`).
+    shared: bool = False
     #: Whether `thread/resume` has been called, which is what subscribes this
     #: client to the thread's turn and item stream.
     subscribed: bool = False
@@ -134,3 +144,9 @@ class PendingApproval:
     approval_id: str
     wire_id: Any
     method: str
+    #: The prompt as the Agent seam describes it, parsed once when it arrived.
+    #: Kept so the roster can say what a Codex Session stopped on (#77) without
+    #: a second reading of the same params — two parses of one message are two
+    #: answers that can disagree, which is the defect `SessionInspection` exists
+    #: to close.
+    request: ApprovalRequest | None = None

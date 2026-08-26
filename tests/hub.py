@@ -21,6 +21,7 @@ from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
+from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -44,6 +45,8 @@ class Hub:
         control: object = None,
         delegate: object = None,
         instructions: bool = True,
+        channel_outcome: Delivery = Delivery.DELIVERED,
+        channel_reason: str = "fake channel",
     ) -> None:
         self.now = 1_000.0
         switches = Switchboard()
@@ -67,7 +70,7 @@ class Hub:
             )
 
         self.call = FakeCall()
-        self.channel = FakeCompanionChannel()
+        self.channel = FakeCompanionChannel(outcome=channel_outcome, reason=channel_reason)
         self.agent = FakeAgent(routes=frozenset(RelayRoute))
         self.state = BridgeState(switches=switches, sessions=registry, relays=RelayQueue())
         self.core = BridgeCore(

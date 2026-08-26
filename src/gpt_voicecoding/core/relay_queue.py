@@ -60,7 +60,17 @@ class PendingRelay:
     queued_at: float
     expires_at: float
     route: RelayRoute = RelayRoute.DELIVER
-    outcome: Delivery = Delivery.UNKNOWN
+    #: What the last attempt proved, or `None` for an entry nothing has been
+    #: attempted for yet.
+    #:
+    #: **`None` rather than `UNKNOWN`, and the difference is P9's whole rule.**
+    #: `UNKNOWN` is a positive observation — something went on the wire and
+    #: produced no proof either way, so re-sending it risks a duplicate. Words
+    #: that were queued against a closed Reply Window went nowhere and carry no
+    #: such risk. Spelling both `UNKNOWN` made one value mean two things and
+    #: made the settlement policy unable to tell "may already have arrived" from
+    #: "never left this process".
+    outcome: Delivery | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -85,7 +95,7 @@ class RelayQueue:
 
     def enqueue(self, pending: PendingRelay) -> PendingRelay:
         """Hold a Relay until something proves it delivered or releases it."""
-        if pending.outcome.is_delivered:
+        if pending.outcome is not None and pending.outcome.is_delivered:
             raise ValueError(
                 "this queue holds undelivered Relays; something already delivered cannot wait in it"
             )

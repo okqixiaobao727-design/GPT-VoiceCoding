@@ -21,6 +21,11 @@ DerivedData/
 .claude/
 .code-review-graph/
 
+# Secrets, kept out of the tree and read into the shell that needs them. The
+# acceptance's Telegram bot token has no durable home yet (#55); this is it
+# until it does.
+.env
+
 # Local-only research notes, scratch work, and throwaway prototypes.
 docs/research
 notes/

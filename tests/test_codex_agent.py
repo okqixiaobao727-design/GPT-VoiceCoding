@@ -24,11 +24,16 @@ import pytest
 
 from codex_fake import FakeAppServer, FakeRemoteError
 from gpt_voicecoding.adapters.agent.codex import codex_agent
-from gpt_voicecoding.adapters.agent.codex.adapter import CodexAgentAdapter
+from gpt_voicecoding.adapters.agent.codex.adapter import (
+    PRE_WIRE_UNREACHABLE,
+    CodexAgentAdapter,
+)
 from gpt_voicecoding.adapters.agent.codex.approvals import voice_menu
+from gpt_voicecoding.adapters.agent.codex.shared_daemon import DaemonAddress, SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
 from gpt_voicecoding.seams.agent import (
+    ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
     RelayRoute,
@@ -36,6 +41,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindowChanged,
     SessionEnded,
     SessionStopped,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
@@ -144,6 +150,22 @@ def socket_path() -> Iterator[Path]:
     shutil.rmtree(home, ignore_errors=True)
 
 
+def no_daemon() -> SharedDaemon:
+    """A shared daemon that is honestly not there.
+
+    Every test in this module drives a *scripted* app-server, so none of them
+    wants the machine's real daemon — and since #77 the Relay and Approval verbs
+    reach for one when they hold no thread. `conftest` refuses the real lookup
+    loudly; this is the honest answer to put in its place, and it is also the
+    pre-wire `FAILED` case in its own right.
+    """
+
+    async def not_running(_executable: str) -> tuple[None, str]:
+        return None, "the shared Codex daemon is not answering: no daemon is running"
+
+    return SharedDaemon(settings=CodexSettings(), version="test", locate=not_running)
+
+
 def quick(**overrides: Any) -> CodexSettings:
     """Settings whose waits are short enough for a test to actually spend them."""
     return CodexSettings(
@@ -157,7 +179,7 @@ def quick(**overrides: Any) -> CodexSettings:
 
 async def watching(server: Codex, sink: Sink, settings: CodexSettings | None = None):
     """An adapter already attached to one scripted Session."""
-    adapter = CodexAgentAdapter(sink=sink, settings=settings or quick())
+    adapter = CodexAgentAdapter(sink=sink, settings=settings or quick(), daemon=no_daemon())
     await adapter.register_session(TARGET, server.path)
     return adapter
 
@@ -306,14 +328,69 @@ class TestCarryingTheUsersWords:
         assert ids == ["r-1", "r-2"]
         assert texts == ["one", "two"]
 
-    def test_an_unregistered_session_fails_closed(self, socket_path: Path) -> None:
+    def test_a_session_with_no_shared_daemon_fails_before_the_wire(self, socket_path: Path) -> None:
+        """The pre-wire refusal (#83's advisor note): nothing was sent, so FAILED.
+
+        `FAILED` rather than `UNKNOWN` is the whole point. Nothing left this
+        process, so non-delivery is *proven* — which is what lets Bridge Core try
+        again at the next Reply Window instead of holding the words as a
+        duplicate risk forever (P9).
+        """
+
         async def scenario():
-            adapter = CodexAgentAdapter(sink=Sink(), settings=quick())
+            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
             return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
 
         receipt = asyncio.run(scenario())
         assert receipt.outcome is Delivery.FAILED
-        assert "no Codex Session is registered" in receipt.reason
+        assert PRE_WIRE_UNREACHABLE in receipt.reason
+        assert "no daemon is running" in receipt.reason
+
+    def test_that_refusal_names_the_daemons_own_reason(self, socket_path: Path) -> None:
+        """ "The daemon is down" and "`codex` is not installed" send you elsewhere."""
+
+        async def scenario():
+            async def missing(_executable: str) -> tuple[None, str]:
+                return None, "codex could not be run: No such file or directory"
+
+            adapter = CodexAgentAdapter(
+                sink=Sink(),
+                settings=quick(),
+                daemon=SharedDaemon(settings=CodexSettings(), version="t", locate=missing),
+            )
+            return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
+
+        assert "No such file or directory" in asyncio.run(scenario()).reason
+
+    def test_a_verdict_with_no_shared_daemon_fails_before_the_wire_too(
+        self, socket_path: Path
+    ) -> None:
+        async def scenario():
+            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+            return await adapter.approval_relay(
+                ApprovalRequest(approval_id="a1", target=TARGET, tool_name="a shell command"),
+                ApprovalVerdict.ALLOW,
+                request_id=rid(),
+            )
+
+        receipt = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.FAILED
+        assert PRE_WIRE_UNREACHABLE in receipt.reason
+
+    def test_a_tui_that_has_taken_no_turn_yet_says_so(self) -> None:
+        """#73: a Codex Session gains its thread id at its first turn."""
+
+        async def scenario():
+            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+            return await adapter.answer_relay(
+                SessionTarget(agent=AgentKind.CODEX, pid=4321),
+                "ship it",
+                request_id=rid(),
+            )
+
+        receipt = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.FAILED
+        assert "has not started a thread yet" in receipt.reason
 
 
 class TestSupplement:
@@ -845,7 +922,10 @@ class TestWhenTheAppServerDies:
 
         receipt = asyncio.run(scenario())
         assert receipt.outcome is Delivery.FAILED
-        assert "unreachable" in receipt.reason
+        # Since #77 a thread whose own app-server went away is looked for on the
+        # shared daemon before anything is given up on. There is none here, so
+        # the refusal is the pre-wire one — still FAILED, still nothing sent.
+        assert PRE_WIRE_UNREACHABLE in receipt.reason
 
 
 class TestSettings:
@@ -984,7 +1064,7 @@ class TestWhenTheSessionsAppServerDies:
 
         receipt = asyncio.run(scenario())
         assert receipt.outcome is Delivery.FAILED
-        assert "no Codex Session is registered" in receipt.reason
+        assert PRE_WIRE_UNREACHABLE in receipt.reason
 
     def test_an_orderly_close_is_not_reported_as_a_session_ending(self, socket_path: Path) -> None:
         """Shutting the engine down must not tell the hub every Session died."""
@@ -998,3 +1078,369 @@ class TestWhenTheSessionsAppServerDies:
 
         asyncio.run(scenario())
         assert sink.of(SessionEnded) == []
+
+
+def daemon_at(path: Path) -> SharedDaemon:
+    """A shared daemon that is really there, listening on the scripted server.
+
+    `attach` is the shipped one — the same dial `register_session` makes — so
+    what these tests exercise is the real client of a real socket, with only the
+    *lookup* replaced. The lookup is the part that would otherwise find the
+    machine's own daemon (`tests/conftest.py`).
+    """
+
+    async def found(_executable: str) -> tuple[DaemonAddress, str]:
+        return DaemonAddress(socket_path=path, cli_version="t", app_server_version="t"), ""
+
+    return SharedDaemon(settings=CodexSettings(), version="test", locate=found)
+
+
+async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = None):
+    """An adapter that has joined the shared daemon and registered nothing.
+
+    This is the shape the product actually runs in: v1.0 launches no Session
+    (#72), so nothing ever calls `register_session`, and every Codex Session on
+    the machine is reached through the daemon it joined (#76, #77).
+    """
+
+    async def no_other_sessions() -> list[Any]:
+        """The machine's own `codex` processes are nobody's business here."""
+        return []
+
+    return CodexAgentAdapter(
+        sink=sink,
+        settings=settings or quick(),
+        daemon=daemon_at(server.path),
+        processes=no_other_sessions,
+    )
+
+
+class TestReachingASessionThroughTheSharedDaemon:
+    """The route the product actually has (#77, advisor ruling Q2).
+
+    `register_session` is called by nothing in `src/`: it wants a per-Session
+    app-server socket that only a launch wrapper could supply, and v1.0 launches
+    nothing (#72). So every Relay and every verdict goes over the one connection
+    this engine joined — `SharedDaemon.client()`, which #76 built — and a Session
+    the daemon holds is reachable without anything having registered it.
+
+    Join-only throughout (ADR 0012): nothing here starts a daemon or stops one.
+    """
+
+    def test_a_relay_reaches_a_session_nothing_registered(self, socket_path: Path) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    receipt = await adapter.answer_relay(TARGET, "ship it", request_id=rid())
+                    return receipt, server.calls_to("turn/start")
+                finally:
+                    await adapter.aclose()
+
+        receipt, started = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.DELIVERED
+        assert [call["threadId"] for call in started] == [THREAD]
+
+    def test_the_receipt_is_still_the_exact_id_readback(self, socket_path: Path) -> None:
+        """P8: the protocol is unchanged. Only the wire it rides moved."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.readback_shows_words = False
+                adapter = await joined(server, Sink())
+                try:
+                    return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
+                finally:
+                    await adapter.aclose()
+
+        receipt = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.UNKNOWN
+        assert "never showed the words" in receipt.reason
+
+    def test_one_connection_carries_every_session(self, socket_path: Path) -> None:
+        """A dial per Session would have the daemon holding one client per TUI."""
+        second = SessionTarget(agent=AgentKind.CODEX, session_id="01a02110-0000-7000-8000-00000000")
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.answer_relay(TARGET, "one", request_id=rid("r-1"))
+                    await adapter.answer_relay(second, "two", request_id=rid("r-2"))
+                    return server.connection_count
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()) == 1
+
+    def test_letting_go_of_one_session_does_not_let_go_of_the_rest(self, socket_path: Path) -> None:
+        """The connection is the daemon's. Forgetting one thread must not close it."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.answer_relay(TARGET, "one", request_id=rid("r-1"))
+                    await adapter.forget_session(TARGET)
+                    second = await adapter.answer_relay(TARGET, "two", request_id=rid("r-2"))
+                    return second, server.connection_count
+                finally:
+                    await adapter.aclose()
+
+        receipt, connections = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.DELIVERED
+        assert connections == 1
+
+    def test_a_verdict_rides_the_same_connection(self, socket_path: Path) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    await adapter.discover()
+                    wire_id = await server.ask_all(
+                        APPROVAL, {"threadId": THREAD, "command": "rm -rf build"}
+                    )
+                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    request = sink.of(AwaitingApproval)[0].request
+                    verdict = asyncio.ensure_future(
+                        adapter.approval_relay(request, ApprovalVerdict.ALLOW, request_id=rid())
+                    )
+                    await _until(lambda: server.answered(wire_id))
+                    await server.notify_all(
+                        "serverRequest/resolved", {"threadId": THREAD, "requestId": wire_id}
+                    )
+                    return await verdict
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()).outcome is Delivery.DELIVERED
+
+
+class TestWhatADiscoveredThreadGetsSubscribedTo:
+    """Adoption on the cadence, because a prompt belongs to the user's own turn.
+
+    A permission prompt is fanned out to every *subscribed* client. A thread
+    nothing resumed raises a dialog this adapter never sees — and the turn that
+    raises it is usually one the user started in their own TUI, not one this
+    engine sent. Waiting until the first Relay would mean the bridge could only
+    be called about work it had itself asked for.
+    """
+
+    def test_discovery_subscribes_to_every_thread_the_daemon_holds(self, socket_path: Path) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.discover()
+                    return adapter.watching(), server.calls_to("thread/resume")
+                finally:
+                    await adapter.aclose()
+
+        watching, resumed = asyncio.run(scenario())
+        assert [target.session_id for target in watching] == [THREAD]
+        assert [call["threadId"] for call in resumed] == [THREAD]
+
+    def test_it_resumes_each_thread_once_however_many_ticks_pass(self, socket_path: Path) -> None:
+        """`thread/resume` answers with the whole turn history. Once per thread."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.discover()
+                    await adapter.discover()
+                    await adapter.discover()
+                    return server.calls_to("thread/resume")
+                finally:
+                    await adapter.aclose()
+
+        assert len(asyncio.run(scenario())) == 1
+
+    def test_a_prompt_raised_by_the_users_own_turn_reaches_the_user(
+        self, socket_path: Path
+    ) -> None:
+        """The whole reason adoption is on the cadence rather than on a Relay."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    await adapter.discover()
+                    await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    return sink.of(AwaitingApproval)[0].request
+                finally:
+                    await adapter.aclose()
+
+        request = asyncio.run(scenario())
+        assert request.target == TARGET
+        assert "rm -rf build" in request.detail
+
+
+class TestWhatACodexRowSaysItStoppedOn:
+    """The projection the Codex lane never had (#77, from #75's review).
+
+    `_asked` raised `AwaitingApproval` and stopped, so a Codex roster row could
+    not say what its Session had stopped on while a Claude row could. This is the
+    same request in the seam's one inspection vocabulary — **not** a second
+    reader: no transcript parser for Codex, ever, because the rollout on disk is
+    worse evidence for a question the app-server already answered (P6, P13).
+    """
+
+    async def row_with_a_dialog(self, server: Codex, sink: Sink, adapter):
+        await adapter.discover()
+        await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+        await _until(lambda: bool(sink.of(AwaitingApproval)))
+        lane = await adapter.discover()
+        return next(row for row in lane.rows if row.target.session_id == THREAD)
+
+    def test_a_pending_dialog_shows_on_the_row(self, socket_path: Path) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    return await self.row_with_a_dialog(server, sink, adapter)
+                finally:
+                    await adapter.aclose()
+
+        row = asyncio.run(scenario())
+        assert row.waiting_for.kind is WaitingKind.PERMISSION
+        assert row.waiting_for.tool_name == "a shell command"
+        assert "rm -rf build" in (row.waiting_for.detail or "")
+
+    def test_the_row_carries_the_handle_the_verdict_is_answered_with(
+        self, socket_path: Path
+    ) -> None:
+        """`as_approval_request` needs it, and a row without one claims no route."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    row = await self.row_with_a_dialog(server, sink, adapter)
+                    return row, sink.of(AwaitingApproval)[0].request
+                finally:
+                    await adapter.aclose()
+
+        row, request = asyncio.run(scenario())
+        assert row.waiting_for.approval_id == request.approval_id
+        assert row.waiting_for.as_approval_request(row.target) is not None
+
+    def test_the_stop_says_what_it_stopped_on_too(self, socket_path: Path) -> None:
+        """The row and the Stop are one reading, not two that agree most of the time.
+
+        It matters more here than on the roster: a Codex permission already
+        reaches the user through `AwaitingApproval`, so a `SessionStopped` with
+        no `approval_id` is one Bridge Core cannot recognise as the same dialog —
+        it announces that too, and the user is asked twice for one decision.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _settled()
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+        (stopped,) = sink.of(SessionStopped)
+        assert stopped.waiting_for.kind is WaitingKind.PERMISSION
+        assert stopped.waiting_for.tool_name == "a shell command"
+        assert stopped.waiting_for.approval_id == sink.of(AwaitingApproval)[0].request.approval_id
+        assert stopped.waiting_for.as_approval_request(stopped.target) is not None
+
+    def test_a_stop_with_no_dialog_still_says_it_stopped_on_nothing(
+        self, socket_path: Path
+    ) -> None:
+        """The control: the projection fills a gap and never invents one."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _settled()
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+        (stopped,) = sink.of(SessionStopped)
+        assert stopped.waiting_for.kind is WaitingKind.NONE
+
+    def test_a_row_with_no_dialog_is_left_exactly_as_the_roster_read_it(
+        self, socket_path: Path
+    ) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    lane = await adapter.discover()
+                    return next(row for row in lane.rows if row.target.session_id == THREAD)
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()).waiting_for.kind is WaitingKind.NONE
+
+
+class TestWhenTheSharedDaemonLetsGo:
+    """A daemon blip is not nine Sessions dying. The roster is the authority."""
+
+    def test_no_session_is_reported_ended(self, socket_path: Path) -> None:
+        """Ending a row terminates every Relay queued for it. Far too expensive a guess."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    await adapter.discover()
+                    await server.drop_everyone()
+                    await _until(lambda: not adapter.watching())
+                    return sink.of(SessionEnded)
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()) == []
+
+    def test_the_watch_is_dropped_so_the_next_discovery_picks_it_up_again(
+        self, socket_path: Path
+    ) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.discover()
+                    await server.drop_everyone()
+                    await _until(lambda: not adapter.watching())
+                    await adapter.discover()
+                    return adapter.watching()
+                finally:
+                    await adapter.aclose()
+
+        assert [target.session_id for target in asyncio.run(scenario())] == [THREAD]

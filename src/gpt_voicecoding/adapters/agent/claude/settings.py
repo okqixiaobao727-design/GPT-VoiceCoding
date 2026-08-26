@@ -45,6 +45,16 @@ DEFAULT_MAX_MESSAGE_BYTES = 1 << 20
 #: The longest the user's words themselves may be, inside that line.
 DEFAULT_MAX_TEXT_BYTES = 64 << 10
 
+#: How often the two sources of a Relay's receipt are re-read while one is
+#: outstanding: our own reply socket, and the target's transcript. A quarter of a
+#: second because neither source announces itself — a status frame lands on a
+#: socket this engine is not blocked on, and the transcript is a file the Session
+#: appends to — and because the transcript record appears within a moment of the
+#: message being injected, so a slower poll would spend the user's wait on
+#: nothing. The transcript read behind it is cached on the file's own identity,
+#: so a poll that finds it unchanged costs one `stat`.
+DEFAULT_RECEIPT_POLL_SECONDS = 0.25
+
 #: How often each registered Session's registry record is re-read to see whether
 #: its Reply Window has moved. One second, and the number is a judgement about
 #: what is on the other end of it: what waits on this signal is a queued Relay
@@ -71,6 +81,7 @@ class ClaudeSettings:
     #: Where Claude Code keeps the Session records the Reply Window reads.
     registry_directory: Path = DEFAULT_REGISTRY_DIRECTORY
     reply_window_poll_seconds: float = DEFAULT_REPLY_WINDOW_POLL_SECONDS
+    receipt_poll_seconds: float = DEFAULT_RECEIPT_POLL_SECONDS
 
     def __post_init__(self) -> None:
         for name in (
@@ -78,6 +89,7 @@ class ClaudeSettings:
             "ack_timeout_seconds",
             "late_ack_timeout_seconds",
             "reply_window_poll_seconds",
+            "receipt_poll_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise SettingsError(f"{name} must be a positive number of seconds")

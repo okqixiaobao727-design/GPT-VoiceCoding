@@ -33,12 +33,12 @@ is not going to arrive, and finding that out fast is what keeps a stalled dialog
 from also being a slow one. If the engine dies mid-wait the socket ends, the read
 returns nothing, and that is silence too.
 
-**It is stdlib-only and blocking**, for the same reason the channel server is
-stdlib-only (ADR 0006): it runs under whatever interpreter the deployment
-provides, in a position where a missing dependency is a failure nobody is
-reading. Blocking sockets rather than `wire.py`'s asyncio framing because this
-process sends one line and reads one line — an event loop to do that would be
-startup cost paid on every permission dialog for nothing.
+**It is stdlib-only and blocking**, for the reason ADR 0006's channel server was
+stdlib-only before it was removed: it runs under whatever interpreter the
+deployment provides, in a position where a missing dependency is a failure nobody
+is reading. Blocking sockets rather than the engine's asyncio framing because
+this process sends one line and reads one line — an event loop to do that would
+be startup cost paid on every permission dialog for nothing.
 
 **Two gates, both fail open.** No address at all — no bootstrap variable and no
 engine has published one — means there is nobody to ask, and the process exits
@@ -69,6 +69,7 @@ from typing import Any
 from gpt_voicecoding.adapters.agent.claude.approval import (
     ACK_TYPE,
     MAX_HOOK_REQUEST_BYTES,
+    PROMPT_ID_FIELD,
     REQUEST_TYPE,
     SESSION_ID_FIELD,
     TOOL_INPUT_FIELD,
@@ -91,6 +92,16 @@ def request_for(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     `session_id` is the load-bearing field: it is what the engine resolves, via
     Claude Code's own session registry, into the pid it holds a registration for.
     Without it there is nobody to ask, so there is nothing to send.
+
+    **This is a copy, not a forward, and every field the engine reads has to be
+    named here.** The payload Claude Code hands this process carries much more
+    than the engine needs — a whole file's contents on a `Write`, a permission
+    suggestion that is a *rule* — so it is transcribed rather than passed on. The
+    cost of that choice is exactly this: a field left out of this dictionary is
+    absent on the engine's side and nothing errors. `prompt_id` is the dialog's
+    own correlator, undocumented, and the handle a question is projected with
+    (#77) and answered by (#103); it is carried here because a `WaitingFor` with
+    no handle reads as "the roster saw it and nobody can address it".
     """
     session_id = payload.get(SESSION_ID_FIELD)
     if not isinstance(session_id, str) or not session_id.strip():
@@ -100,6 +111,7 @@ def request_for(payload: Mapping[str, Any]) -> dict[str, Any] | None:
         SESSION_ID_FIELD: session_id.strip(),
         TOOL_NAME_FIELD: payload.get(TOOL_NAME_FIELD),
         TOOL_INPUT_FIELD: payload.get(TOOL_INPUT_FIELD),
+        PROMPT_ID_FIELD: payload.get(PROMPT_ID_FIELD),
     }
 
 

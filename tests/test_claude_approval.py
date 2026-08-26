@@ -42,15 +42,14 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     ApprovalListener,
     approval_socket_path,
     hook_decision,
+    question_from,
     request_from,
 )
 from gpt_voicecoding.adapters.agent.claude.approval_hook import decide, request_for
-from gpt_voicecoding.adapters.agent.claude.bootstrap import (
-    CHANNEL_CONFIG_VARIABLE,
-    bootstrap_value,
-)
+from gpt_voicecoding.adapters.agent.claude.bootstrap import CHANNEL_CONFIG_VARIABLE
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
-from gpt_voicecoding.seams.agent import ApprovalVerdict, AwaitingApproval
+from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
+from gpt_voicecoding.seams.agent import ApprovalVerdict, AwaitingApproval, WaitingKind
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
 
@@ -105,12 +104,15 @@ def dialog(tool_name: str = "Bash", **tool_input: Any) -> dict[str, Any]:
 
 
 def environment(path: Path, root: Path) -> dict[str, str]:
-    """What the launch wrapper set, as the hook process inherits it."""
-    return {
-        CHANNEL_CONFIG_VARIABLE: bootstrap_value(
-            root / "channel.sock", settings_for(root), approval_socket_path=path
-        )
-    }
+    """Where this engine is, handed to the hook process directly.
+
+    The variable rather than the published file, because a test that used the
+    file would be reaching for the one address on this machine — and every hook
+    in this module must reach *its own* listener. `publish_address` is
+    `test_claude_published_address.py`'s.
+    """
+    del root
+    return {CHANNEL_CONFIG_VARIABLE: json.dumps({"approvalSocketPath": str(path)})}
 
 
 def _request_line() -> bytes:
@@ -257,15 +259,9 @@ class TestTheHookClient:
         """Gate one: a Session this engine did not launch is not ours to answer."""
         assert decide(dialog(), {}) is None
 
-    def test_a_launch_that_carried_no_approval_address_is_the_same_silence(
-        self, socket_root: Path
-    ) -> None:
-        environ = {
-            CHANNEL_CONFIG_VARIABLE: bootstrap_value(
-                socket_root / "channel.sock", settings_for(socket_root)
-            )
-        }
-        assert decide(dialog(), environ) is None
+    def test_a_value_that_names_no_approval_address_is_the_same_silence(self) -> None:
+        """Gate one again: a value this build can read and that says nothing."""
+        assert decide(dialog(), {CHANNEL_CONFIG_VARIABLE: json.dumps({})}) is None
 
     def test_a_hook_that_fires_while_the_engine_is_down_leaves_the_dialog_alone(
         self, socket_root: Path
@@ -799,3 +795,163 @@ class TestTheProofIsTheHooksOwnWord:
 
         outcomes = asyncio.run(scenario())
         assert Delivery.DELIVERED not in outcomes, "a hook that had already gone was not told"
+
+
+def question_dialog(*groups: dict[str, Any], prompt_id: str | None = "p-1") -> dict[str, Any]:
+    """The payload an `AskUserQuestion` raises, as measured on 2.1.246 (#77).
+
+    The same `PermissionRequest` hook a `Write` raises — that is the measurement
+    this whole route hangs on — carrying the structured question rather than a
+    command, and a `prompt_id` beside it.
+    """
+    payload = {
+        **dialog(tool_name=QUESTION_TOOL),
+        "tool_input": {"questions": list(groups)},
+    }
+    if prompt_id is not None:
+        payload["prompt_id"] = prompt_id
+    return payload
+
+
+def group(question: str, *labels: str, multi: bool = False) -> dict[str, Any]:
+    return {
+        "question": question,
+        "header": question[:12],
+        "options": [{"label": label, "description": f"{label}, at length"} for label in labels],
+        "multiSelect": multi,
+    }
+
+
+class TestAQuestionIsNotAPermission:
+    """`AskUserQuestion` rides this hook, and must not be announced as an approval.
+
+    Measured on 2.1.246 (#77): the tool raises a `PermissionRequest`, and a hook
+    `deny` carrying a message is consumed by the Session *as the user's answer*.
+    So a route that announced it like any other dialog would offer a voice
+    allow/deny menu whose "deny" writes `DENIED_BY_VOICE` into the conversation as
+    an answer the user never gave. It is parked — the projection needs it, and the
+    dialog must still reach the screen — and announced by the Stop Notice instead.
+    """
+
+    def test_a_question_payload_projects_the_whole_question(self) -> None:
+        waiting = question_from(question_dialog(group("Tabs or spaces?", "Spaces", "Tabs")))
+
+        assert waiting is not None
+        assert waiting.kind is WaitingKind.QUESTION
+        assert waiting.prompt == "Tabs or spaces?"
+        assert [option.text for option in waiting.options] == ["Spaces", "Tabs"]
+        assert waiting.approval_id == "p-1", "the dialog's own correlator, for #103"
+
+    def test_the_session_s_own_mark_on_a_label_is_read_as_one(self) -> None:
+        """`AskUserQuestion` has no recommendation field; the mark is in the label.
+
+        The tool's own instructions tell the model to end that option's label
+        with `(recommended)`, so the payload carries it whenever there is one and
+        reading it is the Session's own words rather than an inference. Advisor,
+        2026-08-26: one parser, one reading — the earlier "always `False` on this
+        route" was written believing the payload could not carry the mark.
+        """
+        waiting = question_from(
+            question_dialog(group("Which base?", "main (recommended)", "develop"))
+        )
+
+        assert waiting is not None
+        assert [(o.text, o.recommended) for o in waiting.options] == [
+            ("main", True),
+            ("develop", False),
+        ]
+        assert waiting.recommendation == "main"
+
+    def test_order_is_never_a_recommendation(self) -> None:
+        """The half of the rule that stands: no mark, no recommendation, ever."""
+        waiting = question_from(question_dialog(group("Which base?", "main", "develop")))
+
+        assert waiting is not None
+        assert waiting.recommendation is None
+        assert not any(option.recommended for option in waiting.options)
+
+    def test_a_multi_question_call_says_everything_it_asked(self) -> None:
+        """One parser of this shape, so the two routes cannot disagree (#75)."""
+        waiting = question_from(
+            question_dialog(group("Tabs or spaces?", "Spaces"), group("Which base?", "main"))
+        )
+
+        assert waiting is not None
+        assert waiting.prompt == "Tabs or spaces?\nWhich base?"
+        assert [option.text for option in waiting.options] == ["Spaces", "main"]
+
+    def test_a_permission_payload_is_no_question_at_all(self) -> None:
+        assert question_from(dialog()) is None
+
+    def test_an_unreadable_question_is_still_a_question(self) -> None:
+        """A payload whose input never finished being written names no options.
+
+        It must not fall through to the permission branch: the tool name says
+        what it is, and announcing it as a dialog to allow or deny would restore
+        exactly the menu this route exists to withhold.
+        """
+        waiting = question_from({**dialog(tool_name=QUESTION_TOOL), "tool_input": {}})
+
+        assert waiting is not None
+        assert waiting.kind is WaitingKind.QUESTION
+        assert waiting.options == ()
+
+    def test_a_question_is_parked_and_raises_no_awaiting_approval(self, socket_root: Path) -> None:
+        async def scenario():
+            sink = Sink()
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=sink.emit,
+                pid=41,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "Spaces", "Tabs")),
+                )
+                parked = listener.newest_question_for(TARGET)
+                announced = sink.of(AwaitingApproval)
+            finally:
+                # Releases the parked dialog to its human, which is what lets
+                # the hook thread finish: nothing here ever answers a question.
+                await listener.aclose()
+            assert await hook is None, "no verdict was carried, so nothing was printed"
+            return parked, announced
+
+        parked, announced = asyncio.run(scenario())
+        assert announced == [], "a question carries no verdict; #103 gives it its own route"
+        assert parked is not None
+        assert parked.kind is WaitingKind.QUESTION
+        assert [option.text for option in parked.options] == ["Spaces", "Tabs"]
+        # Through the real hook process, because the request it sends is a copy
+        # rather than a forward: a field the hook does not name is absent on this
+        # side and nothing errors. The projector's own test cannot see that.
+        assert parked.approval_id == "p-1", "the dialog's correlator crossed the wire"
+
+    def test_a_permission_still_raises_awaiting_approval(self, socket_root: Path) -> None:
+        """The control: nothing about the ordinary dialog changed."""
+
+        async def scenario():
+            sink = Sink()
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=sink.emit,
+                pid=42,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(listener, socket_root)
+                announced = sink.of(AwaitingApproval)
+                question = listener.newest_question_for(TARGET)
+            finally:
+                await listener.aclose()
+            await hook
+            return announced, question
+
+        announced, question = asyncio.run(scenario())
+        assert len(announced) == 1
+        assert question is None, "a permission is not a question, whatever else is parked"

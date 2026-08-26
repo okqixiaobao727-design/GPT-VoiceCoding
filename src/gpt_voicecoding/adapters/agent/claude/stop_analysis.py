@@ -178,7 +178,7 @@ def _follow(content: Any, open_calls: dict[str, _OpenCall], ordinal: int) -> Non
                     continue
                 name = item.get("name")
                 tool_input = item.get("input")
-                question = _question(tool_input) if name == QUESTION_TOOL else None
+                question = question_in(tool_input) if name == QUESTION_TOOL else None
                 if name == QUESTION_TOOL and question is None:
                     continue
                 open_calls[identifier] = _OpenCall(
@@ -214,8 +214,16 @@ def _tail_wait(open_calls: dict[str, _OpenCall], *, last_spoken_at: int) -> Wait
     )
 
 
-def _question(tool_input: Any) -> WaitingFor | None:
+def question_in(tool_input: Any) -> WaitingFor | None:
     """Everything one `AskUserQuestion` call gives an announcement to say.
+
+    **Public because there are two sources of this exact object and one parser
+    of it.** The transcript's `tool_use.input` and the `PermissionRequest` hook's
+    `tool_input` are the same payload — `AskUserQuestion` raises that hook,
+    measured on 2.1.246 (#77) — so `approval.question_from` reads it through
+    here rather than through a second projector of its own. The hook adds one
+    thing the transcript cannot carry, the dialog's `prompt_id`, and adds it
+    beside this answer instead of inside it.
 
     One call can hold several groups. Options are flattened into one list —
     that is the list the user hears read out — and prompts are joined the same
