@@ -22,11 +22,18 @@ carrying two foreign hooks (#71). Uninstall is the same merge with nothing of
 ours to put back, so it reproduces the pre-install file byte for byte and the
 round trip is checkable rather than asserted.
 
-**What is *not* installed here.** ADR 0011 names two hooks, and only the
-approval one exists as a module today; the ``SessionStart`` registration hook
-arrives with the ticket that builds it (#74/#77). Installing a hook whose module
-is not there would break every Session in the config directory, so the list below
-is the list of hooks that run.
+**Both of ADR 0011's hooks are installed, and they arrived with their modules.**
+The rule this list is held to is that the two go together: installing a hook
+whose module is not there would break every Session in the config directory, so
+nothing is named here that cannot be run. `SessionStart` landed with #74, which
+built `registration.py`.
+
+**The two hooks fail in opposite directions, and their timeouts say so.** The
+approval hook *is* the wire — it is held open for as long as the user takes to
+answer, so it gets Claude Code's own generous ceiling. The registration hook
+runs on the path that opens a Session and never waits for an answer, so it gets
+a small one: an engine that is not answering must cost the user a registration,
+never a pause in front of their prompt.
 """
 
 from __future__ import annotations
@@ -56,6 +63,18 @@ DEFAULT_CONFIG_DIRECTORY_NAME: Final = ".claude"
 #: verdict; printing nothing hands the dialog back to the human.
 APPROVAL_EVENT: Final = "PermissionRequest"
 APPROVAL_MODULE: Final = "gpt_voicecoding.adapters.agent.claude.approval_hook"
+
+#: The registration wire. The hook sends one line and leaves; its stdout is
+#: never written to, because Claude Code reads a `SessionStart` hook's stdout as
+#: **context to add to the Session** — anything printed would land in the user's
+#: own conversation.
+REGISTRATION_EVENT: Final = "SessionStart"
+REGISTRATION_MODULE: Final = "gpt_voicecoding.adapters.agent.claude.registration"
+
+#: What the registration hook gets before Claude Code gives up on it. Small,
+#: because this runs while a Session is opening: the cost of an engine that is
+#: not answering must be a lost registration, not a wait the user watches.
+REGISTRATION_TIMEOUT_SECONDS: Final = 5
 
 #: The ceiling Claude Code puts on the hook process. It must not be *below*
 #: Bridge Core's approval budget, or Claude Code would give up on a dialog the
@@ -98,6 +117,11 @@ def desired_hooks(interpreter: Path) -> dict[str, list[dict[str, Any]]]:
     No matcher on ``PermissionRequest``: narrowing by tool name here would be
     this installer deciding which of the user's dialogs may be answered by voice,
     and that is the user's decision, made per dialog, out loud.
+
+    No matcher on ``SessionStart`` either, and for a different reason: it fires
+    for every Session in the config directory by design (ADR 0011), and the
+    scope that used to be structural is now the hook doing nothing when no
+    engine has published an address.
     """
     return {
         APPROVAL_EVENT: [
@@ -110,7 +134,18 @@ def desired_hooks(interpreter: Path) -> dict[str, list[dict[str, Any]]]:
                     }
                 ]
             }
-        ]
+        ],
+        REGISTRATION_EVENT: [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": hook_command(interpreter, REGISTRATION_MODULE),
+                        "timeout": REGISTRATION_TIMEOUT_SECONDS,
+                    }
+                ]
+            }
+        ],
     }
 
 

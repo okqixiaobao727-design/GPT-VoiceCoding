@@ -43,10 +43,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
-from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
+from gpt_voicecoding.adapters.agent.claude.approval import (
+    CWD_FIELD,
+    MESSAGING_SOCKET_FIELD,
+    MESSAGING_TOKEN_FIELD,
+    SESSION_ID_FIELD,
+    TRANSCRIPT_PATH_FIELD,
+    ApprovalError,
+    ApprovalListener,
+)
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     bootstrap_value,
     publish_address,
@@ -100,6 +109,29 @@ SUPPLEMENT_UNAVAILABLE = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class SessionReport:
+    """What one Session's own `SessionStart` hook said about where it can be reached.
+
+    Every field but the id is optional, because every one of them can honestly
+    be absent: a build that does not export the messaging variables, a Session
+    whose first turn has not created a transcript, a payload without a cwd. A
+    partial report is worth keeping — the fields that did arrive are still the
+    ones nothing else carries.
+    """
+
+    session_id: str
+    workspace: Path | None = None
+    transcript_path: Path | None = None
+    messaging_socket: Path | None = None
+    messaging_token: str | None = None
+
+
+def _path_in(payload: dict[str, object], field: str) -> Path | None:
+    value = payload.get(field)
+    return Path(value) if isinstance(value, str) and value.strip() else None
+
+
 class ClaudeAgentAdapter:
     """Claude, behind the Agent seam. Implements `AgentAdapter` and `Connectable`."""
 
@@ -116,8 +148,16 @@ class ClaudeAgentAdapter:
         #: The socket this adapter owns: hook processes dial in here holding a
         #: dialog open, so this adapter is the server on this route.
         self._approvals = ApprovalListener(
-            settings=self._settings, resolve=self._registered_as, emit=self._emit
+            settings=self._settings,
+            resolve=self._registered_as,
+            emit=self._emit,
+            register=self._session_started,
         )
+        #: What each Session's own `SessionStart` hook reported, by session id.
+        #: **Not a roster**: `claude agents --json` is the roster, and it sees
+        #: Sessions whose hook never ran. This is the two things that command
+        #: does not carry — the inbox socket, and the transcript path (#71).
+        self._reported: dict[str, SessionReport] = {}
 
     # -- lifecycle --------------------------------------------------------
 
@@ -205,10 +245,50 @@ class ClaudeAgentAdapter:
             socket_path,
         )
 
+    def _session_started(self, payload: dict[str, object]) -> None:
+        """One Session's `SessionStart` hook reported where it can be reached.
+
+        **This adds no roster row.** A Session appears in the roster because
+        `claude agents --json` lists it, which it does whether or not this hook
+        ran — including for every Session that started before this engine did.
+        What lands here is what that command cannot say: the Session's own inbox
+        socket, and the `transcript_path` #75 and #76 read.
+
+        The Session channel is registered from it when the hook carried a
+        socket, because that is exactly the address `register_session` has
+        always needed and could not discover.
+        """
+        session_id = payload.get(SESSION_ID_FIELD)
+        if not isinstance(session_id, str) or not session_id.strip():
+            return
+        report = SessionReport(
+            session_id=session_id.strip(),
+            workspace=_path_in(payload, CWD_FIELD),
+            transcript_path=_path_in(payload, TRANSCRIPT_PATH_FIELD),
+            messaging_socket=_path_in(payload, MESSAGING_SOCKET_FIELD),
+            messaging_token=payload.get(MESSAGING_TOKEN_FIELD)
+            if isinstance(payload.get(MESSAGING_TOKEN_FIELD), str)
+            else None,
+        )
+        self._reported[report.session_id] = report
+        _log.info(
+            "registration received for session_id=%s workspace=%s transcript=%s socket=%s",
+            report.session_id,
+            report.workspace,
+            report.transcript_path,
+            report.messaging_socket,
+        )
+
+    def reported(self, session_id: str) -> SessionReport | None:
+        """What that Session's own hook said about itself, if it ever ran."""
+        return self._reported.get(session_id)
+
     def forget_session(self, target: SessionTarget) -> None:
         """Stop holding a route to one Session. The Session itself is untouched."""
         self._channels.pop(target, None)
         self._windows.forget(target)
+        if target.session_id is not None:
+            self._reported.pop(target.session_id, None)
 
     def reachable(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter holds a channel address for."""
