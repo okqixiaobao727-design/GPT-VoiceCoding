@@ -210,6 +210,41 @@ class WaitingFor:
         )
 
 
+class ProgressRole(StrEnum):
+    """Which side said one progress entry.
+
+    **Carried rather than inferred.** A roster of bare strings reads "make it
+    blue" and "I made it blue" the same way, so every surface would have to
+    guess — which is the per-consumer parsing #74 exists to end. The reference
+    implementation carried the role all the way to the wire
+    (`legacy@1d32845:bridge/transcript.py:40-46`), and this is that fact, named.
+    """
+
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressEntry:
+    """One thing that was said in a Session, and by which side.
+
+    Deliberately just the two fields. Legacy carried `turn_id` and `turn_status`
+    beside them on the Codex lane (`legacy@1d32845:bridge/codex.py:1484-1492,
+    1516-1520`); **dropped, because** no v1.0 consumer reads them — the Live
+    Call, the Companion Channel and the Control Panel ask what a Session last
+    said and what it was last told, never which turn that was or how the turn
+    ended — and adding a field here later is additive rather than a second
+    widening of `Progress`.
+    """
+
+    role: ProgressRole
+    text: str
+
+    def __post_init__(self) -> None:
+        if not self.text.strip():
+            raise ValueError("an entry with nothing said in it is not progress")
+
+
 @dataclass(frozen=True, slots=True)
 class Progress:
     """How far along a Session is, in its own words, as of one reading.
@@ -220,7 +255,7 @@ class Progress:
     that renders "3 steps" when there were thirty is worse than one that says so.
     """
 
-    recent: tuple[str, ...] = ()
+    recent: tuple[ProgressEntry, ...] = ()
     truncated: bool = False
     read_at: datetime | None = None
 

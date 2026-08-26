@@ -110,7 +110,7 @@ def analyse(records: Sequence[Mapping[str, Any]]) -> WaitingFor:
         # closes the call it names whether or not it is worth reading aloud,
         # and a call is followed whether or not its record is visible.
         _follow(content, open_calls, ordinal)
-        if _is_visible(record) and not _is_pipeline_noise(record, content) and _speaks(content):
+        if is_visible(record) and not is_pipeline_noise(record, content) and visible_text(content):
             last_spoken_at = ordinal
     return _tail_wait(open_calls, last_spoken_at=last_spoken_at)
 
@@ -297,7 +297,7 @@ def _split_recommendation(label: str) -> tuple[str, bool]:
     return label, False
 
 
-def _is_visible(record: Mapping[str, Any]) -> bool:
+def is_visible(record: Mapping[str, Any]) -> bool:
     """Whether this record is part of the conversation the user can see.
 
     Three semantic exclusions, not format checks: a sidechain record is a
@@ -317,7 +317,7 @@ def _is_visible(record: Mapping[str, Any]) -> bool:
     )
 
 
-def _is_pipeline_noise(record: Mapping[str, Any], content: Any) -> bool:
+def is_pipeline_noise(record: Mapping[str, Any], content: Any) -> bool:
     """Whether this record is slash-command plumbing rather than conversation.
 
     Running a slash command writes machinery into the transcript beside the
@@ -349,34 +349,70 @@ def _is_pipeline_noise(record: Mapping[str, Any], content: Any) -> bool:
     return False
 
 
-def _speaks(content: Any) -> bool:
-    """Whether this message put anything in front of the user.
+def visible_text(content: Any) -> str:
+    """What this message put in front of the user, or nothing at all.
 
-    The tail boundary, and nothing more — which is why it answers a boolean
-    rather than returning the text. What the Session *said* is `Progress`, read
-    from these same records by its own reader (#76); what this needs to know is
-    only where the last thing the user would hear sits, because that is what
-    makes "the tail" mean this stop rather than any older moment.
+    **Two callers, one rule, and that is the point.** `analyse` needs only
+    whether a message spoke, because that is what gives "the tail" a boundary;
+    `transcript_tail` needs the words themselves, because that is what `Progress`
+    is made of (#76). Answering the boolean from a second scan of the same
+    content is how the reference implementation ended up with readers that
+    disagreed about the same record — so there is one extractor and the boundary
+    is `bool(visible_text(...))`.
 
-    `tool_use` counts for exactly one tool name. The Session's own words say what
-    decision it is waiting on, but the choices live in `AskUserQuestion`'s input,
-    so this call *is* something the user is shown. Every other `tool_use` carries
-    commands, code and file contents (`legacy@1d32845:bridge/transcript.py:
-    1568-1605`) — and, more to the point here, counting one would put the tail
-    boundary after the very call the Session is waiting on.
+    Every content shape Claude Code writes is *collected from* rather than
+    enumerated: real transcripts carry at least six user shapes and five
+    assistant ones and the product adds more, so an unknown item contributes
+    nothing instead of making the message unreadable
+    (`legacy@1d32845:bridge/transcript.py:1568-1607`).
+
+    `tool_use` is readable for exactly one tool name. The Session's own words say
+    what decision it is waiting on, but the choices live in `AskUserQuestion`'s
+    input, so this call *is* something the user is shown — without it the user
+    hears the question and never hears the options. Every other `tool_use`
+    carries commands, code and file contents, which must not be read aloud; and,
+    for the tail boundary, counting one would put the boundary after the very
+    call the Session is waiting on.
     """
     if isinstance(content, str):
-        return bool(content.strip())
+        return content if content.strip() else ""
     if not isinstance(content, list):
-        return False
+        return ""
+    readable = ""
     for item in content:
         if not isinstance(item, Mapping):
             continue
         if item.get("type") == "text":
             text = item.get("text")
             if isinstance(text, str) and text.strip():
-                return True
+                readable += text
         elif item.get("type") == "tool_use" and item.get("name") == QUESTION_TOOL:
-            if _question(item.get("input")) is not None:
-                return True
-    return False
+            asked = _question_text(item.get("input"))
+            if asked:
+                readable += f"\n{asked}" if readable else asked
+    return readable
+
+
+def _question_text(tool_input: Any) -> str:
+    """What one `AskUserQuestion` call asks, and what it offers as answers.
+
+    Rendered off the same `_groups` the seam's `Option` values are built from, so
+    the words the user hears and the choices they may say back can never come
+    from two different readings of one call
+    (`legacy@1d32845:bridge/transcript.py:1861-1874`).
+
+    **A call with no readable option renders as nothing**, which is the same
+    test `_question` fails on. An input still being streamed arrives with no
+    options at all, and a prompt without choices read aloud is a question the
+    user cannot answer — and, for `analyse`'s tail boundary, would move the
+    boundary past the very call the Session is waiting on.
+    """
+    groups = _groups(tool_input)
+    if not any(labels for _, labels in groups):
+        return ""
+    lines: list[str] = []
+    for prompt, labels in groups:
+        if prompt:
+            lines.append(f"Question: {prompt}")
+        lines.extend(f"Option: {label}" for label in labels)
+    return "\n".join(lines)
