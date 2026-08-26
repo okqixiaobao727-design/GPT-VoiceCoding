@@ -47,6 +47,19 @@ DEFAULT_MAX_FRAME_BYTES = 32 * 1024 * 1024
 #: How long one request waits for its answer when the caller states no deadline.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 
+#: How long the closing courtesy gets. `aclose` sends a close frame and waits for
+#: the transport to finish, and both of those are waits on the far side: a peer
+#: that has stopped reading holds them for as long as it likes. That is a wait
+#: inside the engine's shutdown, and #96 is what an unbounded one there costs —
+#: the app-server this connection belongs to is stopped *after* it, so a hang
+#: here is a leaked process. The frame is a courtesy; going is not optional.
+#:
+#: One second because this is a local `AF_UNIX` socket with an empty frame on
+#: it: a write that has not left in a second is not waiting on bandwidth, it is
+#: waiting on a peer that has stopped reading, and that peer is about to be
+#: signalled anyway.
+CLOSE_TIMEOUT_SECONDS = 1.0
+
 _OPCODE_CONTINUATION = 0x0
 _OPCODE_TEXT = 0x1
 _OPCODE_BINARY = 0x2
@@ -218,11 +231,13 @@ class AppServerConnection:
         self._reader = None
         if writer is not None:
             with suppress(Exception):
-                writer.write(self._frame(b"", _OPCODE_CLOSE))
-                await writer.drain()
+                async with asyncio.timeout(CLOSE_TIMEOUT_SECONDS):
+                    writer.write(self._frame(b"", _OPCODE_CLOSE))
+                    await writer.drain()
             writer.close()
             with suppress(Exception):
-                await writer.wait_closed()
+                async with asyncio.timeout(CLOSE_TIMEOUT_SECONDS):
+                    await writer.wait_closed()
         self._fail_pending(self._closed_reason)
 
     # -- the reader -------------------------------------------------------

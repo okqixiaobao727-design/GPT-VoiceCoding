@@ -32,6 +32,25 @@ Attaching is possible because of a fact established by probing codex 0.148.0
 directly: one app-server accepts many concurrent clients, `thread/resume` against
 a thread another live client already holds is non-destructive, and it subscribes
 the resuming client to that thread's full turn and item stream.
+
+**What is spawned here is a tree, so it is stopped as a tree** (#96). On this
+machine `codex` on `PATH` is an npm shim — a `node` process that execs nothing
+and instead spawns the real binary as a child (`@openai/codex/bin/codex.js`). It
+forwards SIGTERM, which is why an ordinary stop works; it cannot forward SIGKILL,
+which is why the fallback used to orphan the very process the socket belongs to.
+So the spawn takes its own session (`start_new_session`) and every signal on the
+way out goes to the process *group*: the shim and whatever it started go
+together, and there is no signal this can send that leaves the binary holding
+`codex-app-server.sock`. A leaked one refuses the next engine outright — that is
+the failure #96 was raised for, and the socket claim is right to refuse it.
+
+**New, not ported.** Legacy owned an app-server too and stopped it with the same
+two signals (`legacy@1d32845:bridge/codex.py:640-666`), but it signalled the
+process alone — there is no `killpg`, no `getpgid` and no `start_new_session`
+anywhere in that tree, and its own spawn (`bridge/codex.py:290-300`) takes no
+session either. What it had instead was ownership re-proved before every signal,
+against pid reuse; this holds a `Popen` and cannot be fooled that way. The
+group-signalling half has no legacy analogue and is written fresh.
 """
 
 from __future__ import annotations
@@ -41,6 +60,7 @@ import contextlib
 import logging
 import os
 import shutil
+import signal
 import stat
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -68,6 +88,24 @@ CLIENT_NAME = "gpt-voicecoding"
 #: accepted and then refused with "thread ... does not support realtime
 #: conversation" — a per-thread-sounding message for a per-process cause.
 REALTIME_FEATURE = "realtime_conversation"
+
+#: How long the app-server gets after each signal on the way out. Deliberately
+#: **not** `startup_timeout_seconds`, which is what this used to reach for: that
+#: is thirty seconds, it is spent twice here, and the engine's whole shutdown is
+#: given twelve (`engine/runner.py`) inside a grace of twenty
+#: (`tests/acceptance/support.py`). A local process that has been signalled and
+#: is coming back does so in well under a second; one that has not moved in five
+#: is not going to, and waiting longer only converts a stop into a SIGKILL.
+#:
+#: **Ported.** Legacy had exactly this constant and exactly this reasoning —
+#: `catalog_termination_timeout_seconds`, spent "after SIGTERM and again after
+#: SIGKILL", and "separate from `startup_timeout_seconds` because these are
+#: different waits: one is a process coming up, the other is a process going
+#: away, and the second must never cost as much as the first may"
+#: (`legacy@1d32845:bridge/config.py:170-176`, used by
+#: `bridge/codex.py:640-666`). The rewrite dropped it and reached for the
+#: startup number instead, which is how a stop came to cost up to a minute.
+STOP_TIMEOUT_SECONDS = 5.0
 
 _log = logging.getLogger(__name__)
 
@@ -327,10 +365,20 @@ class OwnedAppServer:
 
         process, self._process = self._process, None
         if process is not None and process.poll() is None:
-            process.terminate()
+            _signal_the_group(process, signal.SIGTERM)
             if not await self._waited_for(process):
-                process.kill()
-                await self._waited_for(process)
+                _log.warning(
+                    "the codex app-server did not stop within %.0fs; killing its process group",
+                    STOP_TIMEOUT_SECONDS,
+                )
+                _signal_the_group(process, signal.SIGKILL)
+                if not await self._waited_for(process):
+                    # Said out loud because of what it costs: whatever is still
+                    # bound to the socket refuses the next engine's start.
+                    _log.error(
+                        "the codex app-server did not go; %s may still be held",
+                        self._socket_path,
+                    )
 
         log, self._log = self._log, None
         if log is not None:
@@ -364,6 +412,11 @@ class OwnedAppServer:
             stdout=output,
             stderr=subprocess.STDOUT,
             env=dict(os.environ),
+            # Its own session, so `aclose` can signal the whole tree rather than
+            # only the process this engine can see. See the module docstring:
+            # what `PATH` resolves to here is usually a shim, and the process
+            # that ends up holding the socket is its child.
+            start_new_session=True,
         )
         self._owns_socket = True
 
@@ -401,9 +454,14 @@ class OwnedAppServer:
         path.unlink(missing_ok=True)
 
     async def _waited_for(self, process: subprocess.Popen[bytes]) -> bool:
-        """Wait for a process to go, without blocking the whole event loop."""
+        """Wait for a process to go, without blocking the whole event loop.
+
+        Held to `STOP_TIMEOUT_SECONDS` rather than to how long a *start* may
+        take: they were the same number, which put up to a minute inside a
+        shutdown that has ten seconds (#96).
+        """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._settings.startup_timeout_seconds
+        deadline = loop.time() + STOP_TIMEOUT_SECONDS
         while loop.time() < deadline:
             if process.poll() is not None:
                 return True
@@ -425,3 +483,28 @@ def _something_listens(path: Path) -> bool:
         return True
     finally:
         probe.close()
+
+
+def _signal_the_group(process: subprocess.Popen[bytes], number: int) -> None:
+    """Signal the whole tree this engine spawned, not only the process it holds.
+
+    The spawn asked for its own session, so the child is a process-group leader
+    and its group is exactly what it started. Signalling the group is therefore
+    the same reach as signalling the child *plus* whatever the child spawned —
+    which on this machine is the process that actually binds the socket (#96).
+
+    Falls back to the child alone rather than raising: a group that has already
+    gone, or one this process may no longer signal, is a stop that is already
+    happening, and `aclose` promises never to raise on the way out.
+    """
+    try:
+        os.killpg(os.getpgid(process.pid), number)
+        return
+    except (ProcessLookupError, PermissionError, OSError) as ungroupable:
+        _log.info(
+            "could not signal the codex app-server's process group (%s); signalling pid %d alone",
+            ungroupable,
+            process.pid,
+        )
+    with contextlib.suppress(ProcessLookupError, OSError):
+        process.send_signal(number)

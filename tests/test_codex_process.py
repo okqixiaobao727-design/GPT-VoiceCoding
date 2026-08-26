@@ -24,6 +24,7 @@ import os
 import shutil
 import stat
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -545,3 +546,95 @@ class TestRefusingAPathSubstitution:
                 verify_private_socket(socket_path)
 
         asyncio.run(scenario())
+
+
+#: A stand-in for the npm shim `codex` really is on this machine: a wrapper that
+#: does **not** exec, so the process holding the socket is a *grandchild* of the
+#: engine, and one that survives SIGTERM, so the fallback is the path under test.
+#: `trap 'sleep 30' TERM` is deliberately a non-empty trap: an empty one would be
+#: inherited by the child as SIG_IGN and the child would survive SIGTERM too,
+#: which is a different shim from the one measured (`@openai/codex/bin/codex.js`
+#: forwards SIGTERM and cannot forward SIGKILL).
+SHIM = """\
+trap 'sleep 30' TERM
+{python} {runner} "$@" &
+echo $! > {pidfile}
+wait
+"""
+
+
+def shim(tmp_path: Path, pidfile: Path) -> str:
+    """A `codex` whose real server is its child, and which will not die politely."""
+    runner = tmp_path / "stand_in.py"
+    runner.write_text(STAND_IN.format(tests=str(Path(__file__).parent)))
+    where = tmp_path / "codex"
+    where.write_text(
+        "#!/bin/sh\n" + SHIM.format(python=sys.executable, runner=str(runner), pidfile=str(pidfile))
+    )
+    where.chmod(where.stat().st_mode | stat.S_IXUSR)
+    return str(where)
+
+
+class TestStoppingTheWholeTreeItSpawned:
+    """#96: nothing this engine spawned may outlive the engine holding the socket.
+
+    `codex` on `PATH` is an npm shim — a `node` process whose child is the real
+    binary. The stop used to signal only the process this engine holds, so the
+    SIGKILL fallback killed the shim and reparented the binary to launchd, still
+    listening on `codex-app-server.sock`. The next engine's `_claim_socket_path`
+    then refused to start, correctly and unhelpfully, and that is what ended the
+    acceptance run after the one that leaked it.
+    """
+
+    def test_the_process_holding_the_socket_goes_with_the_shim(
+        self, tmp_path: Path, socket_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pidfile = tmp_path / "server.pid"
+        # Bounded well under the real one so the fallback is reached in a test's
+        # patience rather than in a shutdown's. The path is the point, not the wait.
+        monkeypatch.setattr(process, "STOP_TIMEOUT_SECONDS", 1.0)
+
+        async def scenario() -> int:
+            owned = OwnedAppServer(
+                settings=quick(executable=shim(tmp_path, pidfile)), socket_path=socket_path
+            )
+            await owned.start()
+            await _until(lambda: pidfile.exists() and pidfile.read_text().strip())
+            server_pid = int(pidfile.read_text().strip())
+            assert running(server_pid)
+            await owned.aclose()
+            return server_pid
+
+        server_pid = asyncio.run(scenario())
+        # The grandchild had to be reaped by somebody; give the kernel the
+        # moment it needs rather than racing it.
+        deadline = time.monotonic() + 5
+        while running(server_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not running(server_pid), (
+            f"pid {server_pid} outlived the engine that spawned it and is still "
+            f"holding {socket_path}"
+        )
+
+    def test_the_spawn_takes_a_session_of_its_own(self, tmp_path: Path, socket_path: Path) -> None:
+        """Which is what makes signalling the group reach the tree and nothing else.
+
+        Without it the group is the *engine's* group, and killing it would take
+        down whatever started the engine — so this is a safety property as much
+        as a reach one.
+        """
+
+        async def scenario() -> tuple[int, int]:
+            owned = OwnedAppServer(
+                settings=quick(executable=stand_in(tmp_path)), socket_path=socket_path
+            )
+            await owned.start()
+            try:
+                spawned = owned._process  # noqa: SLF001 - the pid is not otherwise exposed
+                assert spawned is not None
+                return os.getpgid(spawned.pid), os.getpgid(os.getpid())
+            finally:
+                await owned.aclose()
+
+        theirs, ours = asyncio.run(scenario())
+        assert theirs != ours

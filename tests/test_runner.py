@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -313,3 +314,92 @@ class TestARealEngineOwningARealLog:
         written = (home / "engine.log").read_text()
         assert f"{NOISE}INHERITED" in written
         assert "dropped inherited environment variables" in written
+
+
+class TestStoppingIsWrittenDownAndBounded:
+    """#96, end to end: SIGTERM with a surface still connected must still exit.
+
+    The engine that failed the acceptance took SIGTERM, wrote nothing, and was
+    SIGKILLed twenty seconds later with the `codex app-server` it had spawned
+    still holding its socket — which then refused the next run. Two properties
+    close it, and both are checked here rather than only at the unit that owns
+    them: the stop finishes with a surface connected, and the log says it
+    happened.
+    """
+
+    def test_a_connected_surface_does_not_hold_the_engine_past_sigterm(
+        self, home: Path, configured: Path
+    ) -> None:
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(TESTS_DIR)
+
+        engine = subprocess.Popen(
+            [sys.executable, "-m", "gpt_voicecoding.engine", "--config", str(configured)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        socket_path = home / "control.sock"
+        surface: socket.socket | None = None
+        try:
+            deadline = time.monotonic() + 20
+            while not socket_path.exists() and time.monotonic() < deadline:
+                assert engine.poll() is None, "the engine exited before it served"
+                time.sleep(0.05)
+            assert socket_path.exists(), "the engine never bound its socket"
+
+            # A surface that connected and then said nothing — a Control Panel
+            # sitting open, a `bridgectl` between commands. This is the whole
+            # defect: before #96 the engine's stop waited on this socket for as
+            # long as it stayed open, which was forever.
+            surface = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            surface.connect(str(socket_path))
+
+            engine.send_signal(signal.SIGTERM)
+            # Well inside the twenty seconds the acceptance harness allows, so a
+            # pass here is a pass there rather than a coin toss on a busy machine.
+            stdout, stderr = engine.communicate(timeout=15)
+        finally:
+            if surface is not None:
+                surface.close()
+            if engine.poll() is None:  # the failure this test exists to catch
+                engine.kill()
+                engine.communicate(timeout=20)
+
+        assert engine.returncode == EXIT_OK
+        assert stdout == ""
+        assert stderr == ""
+
+    def test_the_log_names_the_signal_and_the_end_of_the_shutdown(
+        self, home: Path, configured: Path
+    ) -> None:
+        """An engine log whose last line is an ordinary tick is why #96 took a session."""
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(TESTS_DIR)
+
+        engine = subprocess.Popen(
+            [sys.executable, "-m", "gpt_voicecoding.engine", "--config", str(configured)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            socket_path = home / "control.sock"
+            deadline = time.monotonic() + 20
+            while not socket_path.exists() and time.monotonic() < deadline:
+                assert engine.poll() is None, "the engine exited before it served"
+                time.sleep(0.05)
+            engine.send_signal(signal.SIGTERM)
+            engine.communicate(timeout=15)
+        finally:
+            if engine.poll() is None:
+                engine.kill()
+                engine.communicate(timeout=20)
+
+        written = (home / "engine.log").read_text()
+        assert "stopping on SIGTERM" in written
+        assert "stopping: closing the control plane" in written
+        assert "stopping: closing the adapters" in written
+        assert "stopped in " in written

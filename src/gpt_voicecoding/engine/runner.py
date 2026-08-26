@@ -50,6 +50,17 @@ cannot discharge for it and does not pretend to.
 Signals: SIGINT and SIGTERM both mean stop, and stopping is orderly — the loops
 are cancelled and the socket file is removed, so the next start is not left
 claiming its own debris.
+
+**Stopping is written down, and it is bounded.** Both because of #96, where this
+engine took SIGTERM, wrote nothing, and was still alive when the SIGKILL came
+twenty seconds later — leaving the `codex app-server` it had spawned orphaned on
+its socket, which refused the next run. The defect itself was one unbounded wait
+in the control plane, and it is fixed there; what is here is the pair of
+properties that would have made it a five-minute diagnosis instead of a session:
+the log says which signal arrived and when the stop finished, and no single
+component can hold the stop past `SHUTDOWN_SECONDS`. An engine that overruns
+says which phase it was in and leaves anyway — the alternative is not a tidier
+shutdown, it is the same SIGKILL with nothing written down.
 """
 
 from __future__ import annotations
@@ -60,6 +71,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -76,6 +88,27 @@ from gpt_voicecoding.engine.logfile import own_the_log, strip_environment
 #: run that ended badly; the menu-bar shell restarts on every one of them.
 EXIT_OK = 0
 EXIT_REFUSED = 2
+
+#: The whole orderly shutdown's ceiling, and the outer guarantee behind every
+#: bound inside it. Derived rather than chosen, from two directions that have to
+#: meet:
+#:
+#: - **From above**, whoever stops this engine gives it a finite grace and then
+#:   kills it — twenty seconds for the acceptance harness
+#:   (`tests/acceptance/support.py`), twenty for launchd's default `ExitTimeOut`.
+#:   Overrunning that grace is how #96 lost its `codex app-server`, so this has
+#:   to leave real margin under it rather than sit at it.
+#: - **From below**, the phases each carry their own bound and they add up:
+#:   3s for the control plane (`control_plane/server.py`), then the adapters,
+#:   of which the Codex one dominates at 1s + 1s to let the Sessions go
+#:   (`codex_app_server/wire.py`, and they go concurrently) plus 5s for the
+#:   app-server itself (`codex_app_server/process.py`) — about eleven seconds if
+#:   every single one is hit at once, which nothing has ever done.
+#:
+#: Twelve is the smallest round number above the second and comfortably below
+#: the first. A phase that overruns it is named and abandoned, because the
+#: alternative is not a tidier shutdown — it is a SIGKILL with nothing written.
+SHUTDOWN_SECONDS = 12.0
 
 _log = logging.getLogger(__name__)
 
@@ -224,9 +257,18 @@ class StartRefused(Exception):
 async def _serve(engine: Engine) -> None:
     """Serve until a signal arrives, then shut down in order."""
     stopping = asyncio.Event()
+    #: Which signal it was, for the log. A list rather than a `nonlocal` because
+    #: the handler is a plain callback the loop calls, not a closure over a cell
+    #: this function can rebind.
+    arrived: list[signal.Signals] = []
+
+    def stop(received: signal.Signals) -> None:
+        arrived.append(received)
+        stopping.set()
+
     loop = asyncio.get_running_loop()
     for received in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(received, stopping.set)
+        loop.add_signal_handler(received, stop, received)
 
     try:
         await engine.start()
@@ -239,4 +281,31 @@ async def _serve(engine: Engine) -> None:
     try:
         await stopping.wait()
     finally:
-        await engine.aclose()
+        await _stopping(engine, arrived)
+
+
+async def _stopping(engine: Engine, arrived: Sequence[signal.Signals]) -> None:
+    """Shut the engine down, saying so, and never past `SHUTDOWN_SECONDS`.
+
+    The cause is named because there are two — a signal, and a `serve` that was
+    cancelled from inside this process — and an operator reading the log after
+    the fact cannot otherwise tell "the user quit" from "something else stopped
+    it".
+    """
+    _log.info("stopping on %s", arrived[0].name if arrived else "a cancelled serve")
+    began = time.monotonic()
+    try:
+        async with asyncio.timeout(SHUTDOWN_SECONDS):
+            await engine.aclose()
+    except TimeoutError:
+        # The last "stopping: …" line above this one is the phase that did not
+        # finish. Leaving is the right answer: whoever stopped this engine is
+        # holding a grace period, and overrunning it converts an unclean stop
+        # into a SIGKILL, which is strictly worse — nothing further would run.
+        _log.error(
+            "the shutdown did not finish within %.0fs and is being abandoned; "
+            "the line above this one names the phase that was still running",
+            SHUTDOWN_SECONDS,
+        )
+        return
+    _log.info("stopped in %.2fs", time.monotonic() - began)

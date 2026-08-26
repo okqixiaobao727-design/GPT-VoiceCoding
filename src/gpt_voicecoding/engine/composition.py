@@ -291,7 +291,15 @@ class Engine:
         In the reverse order of opening, and every adapter is given its turn
         even if an earlier one objected: a shutdown that abandoned the rest on
         the first raise is how a reader task outlives the engine that owned it.
+
+        **Every phase says it is starting, before it starts.** #96 was diagnosed
+        from an engine log whose last line was an ordinary discovery tick: the
+        shutdown wrote nothing at all, so "it never began" and "it began and
+        hung" were the same file, and the session that read it went looking in
+        the wrong half of the code. A line per phase makes the next hang name
+        itself — the last line written is the phase that did not finish.
         """
+        _log.info("stopping: cancelling the loops")
         for loop in self._loops:
             loop.cancel()
         for loop in self._loops:
@@ -300,12 +308,23 @@ class Engine:
             except asyncio.CancelledError:
                 pass
         self._loops = []
+        _log.info("stopping: closing the control plane")
         await self._server.aclose()
+        _log.info("stopping: closing the adapters")
         await self._closing(self.adapters.connectable())
+        _log.info("stopped: every loop cancelled, the socket gone and the adapters closed")
 
     async def _closing(self, opened: Sequence[Connectable]) -> None:
-        """Close what is open, newest first, and give every one of them its turn."""
+        """Close what is open, newest first, and give every one of them its turn.
+
+        Newest first is also **most owned first**: the Agent adapters go before
+        the Companion Channel and the Call, and the Codex one — the only adapter
+        here that owns a *process* — goes first of all. That ordering is what
+        makes a later hang survivable: whatever else stalls on the way out, the
+        app-server this engine spawned has already been told to go (#96).
+        """
         for adapter in reversed(list(opened)):
+            _log.info("stopping: closing %s", type(adapter).__name__)
             try:
                 await adapter.aclose()
             except Exception:
