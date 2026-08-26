@@ -43,10 +43,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
+from gpt_voicecoding.adapters.agent.claude import stop_analysis
 from gpt_voicecoding.adapters.agent.claude.approval import (
     CWD_FIELD,
     MESSAGING_SOCKET_FIELD,
@@ -72,6 +73,7 @@ from gpt_voicecoding.adapters.agent.claude.protocol import (
     channel_kind_for,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
+from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 from gpt_voicecoding.adapters.agent.claude.wire import (
     ChannelConnection,
@@ -89,6 +91,8 @@ from gpt_voicecoding.seams.agent import (
     SessionInspection,
     SessionLifecycle,
     SessionState,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -164,7 +168,12 @@ class ClaudeAgentAdapter:
         self._channels: dict[SessionTarget, Path] = {}
         #: Late-receipt listeners in flight, so none outlives this adapter.
         self._listening: set[asyncio.Task[None]] = set()
-        self._windows = ReplyWindowWatcher(settings=self._settings, emit=self._emit)
+        #: The lane's one opener of a transcript file, shared by what a Session
+        #: stopped on (#75) and how far along it is (#76).
+        self._transcripts = TranscriptReader()
+        self._windows = ReplyWindowWatcher(
+            settings=self._settings, emit=self._emit, stopped_on=self.stopped_on
+        )
         #: The socket this adapter owns: hook processes dial in here holding a
         #: dialog open, so this adapter is the server on this route.
         self._approvals = ApprovalListener(
@@ -335,7 +344,9 @@ class ClaudeAgentAdapter:
         """Stop holding a route to one Session. The Session itself is untouched."""
         self._channels.pop(target, None)
         self._windows.forget(target)
-        self._reported.pop(target, None)
+        report = self._reported.pop(target, None)
+        if report is not None:
+            self._transcripts.forget(report.transcript_path)
 
     def reachable(self) -> tuple[SessionTarget, ...]:
         """Every Session this adapter holds a channel address for."""
@@ -362,12 +373,107 @@ class ClaudeAgentAdapter:
     async def discover(self) -> LaneDiscovery:
         """Every Claude Session running, from Claude Code's own roster.
 
-        Delegated whole to `discovery.py`, which owns the command and the
-        mapping. Nothing about being *reachable* enters here: a Session is
+        The roster is `discovery.py`'s whole business — it owns the command and
+        the mapping. Nothing about being *reachable* enters there: a Session is
         listed because it exists, and whether this adapter holds a channel to it
         is a question `answer_relay` answers with a receipt (#68).
+
+        What is added here is the one thing the roster cannot say: **what a
+        stopped Session stopped on** (#75). The roster reports `waiting` without
+        naming a tool, a dialog or a prompt, so a row that stopped is read
+        against its own transcript and against any dialog parked on this
+        engine's approval socket. It happens on this verb rather than on
+        `inspect` because this is the verb Bridge Core actually calls — every
+        five seconds, for the whole machine (`core/bridge.py:442`) — and
+        `inspect` reads the same rows.
         """
-        return await claude_discovery.discover()
+        lane = await claude_discovery.discover()
+        if not lane.enumerated:
+            return lane
+        return replace(lane, rows=tuple(self._row_with_stop(row) for row in lane.rows))
+
+    def _row_with_stop(self, row: SessionInspection) -> SessionInspection:
+        """One roster row, with what it stopped on read in.
+
+        **A Session mid-turn is not stopped on anything**, so a `RUNNING` row is
+        returned untouched and its transcript is never opened. That is what keeps
+        this off the hot path: on a machine of busy Sessions, the five-second
+        cadence costs one roster command and no file reads at all.
+        """
+        if row.state is SessionState.RUNNING:
+            return row
+        waiting = self.stopped_on(row.target, row.waiting_for)
+        return row if waiting == row.waiting_for else replace(row, waiting_for=waiting)
+
+    def stopped_on(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+        """What one Session stopped on, from its transcript and any parked dialog.
+
+        Two sources, and they are ranked rather than merged, because they can
+        disagree and the ranking is the behaviour (#75):
+
+        1. **A readable question wins outright.** The reference implementation's
+           precedence — a decision only the user can supply outranks a permission
+           call beside it (`legacy@1d32845:bridge/transcript.py:1691-1692`) — and
+           a hook holding a dialog open never overrides one.
+        2. **A permission read from the transcript keeps its own fields** and
+           takes the `approval_id` from the dialog, which is the only place a
+           handle exists at all. It fills a tool name the record did not carry
+           and never overwrites one it did.
+        3. **A dialog with nothing readable behind it is still a stop.** This is
+           the first-turn case: `PermissionRequest` fires when the dialog opens,
+           before the `tool_use` record is flushed. The reference implementation
+           scraped the tool name out of an English Notification sentence
+           (`legacy@1d32845:bridge/daemon.py:143-145,213-223,2049-2051`);
+           **adapted**, because v2's hook carries the same fact plus the handle,
+           delivered by the process holding the dialog. `caught_up` is `True`
+           here: the seam's rule is that a reader claiming a kind must have read
+           the record that says so, and the hook payload is that record.
+        4. **Nothing said and no dialog** leaves the roster's own word standing —
+           `NONE` for a finished turn, and `UNKNOWN` with `caught_up=False` for a
+           Session the roster calls `waiting`, which is the seam's way of saying
+           *ask again, never guess*.
+        """
+        base = roster if roster is not None else WaitingFor()
+        report = self._reported.get(target)
+        records = self._transcripts.records(report.transcript_path if report else None)
+        found = base if records is None else stop_analysis.analyse(records)
+        if found.kind is WaitingKind.NONE:
+            # The transcript is not held up on anything, which the roster may
+            # still know to be a Session waiting on the user. Its word stands.
+            found = base
+        dialog = self._parked_for(target)
+        if dialog is None or found.kind is WaitingKind.QUESTION:
+            return found
+        if found.kind is WaitingKind.PERMISSION:
+            return replace(
+                found,
+                tool_name=found.tool_name or dialog.tool_name or None,
+                detail=found.detail or dialog.detail or None,
+                approval_id=dialog.approval_id,
+            )
+        _log.info(
+            "the transcript for %s has not flushed the call behind the dialog parked here; "
+            "naming it from the hook payload instead: tool=%s approval=%s",
+            target,
+            dialog.tool_name,
+            dialog.approval_id,
+        )
+        return WaitingFor(
+            kind=WaitingKind.PERMISSION,
+            tool_name=dialog.tool_name or None,
+            detail=dialog.detail or None,
+            approval_id=dialog.approval_id,
+        )
+
+    def _parked_for(self, target: SessionTarget) -> ApprovalRequest | None:
+        """The newest dialog this engine is holding open for that exact Session.
+
+        The newest, because a Session that raised two is held up on the one it
+        raised last; keyed by the exact target, because `--resume` forks two
+        processes under one session id and a dialog belongs to one of them.
+        """
+        parked = [request for request in self._approvals.pending() if request.target == target]
+        return parked[-1] if parked else None
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
         """One Session, freshly read from the same roster `discover` reads.

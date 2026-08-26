@@ -57,6 +57,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Final
 
+from gpt_voicecoding.adapters.agent.claude import stop_analysis
 from gpt_voicecoding.adapters.agent.claude.privacy import (
     PRIVATE_SOCKET_MODE,
     ChannelPathError,
@@ -199,26 +200,29 @@ def approval_socket_path(directory: Path, pid: int) -> Path:
 
 
 def summary_of(tool_input: Any) -> str:
-    """One line saying what is actually about to happen, in the tool's own words.
+    """One line saying what is about to happen — P5's extractor, and only its.
 
-    The fields are tried in the order that puts the most specific thing first: a
-    shell command says everything, a path says most of it, and a description is
-    the tool's own summary of itself. Anything else is left to the tool name,
-    which the announcement already carries — inventing a sentence out of an
-    arbitrary input object would be guessing at the user's risk.
+    **Reversed in #75, deliberately.** This used to read `command` first and
+    return it whole, on two arguments: that a shell command says everything, and
+    that shortening is a presentation decision belonging to Bridge Core (ADR
+    0001). The signed port table's P5 row rules the other way, and it is the
+    reference implementation's own rule rather than a new one
+    (`legacy@1d32845:bridge/transcript.py:1779-1811,126-143`): the arguments
+    proper — command text, file contents, edit strings — are excluded outright,
+    and anything over 200 characters is passed over rather than cut.
 
-    **It is not shortened here.** How long a thing may be before it is read aloud
-    or pushed to a phone is a presentation decision, and presentation decisions
-    are Bridge Core's (ADR 0001). The Codex spoke's equivalent takes the same
-    position; an adapter that trimmed would be two components deciding one thing.
+    Both of the old arguments hold less than they look. The exclusion is not
+    about length, so Bridge Core cannot make it later: a command carries tokens
+    and paths, and v1.0 reads this field into a Live Call and pushes it to a
+    phone. And the bound rejects rather than truncates precisely because a cut
+    lands mid-secret as readily as mid-word.
+
+    The extractor itself lives in `stop_analysis.py`, which is where P3–P5 were
+    rebuilt, so that the transcript-derived `WaitingFor.detail` and this
+    hook-derived `ApprovalRequest.detail` cannot enforce one safety rule on one
+    path and not on the other.
     """
-    if not isinstance(tool_input, dict):
-        return ""
-    for key in ("command", "file_path", "path", "url", "description"):
-        value = tool_input.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())
-    return ""
+    return stop_analysis.summarise(tool_input)
 
 
 def request_from(

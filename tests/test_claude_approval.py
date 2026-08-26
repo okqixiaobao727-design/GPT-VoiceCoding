@@ -188,7 +188,9 @@ class TestWhatTheHookPrints:
 
 class TestWhatIsAnnounced:
     def test_the_detail_is_the_tool_s_own_words(self) -> None:
-        assert summary_of({"command": "rm  -rf   build"}) == "rm -rf build"
+        assert summary_of({"description": "clean the build directory"}) == (
+            "clean the build directory"
+        )
         assert summary_of({"file_path": "/tmp/x"}) == "/tmp/x"
 
     def test_an_input_that_says_nothing_readable_adds_nothing(self) -> None:
@@ -196,14 +198,38 @@ class TestWhatIsAnnounced:
         assert summary_of({"weird": 12}) == ""
         assert summary_of("not an object") == ""
 
-    def test_the_detail_is_not_shortened_here(self) -> None:
-        """How long a thing may be before it is spoken is Bridge Core's decision.
+    def test_the_command_the_user_is_being_asked_about_is_never_in_the_words(self) -> None:
+        """P5's exclusion, on the path that actually speaks and pushes (#75).
 
-        An adapter that trimmed would be a second component deciding one thing,
-        and the Codex spoke's equivalent already declines to.
+        This asserted the opposite until #75: `command` was read first and
+        returned whole. The signed port table rules the reference
+        implementation's way (`legacy@1d32845:bridge/transcript.py:1779-1790`) —
+        the arguments proper are the code and shell text that must not be read
+        into a Live Call or pushed to a phone, and the user decides *allow / deny
+        / ask* from the tool's name and its own one-line description.
         """
-        long_path = "/x" * 4000
-        assert summary_of({"file_path": long_path}) == long_path
+        leak = "curl -H 'Authorization: Bearer sk-live-secret' https://example.test"
+        assert summary_of({"command": leak}) == ""
+        assert summary_of({"content": leak}) == ""
+        assert summary_of({"old_string": leak, "new_string": leak}) == ""
+        assert leak not in summary_of({"command": leak, "description": "call the API"})
+        assert (
+            request_from(
+                {**dialog(), "tool_input": {"command": leak}}, target=TARGET, approval_id="a-1"
+            ).detail
+            == ""
+        )
+
+    def test_a_detail_over_the_bound_is_passed_over_rather_than_cut(self) -> None:
+        """The other half of P5, and the reason it rejects instead of trimming.
+
+        This asserted the opposite until #75, on the argument that trimming is
+        Bridge Core's decision. It is not a trimming rule: a cut lands mid-secret
+        as readily as mid-word, so something over the bound is not the one-line
+        summary this reads for and is passed over whole. What the user hears then
+        is the tool's name, which is what the announcement already carries.
+        """
+        assert summary_of({"file_path": "/x" * 4000}) == ""
 
     def test_the_route_offers_no_menu_and_says_so(self) -> None:
         """`options` empty is the honest report: this route has allow and deny."""

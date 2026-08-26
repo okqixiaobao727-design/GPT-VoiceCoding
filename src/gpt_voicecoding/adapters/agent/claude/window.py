@@ -103,6 +103,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindowChanged,
     SessionEnded,
     SessionStopped,
+    WaitingFor,
 )
 from gpt_voicecoding.seams.identity import SessionTarget
 
@@ -174,9 +175,17 @@ class ReplyWindowWatcher:
         *,
         settings: ClaudeSettings,
         emit: Callable[[AgentEvent], None],
+        stopped_on: Callable[[SessionTarget], WaitingFor] | None = None,
     ) -> None:
         self._settings = settings
         self._emit = emit
+        #: What a Session that just stopped is stopped on (#75). Injected rather
+        #: than read here: this class watches the registry, and what a stop is
+        #: *about* lives in the Session's own transcript and in the dialogs
+        #: parked on the approval socket — neither of which is a registry fact.
+        #: `None` leaves `SessionStopped.waiting_for` at its default, which is
+        #: how the window tests keep watching windows.
+        self._stopped_on = stopped_on
         #: The last level reported for each target, so only transitions are sent.
         self._reported: dict[SessionTarget, ReplyWindow] = {}
         #: Targets whose current turn has been observed in progress. Kept across
@@ -284,7 +293,25 @@ class ReplyWindowWatcher:
                 self._reported[target] = window
                 self._emit(ReplyWindowChanged(target=target, window=window))
             if was_active and live_record is not None and live_record.status == STATUS_MEANING_OPEN:
-                self._emit(SessionStopped(target=target))
+                self._emit(SessionStopped(target=target, waiting_for=self._what_for(target)))
+
+    def _what_for(self, target: SessionTarget) -> WaitingFor:
+        """What this Session stopped on, asked of the reader that can tell.
+
+        **A reader that raises must not cost the notice.** The Stop is a
+        registry fact and is already proven at this point; failing to say what it
+        is about is a poorer notice, while dropping the event would be silence
+        about a Session that needs the user. So a raise here is logged and
+        answered with the empty `WaitingFor`, which renders as the notice
+        `core/bridge.py` produced before this field existed.
+        """
+        if self._stopped_on is None:
+            return WaitingFor()
+        try:
+            return self._stopped_on(target)
+        except Exception:  # noqa: BLE001 - a poorer notice beats no notice
+            _log.exception("could not read what %s stopped on; announcing it without", target)
+            return WaitingFor()
 
     def _observe(self, target: SessionTarget) -> tuple[SessionRecord | None, bool]:
         """The sweep's only evidence: one registry read and one liveness probe.
