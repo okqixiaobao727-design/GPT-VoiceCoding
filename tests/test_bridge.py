@@ -23,7 +23,6 @@ from gpt_voicecoding.core.bridge import (
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.router import Classification
-from gpt_voicecoding.core.sessions import SessionState
 from gpt_voicecoding.core.switches import SwitchName
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -32,7 +31,9 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionLifecycle,
     SessionStopped,
+    WaitingFor,
 )
 from gpt_voicecoding.seams.call import CallDropped, CallStarted, CallState, UserSpeech
 from gpt_voicecoding.seams.companion_channel import InboundText
@@ -172,7 +173,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.emit(SessionEnded(target=CODEX))
 
         assert hub.state.relays.pending() == ()
-        assert hub.state.sessions.all()[0].state is SessionState.ENDED
+        assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
 
 
 class TestTheInboundRouterEndToEnd:
@@ -478,8 +479,8 @@ class TestEventsThatDecideNothing:
         hub = Hub(voice=False)
 
         hub.emit(
-            SessionStopped(target=CODEX, detail="first"),
-            SessionStopped(target=CODEX, detail="second"),
+            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="first", detail="first")),
+            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="second", detail="second")),
         )
 
         assert [sent.endswith("first") for sent in hub.channel.sent] == [True, False]

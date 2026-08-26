@@ -80,7 +80,7 @@ class Surface:
         onto one.
         """
         return self.state.sessions.register(
-            Session(target=target, label=LABEL, workspace=WORKSPACE, registered_at=0.0)
+            Session(target=target, label=LABEL, workspace=WORKSPACE, first_seen=0.0)
         )
 
     def open_window(self) -> None:
@@ -146,7 +146,11 @@ class TestStatus:
         assert data["call_id"] is None
         assert data["sessions"][0]["target"] == CODEX_ADDRESS
         assert data["sessions"][0]["label"] == str(LABEL)
-        assert data["sessions"][0]["state"] == "live"
+        # Two facts, two fields: whether the Session is still there, and what
+        # it is doing. They used to be one enum, which is how a busy Session and
+        # a finished one read alike.
+        assert data["sessions"][0]["lifecycle"] == "live"
+        assert data["sessions"][0]["state"] == "running"
         assert data["pending_relays"] == []
         assert data["pending_approvals"] == []
 

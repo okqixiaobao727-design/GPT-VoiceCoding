@@ -25,8 +25,10 @@ from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContex
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
+    LaneDiscovery,
     RelayRoute,
     ReplyWindow,
+    SessionInspection,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
@@ -83,6 +85,12 @@ class FakeAgent:
         #: Every target the hub asked about, in order, so a test can prove the
         #: level was pulled at all rather than infer it from the result.
         self.asked_windows: list[SessionTarget] = []
+        #: What this fake answers `discover` with. Empty and enumerated by
+        #: default: a lane that really sees no Sessions, which is not the same
+        #: as one that could not look.
+        self.discovery = LaneDiscovery()
+        #: How many times the hub asked. A cadence is a thing a test asserts on.
+        self.discoveries = 0
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         return self._routes
@@ -130,6 +138,18 @@ class FakeAgent:
         """
         self.asked_windows.append(target)
         return self.windows.get(target, ReplyWindow.CLOSED)
+
+    async def discover(self) -> LaneDiscovery:
+        """Whatever a test told this fake to see."""
+        self.discoveries += 1
+        return self.discovery
+
+    async def inspect(self, target: SessionTarget) -> SessionInspection:
+        """The row this fake already holds for that target, or a bare live one."""
+        for row in self.discovery.rows:
+            if row.target == target:
+                return row
+        return SessionInspection(target=target, workspace=Path("/nowhere"))
 
     async def verify(self) -> VerifyResult:
         return self.verify_result

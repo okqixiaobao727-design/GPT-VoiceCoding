@@ -29,7 +29,13 @@ from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.verification import SeamVerification
-from gpt_voicecoding.seams.agent import ApprovalVerdict, RelayRoute
+from gpt_voicecoding.seams.agent import (
+    ApprovalVerdict,
+    ChildClassification,
+    Progress,
+    RelayRoute,
+    WaitingFor,
+)
 from gpt_voicecoding.seams.call import CallSnapshot
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
@@ -77,10 +83,15 @@ def read_target(payload: Mapping[str, Any], key: str = "target") -> SessionTarge
     pid = raw.get("pid")
     if pid is not None and not isinstance(pid, int):
         raise InvalidPayload("a pid is a whole number, or absent")
+    raw_id = raw.get("session_id")
+    if raw_id is not None and not isinstance(raw_id, str):
+        raise InvalidPayload("a session id is text, or absent on a Session not named yet")
+    # A `codex` Session has no session id until its first turn (#73), so absent
+    # is a state and not a malformed payload. `SessionTarget` refuses the
+    # combinations that name nothing.
+    session_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else None
     try:
-        return SessionTarget(
-            agent=read_agent(raw, "agent"), session_id=read_text(raw, "session_id"), pid=pid
-        )
+        return SessionTarget(agent=read_agent(raw, "agent"), session_id=session_id, pid=pid)
     except ValueError as refusal:
         raise InvalidPayload(str(refusal)) from None
 
@@ -125,14 +136,66 @@ def target_document(target: SessionTarget) -> dict[str, Any]:
 
 
 def session_document(session: Session) -> dict[str, Any]:
-    """One Session as a surface renders it: spoken by label, addressed by target."""
+    """One Session as a surface renders it: spoken by name, addressed by target.
+
+    Every field of the roster row travels, because a surface that had to ask a
+    second question to render one line would be a second reader of the same
+    Session — which is the thing `SessionInspection` exists to prevent. The
+    rendering of these fields is each surface's own; the facts are not.
+    """
     return {
         "target": target_document(session.target),
-        "label": str(session.label),
+        "label": str(session.label) if session.label is not None else None,
+        "name": session.name,
         "workspace": str(session.workspace),
-        "registered_at": session.registered_at,
+        "first_seen": session.first_seen,
+        "lifecycle": str(session.lifecycle),
         "state": str(session.state),
+        "waiting_for": waiting_for_document(session.waiting_for),
+        "progress": progress_document(session.progress),
+        "last_activity": (
+            session.last_activity.isoformat() if session.last_activity is not None else None
+        ),
+        "child": child_document(session.child),
+        # Derived on the row and rendered here, so no surface re-derives it and
+        # no two surfaces can disagree about the same Session.
         "reply_window": str(session.reply_window),
+    }
+
+
+def waiting_for_document(waiting_for: WaitingFor) -> dict[str, Any]:
+    """What a Session stopped on, as structure rather than as a rendered sentence."""
+    return {
+        "kind": str(waiting_for.kind),
+        "caught_up": waiting_for.caught_up,
+        "prompt": waiting_for.prompt,
+        "options": [
+            {"text": option.text, "recommended": option.recommended}
+            for option in waiting_for.options
+        ],
+        "recommendation": waiting_for.recommendation,
+        "tool_name": waiting_for.tool_name,
+        "detail": waiting_for.detail,
+        "approval_id": waiting_for.approval_id,
+    }
+
+
+def progress_document(progress: Progress | None) -> dict[str, Any] | None:
+    """How far along a Session is. `None` is "not read", not "read and empty"."""
+    if progress is None:
+        return None
+    return {
+        "recent": list(progress.recent),
+        "truncated": progress.truncated,
+        "read_at": progress.read_at.isoformat() if progress.read_at is not None else None,
+    }
+
+
+def child_document(child: ChildClassification) -> dict[str, Any]:
+    """Whether this row is the user's Session or something one of them spawned."""
+    return {
+        "kind": str(child.kind),
+        "parent": target_document(child.parent) if child.parent is not None else None,
     }
 
 

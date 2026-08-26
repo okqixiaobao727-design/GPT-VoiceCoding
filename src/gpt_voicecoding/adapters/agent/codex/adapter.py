@@ -69,6 +69,8 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindowChanged,
     SessionEnded,
     SessionStopped,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -640,7 +642,11 @@ class CodexAgentAdapter:
             self._emit(
                 SessionStopped(
                     target=watched.target,
-                    detail="that session stopped with an error" if kind == "systemError" else "",
+                    waiting_for=(
+                        WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+                        if kind == "systemError"
+                        else WaitingFor()
+                    ),
                 )
             )
 

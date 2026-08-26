@@ -58,6 +58,25 @@ class StaleSessionError(SessionError):
         self.live_pids = live_pids
 
 
+class ChildSessionError(SessionError):
+    """That identity names a Child Process. It is seen, never spoken to (#68).
+
+    A refusal rather than a silent skip, and structural rather than a rule the
+    Relay pipeline remembers: a crew's reviewer answering a question meant for
+    the Session that spawned it is the user's own words landing under somebody
+    else's authority.
+    """
+
+    def __init__(self, target: SessionTarget, parent: SessionTarget | None = None) -> None:
+        whose = f" spawned by {parent}" if parent is not None else ""
+        super().__init__(
+            f"{target} is a Child Process{whose}: it appears in the roster and is never "
+            "Relayed into"
+        )
+        self.target = target
+        self.parent = parent
+
+
 class DuplicateSessionError(SessionError):
     """That identity is already registered. Registering it again would split truth."""
 

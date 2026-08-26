@@ -98,25 +98,39 @@ def _state(word: str) -> bool:
 
 
 def parse_address(address: str) -> dict[str, object]:
-    """`agent:session_id[:pid]` — the exact identity, written on one line."""
+    """`agent:session_id[:pid]` — the exact identity, written on one line.
+
+    **The session id half may be empty, and only when a pid follows it.** A
+    `codex` Session writes the rollout that names it at its first *turn* (#73,
+    measured), so a Session that exists and has not been spoken to is addressed
+    as `codex::6548` — the process is the only thing either side can agree on
+    yet. An empty id with no pid names nothing and is still refused.
+    """
     parts = address.split(ADDRESS_SEPARATOR)
-    if len(parts) not in (2, 3) or not all(part.strip() for part in parts):
+    agent, session_id, *rest = parts if len(parts) in (2, 3) else ("", "", "")
+    if not agent.strip() or not (session_id.strip() or rest):
         raise CommandError(
             f"name the Session as <agent>{ADDRESS_SEPARATOR}<session id>"
             f"[{ADDRESS_SEPARATOR}<pid>]; {address!r} is not that"
         )
-    agent, session_id, *rest = parts
+    named = session_id.strip() or None
     if not rest:
-        return {"agent": agent, "session_id": session_id, "pid": None}
+        return {"agent": agent, "session_id": named, "pid": None}
     if not rest[0].isdigit():
         raise CommandError(f"not a process id: {rest[0]!r}")
-    return {"agent": agent, "session_id": session_id, "pid": int(rest[0])}
+    return {"agent": agent, "session_id": named, "pid": int(rest[0])}
 
 
 def format_address(target: dict[str, object]) -> str:
+    """The address a surface reads off a roster row and hands straight back.
+
+    An unnamed Session writes its id half as nothing at all rather than as the
+    word `None`: `parse_address` reads the empty half back as "not named yet",
+    while `None` would read back as a session id spelled `None`.
+    """
     pid = target.get("pid")
     tail = f"{ADDRESS_SEPARATOR}{pid}" if pid else ""
-    return f"{target['agent']}{ADDRESS_SEPARATOR}{target['session_id']}{tail}"
+    return f"{target['agent']}{ADDRESS_SEPARATOR}{target['session_id'] or ''}{tail}"
 
 
 def render(reply: Reply) -> str:
@@ -170,7 +184,8 @@ def _roster_lines(sessions: object) -> list[str]:
     if not sessions:
         return ["sessions: none"]
     return ["sessions:"] + [
-        f"  {session['label']} — {format_address(session['target'])} — {session['workspace']} "
+        f"  {session['label'] or session['name'] or '(unnamed)'} — "
+        f"{format_address(session['target'])} — {session['workspace']} "
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions
     ]

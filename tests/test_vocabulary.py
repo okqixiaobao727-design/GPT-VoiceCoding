@@ -76,8 +76,9 @@ class TestSessionTarget:
         assert forked != original
 
     def test_an_empty_session_id_is_refused(self) -> None:
+        """Empty is not the same as absent: it is a name nobody wrote."""
         with pytest.raises(ValueError):
-            SessionTarget(agent=AgentKind.CODEX, session_id="")
+            SessionTarget(agent=AgentKind.CODEX, session_id="", pid=101)
 
     def test_a_nonsense_pid_is_refused(self) -> None:
         with pytest.raises(ValueError):
@@ -85,6 +86,25 @@ class TestSessionTarget:
 
     def test_a_target_is_hashable_so_it_can_key_the_registry(self) -> None:
         assert {SessionTarget(agent=AgentKind.CODEX, session_id="abc")}
+
+    def test_a_codex_session_before_its_first_turn_has_no_session_id(self) -> None:
+        """Measured 2026-08-26 (#73): `codex` writes the rollout that names it
+        when the first *turn* starts, so a fresh TUI is nameable only by pid."""
+        target = SessionTarget(agent=AgentKind.CODEX, pid=6548)
+        assert target.session_id is None
+        assert not target.named
+
+    def test_a_target_with_a_session_id_is_named(self) -> None:
+        assert SessionTarget(agent=AgentKind.CODEX, session_id="abc").named
+
+    def test_a_target_that_names_nothing_at_all_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            SessionTarget(agent=AgentKind.CODEX)
+
+    def test_a_claude_target_always_carries_a_session_id(self) -> None:
+        """The official roster always gives one, so an anonymous Claude row is a bug."""
+        with pytest.raises(ValueError):
+            SessionTarget(agent=AgentKind.CLAUDE, pid=3538)
 
 
 class TestDelivery:

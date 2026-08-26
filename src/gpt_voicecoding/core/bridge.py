@@ -65,7 +65,10 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionState,
     SessionStopped,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.call import (
     CallAdapter,
@@ -92,15 +95,71 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def stop_notice_for(session: Session | None, target: SessionTarget, detail: str = "") -> str:
+def name_for(session: Session | None, target: SessionTarget) -> str:
+    """What to call one Session out loud, best name first.
+
+    The Session Label if the user has one for it, else the agent's own Session
+    Name, else the address — because a notice that names nothing is a notice the
+    user cannot answer. #78 stabilises the middle one.
+    """
+    if session is not None and session.label is not None:
+        return str(session.label)
+    if session is not None and session.name:
+        return session.name
+    return f"{target.agent} {target.session_id or f'pid {target.pid}'}"
+
+
+def stop_notice_for(
+    session: Session | None, target: SessionTarget, waiting_for: WaitingFor | None = None
+) -> str:
     """The words a stopped Session is announced with.
 
-    Names the Session the way the user named it, because a Session Label is what
-    they will say back when they answer.
+    Names the Session the way the user names it, because that is what they will
+    say back when they answer, and carries **what it stopped on** — the question
+    with its options and any recommendation, or the tool awaiting permission.
+    Rendering happens here rather than in the adapter because the words are
+    Bridge Core's policy; the adapter's job was to keep the structure.
     """
-    named = str(session.label) if session is not None else f"{target.agent} {target.session_id}"
-    tail = f" — {detail}" if detail.strip() else ""
-    return f"{named} stopped and may need you{tail}"
+    stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
+    tail = f" — {stopped_on}" if stopped_on else ""
+    return f"{name_for(session, target)} stopped and may need you{tail}"
+
+
+def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
+    """The Session state a Reply Window report implies, given what we already hold.
+
+    An open window is a Session that will take the next turn, which is `IDLE`.
+    A closed one has two causes and the report cannot tell them apart — mid-turn,
+    or holding a dialog — so a Session already known to be `WAITING` keeps that,
+    and anything else becomes `RUNNING`. Guessing the other way would erase a
+    permission dialog from the roster while it is still on the user's screen.
+    """
+    if window is ReplyWindow.OPEN:
+        return SessionState.IDLE
+    return held if held is SessionState.WAITING else SessionState.RUNNING
+
+
+def _stopped_on(waiting_for: WaitingFor) -> str:
+    """One line describing what a Session is waiting for, or nothing to add."""
+    match waiting_for.kind:
+        case WaitingKind.QUESTION:
+            parts = [waiting_for.prompt or "it asked you something"]
+            if waiting_for.options:
+                parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
+            if waiting_for.recommendation:
+                parts.append(f"it recommends {waiting_for.recommendation}")
+            return "; ".join(parts)
+        case WaitingKind.PERMISSION:
+            named = waiting_for.tool_name or "a tool"
+            return f"{named} needs your permission" + (
+                f": {waiting_for.detail}" if waiting_for.detail else ""
+            )
+        case WaitingKind.UNKNOWN:
+            # The honest answer while the record has not flushed (#73): say that
+            # rather than invent a reason the Session never gave.
+            return "it has not said what it is waiting for yet"
+        case _:
+            return waiting_for.detail or ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,7 +438,7 @@ class BridgeCore:
             Notice(
                 request_id=new_request_id(),
                 target=event.target,
-                text=stop_notice_for(session, event.target, event.detail),
+                text=stop_notice_for(session, event.target, event.waiting_for),
             )
         )
 
@@ -393,12 +452,19 @@ class BridgeCore:
             await self._announce(outcome.target, outcome.report)
 
     async def _reply_window_changed(self, event: ReplyWindowChanged) -> None:
+        """An adapter saw the window move between two discoveries. Land it on the state.
+
+        The window is derived, so there is nothing here to set directly: this
+        event is a coarser reading of the same fact and it lands on the field
+        the fine-grained one lands on. The next discovery overwrites both, which
+        is what makes this a shortcut rather than a second source of truth.
+        """
         try:
-            self._state.sessions.set_reply_window(event.target, event.window)
+            held = self._state.sessions.resolve(event.target)
+            self._state.sessions.set_state(event.target, _state_behind(event.window, held.state))
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
-        self._state.persist()
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
 

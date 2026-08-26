@@ -29,13 +29,33 @@ policy. Route choice follows the user's explicit intent and is never inferred
 from Session status: the same "busy" carries both "add this now" and "this can
 wait".
 
+**There is one Session-inspection result type, and it is `SessionInspection`.**
+Everything this system knows about one running Session — what it is doing, what
+it stopped on, how far along it is, whose child it is — arrives as that one
+value, from that one verb. A consumer that needs a fact the type does not carry
+**widens the type and both lane projections**; it never grows a sibling reader,
+a second seam, or its own parsing of an agent's files. That is the architecture
+gate #74 exists to close: the reference implementation had four readers of the
+same transcript answering slightly different questions, and no two of them
+agreed about a Session that was mid-write.
+
+**No Reach and no Provenance.** An earlier draft graded every row by how the
+bridge could reach it and where the row came from. #68 removed that vocabulary
+and this seam does not carry it: *every* listed Session is one the bridge talks
+to, and a route that cannot be walked surfaces where it fails — as a
+`DeliveryReceipt` that is not `DELIVERED` and carries the reason why
+(`seams/delivery.py`). A lane that cannot enumerate *at all* is a different
+fact, about the lane and not about any row, and it rides on `LaneDiscovery`.
+
 Adapters: Codex and Claude.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
@@ -71,6 +91,251 @@ class ApprovalVerdict(StrEnum):
     ASK = "ask"
 
 
+# ----------------------------------------------------------------------
+# The one Session-inspection result type, and the vocabulary it is made of.
+# ----------------------------------------------------------------------
+
+
+class SessionLifecycle(StrEnum):
+    """Whether this Session is still there at all."""
+
+    LIVE = "live"
+    ENDED = "ended"
+
+
+class SessionState(StrEnum):
+    """What a live Session is doing right now, in the agent's own terms.
+
+    Read straight off the official Claude roster, which moves `idle → busy →
+    waiting → idle` across one turn (#73, measured on 2.1.246) — `busy` is
+    spelled `running` here because that is the word the product's surfaces use.
+    Deliberately *not* a Reply Window: this says what the Session is doing, and
+    `derive_reply_window` says what follows from it.
+    """
+
+    RUNNING = "running"
+    IDLE = "idle"
+    WAITING = "waiting"
+
+
+class WaitingKind(StrEnum):
+    """What a Session that stopped is waiting for."""
+
+    #: Not waiting on the user at all.
+    NONE = "none"
+    #: A question with options, asked of the user.
+    QUESTION = "question"
+    #: A permission dialog. The Approval Relay's business.
+    PERMISSION = "permission"
+    #: Something is being waited on and we cannot yet say what. Only honest
+    #: alongside `caught_up=False`; see `WaitingFor`.
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class Option:
+    """One answer a Session offered — the ready-made voice menu, one line of it."""
+
+    text: str
+    #: Whether the Session marked this one as its own recommendation. Carried
+    #: rather than acted on: the recommendation is the agent's, and the choice
+    #: is the user's.
+    recommended: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.text.strip():
+            raise ValueError("an option the user could choose must have words")
+
+
+@dataclass(frozen=True, slots=True)
+class WaitingFor:
+    """What one Session stopped on, or the honest admission that we cannot tell yet.
+
+    **`kind=UNKNOWN` with `caught_up=False` is the one that matters.** It means
+    the agent's own record has not flushed the awaited entry — a fresh Session
+    has no transcript file at all until it takes a turn (#73) — so the answer is
+    *ask again*, never guess. Knowing what a Session is waiting for and not
+    having caught up with its record are mutually exclusive, so the pair is
+    enforced here rather than remembered: if the kind is known, the reader had
+    to have read the record that says so.
+    """
+
+    kind: WaitingKind = WaitingKind.NONE
+    #: Whether the reader has seen everything the Session has written so far.
+    caught_up: bool = True
+    #: The question as the Session asked it.
+    prompt: str | None = None
+    options: tuple[Option, ...] = ()
+    #: The Session's own recommendation among its options, when it made one.
+    recommendation: str | None = None
+    #: The tool a permission dialog is about.
+    tool_name: str | None = None
+    #: One line summarising the call, for speech.
+    detail: str | None = None
+    #: The adapter's handle for the pending dialog, when it has one. Absent on a
+    #: permission observed from a roster alone: the official roster says a
+    #: Session is `waiting` without naming the dialog, and the handle arrives
+    #: with the hook that holds it open.
+    approval_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.caught_up and self.kind is not WaitingKind.UNKNOWN:
+            raise ValueError(
+                f"a reader that has not caught up with the Session's record cannot also "
+                f"know it is waiting on a {self.kind}; that pair is a guess wearing a fact's "
+                "clothes"
+            )
+
+    @property
+    def needs_the_user(self) -> bool:
+        """Whether this is something only the user can answer."""
+        return self.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
+
+    def as_approval_request(self, target: SessionTarget) -> ApprovalRequest | None:
+        """The pending permission as the Approval Relay addresses it, if it is one.
+
+        `None` covers both "not a permission" and "a permission nobody has
+        handed us a handle for yet" — an Approval Relay has nothing to answer
+        into in either case, and saying so here is what keeps every consumer
+        from inventing its own half of the check.
+        """
+        if self.kind is not WaitingKind.PERMISSION or not self.approval_id:
+            return None
+        return ApprovalRequest(
+            approval_id=self.approval_id,
+            target=target,
+            tool_name=self.tool_name or "",
+            detail=self.detail or "",
+            options=tuple(option.text for option in self.options),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Progress:
+    """How far along a Session is, in its own words, as of one reading.
+
+    `read_at` is on the value rather than inferred by the reader, because a
+    progress line's whole meaning is when it was true. `truncated` says the
+    reader stopped early rather than that the Session said this much: a surface
+    that renders "3 steps" when there were thirty is worse than one that says so.
+    """
+
+    recent: tuple[str, ...] = ()
+    truncated: bool = False
+    read_at: datetime | None = None
+
+
+class ChildKind(StrEnum):
+    """Whether this Session is the user's, or something a Session of theirs spawned."""
+
+    MAIN = "main"
+    CHILD = "child"
+
+
+@dataclass(frozen=True, slots=True)
+class ChildClassification:
+    """Seen, not spoken to. A Child Process is listed and never Relayed into (#68).
+
+    The parent is carried when it can be established and is `None` when it
+    cannot — a child whose parent we failed to identify is still a child, and
+    demoting it to `main` over a missing link would open exactly the Relay the
+    classification exists to close.
+    """
+
+    kind: ChildKind = ChildKind.MAIN
+    parent: SessionTarget | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is ChildKind.MAIN and self.parent is not None:
+            raise ValueError("a main Session is nobody's child, so it names no parent")
+
+    @property
+    def is_main(self) -> bool:
+        return self.kind is ChildKind.MAIN
+
+
+#: The ordinary case, named once so no reader spells it out.
+MAIN_SESSION = ChildClassification()
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInspection:
+    """Everything this system knows about one Session, as one lane observed it.
+
+    `target` is the **exact** identity, Claude's pid included
+    (`seams/identity.py`): a resumed Session forks two processes under one
+    session id and they are two rows, not one row that moved.
+    """
+
+    target: SessionTarget
+    #: Where the Session is running. Compared by realpath wherever it is
+    #: joined against anything: the official roster reports a resolved cwd (#73).
+    workspace: Path
+    lifecycle: SessionLifecycle = SessionLifecycle.LIVE
+    state: SessionState = SessionState.RUNNING
+    waiting_for: WaitingFor = field(default_factory=WaitingFor)
+    #: `None` means "not read", which is not the same as "read and empty".
+    progress: Progress | None = None
+    #: Separate from `progress` on purpose: a Session can have moved without
+    #: having said anything a reader would show, and #76 consumes both.
+    last_activity: datetime | None = None
+    child: ChildClassification = MAIN_SESSION
+    #: The agent's own name for this Session, when it has one. #78 stabilises it.
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LaneDiscovery:
+    """One lane's answer to "what Sessions are there?" — its rows, or why it has none.
+
+    **The error is about the lane, never about a row.** A lane that cannot
+    enumerate says so here, and Bridge Core leaves that lane's rows alone rather
+    than reading an unreachable lane as an empty machine. The other lane's rows
+    are unaffected, because two agents failing independently is the ordinary
+    case and one of them being down is not news about the other.
+    """
+
+    rows: tuple[SessionInspection, ...] = ()
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None and not self.error.strip():
+            raise ValueError("a lane that failed to enumerate must say what stopped it")
+
+    @property
+    def enumerated(self) -> bool:
+        """Whether these rows are the whole truth about this lane right now."""
+        return self.error is None
+
+
+def derive_reply_window(state: SessionState, child: ChildClassification) -> ReplyWindow:
+    """Whether a Session will act on the next Relay as its next turn.
+
+    **Derived, never stored.** A Reply Window is a statement about the Session's
+    current state, so keeping a copy of it is keeping a second answer that can
+    disagree with the first — the reference implementation ran two live ledgers
+    and rendered both.
+
+    Two conditions, and each closes a different hole:
+
+    - **`IDLE` only.** `RUNNING` is mid-turn. `WAITING` is a dialog on screen,
+      and `AwaitingApproval` already locks what that means: it blocks every
+      other Relay until answered. #74's brief said `{idle, waiting}`; that was
+      written when `waiting` was assumed to include a Session waiting on a
+      *question*, and whether such a Session consumes an inbox message as its
+      answer has never been measured. This seam does not guess, and the cost of
+      being wrong is asymmetric: a Relay held against a closed window is
+      delivered the moment it opens, while one delivered into a dialog is the
+      user's own words landing somewhere they did not aim them. If #75 or #77
+      measures that a question *does* consume it, this gains a condition — it
+      does not change shape.
+    - **Main Sessions only.** A Child Process is seen, not spoken to (#68).
+    """
+    if not child.is_main:
+        return ReplyWindow.CLOSED
+    return ReplyWindow.OPEN if state is SessionState.IDLE else ReplyWindow.CLOSED
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     """A Session's pending permission request, as the adapter observed it.
@@ -95,10 +360,17 @@ class ApprovalRequest:
 
 @dataclass(frozen=True, slots=True)
 class SessionStopped(Event):
-    """A Session stopped and may need the user. Feeds the Stop Notice pipeline."""
+    """A Session stopped and may need the user. Feeds the Stop Notice pipeline.
+
+    **What it stopped on is a `WaitingFor`, not free text.** The reference
+    implementation carried a rendered sentence here, so every consumer that
+    wanted the question's options — the voice menu, the Companion Channel's
+    buttons — had to parse prose the adapter had already thrown structure away
+    to produce. The structure travels; rendering is the surface's job.
+    """
 
     target: SessionTarget
-    detail: str = ""
+    waiting_for: WaitingFor = field(default_factory=WaitingFor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +414,36 @@ class AgentAdapter(Protocol):
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Which routes this adapter really has. Static, and honest about gaps."""
+        ...
+
+    async def discover(self) -> LaneDiscovery:
+        """Every Session this lane can see right now, or why it can see none.
+
+        **Async, alone with `inspect` among this seam's readers**, because both
+        do real I/O — a subprocess for Claude's official roster, a daemon round
+        trip and a filesystem walk for Codex — and a blocking call here would
+        stall the dispatch loop for as long as the far side takes to answer.
+
+        Called on a cadence rather than subscribed to: neither agent offers a
+        "a Session appeared" event, and the two that come close (Claude's
+        `SessionStart` hook, Codex's daemon notifications) each cover a strict
+        subset of the Sessions the user starts. Polling one source that sees all
+        of them beats stitching two that each see some.
+
+        **It never raises to say a lane is down.** An adapter that cannot
+        enumerate returns `LaneDiscovery(error=...)`, because "this lane is
+        unavailable" is an answer the roster can show and an exception is not.
+        """
+        ...
+
+    async def inspect(self, target: SessionTarget) -> SessionInspection:
+        """Everything this lane knows about one Session, freshly read.
+
+        The same value `discover` yields per row, for the one Session a caller
+        already holds — used when a fact has to be re-read now rather than at
+        the next tick, which is what `WaitingFor(kind=UNKNOWN, caught_up=False)`
+        asks its reader to do.
+        """
         ...
 
     def reply_window(self, target: SessionTarget) -> ReplyWindow:
