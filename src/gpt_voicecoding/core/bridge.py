@@ -159,9 +159,16 @@ def _stopped_on(waiting_for: WaitingFor) -> str:
             return "; ".join(parts)
         case WaitingKind.PERMISSION:
             named = waiting_for.tool_name or "a tool"
-            return f"{named} needs your permission" + (
+            asked = f"{named} needs your permission" + (
                 f": {waiting_for.detail}" if waiting_for.detail else ""
             )
+            if waiting_for.approval_id:
+                return asked
+            # No handle means no Approval Relay: the roster saw `waiting` and
+            # nothing is parked on the approval socket to answer into. Saying so
+            # is the whole difference between a notice the user can act on and
+            # one they try to answer from their phone and cannot.
+            return f"{asked} — answer it in the terminal; it cannot be answered from here"
         case WaitingKind.UNKNOWN:
             # The honest answer while the record has not flushed (#73): say that
             # rather than invent a reason the Session never gave.
@@ -569,6 +576,27 @@ class BridgeCore:
             event.waiting_for.kind,
             f" ({event.waiting_for.tool_name})" if event.waiting_for.tool_name else "",
         )
+        held = event.waiting_for.as_approval_request(event.target)
+        if held is not None:
+            # One dialog, two events, one announcement. A Session entering
+            # `waiting` raises this Stop, and the same dialog reached
+            # `AwaitingApproval` through the hook that is holding it open — so
+            # announcing both would ask the user twice for one decision. The
+            # approval notice wins wherever it exists: it is the one carrying a
+            # budget, a never-deny fallback and a closing notice, so it is the
+            # one that can actually be answered, and `approvals.opened` already
+            # asks for `Reach.EVERY_OUTLET`, which is the wider reach of the two.
+            #
+            # Said out loud rather than dropped: a Stop that produced no notice
+            # is otherwise indistinguishable in the log from a Stop that failed
+            # to reach every outlet.
+            _log.info(
+                "the Stop on %s is the dialog %s, which the Approval Relay announces; "
+                "not announced twice",
+                event.target,
+                held.approval_id,
+            )
+            return
         await self.escalation.escalate(
             Notice(
                 request_id=new_request_id(),
@@ -660,10 +688,35 @@ class BridgeCore:
         ADR 0002 is absolute, and the Companion Channel is one of the surfaces it
         names. Gating this would gate the one way to flip Duty back on from away
         from the computer, using the switch that is off.
+
+        **One attempt, graded, and never sent again** (P15, #61 C2). The
+        reference implementation settled every outbound attempt to `sent`,
+        `failed`, `indeterminate` or `suppressed` and refused to resend an
+        indeterminate one, because a duplicate notification costs the user more
+        than a missing one (`legacy@1d32845:bridge/channel.py:11-13,75-86`;
+        `legacy@1d32845:bridge/daemon.py:830-879`). That rule is **ported**. Its
+        storage is **simplified**: legacy wrote the grade to a durable ledger
+        (`legacy@1d32845:bridge/store.py:1517-1614`) and this is a direct answer
+        to text the user just sent, so the grade is said here and forgotten. It
+        is deliberately not retained on the escalation ledger either — a reply is
+        not a notice, and retaining it would replay an answer to a question the
+        user asked minutes ago the next time an outlet came up.
+
+        **The words never enter the diagnostic.** The reply carries whatever the
+        user's own business is; the log carries the grade and the adapter's
+        reason, and the Telegram adapter already guarantees its token appears in
+        no error message (`telegram/api.py`).
         """
         if not text:
             return
-        await self._channel.send(text, request_id=new_request_id())
+        receipt = await self._channel.send(text, request_id=new_request_id())
+        if receipt.is_delivered:
+            return
+        _log.warning(
+            "the reply to the user was not delivered (%s: %s); it is not sent again",
+            receipt.outcome,
+            receipt.reason,
+        )
 
     def _known(self, target: SessionTarget) -> Session | None:
         try:

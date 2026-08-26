@@ -402,7 +402,7 @@ class TestTheStopNotice:
         watcher = ReplyWindowWatcher(
             settings=ClaudeSettings(),
             emit=raised.append,
-            stopped_on=lambda target: WaitingFor(
+            stopped_on=lambda target, roster=None: WaitingFor(
                 kind=WaitingKind.PERMISSION, tool_name="Bash", detail="push the branch"
             ),
         )
@@ -413,7 +413,7 @@ class TestTheStopNotice:
         from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
         from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 
-        def raising(target: SessionTarget) -> WaitingFor:
+        def raising(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
             raise RuntimeError("the transcript reader is broken")
 
         watcher = ReplyWindowWatcher(

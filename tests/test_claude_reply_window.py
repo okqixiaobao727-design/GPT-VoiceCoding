@@ -41,6 +41,8 @@ from gpt_voicecoding.seams.agent import (
     SessionEnded,
     SessionLifecycle,
     SessionStopped,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
@@ -226,7 +228,9 @@ class TestWhatGetsReported:
         watcher.poll_once()
 
         assert sink.windows == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
-        assert [event.target for event in sink.stops] == [TARGET]
+        # Two Stops, and they are two facts: the turn reached `idle`, and a
+        # dialog then went up (#77). The second is the one a question rides.
+        assert [event.target for event in sink.stops] == [TARGET, TARGET]
         assert sink.deaths == []
 
     def test_watching_the_same_session_twice_holds_it_once(self, tmp_path: Path) -> None:
@@ -314,6 +318,174 @@ class TestReportingStops:
 
         assert [event.target for event in sink.stops] == [TARGET]
         assert sink.deaths == []
+
+
+class TestReportingAStopTheMomentADialogGoesUp:
+    """A Session entering `waiting` has stopped on the user, and says so (#77).
+
+    Found by #75's worker and fenced into this ticket. `STATUSES_MEANING_TURN_
+    ACTIVE` counts `waiting` as part of the turn, which is right for the Reply
+    Window — a dialog takes no Relay — and wrong for the Stop Notice: a Session
+    that raised a question or a permission is stopped on the *user*, which is
+    the whole thing a Stop Notice exists to say. Before this, the only Stop it
+    raised came after the user had answered, by which time the transcript
+    carries the `tool_result` and `analyse` correctly says NONE — so the notice
+    that finally fired said nothing about what it had stopped on.
+
+    The permission half already reached the user by the hook route
+    (`approval.py` → `AwaitingApproval`). **The question half had no
+    announcement route at all**, and `CONTEXT.md` names "the question with its
+    options" as Stop Notice content. Which of the two announces when both fire
+    is Bridge Core's policy, not this watcher's (`core/bridge.py`).
+    """
+
+    def test_a_dialog_going_up_is_reported_stopped(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_it_is_reported_once_however_long_the_dialog_stands(self, tmp_path: Path) -> None:
+        """A dialog waits for a human. Every sweep must not be another notice."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+        watcher.poll_once()
+        watcher.poll_once()
+
+        assert len(sink.stops) == 1
+
+    def test_a_record_that_could_not_be_read_is_not_a_second_dialog(self, tmp_path: Path) -> None:
+        """Absence is not evidence, here as everywhere else in this sweep."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+
+        (registry(tmp_path) / f"{LIVE_PID}.json").unlink()
+        watcher.poll_once()
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+
+        assert len(sink.stops) == 1
+
+    def test_a_second_dialog_in_the_same_turn_is_reported_again(self, tmp_path: Path) -> None:
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+        say(tmp_path, "busy")
+        watcher.poll_once()
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+
+        assert len(sink.stops) == 2
+
+    def test_answering_the_dialog_still_reports_the_turn_stopping(self, tmp_path: Path) -> None:
+        """Two different facts: the dialog went up, and the turn later ended."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        assert len(sink.stops) == 2
+
+    def test_a_dialog_already_up_when_the_engine_arrives_is_reported(self, tmp_path: Path) -> None:
+        """Registration announces nothing (#27); the first sweep is where it lands."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "waiting")
+        watcher.watch(TARGET)
+
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_the_dialog_stop_asks_what_it_stopped_on_with_the_rosters_own_word(
+        self, tmp_path: Path
+    ) -> None:
+        """`waiting` and nothing readable is UNKNOWN, not NONE — the seam's rule."""
+        asked: list[WaitingFor | None] = []
+
+        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+            asked.append(roster)
+            return roster if roster is not None else WaitingFor()
+
+        sink = AllEvents()
+        watcher = ReplyWindowWatcher(
+            settings=ClaudeSettings(
+                registry_directory=registry(tmp_path), reply_window_poll_seconds=0.02
+            ),
+            emit=sink.emit,
+            stopped_on=stopped_on,
+        )
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting")
+        watcher.poll_once()
+
+        assert asked == [WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)]
+        assert sink.stops[0].waiting_for.kind is WaitingKind.UNKNOWN
+
+    def test_the_turn_stop_still_asks_with_nothing_assumed(self, tmp_path: Path) -> None:
+        """An idle Session is not waiting on anything the roster knows about."""
+        asked: list[WaitingFor | None] = []
+
+        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+            asked.append(roster)
+            return WaitingFor()
+
+        sink = AllEvents()
+        watcher = ReplyWindowWatcher(
+            settings=ClaudeSettings(
+                registry_directory=registry(tmp_path), reply_window_poll_seconds=0.02
+            ),
+            emit=sink.emit,
+            stopped_on=stopped_on,
+        )
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        # `None`, not an empty `WaitingFor`: the registry record for an idle
+        # Session says nothing about what it is waiting for, and "nothing to
+        # add" is the honest thing to hand a reader that can look properly.
+        assert asked == [None]
+
+    def test_a_dead_session_reports_its_death_and_no_dialog(self, tmp_path: Path) -> None:
+        """Death is terminal and reported first; nothing else is said in that sweep."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "waiting", pid=LIVE_PID, session_id="somebody-else")
+        watcher.poll_once()
+
+        assert sink.stops == []
+        assert len(sink.deaths) == 1
 
 
 class TestPolling:

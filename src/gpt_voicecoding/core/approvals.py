@@ -18,6 +18,14 @@ believing a decision is still wanted from them. A verdict that arrives after
 the loop was already closed is discarded and emits nothing: its closing notice
 already went out.
 
+**And it may only claim what the receipt proves** (P14, #61 R5). "Approved by
+voice" is a statement about the *Session*, so only a `DELIVERED` receipt earns
+it; every other grade says the verdict was not confirmed and points the user
+back at the on-screen dialog, which is still the thing that can resolve it. The
+reference implementation was honest here for free — it had no approval transport
+at all, so it never claimed a verdict had arrived — and carrying verdicts is
+what makes the claim possible and therefore the restraint necessary.
+
 Pending approvals are held here rather than in the undelivered Relay queue, on
 that queue's own instruction — an Approval Relay has a budget and a fallback, so
 it is answered or handed back; it never waits in the ledger.
@@ -46,8 +54,9 @@ def announcement_for(request: ApprovalRequest) -> str:
     return f"a session is waiting for your permission to use {request.tool_name}{detail}"
 
 
-#: What closes the loop, per resolution. Kept together so no path can resolve a
-#: request without a wording for it.
+#: What closes the loop when the adapter **proved** the verdict arrived, per
+#: resolution. Kept together so no path can resolve a request without a wording
+#: for it.
 #: The `ASK` wording is conditional on purpose, and it was not always. It read
 #: "it's waiting at the on-screen dialog", which is false on the path the Claude
 #: hook route made visible: a human who answers the dialog themselves ends the
@@ -61,6 +70,39 @@ CLOSING_NOTICES: dict[ApprovalVerdict, str] = {
         "the voice window closed — if the dialog is still on screen, answer it there"
     ),
 }
+
+#: What closes the loop when it did not (P14, #61 R5). Same keys, so the choice
+#: between the two tables is total and no verdict can arrive without a sentence.
+#:
+#: **The reference implementation never needed this table, and that is the
+#: point.** It had no approval transport at all — it detected a pending request
+#: and sent the user to the screen (`legacy@1d32845:bridge/transcript.py:
+#: 1633-1713`; `legacy@1d32845:bridge/daemon.py:1901-2052`) — so it could not
+#: claim a verdict had landed. v1 carries verdicts, and inherits the obligation
+#: legacy met for free: "approved by voice" is a claim about the *Session*, and
+#: only a `DELIVERED` receipt is evidence for it.
+#:
+#: Each sentence points back at the on-screen dialog, because on every grade
+#: that lands here the dialog is still the thing that can actually resolve it —
+#: `HELD` says so outright, and `FAILED`/`UNKNOWN` leave it untouched.
+UNCONFIRMED_NOTICES: dict[ApprovalVerdict, str] = {
+    ApprovalVerdict.ALLOW: (
+        "your approval was not confirmed to have reached the session — if the dialog is "
+        "still on screen, answer it there"
+    ),
+    ApprovalVerdict.DENY: (
+        "your denial was not confirmed to have reached the session — if the dialog is "
+        "still on screen, answer it there"
+    ),
+    #: `ask` carried no verdict, so there is nothing a receipt could fail to
+    #: confirm: its own wording already claims nothing and stands on every grade.
+    ApprovalVerdict.ASK: CLOSING_NOTICES[ApprovalVerdict.ASK],
+}
+
+
+def closing_notice_for(verdict: ApprovalVerdict, outcome: Delivery) -> str:
+    """What the user is told, claiming exactly what the receipt proves and no more."""
+    return CLOSING_NOTICES[verdict] if outcome.is_delivered else UNCONFIRMED_NOTICES[verdict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +222,7 @@ class ApprovalPipeline:
         # closing notice exists to absorb, arriving *after* the absorption.
         self._escalation.retire(waiting.request_id)
 
-        closing = CLOSING_NOTICES[verdict]
+        closing = closing_notice_for(verdict, outcome)
         await self._escalation.escalate(
             Notice(
                 request_id=new_request_id(),

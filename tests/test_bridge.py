@@ -37,6 +37,7 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionStopped,
     WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.call import CallDropped, CallStarted, CallState, UserSpeech
 from gpt_voicecoding.seams.companion_channel import InboundText
@@ -541,3 +542,168 @@ class TestWhatDiscoveryCallsAnEnding:
 
         assert asyncio.run(hub.core.discover()) == ()
         assert len(hub.state.sessions.live()) == 1
+
+
+class TestWhatBecomesOfACompanionReplyThatDidNotLand:
+    """P15 (#61 C2): one attempt, the grade written down, and never sent again.
+
+    Ported from `legacy@1d32845:bridge/channel.py:11-13,75-86` and
+    `legacy@1d32845:bridge/daemon.py:830-879`, whose rule is exactly this: an
+    outbound attempt ends `sent` / `failed` / `indeterminate` / `suppressed`, the
+    grade is logged, and an indeterminate one is **never** resent — "a duplicate
+    notification costs the user more than a missing one". **Simplified storage:**
+    legacy recorded the grade in a durable ledger
+    (`legacy@1d32845:bridge/store.py:1517-1614`); this reply is a direct answer
+    to text the user just sent, so it is graded, said out loud in the log, and
+    forgotten.
+    """
+
+    def test_a_reply_that_failed_is_reported_rather_than_swallowed(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(channel_outcome=Delivery.FAILED, channel_reason="the bot token was rejected")
+
+        hub.emit(InboundText(text="/status"))
+
+        assert any("the bot token was rejected" in one.getMessage() for one in caplog.records)
+
+    def test_the_grade_is_named_so_a_reader_can_tell_which_failure_it_was(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(channel_outcome=Delivery.UNKNOWN, channel_reason="1 of 3 parts reached the chat")
+
+        hub.emit(InboundText(text="/status"))
+
+        assert any(Delivery.UNKNOWN in one.getMessage() for one in caplog.records)
+
+    def test_an_undelivered_reply_is_never_sent_again(self) -> None:
+        hub = Hub(channel_outcome=Delivery.UNKNOWN, channel_reason="the write may have landed")
+
+        hub.emit(InboundText(text="/status"))
+
+        assert len(hub.channel.sent) == 1
+
+    def test_an_undelivered_reply_is_not_retained_for_a_later_outlet(self) -> None:
+        """A reply is not a notice. Nothing holds it, so nothing can replay it."""
+        hub = Hub(channel_outcome=Delivery.FAILED, channel_reason="the chat id points nowhere")
+
+        hub.emit(InboundText(text="/status"))
+
+        assert hub.state.relays.pending() == ()
+
+    def test_the_words_themselves_never_reach_the_log(self, caplog) -> None:
+        """The reply carries the user's own business; the diagnostic carries none."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(
+            sessions=((CODEX, "port the log"),),
+            channel_outcome=Delivery.FAILED,
+            channel_reason="the chat id points nowhere",
+        )
+
+        hub.emit(InboundText(text="ship it"))
+
+        said = " ".join(one.getMessage() for one in caplog.records)
+        assert hub.channel.sent
+        for reply in hub.channel.sent:
+            assert reply not in said
+
+    def test_a_delivered_reply_says_nothing_at_all(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub()
+
+        hub.emit(InboundText(text="/status"))
+
+        assert [one.getMessage() for one in caplog.records] == [
+            "handled inbound Companion Channel message kind=control"
+        ]
+
+
+class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
+    """One dialog, two events, one announcement (#77, from #75's review).
+
+    A Session entering `waiting` now raises `SessionStopped` — without it, a
+    question reaches no outlet at all, because `AskUserQuestion` raises no
+    `PermissionRequest` hook and the roster alone never names the prompt. That
+    edge opens a policy Bridge Core owns and the adapter does not: a *permission*
+    would otherwise announce twice, once through `AwaitingApproval` and once
+    through `SessionStopped`.
+
+    The `AwaitingApproval` notice wins wherever it exists, because it is the one
+    with a budget, a fallback and a closing notice — it can actually be answered
+    — and it already asks for `EVERY_OUTLET`, which is the wider reach. Where it
+    does *not* exist, the Stop Notice is all there is, and it says so.
+
+    Voice is off throughout, so every announcement lands on one surface and can
+    simply be counted.
+    """
+
+    def permission(self, approval_id: str | None) -> WaitingFor:
+        return WaitingFor(
+            kind=WaitingKind.PERMISSION,
+            tool_name="Bash",
+            detail="push the branch",
+            approval_id=approval_id,
+        )
+
+    def dialog(self) -> AwaitingApproval:
+        return AwaitingApproval(
+            request=ApprovalRequest(
+                approval_id="a1", target=CODEX, tool_name="Bash", detail="push the branch"
+            )
+        )
+
+    def test_a_dialog_the_approval_pipeline_holds_announces_once(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(
+            self.dialog(),
+            SessionStopped(target=CODEX, waiting_for=self.permission("a1")),
+        )
+
+        assert hub.channel.sent == [
+            "a session is waiting for your permission to use Bash — push the branch"
+        ]
+
+    def test_the_suppressed_stop_is_written_down_rather_than_dropped_silently(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission("a1")))
+
+        assert any("a1" in one.getMessage() for one in caplog.records)
+        assert hub.channel.sent == []
+
+    def test_a_permission_nothing_is_holding_is_announced_after_all(self) -> None:
+        """The roster saw `waiting`; no hook is parked. Nothing else will say it."""
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission(None)))
+
+        assert len(hub.channel.sent) == 1
+
+    def test_that_announcement_sends_the_user_to_the_terminal(self) -> None:
+        """A notice the user tries to answer from here and cannot is worse than none."""
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission(None)))
+
+        (notice,) = hub.channel.sent
+        assert "terminal" in notice
+
+    def test_a_question_is_always_announced(self) -> None:
+        """It has no other route at all — that is the whole point of the new edge."""
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+
+    def test_a_stop_that_needs_nobody_is_announced_as_before(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX))
+
+        assert len(hub.channel.sent) == 1

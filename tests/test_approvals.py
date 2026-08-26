@@ -23,7 +23,11 @@ import asyncio
 
 from fakes import HOUSE_RULES, FakeAgent, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
-from gpt_voicecoding.core.approvals import CLOSING_NOTICES, ApprovalPipeline
+from gpt_voicecoding.core.approvals import (
+    CLOSING_NOTICES,
+    UNCONFIRMED_NOTICES,
+    ApprovalPipeline,
+)
 from gpt_voicecoding.core.escalation import EscalationPipeline
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
@@ -31,6 +35,7 @@ from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict
+from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -57,6 +62,7 @@ class Harness:
         voice: bool = True,
         message: bool = True,
         budget: float = TEN_MINUTES,
+        outcome: Delivery = Delivery.DELIVERED,
     ) -> None:
         self.now = 1_000.0
         self.switches = Switchboard()
@@ -66,7 +72,7 @@ class Harness:
 
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
-        self.agent = FakeAgent()
+        self.agent = FakeAgent(outcome=outcome, reason="the fake carried nothing")
         self.relays = RelayQueue()
         self.escalation = EscalationPipeline(
             call=self.call,
@@ -346,3 +352,71 @@ class TestAVerdictThatArrivesTooLate:
         harness = Harness()
 
         assert harness.answer(ApprovalVerdict.ALLOW, "never-heard-of-it") is None
+
+
+class TestWhatTheClosingNoticeMayClaim:
+    """P14: only a `DELIVERED` receipt earns the word "approved" or "denied".
+
+    Legacy never claimed a verdict had reached a Session because it never
+    carried one — it detected a pending request and sent the user to the screen
+    (`legacy@1d32845:bridge/transcript.py:1633-1713`;
+    `legacy@1d32845:bridge/daemon.py:1901-2052`). v1 does carry verdicts, so it
+    inherits the obligation legacy never had: a receipt that proves nothing is
+    told to the user as proving nothing, and the on-screen dialog — which is
+    still the thing that can actually resolve it — is where they are pointed.
+    """
+
+    def test_an_allow_the_session_never_confirmed_is_not_announced_as_approved(self) -> None:
+        harness = Harness(outcome=Delivery.UNKNOWN)
+        harness.opened()
+
+        outcome = harness.answer(ApprovalVerdict.ALLOW)
+
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.ALLOW]
+        assert outcome.closing_notice != CLOSING_NOTICES[ApprovalVerdict.ALLOW]
+
+    def test_a_deny_the_session_never_confirmed_is_not_announced_as_denied(self) -> None:
+        harness = Harness(outcome=Delivery.FAILED)
+        harness.opened()
+
+        outcome = harness.answer(ApprovalVerdict.DENY)
+
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.DENY]
+
+    def test_a_held_verdict_is_not_confirmed_either(self) -> None:
+        """HELD is parked in front of the human. It is the dialog's, not ours."""
+        harness = Harness(outcome=Delivery.HELD)
+        harness.opened()
+
+        outcome = harness.answer(ApprovalVerdict.ALLOW)
+
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.ALLOW]
+
+    def test_the_unconfirmed_wording_points_at_the_dialog_that_can_still_resolve_it(
+        self,
+    ) -> None:
+        for wording in UNCONFIRMED_NOTICES.values():
+            assert "dialog" in wording
+
+    def test_the_unconfirmed_wording_reaches_the_user_and_not_only_the_outcome(self) -> None:
+        harness = Harness(outcome=Delivery.UNKNOWN)
+        harness.opened()
+
+        outcome = harness.answer(ApprovalVerdict.ALLOW)
+
+        assert outcome.closing_notice in harness.channel.sent[-1]
+
+    def test_a_delivered_verdict_still_says_which_way_it_went(self) -> None:
+        harness = Harness()
+        harness.opened()
+
+        outcome = harness.answer(ApprovalVerdict.ALLOW)
+
+        assert outcome.closing_notice == CLOSING_NOTICES[ApprovalVerdict.ALLOW]
+
+    def test_an_expiry_says_the_same_thing_on_every_grade(self) -> None:
+        """`ask` carried no verdict, so no receipt can fail to confirm one."""
+        assert UNCONFIRMED_NOTICES[ApprovalVerdict.ASK] == CLOSING_NOTICES[ApprovalVerdict.ASK]
+
+    def test_every_verdict_has_an_unconfirmed_wording(self) -> None:
+        assert set(UNCONFIRMED_NOTICES) == set(ApprovalVerdict)
