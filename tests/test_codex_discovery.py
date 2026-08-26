@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import discovery
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate
@@ -86,11 +87,26 @@ def refusing_processes(error: Exception) -> object:
     return processes
 
 
+def not_a_repository() -> object:
+    """A `git` that says a workspace belongs to no repository.
+
+    The default here, so a name in this file is the workspace's own directory
+    and the assertions do not depend on where the checkout running them lives.
+    """
+
+    async def ask(asked: Path) -> str | None:
+        del asked
+        return None
+
+    return ask
+
+
 def found(
     client: object | None,
     *candidates: Candidate,
     home: Path | None = None,
     daemon_note: str = "",
+    git: object = None,
 ) -> object:
     return asyncio.run(
         discover(
@@ -98,6 +114,7 @@ def found(
             processes=listing(*candidates),
             home=home,
             daemon_note=daemon_note,
+            projects=ProjectNames(ask=git or not_a_repository()),  # type: ignore[arg-type]
         )
     )
 
@@ -109,7 +126,7 @@ class TestTheDaemonIsTheAuthorityWhenItIsUp:
         row = lane.rows[0]
         assert row.target.session_id == THREAD
         assert row.workspace == Path("/tmp/w")
-        assert row.name == "a-thread"
+        assert str(row.name) == "w · a-thread"
 
     def test_rows_from_the_daemon_are_not_degraded(self) -> None:
         assert found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})).degraded is None
@@ -305,6 +322,54 @@ class TestASessionNobodyHasSpokenToYet:
 
         lane = found(None, running(101, workspace), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
+
+
+class TestWhatEachRowIsCalled:
+    """#78: `<project> · <title>`, and the title is whatever this lane can honestly say.
+
+    The amended #67 port table (2026-08-25) dropped the route where a Session
+    reported a title of its own (`legacy@1d32845:bridge/hook.py:215-253`,
+    `bridge/daemon.py:1504-1544`), so every title here is composed from a fact
+    the lane already holds and nothing is asked of the Session.
+    """
+
+    def test_a_thread_the_daemon_named_is_called_that(self) -> None:
+        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="port the log")}))
+        assert str(lane.rows[0].name) == "w · port the log"
+
+    def test_a_thread_the_daemon_did_not_name_is_called_by_its_short_id(self) -> None:
+        """Eight characters of the thread id: short enough to say out loud."""
+        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
+        assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
+
+    def test_a_row_read_off_the_process_table_is_named_the_same_way(self, tmp_path: Path) -> None:
+        """The daemon is where a thread name comes from, so these rows take the id."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        write_rollout(tmp_path, THREAD, workspace)
+
+        lane = found(None, running(101, workspace), home=tmp_path)
+        assert str(lane.rows[0].name) == f"workspace · {THREAD[:8]}"
+
+    def test_a_session_with_no_thread_id_yet_has_no_name_yet(self) -> None:
+        """#73: `codex` writes the id at the first turn, and there is nothing else to use."""
+        assert found(None, running(101, "/tmp/w")).rows[0].name is None
+
+    def test_the_project_half_is_the_repository_when_the_workspace_is_in_one(self) -> None:
+        async def inside_a_repository(asked: Path) -> str | None:
+            del asked
+            return "/src/GPT-VoiceCoding/.git\n"
+
+        lane = found(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="port the log")}),
+            git=inside_a_repository,
+        )
+        assert str(lane.rows[0].name) == "GPT-VoiceCoding · port the log"
+
+    def test_a_thread_named_with_the_separator_is_left_unnamed(self) -> None:
+        """A name with a `·` in it cannot be read back as two halves, so it is not one."""
+        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a · b")}))
+        assert lane.rows[0].name is None
 
 
 class TestWhenTheLaneCannotLookAtAll:

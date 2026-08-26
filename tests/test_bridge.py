@@ -55,7 +55,7 @@ class TestTheStopNoticePipelineEndToEnd:
 
         assert hub.agent.calls == []
 
-    def test_a_stopped_session_is_announced_by_its_label(self) -> None:
+    def test_a_stopped_session_is_announced_by_its_name(self) -> None:
         hub = Hub()
 
         hub.emit(SessionStopped(target=CODEX))

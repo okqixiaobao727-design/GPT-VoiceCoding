@@ -24,7 +24,7 @@ from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import FeatureSwitch, Switchboard, SwitchName
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget, new_request_id
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 
@@ -32,7 +32,7 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 def a_session(session_id: str = "abc", pid: int = 100) -> Session:
     return Session(
         target=SessionTarget(agent=AgentKind.CLAUDE, session_id=session_id, pid=pid),
-        label=SessionLabel("GPT-VoiceCoding", "Implement the seam contracts"),
+        name=SessionName("GPT-VoiceCoding", "Implement the seam contracts"),
         workspace=WORKSPACE,
         first_seen=1_724_000_000.0,
     )

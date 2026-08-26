@@ -10,7 +10,7 @@ command set belongs to the control-plane surface and not to this module:
 
     /<command> …      a control-plane command
     ><prompt>         a Delegated Turn
-    @<label>: words   the user's own words, for the Session that label names
+    @<name>: words    the user's own words, for the Session that name names
     words             the user's own words, when exactly one Session is live
 
 The collision that has to be got right in both directions: a bare `stop` must
@@ -24,7 +24,7 @@ from pathlib import Path
 
 from gpt_voicecoding.core.router import InboundClass, InboundRouter, TextGrammar
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -38,7 +38,7 @@ def registry_of(*sessions: tuple[SessionTarget, str]) -> SessionRegistry:
         registry.register(
             Session(
                 target=target,
-                label=SessionLabel("GPT-VoiceCoding", task),
+                name=SessionName("GPT-VoiceCoding", task),
                 workspace=Path("/tmp/workspace"),
                 first_seen=0.0,
             )
@@ -109,8 +109,8 @@ class TestDelegation:
         assert found.target is None
 
 
-class TestAddressingASessionByLabel:
-    def test_a_labelled_relay_resolves_to_that_session(self) -> None:
+class TestAddressingASessionByName:
+    def test_a_named_relay_resolves_to_that_session(self) -> None:
         found = router((CODEX, "port the log"), (CLAUDE, "build the shell")).classify(
             "@shell: ship it"
         )
@@ -119,14 +119,14 @@ class TestAddressingASessionByLabel:
         assert found.target == CLAUDE
         assert found.text == "ship it"
 
-    def test_a_label_matching_nothing_fails_closed(self) -> None:
+    def test_a_name_matching_nothing_fails_closed(self) -> None:
         found = router((CODEX, "port the log")).classify("@nothing: ship it")
 
         assert found.kind is InboundClass.UNKNOWN
         assert found.reply
 
-    def test_a_label_matching_two_sessions_refuses_and_names_both(self) -> None:
-        """A label disambiguates or asks — never picks."""
+    def test_a_name_matching_two_sessions_refuses_and_names_both(self) -> None:
+        """A Session Name disambiguates or asks — never picks."""
         found = router((CODEX, "port the log"), (CLAUDE, "port the shell")).classify(
             "@port: ship it"
         )
@@ -135,7 +135,7 @@ class TestAddressingASessionByLabel:
         assert "port the log" in found.reply
         assert "port the shell" in found.reply
 
-    def test_a_labelled_relay_with_no_words_fails_closed(self) -> None:
+    def test_a_named_relay_with_no_words_fails_closed(self) -> None:
         found = router((CODEX, "port the log")).classify("@log:   ")
 
         assert found.kind is InboundClass.UNKNOWN
@@ -203,7 +203,7 @@ class TestTheCommandWordCollision:
         assert found.kind is InboundClass.ANSWER_RELAY
         assert found.text == "stop after the tests pass"
 
-    def test_a_labelled_command_word_is_unambiguous_and_goes_through(self) -> None:
+    def test_a_named_command_word_is_unambiguous_and_goes_through(self) -> None:
         found = router((CODEX, "port the log")).classify("@log: stop")
 
         assert found.kind is InboundClass.ANSWER_RELAY

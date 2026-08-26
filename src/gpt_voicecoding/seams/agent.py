@@ -60,7 +60,12 @@ from typing import Protocol, runtime_checkable
 
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.events import Event
-from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
+from gpt_voicecoding.seams.identity import (
+    AgentKind,
+    RequestId,
+    SessionName,
+    SessionTarget,
+)
 from gpt_voicecoding.seams.verify import VerifyResult
 
 
@@ -315,8 +320,13 @@ class SessionInspection:
     #: having said anything a reader would show, and #76 consumes both.
     last_activity: datetime | None = None
     child: ChildClassification = MAIN_SESSION
-    #: The agent's own name for this Session, when it has one. #78 stabilises it.
-    name: str | None = None
+    #: What this Session is called — `<project> · <title>`, composed by the lane
+    #: from the agent's own name for it and the workspace it runs in
+    #: (`adapters/agent/_naming.py`). `None` is ordinary: a Codex thread that has
+    #: not taken its first turn has neither a name nor an id to make one from.
+    #: The registry freezes the first one it is given (#78), so a lane composing
+    #: a different one later is composing something nobody will see.
+    name: SessionName | None = None
 
 
 @dataclass(frozen=True, slots=True)

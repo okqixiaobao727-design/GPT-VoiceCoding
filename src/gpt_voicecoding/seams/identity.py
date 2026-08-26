@@ -2,9 +2,9 @@
 
 Three locked rules are enforced here by shape rather than by discipline:
 
-- **A label is not a target.** `SessionLabel` is for matching and for speech; it
-  has no session id and no pid, so it cannot be passed where a command expects
-  one. Commands carry a `SessionTarget`.
+- **A Session Name is not a target.** `SessionName` is for matching and for
+  speech; it has no session id and no pid, so it cannot be passed where a
+  command expects one. Commands carry a `SessionTarget`.
 - **Claude Sessions are addressed by pid.** `--resume` forks a second process
   under the same session id, so a Claude target without a pid is ambiguous and
   is refused at construction.
@@ -34,8 +34,8 @@ from typing import NewType
 #: The correlation id for one request intent, minted once by its sender.
 RequestId = NewType("RequestId", str)
 
-#: What separates the two halves of a Session Label when it is rendered.
-LABEL_SEPARATOR = " · "
+#: What separates the two halves of a Session Name when it is rendered.
+NAME_SEPARATOR = " · "
 
 
 def new_request_id() -> RequestId:
@@ -72,11 +72,14 @@ class AgentKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class SessionLabel:
-    """``<git project name> · <task title>`` — for matching and for speech only.
+class SessionName:
+    """``<project> · <task>`` — for matching and for speech only.
 
-    Deliberately holds nothing a command could address: see this module's
-    docstring.
+    The one name the user and the system have for a Session (`CONTEXT.md`,
+    *Session Name*). Deliberately holds nothing a command could address: see
+    this module's docstring. Composed by the lane that observed the Session
+    (`adapters/agent/_naming.py`) and frozen by the Session registry, so what a
+    surface renders is what was true the first time the Session was seen.
     """
 
     project: str
@@ -85,27 +88,27 @@ class SessionLabel:
     def __post_init__(self) -> None:
         for half, value in (("project", self.project), ("task", self.task)):
             if not value.strip():
-                raise ValueError(f"a Session Label's {half} half may not be empty")
-            if LABEL_SEPARATOR.strip() in value:
+                raise ValueError(f"a Session Name's {half} half may not be empty")
+            if NAME_SEPARATOR.strip() in value:
                 raise ValueError(
-                    f"a Session Label's {half} half may not contain {LABEL_SEPARATOR.strip()!r}"
+                    f"a Session Name's {half} half may not contain {NAME_SEPARATOR.strip()!r}"
                 )
 
     def __str__(self) -> str:
-        return f"{self.project}{LABEL_SEPARATOR}{self.task}"
+        return f"{self.project}{NAME_SEPARATOR}{self.task}"
 
     @classmethod
-    def parse(cls, text: str) -> SessionLabel:
-        """Read back a rendered label, refusing anything that is not exactly one."""
-        halves = text.split(LABEL_SEPARATOR.strip())
+    def parse(cls, text: str) -> SessionName:
+        """Read back a rendered name, refusing anything that is not exactly one."""
+        halves = text.split(NAME_SEPARATOR.strip())
         if len(halves) != 2:
-            raise ValueError(f"not a Session Label: {text!r}")
+            raise ValueError(f"not a Session Name: {text!r}")
         return cls(project=halves[0].strip(), task=halves[1].strip())
 
 
 @dataclass(frozen=True, slots=True)
 class SessionTarget:
-    """The exact identity a command carries. Never inferred, never a label."""
+    """The exact identity a command carries. Never inferred, never a name."""
 
     agent: AgentKind
     #: `None` means "this Session has not been named yet", which is a real and

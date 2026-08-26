@@ -7,10 +7,10 @@ have, and how a legacy alias survives a rewrite.
 
 Two shapes are worth naming:
 
-- **An address, not a label.** `codex:abc` and `claude:def:1234` are how a
-  surface writes a `SessionTarget` on one line. A Session Label is for speech and
+- **An address, not a name.** `codex:abc` and `claude:def:1234` are how a
+  surface writes a `SessionTarget` on one line. A Session Name is for speech and
   for matching, and turning one into a target is the router's job on the way in
-  — never this parser's, which would be addressing by label through the back
+  — never this parser's, which would be addressing by name through the back
   door.
 - **A refusal is rendered verbatim.** Bridge Core's words come back unchanged;
   this file never rephrases one. Honest wording lives in one place, and a
@@ -191,7 +191,7 @@ def _roster_lines(sessions: object) -> list[str]:
     if not sessions:
         return ["sessions: none"]
     return ["sessions:"] + [
-        f"  {session['label'] or session['name'] or '(unnamed)'} — "
+        f"  {session['name'] or '(unnamed)'} — "
         f"{format_address(session['target'])} — {session['workspace']} "
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions

@@ -51,7 +51,7 @@ from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, spoken_name, spoken_target
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -104,20 +104,6 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def name_for(session: Session | None, target: SessionTarget) -> str:
-    """What to call one Session out loud, best name first.
-
-    The Session Label if the user has one for it, else the agent's own Session
-    Name, else the address — because a notice that names nothing is a notice the
-    user cannot answer. #78 stabilises the middle one.
-    """
-    if session is not None and session.label is not None:
-        return str(session.label)
-    if session is not None and session.name:
-        return session.name
-    return f"{target.agent} {target.session_id or f'pid {target.pid}'}"
-
-
 def stop_notice_for(
     session: Session | None, target: SessionTarget, waiting_for: WaitingFor | None = None
 ) -> str:
@@ -131,7 +117,10 @@ def stop_notice_for(
     """
     stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
     tail = f" — {stopped_on}" if stopped_on else ""
-    return f"{name_for(session, target)} stopped and may need you{tail}"
+    # What to call it is `core/sessions.py`'s answer, and its floor is the
+    # address: a notice that names nothing is a notice the user cannot answer.
+    called = spoken_name(session) if session is not None else spoken_target(target)
+    return f"{called} stopped and may need you{tail}"
 
 
 def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:

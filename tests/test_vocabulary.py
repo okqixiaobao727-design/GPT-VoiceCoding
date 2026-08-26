@@ -1,6 +1,6 @@
 """The shared vocabulary the seams publish, and the rules it enforces by shape.
 
-Two locked rules are structural here rather than remembered: a Session Label can
+Two locked rules are structural here rather than remembered: a Session Name can
 never be passed where a target is expected, and a Claude Session cannot be
 addressed without a pid. Both are enforced by the types, so an adapter that gets
 it wrong fails at construction rather than at delivery time.
@@ -13,7 +13,7 @@ import pytest
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import (
     AgentKind,
-    SessionLabel,
+    SessionName,
     SessionTarget,
     new_request_id,
 )
@@ -29,35 +29,35 @@ class TestRequestId:
         assert isinstance(new_request_id(), str)
 
 
-class TestSessionLabel:
-    def test_a_label_renders_as_project_then_task(self) -> None:
-        assert str(SessionLabel("GPT-VoiceCoding", "Implement the seam contracts")) == (
+class TestSessionName:
+    def test_a_name_renders_as_project_then_task(self) -> None:
+        assert str(SessionName("GPT-VoiceCoding", "Implement the seam contracts")) == (
             "GPT-VoiceCoding · Implement the seam contracts"
         )
 
-    def test_a_rendered_label_parses_back(self) -> None:
-        label = SessionLabel("GPT-VoiceCoding", "Implement the seam contracts")
-        assert SessionLabel.parse(str(label)) == label
+    def test_a_rendered_name_parses_back(self) -> None:
+        name = SessionName("GPT-VoiceCoding", "Implement the seam contracts")
+        assert SessionName.parse(str(name)) == name
 
-    def test_a_label_is_not_a_target(self) -> None:
+    def test_a_name_is_not_a_target(self) -> None:
         """The locked rule, made structural: no attribute a command could carry."""
-        label = SessionLabel("GPT-VoiceCoding", "a task")
-        assert not hasattr(label, "session_id")
-        assert not hasattr(label, "pid")
+        name = SessionName("GPT-VoiceCoding", "a task")
+        assert not hasattr(name, "session_id")
+        assert not hasattr(name, "pid")
 
     def test_an_empty_half_is_refused(self) -> None:
         with pytest.raises(ValueError):
-            SessionLabel("", "a task")
+            SessionName("", "a task")
         with pytest.raises(ValueError):
-            SessionLabel("GPT-VoiceCoding", "   ")
+            SessionName("GPT-VoiceCoding", "   ")
 
     def test_text_without_the_separator_does_not_parse(self) -> None:
         with pytest.raises(ValueError):
-            SessionLabel.parse("GPT-VoiceCoding")
+            SessionName.parse("GPT-VoiceCoding")
 
     def test_text_with_two_separators_does_not_parse(self) -> None:
         with pytest.raises(ValueError):
-            SessionLabel.parse("a · b · c")
+            SessionName.parse("a · b · c")
 
 
 class TestSessionTarget:

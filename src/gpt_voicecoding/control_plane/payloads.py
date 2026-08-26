@@ -6,10 +6,10 @@ Translation, and nothing else. Two rules hold this module honest:
   refusal carries the refusal's own words. The reference implementation's
   expensive habit was a surface deciding what a result "really meant" on the
   user's behalf.
-- **A label is never an address.** `SessionTarget` is what crosses the wire, and
+- **A Session Name is never an address.** `SessionTarget` is what crosses the wire, and
   it is read back through the same constructor Bridge Core uses, so a Claude
   target without a pid is refused here rather than becoming an ambiguous
-  command later. Turning a spoken label into a target is the router's job, on
+  command later. Turning a spoken name into a target is the router's job, on
   the way in from the Companion Channel.
 
 Every reader raises `InvalidPayload`, which the action layer turns into one
@@ -75,7 +75,7 @@ def read_flag(payload: Mapping[str, Any], key: str) -> bool:
 
 
 def read_target(payload: Mapping[str, Any], key: str = "target") -> SessionTarget:
-    """The exact identity a command carries. Never a label, never inferred."""
+    """The exact identity a command carries. Never a name, never inferred."""
     raw = payload.get(key)
     if not isinstance(raw, dict):
         raise InvalidPayload(f"{key!r} must name a Session: agent, session_id and pid")
@@ -145,8 +145,11 @@ def session_document(session: Session) -> dict[str, Any]:
     """
     return {
         "target": target_document(session.target),
-        "label": str(session.label) if session.label is not None else None,
-        "name": session.name,
+        # One name, rendered as the one string the user hears and types after
+        # `@` — `<project> · <task>`. #78 collapsed the `label`/`name` pair
+        # that used to travel here into it; a surface that wants the halves
+        # parses them back with `SessionName.parse`.
+        "name": str(session.name) if session.name is not None else None,
         "workspace": str(session.workspace),
         "first_seen": session.first_seen,
         "lifecycle": str(session.lifecycle),

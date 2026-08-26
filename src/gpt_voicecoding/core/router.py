@@ -15,13 +15,13 @@ name and cannot grow one:
 
     /<command> …      a control-plane command
     ><prompt>         a Delegated Turn
-    @<label>: words   the user's own words, for the Session that label names
+    @<name>: words    the user's own words, for the Session that name names
     words             the user's own words, when exactly one Session is live
 
 Bare text resolving to the single live Session is not a guess in the forbidden
 sense: it classifies into the least dangerous class, and with exactly one
 candidate nothing is being picked *between*. Zero or several fails closed and
-asks, reusing the registry's locked "a label disambiguates or asks" rule rather
+asks, reusing the registry's locked "a Session Name disambiguates or asks" rule rather
 than minting a second disambiguation mechanism.
 
 The one collision worth spelling out is a bare word that is also a registered
@@ -38,8 +38,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from gpt_voicecoding.core.errors import AmbiguousLabelError, LabelMatchError
-from gpt_voicecoding.core.sessions import Session, SessionRegistry
+from gpt_voicecoding.core.errors import AmbiguousNameError, NameMatchError
+from gpt_voicecoding.core.sessions import Session, SessionRegistry, spoken_name
 from gpt_voicecoding.seams.identity import SessionTarget
 
 
@@ -91,7 +91,7 @@ class Classification:
     text: str = ""
     #: Set for CONTROL only. The verb, already known to be registered.
     command: str = ""
-    #: Set for ANSWER_RELAY only. The exact Session identity, never a label.
+    #: Set for ANSWER_RELAY only. The exact Session identity, never a name.
     target: SessionTarget | None = None
     #: Set for UNKNOWN only. What to say back — honest, and never a guess.
     reply: str = ""
@@ -116,7 +116,7 @@ class InboundRouter:
         if body.startswith(grammar.delegate_prefix):
             return self._as_delegation(body[len(grammar.delegate_prefix) :])
         if body.startswith(grammar.relay_marker):
-            return self._as_labelled_relay(body[len(grammar.relay_marker) :])
+            return self._as_named_relay(body[len(grammar.relay_marker) :])
         return self._as_bare_text(body)
 
     def _as_command(self, rest: str) -> Classification:
@@ -133,22 +133,22 @@ class InboundRouter:
             return self._refuse("that asked me to delegate, but did not say what")
         return Classification(kind=InboundClass.DELEGATION, text=prompt)
 
-    def _as_labelled_relay(self, rest: str) -> Classification:
-        label, separator, words = rest.partition(":")
+    def _as_named_relay(self, rest: str) -> Classification:
+        name, separator, words = rest.partition(":")
         if not separator:
             return self._refuse(
                 f"name the session and then the words, like "
                 f"{self._grammar.relay_marker}<session>: your words"
             )
         try:
-            session = self._sessions.match_label(label.strip())
-        except AmbiguousLabelError as ambiguous:
+            session = self._sessions.match_name(name.strip())
+        except AmbiguousNameError as ambiguous:
             return self._refuse(self._which_one(ambiguous.candidates))
-        except LabelMatchError:
-            return self._refuse(f"nothing running matches {label.strip()!r}")
+        except NameMatchError:
+            return self._refuse(f"nothing running matches {name.strip()!r}")
 
         if not words.strip():
-            return self._refuse(f"that named {session.label} but carried no words")
+            return self._refuse(f"that named {spoken_name(session)} but carried no words")
         return Classification(
             kind=InboundClass.ANSWER_RELAY, text=words.strip(), target=session.target
         )
@@ -184,7 +184,7 @@ class InboundRouter:
     def _which_one(self, candidates: tuple[Session, ...]) -> str:
         """Name every candidate and the form that picks one. Never picks itself."""
         marker = self._grammar.relay_marker
-        named = ", ".join(f"{marker}{session.label}" for session in candidates)
+        named = ", ".join(f"{marker}{spoken_name(session)}" for session in candidates)
         return f"say which one: {named}"
 
     @staticmethod

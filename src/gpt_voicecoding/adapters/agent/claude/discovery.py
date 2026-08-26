@@ -30,10 +30,12 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
 
+from gpt_voicecoding.adapters.agent import _naming
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     SessionInspection,
@@ -107,7 +109,9 @@ async def run_command(argv: list[str]) -> CommandResult:
     )
 
 
-async def discover(*, run: Runner = run_command) -> LaneDiscovery:
+async def discover(
+    *, run: Runner = run_command, projects: ProjectNames | None = None
+) -> LaneDiscovery:
     """Every Claude Session running under this config directory, or why none.
 
     **A lane that could not look says so; it never reports an empty machine.**
@@ -140,10 +144,10 @@ async def discover(*, run: Runner = run_command) -> LaneDiscovery:
             )
         )
 
-    return LaneDiscovery(rows=tuple(_rows(document)))
+    return LaneDiscovery(rows=tuple(await _rows(document, projects or ProjectNames())))
 
 
-def _rows(document: list[Any]) -> list[SessionInspection]:
+async def _rows(document: list[Any], projects: ProjectNames) -> list[SessionInspection]:
     """Every row that can be read, skipping the ones that cannot.
 
     One unreadable row is not a broken roster, and refusing the whole document
@@ -158,8 +162,34 @@ def _rows(document: list[Any]) -> list[SessionInspection]:
         if inspection is None:
             _log.info("skipped a roster row this build cannot address: %r", row)
             continue
-        found.append(inspection)
+        found.append(await _named(inspection, row, projects))
     return found
+
+
+async def _named(
+    inspection: SessionInspection, row: dict[str, Any], projects: ProjectNames
+) -> SessionInspection:
+    """The same row, carrying its Session Name.
+
+    **The task half is the roster's own `name`** — `workspace-claude-ed` and the
+    like — which is the official answer to "what is this Session called" and is
+    on every row from the moment the Session exists (#73). Nothing is asked of
+    the Session to get it and no transcript is opened for it, which is what makes
+    it stable enough to be the name the user speaks
+    (`legacy@1d32845:bridge/hook.py:215-253` had the Session report a task title
+    over the hook instead — *dropped, because* the amended #67 port table removed
+    that route on 2026-08-25).
+
+    The project half is the workspace's, resolved here because this is the lane
+    that knows the workspace. A row with neither half stays unnamed.
+    """
+    task = _name(row)
+    if task is None:
+        return inspection
+    project = await projects.of(inspection.workspace)
+    if project is None:
+        return inspection
+    return replace(inspection, name=_naming.compose(project, task))
 
 
 def _inspection(row: dict[str, Any]) -> SessionInspection | None:
@@ -195,7 +225,6 @@ def _inspection(row: dict[str, Any]) -> SessionInspection | None:
         # began is not when it last did anything.
         progress=None,
         last_activity=None,
-        name=_name(row),
     )
 
 
@@ -215,6 +244,6 @@ def _waiting_for(state: SessionState) -> WaitingFor:
 
 
 def _name(row: dict[str, Any]) -> str | None:
-    """The agent's own name for this Session — `workspace-claude-ed` and the like."""
+    """The task half of this Session's name, straight off the official roster."""
     name = row.get("name")
     return name.strip() if isinstance(name, str) and name.strip() else None

@@ -31,10 +31,13 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from gpt_voicecoding.adapters.agent import _naming
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import rollouts, thread_tail
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
 from gpt_voicecoding.seams.agent import (
@@ -68,6 +71,15 @@ STATUS_TYPES: Final = {
     ACTIVE_STATUS: SessionState.RUNNING,
     "systemError": SessionState.IDLE,
 }
+
+#: How much of a thread id stands in for a name the daemon does not have. Eight
+#: characters of a UUID, which is what `codex` itself shows and short enough to
+#: say out loud — the fallback task of every unnamed thread (#78). It is
+#: composed here, from a fact this lane already holds: nothing is asked of the
+#: Session, and the route that used to ask one (`legacy@1d32845:bridge/hook.py:
+#: 215-253`, `bridge/daemon.py:1504-1544`) was *dropped* from the #67 port table
+#: on 2026-08-25.
+SHORT_THREAD_ID_CHARACTERS: Final = 8
 
 #: What every degraded reading ends with: where the rows actually came from.
 #: The *reason* is a separate sentence, because there are two of them and they
@@ -208,6 +220,7 @@ async def discover(
     home: Path | None = None,
     turns: TurnCache | None = None,
     daemon_note: str = "",
+    projects: ProjectNames | None = None,
 ) -> LaneDiscovery:
     """Every Codex Session on this machine, however well it can be described.
 
@@ -221,6 +234,7 @@ async def discover(
         return LaneDiscovery(error=f"the process table could not be read: {unreadable}")
 
     threads, daemon_error = await _threads(client)
+    names = projects or ProjectNames()
     rows: list[SessionInspection] = []
     claimed: set[int] = set()
 
@@ -233,15 +247,15 @@ async def discover(
             if turns is not None and client is not None
             else None
         )
-        rows.append(_from_thread(thread, pid, progress))
+        rows.append(
+            await _named(_from_thread(thread, pid, progress), names, task=_thread_name(thread))
+        )
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
 
-    rows.extend(
-        _from_process(candidate, home=home)
-        for candidate in candidates
-        if candidate.pid not in claimed
-    )
+    for candidate in candidates:
+        if candidate.pid not in claimed:
+            rows.append(await _named(_from_process(candidate, home=home), names))
     return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
 
 
@@ -372,7 +386,6 @@ def _from_thread(
     kind = _status_of(thread)
     state = STATUS_TYPES.get(str(kind), SessionState.RUNNING)
     cwd = thread.get("cwd")
-    name = thread.get("name")
     return SessionInspection(
         target=SessionTarget(agent=AgentKind.CODEX, session_id=str(thread["id"]), pid=pid),
         workspace=Path(str(cwd)) if isinstance(cwd, str) and cwd.strip() else Path(),
@@ -390,8 +403,44 @@ def _from_thread(
         # the thread's own account of when it last moved, which is exactly the
         # case `last_activity` exists to answer when nothing was said (#76).
         last_activity=thread_tail.last_activity(thread),
-        name=name.strip() if isinstance(name, str) and name.strip() else None,
     )
+
+
+def _thread_name(thread: Mapping[str, Any]) -> str | None:
+    """What the daemon calls this thread, when it calls it anything."""
+    name = thread.get("name")
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+async def _named(
+    row: SessionInspection, projects: ProjectNames, *, task: str | None = None
+) -> SessionInspection:
+    """The same row, carrying its Session Name.
+
+    One rule for both sources, because there is one kind of Codex Session: the
+    task is the daemon's `Thread.name` when the daemon has one, and the first
+    `SHORT_THREAD_ID_CHARACTERS` of the thread id when it does not. A row read
+    off the process table simply never has the first, so it takes the second —
+    and a Session that has not taken its first turn has neither, because it has
+    no thread id yet (#73), so it stays unnamed until it does. That is not a
+    reach problem: an unnamed row is listed, and what it can be addressed by is
+    its target, which it has had all along.
+    """
+    chosen = task or _short_thread_id(row.target.session_id)
+    if chosen is None:
+        return row
+    project = await projects.of(row.workspace)
+    if project is None:
+        return row
+    return replace(row, name=_naming.compose(project, chosen))
+
+
+def _short_thread_id(thread_id: str | None) -> str | None:
+    """The head of a thread id, as a name for a thread nobody named."""
+    if thread_id is None:
+        return None
+    short = thread_id.strip()[:SHORT_THREAD_ID_CHARACTERS]
+    return short or None
 
 
 def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspection:
