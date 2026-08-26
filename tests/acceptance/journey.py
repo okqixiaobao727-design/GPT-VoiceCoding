@@ -1418,7 +1418,7 @@ class Walk:
         while this lane's own announcement never went out. That the check is
         possible at all is a product change #109 made — until then the
         announcement named the tool and never the Session
-        (`core/approvals.py:51-56`).
+        (`core/approvals.py:52-76`).
         """
         deadline = time.monotonic() + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
@@ -1510,7 +1510,7 @@ def _named_in(text: str, forms: Sequence[str]) -> bool:
     """Does this message name one of these Sessions? The attribution rule's whole test.
 
     Substring, not equality: the product's own words wrap the name in a sentence
-    it composes (`core/bridge.py:107-123`, `core/approvals.py:51-56`), and which
+    it composes (`core/bridge.py:107-120`, `core/approvals.py:52-76`), and which
     sentence is the product's business rather than this harness's.
     """
     return any(form in text for form in forms)

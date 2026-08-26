@@ -26,8 +26,13 @@ import journey
 from gpt_voicecoding.control_plane.payloads import session_document
 from gpt_voicecoding.core.approvals import announcement_for
 from gpt_voicecoding.core.bridge import stop_notice_for
-from gpt_voicecoding.core.sessions import Session
-from gpt_voicecoding.seams.agent import ApprovalRequest
+from gpt_voicecoding.core.sessions import Session, session_from
+from gpt_voicecoding.seams.agent import (
+    ApprovalRequest,
+    ChildClassification,
+    ChildKind,
+    SessionInspection,
+)
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 MINE = SessionTarget(agent=AgentKind.CLAUDE, session_id="6f723f5c", pid=64312)
@@ -139,11 +144,45 @@ class TestTwoSessionsTheChatCannotTellApart:
     """Nothing makes a Session Name unique, so the harness has to notice when one is not.
 
     `adapters/agent/_naming.py` composes `<project> · <task>` from a project and a
-    task and checks neither against the other rows. Two Sessions in one workspace
-    doing one thing therefore share a name, and the likeliest such pair is a Child
-    Process and its parent — which is #79's step, where the parent is announced
-    while the child must not be.
+    task and checks neither against the other rows, so two Sessions on one machine
+    can be called the same thing. The product already knows this: `match_name`
+    refuses with `AmbiguousNameError` rather than picking one
+    (`core/sessions.py:456-463`). These are the same fact met from the chat.
+
+    **A Child Process and its parent are not such a pair**, and the test below
+    says why: `core/sessions.py:225` keeps `name` for main Sessions and gives a
+    child `None`, so a child's only naming form is its address.
     """
+
+    def test_a_child_has_no_name_to_collide_with_its_parents(self) -> None:
+        """#78/#79's design, taken through the product's own path rather than asserted.
+
+        The lane offers the child a name; `session_from` refuses it because a
+        Child Process is listed and never spoken to (`core/sessions.py:137-143`,
+        `215-231`). So its only naming form is its address.
+        """
+        parent = session()
+        seen_as_a_child = SessionInspection(
+            target=SessionTarget(agent=AgentKind.CLAUDE, session_id="9a11bd2e", pid=64399),
+            workspace=Path("/tmp/workspace"),
+            # The lane offering exactly its parent's name is the collision this
+            # would be, if the product let a child keep one.
+            name=SessionName("workspace-claude", "port the log"),
+            child=ChildClassification(kind=ChildKind.CHILD, parent=parent.target),
+        )
+
+        child = session_from(seen_as_a_child, first_seen=0.0)
+
+        assert row(child)["name"] is None
+        assert journey._naming_forms(row(child)) == ("claude 9a11bd2e",)
+        assert (
+            journey._indistinguishable_from(
+                journey._naming_forms(row(child)),
+                [row(parent), row(child)],
+                journey._address_of(row(child)),
+            )
+            is None
+        )
 
     def test_a_name_two_sessions_share_is_refused_rather_than_guessed(self) -> None:
         parent = session()
