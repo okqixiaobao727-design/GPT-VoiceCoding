@@ -77,9 +77,7 @@ class TestOneProcessStaysOneRow:
     def test_a_session_that_gets_named_is_the_same_row_re_keyed(self) -> None:
         registry = SessionRegistry()
         registry.observe(AgentKind.CODEX, seeing(codex_row(session_id=None, pid=10)), now=NOW)
-        registry.observe(
-            AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW + 5
-        )
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW + 5)
 
         assert len(registry.all()) == 1
         assert registry.live()[0].target.session_id == "abc"
@@ -107,9 +105,7 @@ class TestOneProcessStaysOneRow:
         """`/new` keeps the process and changes the thread. Whoever read an id decides."""
         registry = SessionRegistry()
         registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
-        registry.observe(
-            AgentKind.CODEX, seeing(codex_row(session_id="xyz", pid=10)), now=NOW + 5
-        )
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="xyz", pid=10)), now=NOW + 5)
 
         assert len(registry.all()) == 1
         assert registry.live()[0].target.session_id == "xyz"
@@ -186,6 +182,42 @@ class TestALaneThatCouldNotLook:
 
         assert registry.lane_errors() == {}
 
+    def test_status_can_also_say_a_lane_is_running_on_weaker_evidence(self) -> None:
+        """Which is the Codex lane's ordinary state until #83 installs the daemon."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id=None, pid=10), degraded="shared daemon absent"),
+            now=NOW,
+        )
+
+        assert registry.lane_degradations() == {AgentKind.CODEX: "shared daemon absent"}
+        assert registry.lane_errors() == {}
+
+    def test_a_lane_that_gets_its_daemon_back_stops_being_reported_as_degraded(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id=None, pid=10), degraded="shared daemon absent"),
+            now=NOW,
+        )
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW + 5)
+
+        assert registry.lane_degradations() == {}
+
+    def test_a_lane_that_could_not_look_says_nothing_about_how_well_it_reads(self) -> None:
+        """`error` and `degraded` are different news and never collapse into one."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id=None, pid=10), degraded="shared daemon absent"),
+            now=NOW,
+        )
+        registry.observe(AgentKind.CODEX, LaneDiscovery(error="the process table is shut"), now=NOW)
+
+        assert registry.lane_errors() == {AgentKind.CODEX: "the process table is shut"}
+        assert registry.lane_degradations() == {AgentKind.CODEX: "shared daemon absent"}
+
 
 class TestWhatTheRowCarriesAcrossReadings:
     def test_the_users_own_name_for_it_is_not_overwritten_by_a_lane(self) -> None:
@@ -222,3 +254,67 @@ class TestWhatTheRowCarriesAcrossReadings:
         )
 
         assert registry.live()[0].state is SessionState.RUNNING
+
+
+class TestWhatObserveReportsAsEnded:
+    """The registry is the only place that knows a re-keyed row is not a dead one.
+
+    `BridgeCore.discover` has to tell the user when a Session goes, and the news
+    it sends is not free: it terminates every Relay queued for that target. So
+    "which rows ended" cannot be recovered by diffing targets outside this class
+    — the Codex row that gains its thread id at its first turn changes target
+    without anything having ended, and that is the ordinary path (#73), not an
+    edge.
+    """
+
+    def test_a_row_that_stopped_being_seen_is_reported_once(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
+
+        gone = registry.observe(AgentKind.CODEX, seeing(), now=NOW + 5)
+
+        assert [target.session_id for target in gone] == ["abc"]
+
+    def test_and_not_again_when_it_is_forgotten(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
+        registry.observe(AgentKind.CODEX, seeing(), now=NOW + 5)
+
+        assert registry.observe(AgentKind.CODEX, seeing(), now=NOW + 10) == ()
+
+    def test_a_session_learning_its_own_id_has_not_ended(self) -> None:
+        """The measured Codex path: no id until the first turn, then one."""
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id=None, pid=10)), now=NOW)
+
+        gone = registry.observe(
+            AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW + 5
+        )
+
+        assert gone == ()
+
+    def test_nor_has_one_whose_tui_was_given_a_new_thread(self) -> None:
+        """`/new`: the thread is over, the Session the user is sitting in is not."""
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
+
+        gone = registry.observe(
+            AgentKind.CODEX, seeing(codex_row(session_id="xyz", pid=10)), now=NOW + 5
+        )
+
+        assert gone == ()
+
+    def test_a_lane_that_could_not_look_ends_nothing(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
+
+        assert registry.observe(AgentKind.CODEX, seeing(error="no daemon"), now=NOW + 5) == ()
+
+    def test_one_lane_going_quiet_does_not_end_the_others_rows(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CLAUDE, seeing(claude_row(session_id="c", pid=1)), now=NOW)
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
+
+        gone = registry.observe(AgentKind.CODEX, seeing(), now=NOW + 5)
+
+        assert [target.session_id for target in gone] == ["abc"]

@@ -174,6 +174,11 @@ class Status:
     #: are unknown, and a roster that showed nothing without saying so would be
     #: claiming the machine is empty.
     lanes: Mapping[AgentKind, str]
+    #: Which lanes are reading from a weaker source than usual, and which source.
+    #: Distinct from `lanes`: these lanes *do* have Sessions to show, so folding
+    #: the two together would hide a working lane behind a warning shaped like
+    #: an outage. The Codex lane sits here whenever no shared daemon is up.
+    degraded_lanes: Mapping[AgentKind, str]
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
@@ -275,6 +280,7 @@ class BridgeCore:
             switches=self._state.switches.snapshot(),
             sessions=self._state.sessions.all(),
             lanes=self._state.sessions.lane_errors(),
+            degraded_lanes=self._state.sessions.lane_degradations(),
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
             pending_approvals=self.approvals.pending(),
@@ -421,17 +427,23 @@ class BridgeCore:
         whatever was queued for them: a Session that disappears between two
         ticks owes the user the same news as one that reported its own death,
         and the roster is the only witness to the first kind.
+
+        **Which rows ended is the registry's answer, not a diff taken here.** A
+        Codex row is re-keyed when its Session takes its first turn and gains a
+        thread id, and again when the user types `/new` (#73) — the same row,
+        under a new `SessionTarget`. Comparing the roster before and after would
+        read both as a departure and terminate the Relays queued for a Session
+        that is sitting there waiting for them, so the question is asked of the
+        one component that can tell a re-keying from a death.
         """
         gone: list[SessionTarget] = []
         for kind, adapter in self._agents.items():
-            before = {held.target for held in self._state.sessions.live()}
             try:
                 lane = await adapter.discover()
             except Exception:  # noqa: BLE001 - a defective lane must not stop the rest
                 _log.exception("the %s lane raised instead of reporting its trouble", kind)
                 continue
-            self._state.sessions.observe(kind, lane, now=self._stamp())
-            gone.extend(before - {held.target for held in self._state.sessions.live()})
+            gone.extend(self._state.sessions.observe(kind, lane, now=self._stamp()))
 
         for target in gone:
             _log.info("Session %s is no longer running", target)

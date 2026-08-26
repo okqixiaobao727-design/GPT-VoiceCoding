@@ -142,8 +142,7 @@ def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
     if seen.session_id is None:
         if held.session_id is not None:
             _log.info(
-                "%s was read with process evidence only this tick; keeping its known "
-                "session id",
+                "%s was read with process evidence only this tick; keeping its known session id",
                 held,
             )
         return held
@@ -181,11 +180,27 @@ class SessionRegistry:
         #: Why a lane could not enumerate, per agent. `status` shows it; nothing
         #: else reads it, because it is news about the lane and not about a row.
         self._lane_errors: dict[AgentKind, str] = {}
+        #: Why a lane's rows came from a weaker source than usual, per agent.
+        #: Kept apart from `_lane_errors` rather than folded in, because the two
+        #: are different news: one lane has rows that are true and thin, the
+        #: other has no news at all. Collapsing them would repeat the two-field
+        #: encoding `LaneDiscovery` exists to avoid.
+        self._lane_degradations: dict[AgentKind, str] = {}
 
     # -- observation ----------------------------------------------------
 
-    def observe(self, agent: AgentKind, lane: LaneDiscovery, *, now: float) -> None:
-        """Make this lane's rows the roster's truth about this lane.
+    def observe(
+        self, agent: AgentKind, lane: LaneDiscovery, *, now: float
+    ) -> tuple[SessionTarget, ...]:
+        """Make this lane's rows the roster's truth about this lane, and say what went.
+
+        Returns the Sessions that ended on *this* observation, as they were last
+        addressed. **Only this class can answer that**, and the answer is not
+        recoverable by comparing the roster before and after: a Codex row gains
+        its thread id at its first turn (#73) and so changes `SessionTarget`
+        without anything having ended, and a `/new` does the same. A caller
+        diffing targets would read both as a death — and the news of a death is
+        not free, because it terminates every Relay queued for that target.
 
         **A lane that could not look changes nothing.** `LaneDiscovery.error`
         means the roster has no newer information, not that the machine emptied:
@@ -212,9 +227,12 @@ class SessionRegistry:
             assert lane.error is not None  # `enumerated` is exactly this test
             self._lane_errors[agent] = lane.error
             _log.info("the %s lane could not enumerate: %s", agent, lane.error)
-            return
+            return ()
         self._lane_errors.pop(agent, None)
-        if lane.degraded is not None:
+        if lane.degraded is None:
+            self._lane_degradations.pop(agent, None)
+        else:
+            self._lane_degradations[agent] = lane.degraded
             _log.info("the %s lane is reading from a weaker source: %s", agent, lane.degraded)
 
         seen: set[SessionTarget] = set()
@@ -230,15 +248,31 @@ class SessionRegistry:
                 continue
             seen.add(self._admit(row, now=now).target)
 
+        ended: list[SessionTarget] = []
         for held in [row for row in self._of(agent) if row.target not in seen]:
             if held.is_live:
                 self._sessions[held.target] = replace(held, lifecycle=SessionLifecycle.ENDED)
+                ended.append(held.target)
             else:
                 del self._sessions[held.target]
+        return tuple(ended)
 
     def lane_errors(self) -> dict[AgentKind, str]:
         """Which lanes could not be enumerated at their last attempt, and why."""
         return dict(self._lane_errors)
+
+    def lane_degradations(self) -> dict[AgentKind, str]:
+        """Which lanes have rows read by something weaker than usual, and which.
+
+        The rows are true; this says what read them. Separate from
+        `lane_errors` because a user reading `status` needs to tell "Codex is
+        running on the process table because the shared daemon is not up" from
+        "nobody could look at Codex at all" — the first still lists Sessions.
+
+        A lane that could not look leaves this alone, for the same reason it
+        leaves its rows alone: the note describes rows that did not change.
+        """
+        return dict(self._lane_degradations)
 
     def _admit(self, row: SessionInspection, *, now: float) -> Session:
         """Fold one freshly-read row into the roster, in place where it belongs."""
