@@ -22,12 +22,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import FakeLaunchd, codex_home
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.installation import Outcome, State, read_intent, replace_text, write_intent
 from gpt_voicecoding.installation import claude_hooks as hooks
 from gpt_voicecoding.installation import codex_launch_agent as codex
 from gpt_voicecoding.installation.__main__ import EXIT_FAILED, EXIT_OK, main
+from launchd_fake import FakeLaunchd, codex_home
 
 INTERPRETER = Path("/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/python3")
 OTHER_INTERPRETER = Path("/opt/homebrew/bin/python3.12")

@@ -32,9 +32,9 @@ from pathlib import Path
 
 import pytest
 
-from conftest import DOMAIN, FakeLaunchd, codex_home
 from gpt_voicecoding.installation import State
 from gpt_voicecoding.installation import codex_launch_agent as agent
+from launchd_fake import DOMAIN, FakeLaunchd, codex_home
 
 
 def launch_agents(root: Path) -> Path:
