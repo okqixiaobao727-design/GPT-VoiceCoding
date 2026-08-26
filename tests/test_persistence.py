@@ -210,5 +210,3 @@ class TestOnlyCoreTouchesIt:
         state = PersistedState(switches=Switchboard(features=features()).snapshot())
         store.save(state)
         assert store.load() == state
-
-

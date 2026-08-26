@@ -64,9 +64,7 @@ class TestLocatingOneThread:
     def test_a_codex_home_that_does_not_exist_is_not_yet(self, tmp_path: Path) -> None:
         assert isinstance(rollouts.locate(THREAD, home=tmp_path / "nope"), rollouts.NotYet)
 
-    def test_two_rollouts_claiming_one_thread_refuse_rather_than_pick(
-        self, tmp_path: Path
-    ) -> None:
+    def test_two_rollouts_claiming_one_thread_refuse_rather_than_pick(self, tmp_path: Path) -> None:
         write_rollout(tmp_path, CURRENT_META)
         write_rollout(tmp_path, CURRENT_META, archived=True)
         assert rollouts.locate(THREAD, home=tmp_path) == rollouts.Ambiguous(THREAD, 2)

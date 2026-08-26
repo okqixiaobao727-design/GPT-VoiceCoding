@@ -267,9 +267,7 @@ class Engine:
         self._loops = [
             asyncio.create_task(self._dispatching(), name="bridge-core-dispatch"),
             asyncio.create_task(self._ticking(tick_seconds), name="bridge-core-tick"),
-            asyncio.create_task(
-                self._discovering(discovery_seconds), name="bridge-core-discovery"
-            ),
+            asyncio.create_task(self._discovering(discovery_seconds), name="bridge-core-discovery"),
         ]
 
     async def run(
