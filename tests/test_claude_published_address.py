@@ -11,12 +11,12 @@ nothing and leaving the dialog with the human.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     CHANNEL_CONFIG_VARIABLE,
     approval_socket_path_in,
-    bootstrap_value,
     dial_timeout_in,
     publish_address,
     withdraw_address,
@@ -36,10 +36,8 @@ def test_a_launch_that_carried_an_address_still_wins(tmp_path: Path) -> None:
     """The variable is the direct answer; the file is only the fallback."""
     publish_address(tmp_path / "published.sock", ClaudeSettings(), base_dir=tmp_path)
     told = {
-        CHANNEL_CONFIG_VARIABLE: bootstrap_value(
-            tmp_path / "channel.sock",
-            ClaudeSettings(),
-            approval_socket_path=tmp_path / "handed-over.sock",
+        CHANNEL_CONFIG_VARIABLE: json.dumps(
+            {"approvalSocketPath": str(tmp_path / "handed-over.sock")}
         )
     }
 

@@ -5,14 +5,14 @@
 calls it with the event sink and this seam's settings table. Nothing else
 imports an adapter (ADR 0001).
 
-This package is the shared Claude adapter for the Answer Relay over the MCP
-Session Channel and the Approval Relay over the `PermissionRequest` hook — two
-routes, two proofs, one settings table, one bootstrap contract with the launcher,
-and one set of socket privacy rules.
+This package is the shared Claude adapter for the Answer Relay over the Session's
+own **inbox socket** and the Approval Relay over the `PermissionRequest` hook —
+two routes, two proofs, one settings table, and one set of socket privacy rules.
+The inbox carries the user's words; only the hook can carry their authority, and
+#71 proved that boundary is upstream's own and enforced (`inbox.py`).
 
 The approval socket is bound at `connect` in a directory of this engine's own,
-because its address has to exist before any Session launches — the launch is what
-carries it to the hook.
+because its address has to exist before any Session's hook dials it.
 
 **The Approval Relay needs two things this package does not launch**: the hook
 installed in the Session's config directory, which is `installation`'s job
@@ -35,7 +35,6 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     CHANNEL_CONFIG_VARIABLE,
     BootstrapError,
-    bootstrap_value,
     publish_address,
     withdraw_address,
 )
@@ -57,7 +56,6 @@ __all__ = [
     "RegistryError",
     "SettingsError",
     "approval_socket_path",
-    "bootstrap_value",
     "claude_agent",
     "hook_decision",
     "publish_address",

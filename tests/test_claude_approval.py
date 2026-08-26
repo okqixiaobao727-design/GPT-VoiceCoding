@@ -46,10 +46,7 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     request_from,
 )
 from gpt_voicecoding.adapters.agent.claude.approval_hook import decide, request_for
-from gpt_voicecoding.adapters.agent.claude.bootstrap import (
-    CHANNEL_CONFIG_VARIABLE,
-    bootstrap_value,
-)
+from gpt_voicecoding.adapters.agent.claude.bootstrap import CHANNEL_CONFIG_VARIABLE
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
 from gpt_voicecoding.seams.agent import ApprovalVerdict, AwaitingApproval, WaitingKind
@@ -107,12 +104,15 @@ def dialog(tool_name: str = "Bash", **tool_input: Any) -> dict[str, Any]:
 
 
 def environment(path: Path, root: Path) -> dict[str, str]:
-    """What the launch wrapper set, as the hook process inherits it."""
-    return {
-        CHANNEL_CONFIG_VARIABLE: bootstrap_value(
-            root / "channel.sock", settings_for(root), approval_socket_path=path
-        )
-    }
+    """Where this engine is, handed to the hook process directly.
+
+    The variable rather than the published file, because a test that used the
+    file would be reaching for the one address on this machine — and every hook
+    in this module must reach *its own* listener. `publish_address` is
+    `test_claude_published_address.py`'s.
+    """
+    del root
+    return {CHANNEL_CONFIG_VARIABLE: json.dumps({"approvalSocketPath": str(path)})}
 
 
 def _request_line() -> bytes:
@@ -259,15 +259,9 @@ class TestTheHookClient:
         """Gate one: a Session this engine did not launch is not ours to answer."""
         assert decide(dialog(), {}) is None
 
-    def test_a_launch_that_carried_no_approval_address_is_the_same_silence(
-        self, socket_root: Path
-    ) -> None:
-        environ = {
-            CHANNEL_CONFIG_VARIABLE: bootstrap_value(
-                socket_root / "channel.sock", settings_for(socket_root)
-            )
-        }
-        assert decide(dialog(), environ) is None
+    def test_a_value_that_names_no_approval_address_is_the_same_silence(self) -> None:
+        """Gate one again: a value this build can read and that says nothing."""
+        assert decide(dialog(), {CHANNEL_CONFIG_VARIABLE: json.dumps({})}) is None
 
     def test_a_hook_that_fires_while_the_engine_is_down_leaves_the_dialog_alone(
         self, socket_root: Path

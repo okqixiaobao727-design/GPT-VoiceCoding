@@ -1,27 +1,39 @@
-"""The Agent seam, over the Claude Session Channel. Mechanism only; no queueing.
+"""The Agent seam, over a Session's own inbox socket. Mechanism only; no queueing.
 
-**What proves delivery.** The channel route cannot mint the hub's `request_id`
-into the transcript the way `turn/start` does on the Codex side, so the proof is
-the other direction: the correlation id rides inside the message, and the
-Session calls `acknowledge_answer` with it. That tool call is the only positive
-proof there is. The channel accepting the line is not — it says the notification
-was pushed, not that the Session read it.
+**What proves delivery, and it is narrow.** The Answer Relay writes into the
+inbox socket Claude Code binds for every Session, and a write that is accepted
+proves nothing at all: the line was taken by a socket, not read by a Session.
+#71 measured the two things that do prove it — the `held → delivered`
+`peer_message_status` receipt, and the target's own transcript entry whose
+`origin.from` is our reply address and whose `origin.msg_id` is the id we minted.
+Everything weaker is UNKNOWN, and P9 never re-sends an UNKNOWN on this system's
+own authority. `inbox.py` holds the wire and the whole argument.
 
-**A late acknowledgement is an upgrade, and that is why it exists.** The wait is
-bounded, and a spent wait is UNKNOWN, never DELIVERED. But Bridge Core retains
-anything not proven delivered and sends it again when the Reply Window next
-opens — so an acknowledgement that arrives after the wait and is thrown away
-becomes the hub re-delivering words that provably arrived. The connection is
-therefore kept, for a second and longer budget, purely so a late receipt can be
-raised upward and the hub can drop what it was holding. Only DELIVERED is ever
-raised that way; a late anything-else is logged and changes nothing.
+**A late settlement is raised, and that is why the listening continues.** The
+wait is bounded, and a spent wait is UNKNOWN. But a *held* Relay is parked in
+front of a person and has not finished happening: it settles minutes later to
+`delivered` when they release it, or to `denied` / `expired` when they refuse or
+never answer — and a held message expires after about five minutes. An engine
+that stopped listening would report "parked" for words that were later thrown
+away, which is exactly the implied delivery #71 forbade. So a grade that was not
+terminal keeps a listener for a second and longer budget, and upstream's own
+settlement is raised upward whichever way it went. A grade that *was* terminal
+is never revisited.
 
 **Two verbs over two different wires.** This package is the shared Claude
-adapter. The Answer Relay rides the MCP Session Channel, described above. The
+adapter. The Answer Relay rides the Session's inbox socket, described above. The
 Approval Relay rides the **`PermissionRequest` hook**, delegated to
 `approval.py`, and it is the route where *we* are the server: a hook process
 dials in holding a displayed dialog open, and the verdict travels back down the
 connection it is waiting on.
+
+**Words on one wire, authority on the other, and that is structural.** A peer
+message is announced to the receiving Session as not typed by its user, and
+upstream enforces it — a Session asked to approve a pending dialog on a peer's
+say-so refuses and names it permission laundering. So the inbox carries the
+user's words and never their authority, and a Session's *question* can never be
+answered over it (#71). That is why the hook route exists and why no amount of
+later work on this socket could replace it.
 
 The Approval Relay is also the one verb whose route this adapter cannot start.
 The hook exists for a Session only when it is installed in that Session's config
@@ -48,7 +60,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
-from gpt_voicecoding.adapters.agent.claude import stop_analysis, transcript_tail
+from gpt_voicecoding.adapters.agent.claude import inbox, stop_analysis, transcript_tail
 from gpt_voicecoding.adapters.agent.claude.approval import (
     CWD_FIELD,
     MESSAGING_SOCKET_FIELD,
@@ -60,26 +72,13 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     ApprovalListener,
 )
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
-    bootstrap_value,
     publish_address,
     withdraw_address,
 )
-from gpt_voicecoding.adapters.agent.claude.protocol import (
-    ACKNOWLEDGED,
-    CHANNEL_ERROR,
-    KIND_FIELD,
-    QUEUED,
-    REQUEST_ID_FIELD,
-    TEXT_FIELD,
-    channel_kind_for,
-)
+from gpt_voicecoding.adapters.agent.claude.inbox import InboxError, ReplyInbox
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import Record, TranscriptReader
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
-from gpt_voicecoding.adapters.agent.claude.wire import (
-    ChannelConnection,
-    ChannelError,
-)
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -113,8 +112,8 @@ APPROVAL_UNROUTED = (
     "(bridge-install status) and this engine has published an approval address"
 )
 SUPPLEMENT_UNAVAILABLE = (
-    "the Claude Session Channel has no mid-turn route: a channel message delivered inside "
-    "a turn is framed as not being from the user and is refused"
+    "the Claude inbox route has no mid-turn verb: a Session that is mid-turn queues a peer "
+    "message until its turn ends, so nothing this adapter can send reaches the turn in flight"
 )
 
 
@@ -167,8 +166,17 @@ class ClaudeAgentAdapter:
     ) -> None:
         self._sink = sink
         self._settings = settings or ClaudeSettings()
-        #: The channel socket each registered Session's launch wrapper reported.
-        self._channels: dict[SessionTarget, Path] = {}
+        #: The inbox socket each registered Session's own `SessionStart` hook
+        #: reported. Read, never built: 2.1.245 derives the directory from
+        #: `CLAUDE_CODE_TMPDIR` or `$XDG_RUNTIME_DIR` and accepts
+        #: `--messaging-socket-path`, so a constructed path is a guess.
+        self._inboxes: dict[SessionTarget, Path] = {}
+        #: One reply socket per socket *directory*, because that is the namespace
+        #: a receipt may be addressed inside. Bound on first use rather than on
+        #: `connect`: the directory is a fact about a Session's registration, and
+        #: this adapter may be running before any Session has registered.
+        self._replies: dict[Path, ReplyInbox] = {}
+        self._binding = asyncio.Lock()
         #: Late-receipt listeners in flight, so none outlives this adapter.
         self._listening: set[asyncio.Task[None]] = set()
         #: The lane's one opener of a transcript file, shared by what a Session
@@ -223,10 +231,13 @@ class ClaudeAgentAdapter:
             _log.info("approval address published at %s", published)
 
     async def aclose(self) -> None:
-        """Stop everything this adapter started, and take its socket back out.
+        """Stop everything this adapter started, and take its sockets back out.
 
-        A channel is a process Claude Code owns. Closing this adapter lets go of
+        A Session's inbox is Claude Code's. Closing this adapter lets go of
         connections to it and nothing more — there is nothing there to reap.
+        What *is* ours is the reply socket bound beside it and the key published
+        for it, both in directories belonging to somebody else, so both are
+        removed here rather than left for the next process to trip over.
 
         **Each cancelled task is waited for, not merely cancelled.** A
         cancellation is a request, delivered the next time the task runs, so
@@ -251,28 +262,32 @@ class ClaudeAgentAdapter:
         # dial into nothing, paid by every permission dialog in this config
         # directory until something else publishes over it.
         withdraw_address()
-        self._channels.clear()
+        for replies in self._replies.values():
+            await replies.aclose()
+        self._replies.clear()
+        self._inboxes.clear()
 
     # -- the Session roster this adapter can reach ------------------------
 
     def register_session(self, target: SessionTarget, socket_path: Path) -> None:
-        """Record where one Session's channel listens.
+        """Record where one Session's inbox listens.
 
-        The path is the registration this adapter needs and cannot discover: the
-        channel is spawned by Claude Code inside the Session's own process, so
-        its address exists nowhere outside it. It arrives from that Session's
+        The path is the registration this adapter needs and cannot discover:
+        Claude Code chooses it inside the Session's own process, from
+        `CLAUDE_CODE_TMPDIR`, `$XDG_RUNTIME_DIR` or `--messaging-socket-path`,
+        so it is read and never built. It arrives from that Session's
         `SessionStart` hook (`_session_started`) — the reference implementation
         got it from a launch wrapper it owned, and v1.0 launches nothing (#72).
         """
         if target.agent is not AgentKind.CLAUDE:
             raise ValueError(f"{target.agent} sessions are not this adapter's to reach")
-        self._channels[target] = socket_path
+        self._inboxes[target] = socket_path
         # Registering is also what starts reporting this Session's Reply Window,
         # which is what makes it reachable at all: until a window is observed,
         # Bridge Core holds every Relay against the fail-closed default.
         self._windows.watch(target)
         _log.info(
-            "registered Session channel agent=%s session_id=%s pid=%s socket=%s",
+            "registered Session inbox agent=%s session_id=%s pid=%s socket=%s",
             target.agent,
             target.session_id,
             target.pid,
@@ -350,15 +365,15 @@ class ClaudeAgentAdapter:
         what keeps the caches below bounded by the machine's live Sessions rather
         than by everything that has ever registered (#98).
         """
-        self._channels.pop(target, None)
+        self._inboxes.pop(target, None)
         self._windows.forget(target)
         report = self._reported.pop(target, None)
         if report is not None:
             self._transcripts.forget(report.transcript_path)
 
     def reachable(self) -> tuple[SessionTarget, ...]:
-        """Every Session this adapter holds a channel address for."""
-        return tuple(self._channels)
+        """Every Session this adapter holds an inbox address for."""
+        return tuple(self._inboxes)
 
     def reply_window(self, target: SessionTarget) -> ReplyWindow:
         """Where this Session's Reply Window stands right now, read from the registry.
@@ -367,12 +382,12 @@ class ClaudeAgentAdapter:
         Bridge Core at all: registration cannot announce it, because it runs
         before Bridge Core holds the Session (#27), so Bridge Core asks instead.
 
-        A Session this adapter holds no channel for is CLOSED, whatever its
-        registry record happens to say. The window is a claim about reachability,
-        and reading someone else's record is not the same as being able to reach
-        them — the same fail-closed rule the whole seam runs on.
+        A Session this adapter holds no inbox address for is CLOSED, whatever
+        its registry record happens to say. The window is a claim about
+        reachability, and reading someone else's record is not the same as being
+        able to reach them — the same fail-closed rule the whole seam runs on.
         """
-        if target not in self._channels:
+        if target not in self._inboxes:
             return ReplyWindow.CLOSED
         return self._windows.level(target)
 
@@ -383,8 +398,8 @@ class ClaudeAgentAdapter:
 
         The roster is `discovery.py`'s whole business — it owns the command and
         the mapping. Nothing about being *reachable* enters there: a Session is
-        listed because it exists, and whether this adapter holds a channel to it
-        is a question `answer_relay` answers with a receipt (#68).
+        listed because it exists, and whether this adapter holds an inbox address
+        for it is a question `answer_relay` answers with a receipt (#68).
 
         What is added here is the one thing the roster cannot say: **what a
         stopped Session stopped on** (#75). The roster reports `waiting` without
@@ -597,7 +612,7 @@ class ClaudeAgentAdapter:
             # Bridge Core decides what to do instead — queueing is its policy,
             # never this adapter's.
             return _failed(request_id, SUPPLEMENT_UNAVAILABLE)
-        return await self._deliver(target, text, request_id=request_id, verb="answer_relay")
+        return await self._deliver(target, text, request_id=request_id)
 
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
@@ -631,25 +646,6 @@ class ClaudeAgentAdapter:
         """
         return self._approvals.path
 
-    def launch_bootstrap(self, channel_socket_path: Path) -> str:
-        """What one launch must set the bootstrap variable to for this engine.
-
-        The Session Launcher owns the child environment but not the contents of
-        this value: the byte budgets inside it are this adapter's settings, and
-        the approval address is this adapter's socket. So the launcher says where
-        the channel should listen — that path is per-launch and only it can mint
-        one — and asks here for everything else.
-
-        Answered before anything is bound, for the same reason
-        `approval_socket_path` is: a launch has to carry the address into the
-        Session that will dial it, so the address must exist first.
-        """
-        return bootstrap_value(
-            channel_socket_path,
-            self._settings,
-            approval_socket_path=self.approval_socket_path(),
-        )
-
     def _registered_as(self, session_id: str) -> SessionTarget | None:
         """The authority check behind the approval socket, in this adapter's own terms.
 
@@ -669,7 +665,7 @@ class ClaudeAgentAdapter:
         wrong Session is the truthfulness failure, not the lost approval. The
         dialog stays with its human, which is the safe direction to be wrong in.
         """
-        matches = [target for target in self._channels if target.session_id == session_id]
+        matches = [target for target in self._inboxes if target.session_id == session_id]
         if len(matches) == 1:
             return matches[0]
         if matches:
@@ -682,161 +678,258 @@ class ClaudeAgentAdapter:
         return None
 
     async def verify(self) -> VerifyResult:
-        """Report what is loaded, and whether any registered channel really answers."""
+        """Report what is loaded, and whether any registered inbox really answers.
+
+        A dial and an immediate close, deliberately: this verb runs at start-up
+        against every Session on the machine, and anything written here would
+        land in a real conversation. What it proves is that the address the
+        registration reported is a socket somebody is still listening on.
+        """
         loaded = f"{type(self).__module__}:{type(self).__name__}"
-        if not self._channels:
+        if not self._inboxes:
             return VerifyResult(
                 outcome=VerifyOutcome.PASS,
                 loaded=loaded,
-                detail="no Claude Session is registered, so there is no channel to reach",
+                detail="no Claude Session is registered, so there is no inbox to reach",
             )
 
         answered: list[SessionTarget] = []
         refusals: list[str] = []
-        for target, path in self._channels.items():
+        for target, path in self._inboxes.items():
             try:
-                connection = await self._dial(path)
-            except ChannelError as unreachable:
+                await inbox.dial(path, timeout=self._settings.request_timeout_seconds)
+            except InboxError as unreachable:
                 refusals.append(f"{target.session_id}: {unreachable}")
                 continue
             answered.append(target)
-            await connection.aclose()
 
         if not answered:
             return VerifyResult(
                 outcome=VerifyOutcome.FAIL,
                 loaded=loaded,
-                detail="no registered Claude Session Channel answered: " + "; ".join(refusals),
+                detail="no registered Claude Session inbox answered: " + "; ".join(refusals),
             )
         return VerifyResult(
             outcome=VerifyOutcome.PASS,
             loaded=loaded,
-            detail=f"{len(answered)} of {len(self._channels)} Claude Session Channel(s) answered",
+            detail=f"{len(answered)} of {len(self._inboxes)} Claude Session inbox(es) answered",
         )
 
     # -- carrying words ---------------------------------------------------
 
     async def _deliver(
-        self, target: SessionTarget, text: str, *, request_id: RequestId, verb: str
+        self, target: SessionTarget, text: str, *, request_id: RequestId
     ) -> DeliveryReceipt:
         """One attempt, classified into the hub's four states and nothing else."""
-        socket_path = self._channels.get(target)
+        socket_path = self._inboxes.get(target)
         if socket_path is None:
             return _failed(request_id, f"no Claude Session is registered as {target}")
         spent = len(text.encode("utf-8"))
         if spent > self._settings.max_text_bytes:
             return _failed(
                 request_id,
-                f"the words are {spent} bytes and both ends of the channel cap one Relay at "
+                f"the words are {spent} bytes and this engine caps one Relay at "
                 f"{self._settings.max_text_bytes}",
             )
+        try:
+            replies = await self._reply_inbox(socket_path.parent)
+        except InboxError as unbindable:
+            # Nothing has been sent, so this is proven non-delivery. It is a
+            # refusal rather than a best effort because a Relay written with no
+            # reply address is a Relay no receipt can ever settle: on a receiver
+            # that holds, it would be parked and never heard of again.
+            return _failed(
+                request_id, f"no reply inbox could be bound for this Relay: {unbindable}"
+            )
+
+        msg_id = inbox.new_message_id()
+        frames: list[dict[str, object]] = []
+        token = self._messaging_token(target)
+        if token is not None:
+            frames.append(inbox.auth_frame(token))
+        frames.append(inbox.user_frame(text, msg_id=msg_id, reply_to=replies.address))
 
         # Everything up to and including the dial happens before a byte of the
         # user's words is on the wire, so a failure here proves they never left.
         try:
-            connection = await self._dial(socket_path)
-        except ChannelError as unreachable:
-            return _failed(request_id, f"the Session's channel is unreachable: {unreachable}")
+            await inbox.send(
+                socket_path, tuple(frames), timeout=self._settings.request_timeout_seconds
+            )
+        except InboxError as unreachable:
+            return _failed(request_id, f"the Session's inbox is unreachable: {unreachable}")
+        except (OSError, ConnectionError) as broken:
+            # Past the connection: the line may or may not have been read.
+            return _unknown(request_id, f"the write to the Session's inbox failed: {broken}")
 
-        keep_open = False
-        try:
-            message = {
-                REQUEST_ID_FIELD: str(request_id),
-                KIND_FIELD: channel_kind_for(verb),
-                TEXT_FIELD: text,
-            }
-            try:
-                await connection.send(message)
-            except ChannelError as broken:
-                # Past the write: the line may or may not have been read.
-                return _unknown(request_id, f"the channel write failed: {broken}")
+        receipt = await self._await_receipt(target, replies, msg_id, request_id)
+        if receipt.outcome in (Delivery.HELD, Delivery.UNKNOWN):
+            self._listen_late(target, replies, msg_id, request_id)
+        return receipt
 
-            receipt = await self._await_acknowledgement(connection, request_id)
-            keep_open = receipt.outcome is Delivery.UNKNOWN and receipt.request_id == request_id
-            if keep_open:
-                self._listen_late(target, connection, request_id)
-            return receipt
-        finally:
-            if not keep_open:
-                await connection.aclose()
+    def _messaging_token(self, target: SessionTarget) -> str | None:
+        """The Session's own inbox token, as its `SessionStart` hook reported it."""
+        report = self._reported.get(target)
+        return report.messaging_token if report else None
 
-    async def _await_acknowledgement(
-        self, connection: ChannelConnection, request_id: RequestId
+    async def _reply_inbox(self, directory: Path) -> ReplyInbox:
+        """This engine's reply socket inside one Session's socket namespace.
+
+        Bound once per directory and kept: binding it is a `ps` call and a file
+        written into somebody else's directory, and doing that per Relay would
+        publish and withdraw a key on every sentence the user speaks.
+        """
+        async with self._binding:
+            existing = self._replies.get(directory)
+            if existing is not None:
+                return existing
+            replies = ReplyInbox(
+                directory=directory, registry_directory=self._settings.registry_directory
+            )
+            await replies.start()
+            self._replies[directory] = replies
+            _log.info("reply inbox bound at %s", replies.address)
+            return replies
+
+    async def _await_receipt(
+        self,
+        target: SessionTarget,
+        replies: ReplyInbox,
+        msg_id: str,
+        request_id: RequestId,
     ) -> DeliveryReceipt:
-        """Wait, bounded, for the Session to say it has the words.
+        """Wait, bounded, for one of the two things that prove this Relay arrived.
 
-        `queued_for_claude` is not an answer, so it keeps waiting. A reply about
-        a *different* request id contradicts the attempt, and a contradiction is
-        UNKNOWN rather than a failure: these words may well have arrived.
+        Polled rather than awaited on an event, because the two sources are not
+        one wire: a status frame lands on our own socket, and the transcript is a
+        file the Session appends to with nothing to notify us. A spent wait is
+        UNKNOWN and never DELIVERED — which on an accepting receiver, where
+        nothing is ever held and therefore nothing is ever receipted, is a real
+        and frequent answer rather than an edge.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settings.ack_timeout_seconds
         while True:
-            try:
-                reply = await connection.read_message(
-                    timeout_seconds=deadline - loop.time(),
-                )
-            except TimeoutError:
+            graded = self._graded(target, replies, msg_id, request_id)
+            if graded is not None:
+                return graded
+            if loop.time() >= deadline:
                 return _unknown(
                     request_id,
-                    "the Session did not acknowledge the words within "
-                    f"{self._settings.ack_timeout_seconds:.0f}s",
+                    "nothing proved the words arrived within "
+                    f"{self._settings.ack_timeout_seconds:.0f}s: no receipt, and the "
+                    "Session's own record does not carry them yet",
                 )
-            except ChannelError as broken:
-                return _unknown(request_id, f"the channel stopped answering: {broken}")
+            await asyncio.sleep(self._settings.receipt_poll_seconds)
 
-            outcome = _classify(reply, request_id)
-            if outcome is not None:
-                return outcome
+    def _graded(
+        self,
+        target: SessionTarget,
+        replies: ReplyInbox,
+        msg_id: str,
+        request_id: RequestId,
+    ) -> DeliveryReceipt | None:
+        """What the two sources say right now, or `None` for "keep waiting".
+
+        A settlement wins over the transcript, and the transcript wins over
+        `held` — which is upstream saying it has not finished happening.
+        """
+        settled = self._settled(replies, msg_id, request_id)
+        if settled is not None and settled.outcome is not Delivery.HELD:
+            return settled
+        records = self._transcripts.records(self._transcript_path(target))
+        if inbox.correlated(records, msg_id=msg_id, address=replies.address):
+            return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
+        return settled
+
+    def _settled(
+        self, replies: ReplyInbox, msg_id: str, request_id: RequestId
+    ) -> DeliveryReceipt | None:
+        """What upstream's own status frames say about this message, ranked.
+
+        **Ranked, not taken in arrival order**, because one message's statuses are
+        a sequence and `held` is the first of them: a `held` that has since become
+        `delivered` must read as delivered, and reading the frames in the order
+        they landed would freeze it at the first.
+
+        `held` is returned rather than waited out — the person it is parked in
+        front of may take minutes, and "parked for someone to release" is the true
+        answer for that whole time — but it is the weakest thing here, so a caller
+        that has a better source may still prefer it.
+        """
+        parked = False
+        for frame in replies.statuses(msg_id):
+            status = frame.get("status")
+            if status == inbox.DELIVERED_STATUS:
+                return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
+            if status in inbox.REFUSED_STATUSES:
+                return DeliveryReceipt(
+                    request_id=request_id,
+                    outcome=Delivery.FAILED,
+                    reason=f"the Session's inbox settled this message as {status}",
+                )
+            parked = parked or status == inbox.HELD_STATUS
+        if parked:
+            return DeliveryReceipt(
+                request_id=request_id,
+                outcome=Delivery.HELD,
+                reason="the words are parked for the person at that Session to release",
+            )
+        return None
 
     def _listen_late(
-        self, target: SessionTarget, connection: ChannelConnection, request_id: RequestId
+        self,
+        target: SessionTarget,
+        replies: ReplyInbox,
+        msg_id: str,
+        request_id: RequestId,
     ) -> None:
-        """Keep listening on a spent attempt, so a late acknowledgement is still heard."""
-        task = asyncio.ensure_future(self._late(target, connection, request_id))
+        """Keep watching a Relay whose grade was not terminal, so its end is heard."""
+        task = asyncio.ensure_future(self._late(target, replies, msg_id, request_id))
         self._listening.add(task)
         task.add_done_callback(self._listening.discard)
 
     async def _late(
-        self, target: SessionTarget, connection: ChannelConnection, request_id: RequestId
+        self,
+        target: SessionTarget,
+        replies: ReplyInbox,
+        msg_id: str,
+        request_id: RequestId,
     ) -> None:
-        """One spent attempt's second budget. Only DELIVERED is ever raised from here."""
+        """One unsettled Relay's second budget, which is the hold's own lifetime.
+
+        Started only for HELD and UNKNOWN, and those are the two grades that have
+        not finished happening. A held message settles when the person answers,
+        expires after about five minutes, or is dropped when the hold queue passes
+        a hundred — so `late_ack_timeout_seconds` is that lifetime and not a guess.
+
+        **It watches the status frames and not the transcript**, which is not a
+        shortcut. The `origin` record is written when the message is *injected*,
+        so it is there within a moment or it is never coming — a message still
+        outstanding after the first wait is one a person is holding, and only a
+        status can settle that. Reading the file instead would re-parse a
+        transcript the Session is appending to, four times a second for five
+        minutes, on the event loop.
+
+        **Both directions are raised, and that is the point.** A late `delivered`
+        stops the hub re-sending words that provably arrived; a late `denied` or
+        `expired` is proven non-delivery, which is the one grade P9 permits
+        another attempt for. Reporting only the first would leave a Relay recorded
+        as parked long after it was thrown away — the implied delivery #71
+        forbade. A grade that was already terminal never gets here, so nothing
+        this raises re-grades a settled attempt.
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._settings.late_ack_timeout_seconds
         try:
-            while True:
-                try:
-                    reply = await connection.read_message(
-                        timeout_seconds=deadline - loop.time(),
-                    )
-                except (TimeoutError, ChannelError):
-                    return
-                outcome = _classify(reply, request_id)
-                if outcome is None:
+            while loop.time() < deadline:
+                await asyncio.sleep(self._settings.receipt_poll_seconds)
+                settled = self._settled(replies, msg_id, request_id)
+                if settled is None or settled.outcome is Delivery.HELD:
                     continue
-                if outcome.outcome is Delivery.DELIVERED:
-                    self._emit(RelayReceipt(target=target, receipt=outcome))
-                    return
-                # An upgrade is the only thing a late receipt may be. Anything
-                # else would re-grade an attempt Bridge Core has already
-                # recorded, from a connection nobody is waiting on.
-                _log.info(
-                    "a late channel reply for %s said %s; the recorded grade stands",
-                    request_id,
-                    outcome.outcome,
-                )
+                self._emit(RelayReceipt(target=target, receipt=settled))
                 return
         except asyncio.CancelledError:
             raise
-        finally:
-            await connection.aclose()
-
-    async def _dial(self, socket_path: Path) -> ChannelConnection:
-        return await ChannelConnection.dial(
-            socket_path,
-            timeout_seconds=self._settings.request_timeout_seconds,
-            max_message_bytes=self._settings.max_message_bytes,
-        )
 
     def _emit(self, event: AgentEvent) -> None:
         """Raise one event upward, and let go of a Session that has ended (#98).
@@ -844,7 +937,7 @@ class ClaudeAgentAdapter:
         **The adapter that says a Session ended is the one that forgets it.**
         `forget_session` had no caller: it is not on the `AgentAdapter` seam, and
         Bridge Core's `_session_ended` only marks state — so on an engine that
-        starts at login, every Session that ever registered kept its channel
+        starts at login, every Session that ever registered kept its inbox
         address, its window and its parsed transcript for the life of the
         process, and those records are of files measured at 186 MB on this
         machine. It is done here rather than behind a new seam method because
@@ -854,7 +947,7 @@ class ClaudeAgentAdapter:
         Forgetting happens *before* the sink sees the event, so this adapter is
         never holding a route to a Session it has already declared ended: a
         Relay aimed at one has to fail on the way out rather than be written
-        into a channel still listed here.
+        into an inbox still listed here.
         """
         if isinstance(event, SessionEnded):
             self.forget_session(event.target)
@@ -890,27 +983,6 @@ def _announced_as(found: WaitingFor, dialog: ApprovalRequest) -> tuple[str | Non
         # summary is the fuller of the two and the dialog's fills a gap.
         return dialog.tool_name, found.detail or dialog.detail or None
     return dialog.tool_name, dialog.detail or None
-
-
-def _classify(reply: dict[str, object], request_id: RequestId) -> DeliveryReceipt | None:
-    """What one channel reply says about this attempt, or `None` for "keep waiting"."""
-    kind = reply.get("type")
-    answered = reply.get(REQUEST_ID_FIELD)
-
-    if kind == CHANNEL_ERROR:
-        # This channel only ever refuses a line *before* pushing it, so its
-        # refusal is proof of non-delivery rather than the reference
-        # implementation's ambiguous "it failed, possibly after arriving".
-        return _failed(request_id, f"the channel refused the words: {reply.get('message')}")
-    if kind == QUEUED:
-        if answered != str(request_id):
-            return _unknown(request_id, "the channel queued a different request")
-        return None
-    if kind == ACKNOWLEDGED:
-        if answered != str(request_id):
-            return _unknown(request_id, "the channel acknowledged a different request")
-        return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
-    return _unknown(request_id, f"the channel said something unexpected: {kind!r}")
 
 
 def _failed(request_id: RequestId, reason: str) -> DeliveryReceipt:

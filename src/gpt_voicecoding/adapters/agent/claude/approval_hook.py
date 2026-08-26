@@ -33,12 +33,12 @@ is not going to arrive, and finding that out fast is what keeps a stalled dialog
 from also being a slow one. If the engine dies mid-wait the socket ends, the read
 returns nothing, and that is silence too.
 
-**It is stdlib-only and blocking**, for the same reason the channel server is
-stdlib-only (ADR 0006): it runs under whatever interpreter the deployment
-provides, in a position where a missing dependency is a failure nobody is
-reading. Blocking sockets rather than `wire.py`'s asyncio framing because this
-process sends one line and reads one line — an event loop to do that would be
-startup cost paid on every permission dialog for nothing.
+**It is stdlib-only and blocking**, for the reason ADR 0006's channel server was
+stdlib-only before it was removed: it runs under whatever interpreter the
+deployment provides, in a position where a missing dependency is a failure nobody
+is reading. Blocking sockets rather than the engine's asyncio framing because
+this process sends one line and reads one line — an event loop to do that would
+be startup cost paid on every permission dialog for nothing.
 
 **Two gates, both fail open.** No address at all — no bootstrap variable and no
 engine has published one — means there is nobody to ask, and the process exits

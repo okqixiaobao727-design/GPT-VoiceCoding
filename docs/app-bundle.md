@@ -196,11 +196,12 @@ own words.
 **7. Approval Relay.** Get the Session to ask for a permission it needs, and
 answer it by voice. One verdict, one request.
 
-A live Session is reachable *only* through the Answer Relay: `launch --task`
-carries a label, not an instruction, and a launched Session has no terminal to
-type into. Steps 6 and 7 therefore share the fate of the Session Channel — if
-the carrier is not there, neither step is performable, and that is a blocked
-step rather than a failed one.
+Both steps are performed against a Session you started yourself, at your own
+terminal: v1.0 launches nothing (#67). Step 6 rides that Session's own inbox
+socket and step 7 the `PermissionRequest` hook, so each is performable only where
+its own carrier reached that Session — the hook installed in its config directory
+(ADR 0011) and its `SessionStart` registration received. A carrier that is not
+there is a blocked step rather than a failed one, and the receipt says which.
 
 **8. The Companion Channel.** A notice must reach Telegram, and a reply typed
 there must come back as inbound text. **Run this with Voice off**, together with

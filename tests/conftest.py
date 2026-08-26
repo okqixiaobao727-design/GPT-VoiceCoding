@@ -22,6 +22,14 @@ is a `turn/start`. Injecting a `locate` or a `run` is the design; taking the
 real runner away is what makes forgetting it fail loudly instead of quietly
 starting a turn in somebody's work.
 
+**The real Claude Session registry.** #77 put this engine on Claude Code's own
+cross-session wire, and being answerable there means publishing a peer key into
+`~/.claude/sessions` — the registry holding the live Sessions of whoever is
+running the tests. A test that bound a reply inbox with default settings would
+publish that key, and a key in that directory is this process announcing itself
+as a peer of their open work. Passing a `registry_directory` is the design;
+refusing the real one is what makes forgetting it fail loudly.
+
 **This file holds fixtures and nothing else.** The fake and the helpers it needs
 live in `launchd_fake.py`, because a test module that imports a `conftest` by
 name is importing whichever `conftest` reached `sys.path` first — and with the
@@ -36,6 +44,8 @@ from collections.abc import Sequence
 
 import pytest
 
+from gpt_voicecoding.adapters.agent.claude.inbox import ReplyInbox
+from gpt_voicecoding.adapters.agent.claude.registry import DEFAULT_REGISTRY_DIRECTORY
 from gpt_voicecoding.adapters.agent.codex import shared_daemon
 from gpt_voicecoding.installation import codex_launch_agent
 from launchd_fake import FakeLaunchd
@@ -79,6 +89,22 @@ def _no_real_codex_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
         return await real(arguments)
 
     monkeypatch.setattr(shared_daemon, "_run", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test publishes this process as a peer of the real machine's Sessions."""
+    real = ReplyInbox._publish_key  # noqa: SLF001
+
+    def refuse(self: ReplyInbox) -> None:
+        if self._key_path.parent == DEFAULT_REGISTRY_DIRECTORY:  # noqa: SLF001
+            raise AssertionError(
+                "a test published a peer key into the machine's own Claude registry at "
+                f"{DEFAULT_REGISTRY_DIRECTORY}. Pass a `registry_directory` in ClaudeSettings."
+            )
+        real(self)
+
+    monkeypatch.setattr(ReplyInbox, "_publish_key", refuse)
 
 
 @pytest.fixture

@@ -1,6 +1,6 @@
 # 6. The Claude Session Channel server is Python, and speaks MCP with the standard library alone
 
-Date: 2026-08-21 · Status: Accepted · Source: [#8](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/8)
+Date: 2026-08-21 · Status: Superseded by [ADR 0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md) · Source: [#8](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/8)
 
 The Answer Relay's route into a Claude Session is an MCP channel server that Claude Code spawns from a plugin manifest; the bridge only dials its socket. Legacy wrote it in Node (`claude-channel/channel.mjs`), which would put a second runtime in the bundle (ADR 0005) and outside the test suite.
 
@@ -12,4 +12,4 @@ The Answer Relay's route into a Claude Session is an MCP channel server that Cla
 
 One runtime in the bundle; the handshake is covered by `pytest`. The only deliberate byte-level difference from `channel.mjs` is the bridge–channel wire carrying an explicit Relay kind. Handshake drift surfaces as a classified non-delivery, never as silence.
 
-This route depends on launch-time injection and serves the pre-#67 Session definition; the inbox-socket route replaces it once [#71](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/71) proves it.
+This route depends on launch-time injection and serves the pre-#67 Session definition. [#71](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/71) proved the inbox-socket route live on 2.1.245 and it replaces this one: see [ADR 0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md). The server, its wire and its protocol transcription were removed in [#77](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/77); what the decision leaves behind is its one durable lesson, which ADR 0013 keeps — the channel's acknowledgement was a real receipt, and giving it up for reach is what made "an accepted write is not a receipt" a rule rather than a preference.
