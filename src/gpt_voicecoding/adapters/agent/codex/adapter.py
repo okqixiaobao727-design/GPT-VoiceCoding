@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding import __version__
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import approvals as approval_wire
 from gpt_voicecoding.adapters.agent.codex import discovery as codex_discovery
 from gpt_voicecoding.adapters.agent.codex import thread_tail
@@ -186,6 +187,9 @@ class CodexAgentAdapter:
         )
         #: What each loaded thread last said, read at most once per change.
         self._turns = codex_discovery.TurnCache()
+        #: The project half of every Session Name this lane composes, read once
+        #: per workspace and kept for the life of the adapter (#78).
+        self._projects = ProjectNames()
         #: How the machine's own process table is read. Injected for the reason
         #: the daemon is: a test that shelled out to `ps` would be a test whose
         #: answer depends on what the person running it happens to have open.
@@ -348,6 +352,7 @@ class CodexAgentAdapter:
             processes=self._processes,
             turns=self._turns,
             daemon_note=self._daemon.note,
+            projects=self._projects,
         )
         if not lane.enumerated:
             return lane

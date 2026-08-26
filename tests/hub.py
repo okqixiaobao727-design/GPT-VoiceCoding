@@ -22,7 +22,7 @@ from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -62,7 +62,7 @@ class Hub:
             registry.register(
                 Session(
                     target=target,
-                    label=SessionLabel("GPT-VoiceCoding", task),
+                    name=SessionName("GPT-VoiceCoding", task),
                     workspace=Path("/tmp/workspace"),
                     first_seen=0.0,
                     state=state,

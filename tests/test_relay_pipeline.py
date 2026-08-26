@@ -39,7 +39,7 @@ from gpt_voicecoding.core.relays import (
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget, new_request_id
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget, new_request_id
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -66,7 +66,7 @@ class Harness:
             self.sessions.register(
                 Session(
                     target=target,
-                    label=SessionLabel("GPT-VoiceCoding", f"task {target.session_id}"),
+                    name=SessionName("GPT-VoiceCoding", f"task {target.session_id}"),
                     workspace=Path("/tmp/workspace"),
                     first_seen=0.0,
                     state=state,

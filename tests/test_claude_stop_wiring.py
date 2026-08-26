@@ -103,7 +103,7 @@ def roster(monkeypatch: pytest.MonkeyPatch):
     """
 
     def answering(lane: LaneDiscovery) -> None:
-        async def stub() -> LaneDiscovery:
+        async def stub(**_asked: object) -> LaneDiscovery:
             return lane
 
         monkeypatch.setattr(claude_adapter.claude_discovery, "discover", stub)

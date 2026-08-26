@@ -18,8 +18,8 @@ The ones that hold state:
 
 - ``switches`` — the Duty / Voice / Message hierarchy and the Feature Switches
   configuration declares beneath it.
-- ``sessions`` — the Session registry: exact targets, stale ones refused, labels
-  that disambiguate or ask.
+- ``sessions`` — the Session registry: exact targets, stale ones refused, Session
+  Names that disambiguate or ask.
 - ``relay_queue`` — the *one* ledger of everything undelivered, retained Stop
   Notices included.
 - ``persistence`` — the durable subset, and the only component that touches disk.

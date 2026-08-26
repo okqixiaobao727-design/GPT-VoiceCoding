@@ -51,7 +51,7 @@ from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, spoken_name, spoken_target
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -105,17 +105,16 @@ NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wi
 
 
 def name_for(session: Session | None, target: SessionTarget) -> str:
-    """What to call one Session out loud, best name first.
+    """What to call one Session out loud: its Session Name, else its address.
 
-    The Session Label if the user has one for it, else the agent's own Session
-    Name, else the address — because a notice that names nothing is a notice the
-    user cannot answer. #78 stabilises the middle one.
+    Two rungs rather than three, since #78 collapsed the composed label and the
+    agent's own name into one *Session Name*. The address is still the floor,
+    because a notice that names nothing is a notice the user cannot answer — and
+    a Session with no name is ordinary rather than broken (`core/sessions.py`).
     """
-    if session is not None and session.label is not None:
-        return str(session.label)
-    if session is not None and session.name:
-        return session.name
-    return f"{target.agent} {target.session_id or f'pid {target.pid}'}"
+    if session is not None:
+        return spoken_name(session)
+    return spoken_target(target)
 
 
 def stop_notice_for(

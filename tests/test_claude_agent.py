@@ -49,7 +49,7 @@ from gpt_voicecoding.seams.agent import (
     SessionState,
 )
 from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionName, SessionTarget
 from gpt_voicecoding.seams.verify import VerifyOutcome
 
 SESSION = "0b7cf6f2-0f3c-4f5e-9d1f-8a2b3c4d5e6f"
@@ -870,7 +870,7 @@ class TestTheHubStopsHoldingWhatArrived:
                 registry.register(
                     Session(
                         target=TARGET,
-                        label=SessionLabel("GPT-VoiceCoding", "port the log"),
+                        name=SessionName("GPT-VoiceCoding", "port the log"),
                         workspace=Path("/tmp/workspace"),
                         first_seen=0.0,
                         state=SessionState.IDLE,

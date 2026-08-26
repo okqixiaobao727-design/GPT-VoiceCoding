@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude.discovery import CommandResult, discover
 from gpt_voicecoding.seams.agent import SessionState, WaitingKind
 from gpt_voicecoding.seams.identity import AgentKind
@@ -47,8 +48,31 @@ def refusing(reason: str) -> object:
     return run
 
 
-def found(rows: object, **kwargs: object) -> object:
-    return asyncio.run(discover(run=answering(rows, **kwargs)))  # type: ignore[arg-type]
+def not_a_repository() -> object:
+    """A `git` that says a workspace belongs to no repository."""
+
+    async def ask(asked: Path) -> str | None:
+        del asked
+        return None
+
+    return ask
+
+
+def inside(repository: str) -> object:
+    """A `git` answering with the common directory of exactly this repository."""
+
+    async def ask(asked: Path) -> str | None:
+        del asked
+        return f"{repository}/.git\n"
+
+    return ask
+
+
+def found(rows: object, *, git: object = None, **kwargs: object) -> object:
+    projects = ProjectNames(ask=git or not_a_repository())  # type: ignore[arg-type]
+    return asyncio.run(
+        discover(run=answering(rows, **kwargs), projects=projects)  # type: ignore[arg-type]
+    )
 
 
 class TestMappingOneRow:
@@ -67,8 +91,45 @@ class TestMappingOneRow:
     def test_the_workspace_is_the_cwd_the_roster_reported(self) -> None:
         assert found([IDLE_ROW]).rows[0].workspace == Path("/tmp/workspace-claude")
 
-    def test_the_agents_own_name_travels(self) -> None:
-        assert found([IDLE_ROW]).rows[0].name == "workspace-claude-ed"
+    def test_the_row_is_named_for_its_project_and_the_agents_own_name(self) -> None:
+        """#78: `<project> · <title>`, with the roster's own `name` as the title."""
+        named = found([IDLE_ROW], git=inside("/src/GPT-VoiceCoding")).rows[0].name
+        assert str(named) == "GPT-VoiceCoding · workspace-claude-ed"
+
+    def test_a_workspace_outside_a_repository_is_named_for_its_directory(self) -> None:
+        """*Adapted*: legacy left such a Session unnamed and unspeakable."""
+        assert str(found([IDLE_ROW]).rows[0].name) == "workspace-claude · workspace-claude-ed"
+
+    def test_a_row_the_roster_did_not_name_stays_unnamed(self) -> None:
+        """No title, no name. An unnamed row is listed like any other."""
+        assert found([IDLE_ROW | {"name": "   "}]).rows[0].name is None
+
+    def test_a_row_with_no_workspace_stays_unnamed(self) -> None:
+        """Half a name is not a name, and there is nothing to fill the other half with."""
+        without_cwd = {key: value for key, value in IDLE_ROW.items() if key != "cwd"}
+        lane = found([without_cwd])
+        assert len(lane.rows) == 1
+        assert lane.rows[0].name is None
+
+    def test_the_project_is_read_once_however_many_rows_share_a_workspace(self) -> None:
+        """The cadence asks this per row, every few seconds; `git` is asked once."""
+        asked: list[Path] = []
+
+        async def counting(workspace: Path) -> str | None:
+            asked.append(workspace)
+            return "/src/GPT-VoiceCoding/.git"
+
+        second = IDLE_ROW | {"pid": 3539, "sessionId": "another-session-id"}
+        projects = ProjectNames(ask=counting)
+        lane = asyncio.run(
+            discover(run=answering([IDLE_ROW, second]), projects=projects)  # type: ignore[arg-type]
+        )
+
+        assert [str(row.name) for row in lane.rows] == [
+            "GPT-VoiceCoding · workspace-claude-ed",
+            "GPT-VoiceCoding · workspace-claude-ed",
+        ]
+        assert len(asked) == 1
 
     def test_a_row_in_the_roster_is_live(self) -> None:
         assert found([IDLE_ROW]).rows[0].lifecycle == "live"

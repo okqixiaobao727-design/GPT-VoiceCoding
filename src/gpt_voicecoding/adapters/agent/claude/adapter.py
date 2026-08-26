@@ -59,6 +59,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
 from gpt_voicecoding.adapters.agent.claude import inbox, stop_analysis, transcript_tail
 from gpt_voicecoding.adapters.agent.claude.approval import (
@@ -197,6 +198,10 @@ class ClaudeAgentAdapter:
         #: The lane's one opener of a transcript file, shared by what a Session
         #: stopped on (#75) and how far along it is (#76).
         self._transcripts = TranscriptReader()
+        #: The project half of every Session Name this lane composes, read once
+        #: per workspace and kept for the life of the adapter (#78). Held here
+        #: rather than inside `discovery` so the cache outlives one tick.
+        self._projects = ProjectNames()
         self._windows = ReplyWindowWatcher(
             settings=self._settings, emit=self._emit, stopped_on=self.stopped_on
         )
@@ -425,7 +430,7 @@ class ClaudeAgentAdapter:
         five seconds, for the whole machine (`core/bridge.py:442`) — and
         `inspect` reads the same rows.
         """
-        lane = await claude_discovery.discover()
+        lane = await claude_discovery.discover(projects=self._projects)
         if not lane.enumerated:
             return lane
         return replace(lane, rows=tuple(self._row_with_stop(row) for row in lane.rows))

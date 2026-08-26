@@ -59,7 +59,7 @@ from realtime_fake import (
 )
 
 THREAD = "01a02110-d18f-74a0-916d-de1208e9977a"
-HOUSE_RULES = "speak the Session Label; never invent a detail"
+HOUSE_RULES = "speak the Session Name; never invent a detail"
 DELEGATED_RULES = "act only through the control-plane CLI"
 
 _names = iter(range(10_000))

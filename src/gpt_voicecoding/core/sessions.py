@@ -21,8 +21,9 @@ implementation carried:
   pretending the session id was never seen.
 - **A Child Process is seen, not spoken to.** It is listed like any other row and
   refused as a Relay target, by the registry rather than by a caller's memory.
-- **A label disambiguates or asks.** Labels are for matching and for speech; two
-  candidates are answered by refusing and naming both, never by picking.
+- **A Session Name disambiguates or asks.** Names are for matching and for
+  speech; two candidates are answered by refusing and naming both, never by
+  picking.
 
 There is one registry and one Reply Window per Session — and the Reply Window is
 **derived**, so there is no second copy to disagree with the first. The reference
@@ -38,10 +39,10 @@ from datetime import datetime
 from pathlib import Path
 
 from gpt_voicecoding.core.errors import (
-    AmbiguousLabelError,
+    AmbiguousNameError,
     ChildSessionError,
     DuplicateSessionError,
-    NoLabelMatchError,
+    NoNameMatchError,
     StaleSessionError,
     UnknownSessionError,
 )
@@ -57,7 +58,7 @@ from gpt_voicecoding.seams.agent import (
     WaitingFor,
     derive_reply_window,
 )
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 _log = logging.getLogger(__name__)
 
@@ -66,20 +67,25 @@ _log = logging.getLogger(__name__)
 class Session:
     """One coding-agent run the user started, as the roster holds it.
 
-    Every field but `first_seen` and `label` is a fact one lane observed, carried
-    from `SessionInspection` unchanged. `first_seen` is this registry's own —
-    when *we* first saw it, which no agent knows — and `label` is the user's name
-    for it, which #78 fills.
+    Every field but `first_seen` is a fact one lane observed, carried from
+    `SessionInspection` unchanged. `first_seen` is this registry's own — when
+    *we* first saw it, which no agent knows.
+
+    **There is one name, and it is `name`.** It used to be two — a `label` the
+    user's side composed and a `name` the agent reported — which is two fields
+    meaning almost the same thing and two answers to "what is this Session
+    called". #78 collapsed them into the glossary's single *Session Name*
+    (`CONTEXT.md`): `<project> · <title>`, composed by the lane that saw the
+    Session and frozen here.
     """
 
     target: SessionTarget
     workspace: Path
     first_seen: float
-    #: The user's name for this Session. `None` is ordinary: an unnamed row is
-    #: listed like any other (#78 stabilises naming).
-    label: SessionLabel | None = None
-    #: The agent's own name for this Session, straight off its roster.
-    name: str | None = None
+    #: What this Session is called. `None` is ordinary: an unnamed row is listed
+    #: like any other, and a Codex thread has neither a name nor an id to make
+    #: one from until it takes its first turn (#73).
+    name: SessionName | None = None
     lifecycle: SessionLifecycle = SessionLifecycle.LIVE
     state: SessionState = SessionState.RUNNING
     waiting_for: WaitingFor = field(default_factory=WaitingFor)
@@ -101,18 +107,23 @@ class Session:
     def is_live(self) -> bool:
         return self.lifecycle is SessionLifecycle.LIVE
 
-    def observed(self, row: SessionInspection) -> Session:
+    def observed(self, row: SessionInspection, *, target: SessionTarget) -> Session:
         """This same Session, as a lane has just seen it again.
 
-        Keeps what the registry knows and the lane does not — `first_seen`, and
-        the user's `label` — and takes everything else from the reading, because
-        the reading is the newer truth.
+        Keeps what the registry knows and the lane does not — `first_seen` and
+        the Session Name it has already accepted — and takes everything else
+        from the reading, because the reading is the newer truth.
+
+        `target` is the identity the registry settled on (`_better_known`),
+        which is not always the one the reading carried: a tick with only
+        process evidence names a Session it cannot see the id of. It is passed
+        in rather than read off the row because the naming rule turns on it.
         """
         return replace(
             self,
-            target=row.target,
+            target=target,
             workspace=row.workspace,
-            name=row.name,
+            name=self._named_as(row, target),
             lifecycle=row.lifecycle,
             state=row.state,
             waiting_for=row.waiting_for,
@@ -120,6 +131,42 @@ class Session:
             last_activity=row.last_activity,
             child=row.child,
         )
+
+    def _named_as(self, row: SessionInspection, target: SessionTarget) -> SessionName | None:
+        """The Session Name this row keeps — **the first one it accepted**.
+
+        A name is composed once per exact `SessionTarget` and never changes
+        after that (`legacy@1d32845:bridge/store.py:1875-1902`, *ported*: first
+        write wins, an exact repeat is a no-op, a different one is refused).
+        Stability is the whole point of naming a Session at all — the user says
+        the name to address it, so a name that moved between two Stop Notices
+        would be a name that reached the wrong Session.
+
+        A **target change is the one case that re-composes**, and it is not a
+        mutable name: it is a different Session under the same row. Two ways it
+        happens, both measured — a Codex row takes its first turn and gains the
+        thread id it had no name to be built from (#73), and the user types
+        `/new` in that TUI so the pid stays and the thread does not (#77). The
+        second is a new thread; naming it after the old one is the failure this
+        rule exists to prevent, not the one it would be protecting.
+        """
+        if target != self.target:
+            return row.name
+        if self.name is None:
+            return row.name
+        if row.name is not None and row.name != self.name:
+            # Debug rather than info on purpose: a lane that composes a
+            # different name composes it again on every tick, five seconds
+            # apart, for as long as the Session runs. At info this would be one
+            # steady line per Session per tick describing a decision that never
+            # changes.
+            _log.debug(
+                "%s is now called %s by its lane; keeping the name it was accepted with, %s",
+                target,
+                row.name,
+                self.name,
+            )
+        return self.name
 
 
 def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
@@ -152,7 +199,7 @@ def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
 
 
 def _normalise(text: str) -> str:
-    """Case- and whitespace-insensitive form used for label matching only."""
+    """Case- and whitespace-insensitive form used for name matching only."""
     return " ".join(text.split()).casefold()
 
 
@@ -291,7 +338,7 @@ class SessionRegistry:
             return fresh
 
         target = _better_known(held.target, row.target)
-        updated = replace(held.observed(row), target=target)
+        updated = held.observed(row, target=target)
         if target != held.target:
             del self._sessions[held.target]
         self._sessions[target] = updated
@@ -357,24 +404,23 @@ class SessionRegistry:
             raise ChildSessionError(target, session.child.parent)
         return session
 
-    def match_label(self, query: str) -> Session:
+    def match_name(self, query: str) -> Session:
         """Find the one live Session a spoken name names, or refuse.
 
-        The query is matched as a fragment against the Session Label if the user
-        has given one and against the agent's own Session Name otherwise, and
-        **more than one match refuses**, with every candidate named. An exact
-        label is deliberately *not* given precedence, for three reasons:
+        The query is matched as a fragment against the Session Name, and **more
+        than one match refuses**, with every candidate named. An exact name is
+        deliberately *not* given precedence, for three reasons:
 
         - The costs are asymmetric. A refusal costs one spoken round trip; a
           wrong pick delivers the user's own words into the wrong Session,
           silently, carrying the user's authority.
         - Exactness is only evidence when the text is trustworthy, and the
           primary source here is a realtime voice transcript. "ship it" may be
-          the user meaning the short label, or the transcriber clipping "ship it
+          the user meaning the short name, or the transcriber clipping "ship it
           later". Exactness of lossy text says nothing about intent.
-        - "A label is not a target" is locked. Letting an exact label win
+        - "A Session Name is not a target" is locked. Letting an exact name win
           promotes it to a target by right, which is the first step back toward
-          addressing by label.
+          addressing by name.
 
         The collision only exists while two live names stand in a fragment
         relation. That is worth fixing where names are minted — by keeping a
@@ -382,16 +428,22 @@ class SessionRegistry:
         making matching cleverer here.
         """
         wanted = _normalise(query)
+        if not wanted:
+            # Every name contains the empty fragment, so an empty query would
+            # match the whole roster — and match a single unnamed Session
+            # *exactly*, which is a silent delivery into a Session the user
+            # never named.
+            raise NoNameMatchError(query)
         candidates = [
             held
             for held in self.live()
-            if held.child.is_main and wanted in _normalise(spoken_name(held))
+            if held.child.is_main and held.name is not None and wanted in _normalise(str(held.name))
         ]
 
         if not candidates:
-            raise NoLabelMatchError(query)
+            raise NoNameMatchError(query)
         if len(candidates) > 1:
-            raise AmbiguousLabelError(query, tuple(candidates))
+            raise AmbiguousNameError(query, tuple(candidates))
         return candidates[0]
 
     def set_state(self, target: SessionTarget, state: SessionState) -> Session:
@@ -458,7 +510,20 @@ class SessionRegistry:
 
 
 def spoken_name(session: Session) -> str:
-    """What to match a spoken fragment against: the user's name, else the agent's."""
-    if session.label is not None:
-        return str(session.label)
-    return session.name or ""
+    """What to call one Session out loud: its Session Name, else its address.
+
+    **The one answer to "what is this called", so no two surfaces give two.**
+    Matching is deliberately not done through here — `match_name` matches names
+    and nothing else, because an address the user never heard is not something
+    they can have meant. This is for saying and for showing: a Session with no
+    name is still a Session the user has to be told about, and naming it by the
+    thing that does address it is the honest floor.
+    """
+    if session.name is not None:
+        return str(session.name)
+    return spoken_target(session.target)
+
+
+def spoken_target(target: SessionTarget) -> str:
+    """One identity, said out loud. The floor under every name."""
+    return f"{target.agent} {target.session_id or f'pid {target.pid}'}"

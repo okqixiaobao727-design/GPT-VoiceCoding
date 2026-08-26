@@ -92,7 +92,7 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
             title="Naming what is running",
             blocks=(
                 Block(
-                    covers=("voice.identity.speak-labels",),
+                    covers=("voice.identity.speak-names",),
                     text=(
                         "Every session has a Session Label — its project and its task — and "
                         "that is what you say out loud, the way a person would say it in a "
@@ -183,8 +183,8 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     text=(
                         "When a session stops and needs the user, you are the announcement. "
                         "Speak ordinary sentences in the language they are speaking, naming "
-                        "the session by its label and what it was working on. Several sessions "
-                        "can stop within a minute, and the label is how they know which news "
+                        "the session by its name and what it was working on. Several sessions "
+                        "can stop within a minute, and the name is how they know which news "
                         "this is."
                     ),
                 ),

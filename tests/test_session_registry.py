@@ -1,7 +1,7 @@
 """The Session registry — Bridge Core state, deliberately not a module.
 
 The behaviours under test are the ones the reference implementation got wrong or
-left to prose: a target is exact or it is refused, a label disambiguates or asks,
+left to prose: a target is exact or it is refused, a Session Name disambiguates or asks,
 and a stale identity fails closed rather than resolving to something plausible.
 """
 
@@ -13,9 +13,9 @@ from pathlib import Path
 import pytest
 
 from gpt_voicecoding.core.errors import (
-    AmbiguousLabelError,
+    AmbiguousNameError,
     DuplicateSessionError,
-    NoLabelMatchError,
+    NoNameMatchError,
     StaleSessionError,
     UnknownSessionError,
 )
@@ -27,7 +27,7 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
 )
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 WORKSPACE = Path(__file__).resolve().parents[1]
 
@@ -35,7 +35,7 @@ WORKSPACE = Path(__file__).resolve().parents[1]
 def claude(session_id: str, pid: int, task: str = "a task") -> Session:
     return Session(
         target=SessionTarget(agent=AgentKind.CLAUDE, session_id=session_id, pid=pid),
-        label=SessionLabel("GPT-VoiceCoding", task),
+        name=SessionName("GPT-VoiceCoding", task),
         workspace=WORKSPACE,
         first_seen=1_000.0,
     )
@@ -44,7 +44,7 @@ def claude(session_id: str, pid: int, task: str = "a task") -> Session:
 def codex(session_id: str, task: str = "a task") -> Session:
     return Session(
         target=SessionTarget(agent=AgentKind.CODEX, session_id=session_id),
-        label=SessionLabel("GPT-VoiceCoding", task),
+        name=SessionName("GPT-VoiceCoding", task),
         workspace=WORKSPACE,
         first_seen=1_000.0,
     )
@@ -124,24 +124,24 @@ class TestResolving:
         assert resolved.target.pid is None
 
 
-class TestMatchingLabels:
-    def test_a_label_matches_the_one_session_that_carries_it(self) -> None:
+class TestMatchingNames:
+    def test_a_name_matches_the_one_session_that_carries_it(self) -> None:
         registry = SessionRegistry()
         session = codex("abc", task="Implement the seam contracts")
         registry.register(session)
-        assert registry.match_label("GPT-VoiceCoding · Implement the seam contracts") == session
+        assert registry.match_name("GPT-VoiceCoding · Implement the seam contracts") == session
 
     def test_a_fragment_matches(self) -> None:
         registry = SessionRegistry()
         session = codex("abc", task="Implement the seam contracts")
         registry.register(session)
-        assert registry.match_label("seam contracts") == session
+        assert registry.match_name("seam contracts") == session
 
     def test_matching_ignores_case_and_extra_whitespace(self) -> None:
         registry = SessionRegistry()
         session = codex("abc", task="Implement the seam contracts")
         registry.register(session)
-        assert registry.match_label("  SEAM   CONTRACTS ") == session
+        assert registry.match_name("  SEAM   CONTRACTS ") == session
 
     def test_two_candidates_refuse_rather_than_pick(self) -> None:
         registry = SessionRegistry()
@@ -149,49 +149,49 @@ class TestMatchingLabels:
         second = claude("def", pid=100, task="Implement the seam contracts, part two")
         registry.register(first)
         registry.register(second)
-        with pytest.raises(AmbiguousLabelError) as raised:
-            registry.match_label("seam contracts")
+        with pytest.raises(AmbiguousNameError) as raised:
+            registry.match_name("seam contracts")
         assert set(raised.value.candidates) == {first, second}
 
-    def test_a_whole_label_that_is_also_a_fragment_of_another_still_refuses(self) -> None:
+    def test_a_whole_name_that_is_also_a_fragment_of_another_still_refuses(self) -> None:
         """ "ship it" names both "ship it" and "ship it later". Ask, do not prefer."""
         registry = SessionRegistry()
         exact = codex("abc", task="ship it")
         longer = claude("def", pid=100, task="ship it later")
         registry.register(exact)
         registry.register(longer)
-        with pytest.raises(AmbiguousLabelError) as raised:
-            registry.match_label("GPT-VoiceCoding · ship it")
+        with pytest.raises(AmbiguousNameError) as raised:
+            registry.match_name("GPT-VoiceCoding · ship it")
         assert set(raised.value.candidates) == {exact, longer}
 
-    def test_a_label_shared_by_two_sessions_refuses_even_though_it_is_exact(self) -> None:
+    def test_a_name_shared_by_two_sessions_refuses_even_though_it_is_exact(self) -> None:
         registry = SessionRegistry()
         first = codex("abc", task="ship it")
         second = claude("def", pid=100, task="ship it")
         registry.register(first)
         registry.register(second)
-        with pytest.raises(AmbiguousLabelError):
-            registry.match_label("GPT-VoiceCoding · ship it")
+        with pytest.raises(AmbiguousNameError):
+            registry.match_name("GPT-VoiceCoding · ship it")
 
     def test_no_match_fails_closed(self) -> None:
         registry = SessionRegistry()
         registry.register(codex("abc"))
-        with pytest.raises(NoLabelMatchError):
-            registry.match_label("something else entirely")
+        with pytest.raises(NoNameMatchError):
+            registry.match_name("something else entirely")
 
     def test_an_ended_session_is_not_a_candidate(self) -> None:
         registry = SessionRegistry()
         ended = codex("abc", task="Implement the seam contracts")
         registry.register(ended)
         registry.mark_ended(ended.target)
-        with pytest.raises(NoLabelMatchError):
-            registry.match_label("seam contracts")
+        with pytest.raises(NoNameMatchError):
+            registry.match_name("seam contracts")
 
-    def test_a_match_returns_a_session_never_a_target_built_from_the_label(self) -> None:
+    def test_a_match_returns_a_session_never_a_target_built_from_the_name(self) -> None:
         registry = SessionRegistry()
         session = codex("abc", task="Implement the seam contracts")
         registry.register(session)
-        assert registry.match_label("seam contracts").target == session.target
+        assert registry.match_name("seam contracts").target == session.target
 
 
 class TestReplyWindow:

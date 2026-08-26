@@ -320,8 +320,7 @@ class TestRenderingWhatProgressCameBack:
             {
                 "session": {
                     "target": {"agent": "codex", "session_id": "abc", "pid": None},
-                    "label": "GPT-VoiceCoding · build it",
-                    "name": None,
+                    "name": "GPT-VoiceCoding · build it",
                     "workspace": "/tmp/workspace",
                     "state": "idle",
                     "reply_window": "open",

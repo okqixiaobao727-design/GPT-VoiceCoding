@@ -9,7 +9,6 @@ a TUI, and a lane that cannot look at all.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 from gpt_voicecoding.core.sessions import SessionRegistry
@@ -19,7 +18,7 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
 )
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 WORKSPACE = Path("/tmp/workspace")
 NOW = 1_000.0
@@ -39,6 +38,11 @@ def claude_row(*, session_id: str, pid: int, **fields: object) -> SessionInspect
         workspace=WORKSPACE,
         **fields,  # type: ignore[arg-type]
     )
+
+
+def named(task: str) -> SessionName:
+    """One composed Session Name, as a lane hands it over."""
+    return SessionName(project="GPT-VoiceCoding", task=task)
 
 
 def seeing(*rows: SessionInspection, **lane: object) -> LaneDiscovery:
@@ -219,27 +223,98 @@ class TestALaneThatCouldNotLook:
         assert registry.lane_degradations() == {AgentKind.CODEX: "shared daemon absent"}
 
 
-class TestWhatTheRowCarriesAcrossReadings:
-    def test_the_users_own_name_for_it_is_not_overwritten_by_a_lane(self) -> None:
-        """A lane knows the agent's name for a Session; it does not know the user's."""
-        from gpt_voicecoding.seams.identity import SessionLabel
+class TestTheNameARowKeeps:
+    """#78: a Session Name is composed once per exact identity and then held.
 
+    The rule the reference implementation enforced in its store — first write
+    wins, an exact repeat is a no-op, a different one is refused
+    (`legacy@1d32845:bridge/store.py:1875-1902`) — moved here, where the writes
+    now come from: a lane composing a name off every reading, five seconds
+    apart, forever.
+    """
+
+    def test_the_first_name_a_lane_composes_is_taken(self) -> None:
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
+
+    def test_a_row_seen_unnamed_takes_the_name_that_arrives_later(self) -> None:
+        """Filling an empty name is not changing one; an unnamed row is ordinary."""
         registry = SessionRegistry()
         registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW)
-        target = registry.live()[0].target
-        registry._sessions[target] = replace(  # noqa: SLF001 - #78 owns the public path
-            registry._sessions[target], label=SessionLabel("GPT-VoiceCoding", "a task")
-        )
+        assert registry.live()[0].name is None
 
         registry.observe(
             AgentKind.CODEX,
-            seeing(codex_row(session_id="abc", pid=10, name="something-else")),
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
             now=NOW + 5,
         )
 
-        assert str(registry.live()[0].label) == "GPT-VoiceCoding · a task"
-        assert registry.live()[0].name == "something-else"
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
 
+    def test_a_second_different_name_for_one_identity_is_ignored(self) -> None:
+        """The whole point of naming: the user says the name they were told."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("something else"))),
+            now=NOW + 5,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
+
+    def test_a_codex_row_that_gains_its_thread_id_is_named_for_it(self) -> None:
+        """A new exact identity re-composes: #73's row had no id to be named from."""
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id=None, pid=10)), now=NOW)
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("abc12345"))),
+            now=NOW + 5,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · abc12345"
+
+    def test_a_new_thread_under_the_same_pid_is_named_for_the_new_thread(self) -> None:
+        """`/new` in that TUI (#77): same process, different Session, different name."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("the first thread"))),
+            now=NOW,
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="def", pid=10, name=named("the second thread"))),
+            now=NOW + 5,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · the second thread"
+
+    def test_a_tick_with_only_process_evidence_keeps_the_name(self) -> None:
+        """The identity did not change, so neither does the name it was given."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id=None, pid=10)), now=NOW + 5)
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
+
+
+class TestWhatTheRowCarriesAcrossReadings:
     def test_the_state_a_lane_read_replaces_the_one_held(self) -> None:
         registry = SessionRegistry()
         registry.observe(

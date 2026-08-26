@@ -1,7 +1,7 @@
 """What Bridge Core raises when it refuses.
 
 Every error here is a *refusal*, not a surprise: the state components fail closed
-on an unknown switch, an unknown or stale Session, or an ambiguous label, because
+on an unknown switch, an unknown or stale Session, or an ambiguous name, because
 the alternative — guessing — is the failure class this repository exists to
 avoid. Callers that must speak the refusal aloud get the offending value back on
 the exception rather than having to parse a message.
@@ -113,11 +113,11 @@ class DuplicateSessionError(SessionError):
         self.target = target
 
 
-class LabelMatchError(BridgeCoreError):
-    """Base for a label that did not resolve to exactly one Session."""
+class NameMatchError(BridgeCoreError):
+    """Base for a Session Name that did not resolve to exactly one Session."""
 
 
-class NoLabelMatchError(LabelMatchError):
+class NoNameMatchError(NameMatchError):
     """Nothing matched. Ask; do not guess."""
 
     def __init__(self, query: str) -> None:
@@ -125,7 +125,7 @@ class NoLabelMatchError(LabelMatchError):
         self.query = query
 
 
-class AmbiguousLabelError(LabelMatchError):
+class AmbiguousNameError(NameMatchError):
     """More than one matched. Refuse and name them, rather than picking one."""
 
     def __init__(self, query: str, candidates: tuple[Session, ...]) -> None:

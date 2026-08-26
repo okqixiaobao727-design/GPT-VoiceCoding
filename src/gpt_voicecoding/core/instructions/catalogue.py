@@ -179,11 +179,11 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
-            id="voice.identity.speak-labels",
+            id="voice.identity.speak-names",
             audience=Audience.VOICE,
             source="skill/SKILL.md:56-62",
             gist=(
-                "Sessions are spoken about by Session Label. A position — 'the third one' — "
+                "Sessions are spoken about by Session Name. A position — 'the third one' — "
                 "refers to the row just read out, and is resolved to that row's identity "
                 "before anything acts."
             ),
@@ -194,9 +194,9 @@ def _rules() -> tuple[Rule, ...]:
             source="skill/SKILL.md:56-62",
             gist=(
                 "The identity a Session is addressed by is structured and machine-side; a "
-                "Session Label is not a target and cannot be passed as one."
+                "Session Name is not a target and cannot be passed as one."
             ),
-            enforced_by="SessionLabel and SessionTarget are different types — seams/identity.py",
+            enforced_by="SessionName and SessionTarget are different types — seams/identity.py",
         ),
         Rule(
             id="delegated.outcome.only-a-successful-call-is-success",
@@ -259,7 +259,7 @@ def _rules() -> tuple[Rule, ...]:
             source="skill/announcing.md:1-11",
             gist=(
                 "A Stop Notice is spoken as ordinary sentences in the user's language, "
-                "naming the Session by its label and the task it is on."
+                "naming the Session by its name and the task it is on."
             ),
         ),
         Rule(
@@ -555,14 +555,14 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
-            id="core.start.exact-identity-until-a-label-exists",
+            id="core.start.exact-identity-until-a-name-exists",
             audience=Audience.CORE,
             source="skill/starting.md:108-126",
             gist=(
                 "A Session is addressable by its exact identity from the moment it "
-                "registers, whether or not it has a Session Label yet."
+                "registers, whether or not it has a Session Name yet."
             ),
-            enforced_by="the Session registry's label-independent targets — core/sessions.py",
+            enforced_by="the Session registry's name-independent targets — core/sessions.py",
         ),
         Rule(
             id="dropped.starting.duty-gated-reads",

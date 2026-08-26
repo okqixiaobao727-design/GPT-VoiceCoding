@@ -38,7 +38,7 @@ from gpt_voicecoding.seams.agent import (
 )
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(
@@ -137,7 +137,7 @@ def put_on_the_roster(engine: Engine, target: SessionTarget = CODEX) -> None:
     engine.core._state.sessions.register(
         Session(
             target=target,
-            label=SessionLabel(project="GPT-VoiceCoding", task="t"),
+            name=SessionName(project="GPT-VoiceCoding", task="t"),
             workspace=Path("/tmp/workspace"),
             first_seen=0.0,
         )

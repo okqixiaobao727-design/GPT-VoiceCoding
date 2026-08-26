@@ -46,11 +46,11 @@ from gpt_voicecoding.seams.agent import (
     SessionState,
 )
 from gpt_voicecoding.seams.control_plane import Action, ErrorCode, Reply, Request
-from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 WORKSPACE = Path("/tmp/workspace")
 SECOND_WORKSPACE = Path("/tmp/another-workspace")
-LABEL = SessionLabel(project="GPT-VoiceCoding", task="build the control plane")
+NAME = SessionName(project="GPT-VoiceCoding", task="build the control plane")
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="claude-abc", pid=1234)
 SECOND_CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="def")
@@ -96,7 +96,7 @@ class Surface:
         onto one.
         """
         return self.state.sessions.register(
-            Session(target=target, label=LABEL, workspace=WORKSPACE, first_seen=0.0)
+            Session(target=target, name=NAME, workspace=WORKSPACE, first_seen=0.0)
         )
 
     def open_window(self) -> None:
@@ -175,7 +175,7 @@ class TestStatus:
         assert data["switches"]["duty"] is True
         assert data["call_id"] is None
         assert data["sessions"][0]["target"] == CODEX_ADDRESS
-        assert data["sessions"][0]["label"] == str(LABEL)
+        assert data["sessions"][0]["name"] == str(NAME)
         # Two facts, two fields: whether the Session is still there, and what
         # it is doing. They used to be one enum, which is how a busy Session and
         # a finished one read alike.
