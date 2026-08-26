@@ -286,25 +286,50 @@ class SessionInspection:
 
 @dataclass(frozen=True, slots=True)
 class LaneDiscovery:
-    """One lane's answer to "what Sessions are there?" — its rows, or why it has none.
+    """One lane's answer to "what Sessions are there?" — and how much it is worth.
 
-    **The error is about the lane, never about a row.** A lane that cannot
-    enumerate says so here, and Bridge Core leaves that lane's rows alone rather
-    than reading an unreachable lane as an empty machine. The other lane's rows
-    are unaffected, because two agents failing independently is the ordinary
-    case and one of them being down is not news about the other.
+    **Three states, because there are three facts and they are not the same one.**
+
+    - *Enumerated.* `error is None`. These rows are this lane's whole truth, and
+      an empty tuple is a real answer: the machine has no Sessions on this lane.
+    - *Degraded.* `error is None`, `degraded` says why. The rows are still the
+      truth — they were just read by a weaker means, such as the process table
+      when Codex's shared daemon is not up. They are adopted like any other; the
+      note is for `status`, so the user can see the lane is running on evidence
+      rather than on the daemon's word.
+    - *Failed.* `error` says what stopped it, and the rows **must** be empty.
+      Bridge Core leaves this lane's held rows exactly as they were, because
+      "I could not look" is not a sighting of an empty machine.
+
+    The invariant that a failure carries no rows is enforced here rather than
+    remembered, because the alternative encoding — reading "no rows plus an
+    error" as failure — cannot tell a lane that could not look from a lane that
+    looked and found nothing, and the second one has to be able to end rows.
+
+    The other lane's rows are unaffected in every case: two agents fail
+    independently, and one of them being down is not news about the other.
     """
 
     rows: tuple[SessionInspection, ...] = ()
+    #: Why this lane could not enumerate at all. Never about one row.
     error: str | None = None
+    #: Why these rows come from a weaker source than usual. The rows still count.
+    degraded: str | None = None
 
     def __post_init__(self) -> None:
         if self.error is not None and not self.error.strip():
             raise ValueError("a lane that failed to enumerate must say what stopped it")
+        if self.degraded is not None and not self.degraded.strip():
+            raise ValueError("a lane reading from a weaker source must say which")
+        if self.error is not None and self.rows:
+            raise ValueError(
+                "a lane that could not enumerate has no rows to offer; rows read by a "
+                "weaker means are `degraded`, not `error`"
+            )
 
     @property
     def enumerated(self) -> bool:
-        """Whether these rows are the whole truth about this lane right now."""
+        """Whether this lane looked at all. Says nothing about how well."""
         return self.error is None
 
 

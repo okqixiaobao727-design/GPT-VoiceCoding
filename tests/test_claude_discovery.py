@@ -1,0 +1,176 @@
+"""The Claude lane's roster: `claude agents --json`, mapped onto the seam.
+
+The shapes here are the ones measured on Simon's machine on 2026-08-26 against
+Claude Code 2.1.246 (#73) — a real row, verbatim, and the real failure modes.
+The command is injected, because what is under test is the mapping and the
+refusals, and shelling out to whatever `claude` this machine has would test that
+machine instead.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from gpt_voicecoding.adapters.agent.claude.discovery import CommandResult, discover
+from gpt_voicecoding.seams.agent import SessionState, WaitingKind
+from gpt_voicecoding.seams.identity import AgentKind
+
+#: One row of `claude agents --json`, exactly as it was measured (#73).
+IDLE_ROW = {
+    "pid": 3538,
+    "cwd": "/tmp/workspace-claude",
+    "kind": "interactive",
+    "startedAt": 1787693113762,
+    "sessionId": "d3a776ae-3b60-437d-bc70-ba57a2b280c6",
+    "name": "workspace-claude-ed",
+    "status": "idle",
+}
+
+
+def answering(rows: object, *, code: int = 0, stderr: str = "") -> object:
+    """A stand-in for the roster command that answers with exactly this."""
+    import json
+
+    async def run(argv: list[str]) -> CommandResult:
+        del argv
+        return CommandResult(code=code, stdout=json.dumps(rows), stderr=stderr)
+
+    return run
+
+
+def refusing(reason: str) -> object:
+    async def run(argv: list[str]) -> CommandResult:
+        del argv
+        raise FileNotFoundError(reason)
+
+    return run
+
+
+def found(rows: object, **kwargs: object) -> object:
+    return asyncio.run(discover(run=answering(rows, **kwargs)))  # type: ignore[arg-type]
+
+
+class TestMappingOneRow:
+    def test_the_row_becomes_one_inspection(self) -> None:
+        lane = found([IDLE_ROW])
+        assert len(lane.rows) == 1
+        assert lane.error is None
+
+    def test_the_target_carries_both_the_session_id_and_the_pid(self) -> None:
+        """A resumed Session forks two processes under one id, so both travel."""
+        target = found([IDLE_ROW]).rows[0].target
+        assert target.agent is AgentKind.CLAUDE
+        assert target.session_id == IDLE_ROW["sessionId"]
+        assert target.pid == 3538
+
+    def test_the_workspace_is_the_cwd_the_roster_reported(self) -> None:
+        assert found([IDLE_ROW]).rows[0].workspace == Path("/tmp/workspace-claude")
+
+    def test_the_agents_own_name_travels(self) -> None:
+        assert found([IDLE_ROW]).rows[0].name == "workspace-claude-ed"
+
+    def test_a_row_in_the_roster_is_live(self) -> None:
+        assert found([IDLE_ROW]).rows[0].lifecycle == "live"
+
+
+class TestTheStatusVocabulary:
+    """Measured: `status` walks `idle → busy → waiting → idle` across one turn."""
+
+    def test_idle_is_idle(self) -> None:
+        assert found([IDLE_ROW]).rows[0].state is SessionState.IDLE
+
+    def test_busy_is_running(self) -> None:
+        assert found([IDLE_ROW | {"status": "busy"}]).rows[0].state is SessionState.RUNNING
+
+    def test_waiting_is_waiting(self) -> None:
+        assert found([IDLE_ROW | {"status": "waiting"}]).rows[0].state is SessionState.WAITING
+
+    def test_a_status_this_build_does_not_know_is_not_guessed_at(self) -> None:
+        """An unknown word is a Session doing *something*, which is `running`."""
+        assert found([IDLE_ROW | {"status": "compacting"}]).rows[0].state is SessionState.RUNNING
+
+
+class TestWhatItRefusesToInvent:
+    def test_a_waiting_session_is_not_claimed_to_be_a_permission(self) -> None:
+        """The roster says a Session waits; it never says what for.
+
+        #73 measured that `waiting` is the permission state, but not that it is
+        *only* that, and a question dialog has never been observed from here.
+        `UNKNOWN` with `caught_up=False` is the seam's word for "ask again"; #75
+        answers it from the transcript.
+        """
+        waiting_for = found([IDLE_ROW | {"status": "waiting"}]).rows[0].waiting_for
+        assert waiting_for.kind is WaitingKind.UNKNOWN
+        assert waiting_for.caught_up is False
+
+    def test_an_idle_session_is_waiting_for_nothing(self) -> None:
+        assert found([IDLE_ROW]).rows[0].waiting_for.kind is WaitingKind.NONE
+
+    def test_progress_is_unread_rather_than_empty(self) -> None:
+        """`None` is "not read". #76 reads it; this lane does not pretend to."""
+        assert found([IDLE_ROW]).rows[0].progress is None
+
+    def test_last_activity_is_not_taken_from_the_start_time(self) -> None:
+        """`startedAt` is when it began, which is not when it last did anything."""
+        assert found([IDLE_ROW]).rows[0].last_activity is None
+
+    def test_every_row_the_roster_lists_is_a_main_session(self) -> None:
+        """A child inherits `CLAUDE_CODE_*` and is absent from the roster (#73)."""
+        assert found([IDLE_ROW]).rows[0].child.is_main
+
+
+class TestWhenTheLaneCannotLook:
+    def test_a_missing_roster_command_is_a_lane_error_not_an_empty_machine(self) -> None:
+        lane = asyncio.run(discover(run=refusing("no claude on PATH")))  # type: ignore[arg-type]
+        assert lane.rows == ()
+        assert lane.error is not None
+        assert "claude" in lane.error
+
+    def test_a_non_zero_exit_carries_what_the_command_said(self) -> None:
+        lane = found([], code=1, stderr="unknown flag --json")
+        assert lane.rows == ()
+        assert lane.error is not None
+        assert "unknown flag --json" in lane.error
+
+    def test_output_that_is_not_json_is_a_lane_error(self) -> None:
+        async def run(argv: list[str]) -> CommandResult:
+            del argv
+            return CommandResult(code=0, stdout="Welcome to Claude Code!", stderr="")
+
+        lane = asyncio.run(discover(run=run))
+        assert lane.rows == ()
+        assert lane.error is not None
+
+    def test_json_that_is_not_a_list_of_rows_is_a_lane_error(self) -> None:
+        assert found({"agents": []}).error is not None
+
+    def test_an_empty_roster_is_an_answer_not_a_failure(self) -> None:
+        lane = found([])
+        assert lane.rows == ()
+        assert lane.error is None
+
+
+class TestOneBadRowAmongGoodOnes:
+    def test_a_row_missing_its_session_id_is_skipped_not_fatal(self) -> None:
+        """One unreadable row must not hide every Session on the machine."""
+        lane = found([{"pid": 1, "cwd": "/tmp", "status": "idle"}, IDLE_ROW])
+        assert [row.target.pid for row in lane.rows] == [3538]
+        assert lane.error is None
+
+    def test_a_row_missing_its_pid_is_skipped(self) -> None:
+        """A Claude target without a pid is ambiguous: `--resume` forks."""
+        lane = found([{k: v for k, v in IDLE_ROW.items() if k != "pid"}])
+        assert lane.rows == ()
+        assert lane.error is None
+
+
+class TestTheKindField:
+    def test_a_stated_non_interactive_kind_is_not_a_session(self) -> None:
+        """`--all` adds completed background agents; those are not Sessions here."""
+        assert found([IDLE_ROW | {"kind": "background"}]).rows == ()
+
+    def test_a_row_that_does_not_state_its_kind_is_kept(self) -> None:
+        """A field that moved must not blank the roster — the worse mistake."""
+        lane = found([{k: v for k, v in IDLE_ROW.items() if k != "kind"}])
+        assert len(lane.rows) == 1

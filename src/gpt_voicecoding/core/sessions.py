@@ -122,6 +122,36 @@ class Session:
         )
 
 
+def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
+    """The identity to keep when one process has been named two ways.
+
+    Three cases, and the rule is one sentence: **`None` never overwrites a known
+    session id; a different known id does.**
+
+    - The reading names a Session we held anonymously — it has taken its first
+      turn and written the rollout that names it (#73). Take the new name.
+    - The reading is anonymous and we hold a name — this tick had only process
+      evidence, because the shared daemon is not answering. Keep the name; a
+      Session cannot un-know its own id, and dropping it would make the row
+      look like a different Session to everything that addresses it.
+    - The reading names a *different* Session on the same process — the user
+      typed `/new` in that TUI, so the process is the same one and the thread
+      is not. Take the new name: whoever could read an id is the authority on
+      which one it is.
+    """
+    if seen.session_id is None:
+        if held.session_id is not None:
+            _log.info(
+                "%s was read with process evidence only this tick; keeping its known "
+                "session id",
+                held,
+            )
+        return held
+    if held.session_id is not None and held.session_id != seen.session_id:
+        _log.info("pid %s moved from thread %s to %s", held.pid, held.session_id, seen.session_id)
+    return seen
+
+
 def _normalise(text: str) -> str:
     """Case- and whitespace-insensitive form used for label matching only."""
     return " ".join(text.split()).casefold()
@@ -163,13 +193,19 @@ class SessionRegistry:
         that lane every time a daemon restarted. The error is recorded for
         `status` and the rows are left exactly as they were.
 
+        **A lane that looked found what it found — even if it found nothing, and
+        even if it looked with something weaker than usual.** An empty
+        enumeration ends rows, because a Session that is gone must stop being
+        offered as a target. `LaneDiscovery.degraded` says the rows came from a
+        weaker source; it does not make them less true.
+
         **A Session that stopped being seen ends once, then is forgotten.** It
         goes `LIVE → ENDED` on the first discovery that does not contain it, so
         a surface can still say what happened to it, and is dropped on the next
         one. Forgetting immediately would make a Session that ended between two
         ticks indistinguishable from one that never existed.
 
-        The other lane's rows are untouched either way: two agents fail
+        The other lane's rows are untouched in every case: two agents fail
         independently, and one of them being down is not news about the other.
         """
         if not lane.enumerated:
@@ -178,6 +214,8 @@ class SessionRegistry:
             _log.info("the %s lane could not enumerate: %s", agent, lane.error)
             return
         self._lane_errors.pop(agent, None)
+        if lane.degraded is not None:
+            _log.info("the %s lane is reading from a weaker source: %s", agent, lane.degraded)
 
         seen: set[SessionTarget] = set()
         for row in lane.rows:
@@ -204,47 +242,38 @@ class SessionRegistry:
 
     def _admit(self, row: SessionInspection, *, now: float) -> Session:
         """Fold one freshly-read row into the roster, in place where it belongs."""
-        held = self._sessions.get(row.target) or self._same_process(row)
+        held = self._same_row(row)
         if held is None:
             fresh = session_from(row, first_seen=now)
             self._sessions[fresh.target] = fresh
             return fresh
-        updated = held.observed(row)
-        if updated.target != held.target:
-            # The Session was named between two readings: `codex` writes the
-            # rollout carrying its session id at its first turn (#73). One
-            # process is one Session, so the row is re-keyed, never doubled.
-            _log.info("Session %s is now named %s", held.target, updated.target)
+
+        target = _better_known(held.target, row.target)
+        updated = replace(held.observed(row), target=target)
+        if target != held.target:
             del self._sessions[held.target]
-        self._sessions[updated.target] = updated
+        self._sessions[target] = updated
         return updated
 
-    def _same_process(self, row: SessionInspection) -> Session | None:
-        """The held row for this process under a weaker name, if there is one.
+    def _same_row(self, row: SessionInspection) -> Session | None:
+        """The roster entry this reading is *about*, whatever it happens to name it.
 
-        **One direction only.** A row we hold anonymously becomes the named row
-        for the same pid, because that is a Session telling us its id at last.
-        A named row never quietly becomes an anonymous one — that would be a
-        Session losing its name, which nothing observed can mean — so it is
-        logged and left to be admitted as what it claims to be.
+        **The process is the identity; the session id is a field on it.** A
+        Codex TUI exists before it has a session id (#73) and keeps its pid
+        across `/new`, so keying on the id would make one process come and go
+        from the roster every time it was read by a different source. Where
+        there is no pid — a daemon thread nobody could tie to a TUI — the id is
+        all there is, and it is the key.
         """
+        exact = self._sessions.get(row.target)
+        if exact is not None:
+            return exact
         if row.target.pid is None:
             return None
-        for held in self._of(row.target.agent):
-            if held.target.pid != row.target.pid or held.target == row.target:
-                continue
-            if not held.target.named and row.target.named:
-                return held
-            if held.target.named and not row.target.named:
-                _log.warning(
-                    "the %s lane offered pid %s with no session id while the roster holds "
-                    "it as %s; taken as a separate row rather than as a Session losing its "
-                    "name",
-                    row.target.agent,
-                    row.target.pid,
-                    held.target.session_id,
-                )
-        return None
+        return next(
+            (held for held in self._of(row.target.agent) if held.target.pid == row.target.pid),
+            None,
+        )
 
     # -- addressing -----------------------------------------------------
 
