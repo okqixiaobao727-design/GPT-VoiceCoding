@@ -217,13 +217,26 @@ def own_process_start() -> str:
     Verified by reconstructing all eleven published keys from `ps` and comparing:
     eleven matches, no mismatches.
     """
-    printed = subprocess.run(
-        ["ps", "-p", str(os.getpid()), "-o", "lstart="],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "LC_ALL": "C"},
-        check=False,
-    ).stdout.strip()
+    return published_start(
+        subprocess.run(
+            ["ps", "-p", str(os.getpid()), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_ALL": "C"},
+            check=False,
+        ).stdout.strip()
+    )
+
+
+def published_start(printed: str) -> str:
+    """One `ps -o lstart=` line, as the key file spells the same moment.
+
+    Split out from the `ps` call because the interesting half is pure and its
+    interesting cases are ones this process cannot be made to have: a start time
+    whose UTC form falls on the *previous day*, and a single-digit day. Tested
+    against a fixed zone rather than whatever the machine is set to, so a suite
+    run at a different hour cannot pass a wrong conversion.
+    """
     # Naive, and read as local because that is what `ps` prints. `astimezone`
     # applies the offset in force *at that moment* rather than today's, so a
     # process started on the other side of a daylight-saving change converts
