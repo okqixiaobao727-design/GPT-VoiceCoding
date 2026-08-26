@@ -74,11 +74,17 @@ STATUS_TYPES: Final = {
 #: are not the same fact.
 FROM_THE_MACHINE = "so these rows come from the process table and the rollouts on disk"
 
-#: The dial produced no connection, and the dial did not say why. **The fallback
+#: This engine holds no connection, and nothing recorded why. **The fallback
 #: sentence, and it should be the rarest of the three** — `SharedDaemon.client()`
 #: sets a reason on `note` on every path that answers `None`, and `_degraded`
 #: prefers that reason over this one because the dial's own words are always more
 #: precise than this is.
+#:
+#: **It says only what this process can see**, which is the reading the Advisor
+#: fixed on #96 ("consequence for part B", 2026-08-26): a client `None` means
+#: there is no connection *here*, and it may not be spelled as a claim about
+#: whether the daemon was dialled, answered, or exists. That is `NO_DAEMON`'s
+#: sentence, and it is only ever said after a request was really made.
 #:
 #: **What this used to say, and why it may not say it again** (#96). Until #76,
 #: `CodexAgentAdapter._shared_daemon()` returned `None` unconditionally, and this
@@ -91,7 +97,9 @@ FROM_THE_MACHINE = "so these rows come from the process table and the rollouts o
 #: survives from #96 is its rule, which is the one that mattered: **never claim
 #: the daemon was silent, and never claim anything about it this build did not
 #: observe.**
-NO_CLIENT = f"the shared Codex app-server daemon could not be dialled, {FROM_THE_MACHINE}"
+NO_CLIENT = (
+    f"this engine holds no connection to the shared Codex app-server daemon, {FROM_THE_MACHINE}"
+)
 
 #: The daemon was dialled and did not answer. Only ever said after a request was
 #: actually made — which is what makes it different from `NO_CLIENT`.
@@ -259,7 +267,7 @@ def _degraded(daemon_error: str | None, note: str) -> str | None:
 
     **A dial that failed says why in its own words, once.** When there is no
     client and the dial left a reason, that reason replaces `NO_CLIENT` rather
-    than following it: "could not be dialled; codex did not answer within 10
+    than following it: "holds no connection; codex did not answer within 10
     seconds" is two sentences making one claim, and #96 is the record of what a
     roster that makes more claims than it observed costs to read.
     """

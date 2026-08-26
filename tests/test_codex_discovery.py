@@ -181,17 +181,20 @@ class TestWhenTheDaemonIsNotThere:
         """#96: "did not answer" was said without a byte being sent.
 
         The wording moved when #76 built the client — this build does dial now,
-        so "this build does not connect yet" stopped being true and the sentence
-        had to say what *is*. **#96's rule did not move**, and it is what is
-        asserted here rather than its old spelling: a lane with no client may not
+        so "this build does not connect yet" stopped being true. It says only
+        what this process can see, which is the reading the Advisor fixed on #96
+        ("consequence for part B"). **#96's rule did not move**, and it is what
+        is asserted here rather than any spelling: a lane with no client may not
         claim the daemon was silent, because being unable to reach it and it
         having nothing to say are two facts and only one of them was observed.
         The consequence is identical; the claim is not.
         """
         lane = found(None, running(101, "/tmp/w"))
         assert lane.degraded == discovery.NO_CLIENT
-        assert "could not be dialled" in lane.degraded
+        assert "holds no connection" in lane.degraded
         assert "did not answer" not in lane.degraded
+        # The sentence #96 was told not to write, held so it cannot come back.
+        assert "does not connect" not in lane.degraded
 
     def test_a_dial_that_failed_says_why_once_and_in_its_own_words(self) -> None:
         """The dial's reason replaces the fallback rather than following it (#76).
@@ -208,7 +211,7 @@ class TestWhenTheDaemonIsNotThere:
         assert lane.degraded is not None
         assert lane.degraded.startswith("codex could not be run: no such file")
         assert discovery.FROM_THE_MACHINE in lane.degraded
-        assert "could not be dialled" not in lane.degraded
+        assert "holds no connection" not in lane.degraded
 
     def test_a_daemon_that_refuses_is_still_a_daemon_that_did_not_answer(self) -> None:
         """The other sentence, and the only one that may claim the daemon was silent."""
