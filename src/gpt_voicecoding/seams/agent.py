@@ -60,7 +60,7 @@ from typing import Protocol, runtime_checkable
 
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.events import Event
-from gpt_voicecoding.seams.identity import RequestId, SessionTarget
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
 from gpt_voicecoding.seams.verify import VerifyResult
 
 
@@ -333,6 +333,35 @@ class LaneDiscovery:
         return self.error is None
 
 
+class LaneUnavailable(Exception):
+    """`inspect` could not look, so it says nothing about the Session at all.
+
+    **The one thing on this seam that raises, and only because `inspect` has no
+    other channel.** `discover` reports the same trouble as data
+    (`LaneDiscovery.error`) because "this lane is unavailable" is a row the
+    roster can show; `SessionInspection` has no such field, so an `inspect` that
+    returned *anything* here would be asserting a lifecycle and a state nobody
+    read. A raise is the only answer that claims nothing.
+
+    It is deliberately not `WaitingFor(kind=UNKNOWN, caught_up=False)`, which is
+    the seam's other way of saying "I do not know yet". The two mean different
+    retries: `caught_up=False` is a record the transcript has not flushed, read
+    again in a moment; this is `claude` missing from the PATH or a command that
+    failed, and re-reading it in a moment is a loop against a lane that is down.
+
+    **What a caller does with it is settled here, so no consumer invents its
+    own:** keep the row's last observed state, record `reason` where a lane's
+    `LaneDiscovery.error` is already recorded for `status`, and never end the
+    row. Not being able to look is not a sighting.
+    """
+
+    def __init__(self, agent: AgentKind, reason: str) -> None:
+        super().__init__(f"the {agent} lane could not be read: {reason}")
+        self.agent = agent
+        #: The lane's own words — the same sentence `LaneDiscovery.error` carries.
+        self.reason = reason
+
+
 def derive_reply_window(state: SessionState, child: ChildClassification) -> ReplyWindow:
     """Whether a Session will act on the next Relay as its next turn.
 
@@ -468,6 +497,17 @@ class AgentAdapter(Protocol):
         already holds — used when a fact has to be re-read now rather than at
         the next tick, which is what `WaitingFor(kind=UNKNOWN, caught_up=False)`
         asks its reader to do.
+
+        **It does not answer "is this Session still there".** That is
+        `discover`'s question, asked of the whole lane on a cadence; this reads
+        detail for a target Bridge Core already holds. A caller that derives a
+        lifecycle from what this returns is reading a roster off a magnifying
+        glass.
+
+        **Raises `LaneUnavailable` when the lane cannot be read at all**, and
+        the caller keeps the row's last observed state rather than ending it —
+        the same rule `observe` follows for `LaneDiscovery.error`, for the same
+        reason.
         """
         ...
 

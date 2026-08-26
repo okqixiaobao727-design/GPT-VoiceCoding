@@ -81,6 +81,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     LaneDiscovery,
+    LaneUnavailable,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -329,8 +330,15 @@ class ClaudeAgentAdapter:
         keeps this the *same* value `discover` yields — one reader, one shape.
         A Session the roster no longer lists reads as `ENDED`, which is the
         honest answer to "what is it doing" for a Session that is not there.
+
+        **A roster that could not be read is not a roster that lists nothing.**
+        The two are one value apart here and a whole verdict apart for the
+        caller, so a failed enumeration raises rather than answering `ENDED`.
         """
         lane = await self.discover()
+        if not lane.enumerated:
+            assert lane.error is not None  # `enumerated` is exactly this test
+            raise LaneUnavailable(AgentKind.CLAUDE, lane.error)
         for row in lane.rows:
             if row.target == target:
                 return row

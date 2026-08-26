@@ -66,6 +66,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     AwaitingApproval,
     LaneDiscovery,
+    LaneUnavailable,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
@@ -256,12 +257,17 @@ class CodexAgentAdapter:
         Matched on the whole target where it can be, and on the pid otherwise:
         a Codex Session gains its thread id at its first turn (#73), so the two
         readings of one process may name it differently.
+
+        **A lane that could not look raises**, rather than reporting a Session
+        it never saw as `ENDED` — the same rule `SessionRegistry.observe`
+        follows for `LaneDiscovery.error`, for the same reason.
         """
         lane = await self.discover()
+        if not lane.enumerated:
+            assert lane.error is not None  # `enumerated` is exactly this test
+            raise LaneUnavailable(AgentKind.CODEX, lane.error)
         for row in lane.rows:
-            if row.target == target or (
-                target.pid is not None and row.target.pid == target.pid
-            ):
+            if row.target == target or (target.pid is not None and row.target.pid == target.pid):
                 return row
         return SessionInspection(
             target=target,
