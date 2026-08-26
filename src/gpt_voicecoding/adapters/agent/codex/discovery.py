@@ -1,0 +1,235 @@
+"""What Codex Sessions are running, from the shared daemon and from the machine.
+
+Two sources, and the merge between them is the whole module.
+
+**The shared app-server daemon is the authority when it is up** (#82). It knows a
+thread's id, its name, its workspace and what it is doing, and it is the only
+route a Relay or an Approval can take. Its roster is `thread/loaded/list`
+answering `{"data": [id, …]}`, and each id is described by `thread/read` as
+`{"thread": {"id", "name", "cwd", "status"}}` — measured on 0.149.1 by #82's
+prototype (`661d3d9`), not assumed.
+
+**The process table is what is left when it is not** — and it is not, often. A
+TUI that started while the daemon was down is never adopted by a daemon that
+starts later (#82, measured), so "the daemon is up" and "the daemon knows about
+this Session" are different questions and the second one has to keep an answer.
+Those rows are `degraded`, not an error: they are true, they are just thinner.
+
+**A Session that has not been spoken to has no id at all**, because `codex`
+writes the rollout carrying one at its first *turn* (#73). Such a row is
+addressed by its pid alone, and gains its id later without becoming a second row
+— see `core.sessions._better_known`.
+
+**Unreachability gets no row and no field.** #68 removed that vocabulary: a
+process-table row is listed like any other, and a Relay into a Session the
+daemon cannot load returns the existing `FAILED` grade with its reason, before
+the wire (#82). The roster's job is to say what exists.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any, Final, Protocol
+
+from gpt_voicecoding.adapters.agent.codex import rollouts
+from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
+from gpt_voicecoding.seams.agent import (
+    LaneDiscovery,
+    SessionInspection,
+    SessionLifecycle,
+    SessionState,
+    WaitingFor,
+    WaitingKind,
+)
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
+
+_log = logging.getLogger(__name__)
+
+#: The daemon's roster, and the per-thread read. `includeTurns` is off: this is
+#: discovery, and a turn list is #76's business and a much larger answer.
+ROSTER_METHOD: Final = "thread/loaded/list"
+READ_METHOD: Final = "thread/read"
+
+#: What a thread's `status.type` can be, as the Codex spoke has observed it.
+#: `systemError` is a thread whose turn ended badly — still reachable, still
+#: able to take the next Relay, which is why it reads as idle rather than as
+#: something that must be waited out.
+STATUS_TYPES: Final = {
+    "idle": SessionState.IDLE,
+    "active": SessionState.RUNNING,
+    "systemError": SessionState.IDLE,
+}
+
+#: Said on every row that came from the process table rather than the daemon.
+NO_DAEMON = (
+    "the shared Codex app-server daemon did not answer, so these rows come from the "
+    "process table and the rollouts on disk"
+)
+
+
+class DaemonClient(Protocol):
+    """The one verb this module needs of a connection to the shared daemon."""
+
+    async def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Call one method and wait for its answer, or raise saying why not."""
+        ...
+
+
+#: How the process table is read. Injected so the merge can be tested.
+ProcessLister = Callable[[], Awaitable[tuple[Candidate, ...]]]
+
+
+async def discover(
+    client: DaemonClient | None = None,
+    *,
+    processes: ProcessLister = enumerate_sessions,
+    home: Path | None = None,
+) -> LaneDiscovery:
+    """Every Codex Session on this machine, however well it can be described.
+
+    The process table is read first and always: it is the only source that sees
+    a Session the daemon has never heard of, and #82 proved that is not a corner
+    case but the ordinary result of starting a TUI while the daemon is down.
+    """
+    try:
+        candidates = await processes()
+    except (OSError, TimeoutError) as unreadable:
+        return LaneDiscovery(error=f"the process table could not be read: {unreadable}")
+
+    threads, daemon_error = await _threads(client)
+    rows: list[SessionInspection] = []
+    claimed: set[int] = set()
+
+    for thread in threads:
+        pid = _pid_for(thread, candidates, claimed)
+        if pid is not None:
+            claimed.add(pid)
+        rows.append(_from_thread(thread, pid))
+
+    rows.extend(
+        _from_process(candidate, home=home)
+        for candidate in candidates
+        if candidate.pid not in claimed
+    )
+    return LaneDiscovery(rows=tuple(rows), degraded=daemon_error)
+
+
+async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], str | None]:
+    """Every thread the daemon holds, or the reason there are none to hold.
+
+    A daemon that is absent, refusing or answering nonsense all mean one thing
+    to this lane: the rows will be thinner than usual. None of them is a reason
+    to report no Sessions, because the process table has already been read.
+    """
+    if client is None:
+        return [], NO_DAEMON
+    try:
+        answer = await client.request(ROSTER_METHOD, {})
+    except Exception as unreachable:  # noqa: BLE001 - any failure is the same fact here
+        _log.info("the shared Codex daemon did not answer %s: %s", ROSTER_METHOD, unreachable)
+        return [], f"{NO_DAEMON} ({unreachable})"
+
+    ids = answer.get("data") if isinstance(answer, dict) else None
+    if not isinstance(ids, list):
+        return [], f"{NO_DAEMON} ({ROSTER_METHOD} answered a shape this build cannot read)"
+
+    found: list[dict[str, Any]] = []
+    for thread_id in ids:
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            continue
+        described = await _read(client, thread_id.strip())
+        if described is not None:
+            found.append(described)
+    return found, None
+
+
+async def _read(client: DaemonClient, thread_id: str) -> dict[str, Any] | None:
+    """One thread as the daemon describes it, or `None` if it cannot describe it."""
+    try:
+        answer = await client.request(READ_METHOD, {"threadId": thread_id, "includeTurns": False})
+    except Exception as unreadable:  # noqa: BLE001 - one bad thread is not a bad roster
+        _log.info("the daemon could not describe thread %s: %s", thread_id, unreadable)
+        return None
+    thread = answer.get("thread") if isinstance(answer, dict) else None
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        _log.info("%s answered about a different thread than %s", READ_METHOD, thread_id)
+        return None
+    return thread
+
+
+def _pid_for(
+    thread: dict[str, Any], candidates: tuple[Candidate, ...], claimed: set[int]
+) -> int | None:
+    """The TUI running this thread, when exactly one process can be it.
+
+    Joined on the workspace, because that is the only field the two sources
+    share — the daemon does not report a pid and the process table does not
+    report a thread. Two unclaimed TUIs in one directory cannot be told apart,
+    so neither is claimed: a row addressed by the wrong pid is worse than one
+    addressed by its thread id alone, which still reaches the daemon.
+    """
+    cwd = thread.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    wanted = os.path.realpath(cwd)
+    matches = [
+        candidate.pid
+        for candidate in candidates
+        if candidate.pid not in claimed
+        and os.path.realpath(candidate.workspace) == wanted
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _from_thread(thread: dict[str, Any], pid: int | None) -> SessionInspection:
+    """One daemon-held thread as the seam holds it."""
+    status = thread.get("status")
+    kind = status.get("type") if isinstance(status, dict) else None
+    state = STATUS_TYPES.get(str(kind), SessionState.RUNNING)
+    cwd = thread.get("cwd")
+    name = thread.get("name")
+    return SessionInspection(
+        target=SessionTarget(agent=AgentKind.CODEX, session_id=str(thread["id"]), pid=pid),
+        workspace=Path(str(cwd)) if isinstance(cwd, str) and cwd.strip() else Path(),
+        lifecycle=SessionLifecycle.LIVE,
+        state=state,
+        # The status says whether a turn is running, never what a stopped thread
+        # stopped on. #75 reads that; a `systemError` is flagged for it to look.
+        waiting_for=(
+            WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+            if kind == "systemError"
+            else WaitingFor()
+        ),
+        name=name.strip() if isinstance(name, str) and name.strip() else None,
+    )
+
+
+def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspection:
+    """One running TUI the daemon does not hold, named as well as disk allows.
+
+    Its thread id comes from the newest rollout whose own `cwd` is this
+    workspace, and only once the Session has taken a turn — before that there is
+    genuinely no id, and the row is addressed by pid.
+
+    **The state is `RUNNING` because nothing here can see one.** A process is
+    not evidence of a Reply Window, and `RUNNING` is the reading that holds a
+    Relay rather than delivering it into a Session that may be mid-turn. That
+    matters more here than anywhere: this Session's Relay would fail at the wire
+    anyway (#82), and a held Relay is one the user gets back.
+    """
+    rollout = rollouts.newest_for(candidate.workspace, home=home)
+    meta = rollouts.session_meta(rollout) if rollout is not None else None
+    return SessionInspection(
+        target=SessionTarget(
+            agent=AgentKind.CODEX,
+            session_id=rollouts.session_id_in(meta) if meta is not None else None,
+            pid=candidate.pid,
+        ),
+        workspace=candidate.workspace,
+        lifecycle=SessionLifecycle.LIVE,
+        state=SessionState.RUNNING,
+        waiting_for=WaitingFor(),
+    )

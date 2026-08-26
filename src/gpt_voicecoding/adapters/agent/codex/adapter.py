@@ -42,6 +42,7 @@ from typing import Any
 
 from gpt_voicecoding import __version__
 from gpt_voicecoding.adapters.agent.codex import approvals as approval_wire
+from gpt_voicecoding.adapters.agent.codex import discovery as codex_discovery
 from gpt_voicecoding.adapters.agent.codex.threads import (
     PINNED_POLICY,
     USER_REVIEWER,
@@ -64,10 +65,14 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    LaneDiscovery,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionInspection,
+    SessionLifecycle,
+    SessionState,
     SessionStopped,
     WaitingFor,
     WaitingKind,
@@ -233,6 +238,47 @@ class CodexAgentAdapter:
         return tuple(self._threads)
 
     # -- the seam ---------------------------------------------------------
+
+    async def discover(self) -> LaneDiscovery:
+        """Every Codex Session on this machine, from the daemon and from the machine.
+
+        Delegated whole to `discovery.py`. The client handed over is the shared
+        daemon's when there is one — `None` while the LaunchAgent that starts it
+        is #83's to install, which is not a gap in the roster: those Sessions are
+        listed from the process table, and a Relay into one fails at the wire
+        with its reason (#82).
+        """
+        return await codex_discovery.discover(self._shared_daemon())
+
+    async def inspect(self, target: SessionTarget) -> SessionInspection:
+        """One Session, freshly read from the same sources `discover` reads.
+
+        Matched on the whole target where it can be, and on the pid otherwise:
+        a Codex Session gains its thread id at its first turn (#73), so the two
+        readings of one process may name it differently.
+        """
+        lane = await self.discover()
+        for row in lane.rows:
+            if row.target == target or (
+                target.pid is not None and row.target.pid == target.pid
+            ):
+                return row
+        return SessionInspection(
+            target=target,
+            workspace=Path(),
+            lifecycle=SessionLifecycle.ENDED,
+            state=SessionState.IDLE,
+        )
+
+    def _shared_daemon(self) -> codex_discovery.DaemonClient | None:
+        """A connection to the shared app-server daemon, when this engine holds one.
+
+        There is none yet, and deliberately: the daemon's lifecycle is a login
+        `LaunchAgent` that #83 installs, and #74 does not start daemons. Until
+        then this returns `None` and the lane reads the machine instead, which
+        is exactly what it does for a TUI the daemon never adopted anyway.
+        """
+        return None
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Both. `turn/steer` is stable in the codex this adapter is built against."""

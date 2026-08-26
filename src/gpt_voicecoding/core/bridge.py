@@ -396,6 +396,42 @@ class BridgeCore:
             await self._announce(outcome.target, outcome.report)
         return expired, await self.approvals.sweep_expired()
 
+    async def discover(self) -> tuple[SessionTarget, ...]:
+        """Ask every lane what Sessions exist, and make the roster agree.
+
+        **This is how a Session gets onto the roster at all.** v1.0 bridges the
+        Sessions the *user* starts (#68), so nothing announces one — the hub
+        goes and looks, on the cadence the composition root sets, and each lane
+        answers for itself.
+
+        **One lane raising does not stop the others.** A lane is supposed to
+        report its own trouble as `LaneDiscovery(error=...)`; one that raises
+        instead is a defect in that adapter, and the answer to a defective lane
+        is to leave its rows alone and keep asking the other one — which is
+        exactly what the seam's own contract already says an error means.
+
+        Returns the Sessions that ended on this pass, having already answered
+        whatever was queued for them: a Session that disappears between two
+        ticks owes the user the same news as one that reported its own death,
+        and the roster is the only witness to the first kind.
+        """
+        gone: list[SessionTarget] = []
+        for kind, adapter in self._agents.items():
+            before = {held.target for held in self._state.sessions.live()}
+            try:
+                lane = await adapter.discover()
+            except Exception:  # noqa: BLE001 - a defective lane must not stop the rest
+                _log.exception("the %s lane raised instead of reporting its trouble", kind)
+                continue
+            self._state.sessions.observe(kind, lane, now=self._stamp())
+            gone.extend(before - {held.target for held in self._state.sessions.live()})
+
+        for target in gone:
+            _log.info("Session %s is no longer running", target)
+            for outcome in self.relays.session_ended(target):
+                await self._announce(outcome.target, outcome.report)
+        return tuple(gone)
+
     async def dispatch(self, event: Event) -> None:
         """Turn one event into a call on whichever pipeline owns the decision."""
         match event:

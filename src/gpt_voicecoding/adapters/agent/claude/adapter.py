@@ -45,6 +45,7 @@ import logging
 from contextlib import suppress
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
 from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     bootstrap_value,
@@ -70,9 +71,13 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
+    LaneDiscovery,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
+    SessionInspection,
+    SessionLifecycle,
+    SessionState,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -226,6 +231,35 @@ class ClaudeAgentAdapter:
         return self._windows.level(target)
 
     # -- the seam ---------------------------------------------------------
+
+    async def discover(self) -> LaneDiscovery:
+        """Every Claude Session running, from Claude Code's own roster.
+
+        Delegated whole to `discovery.py`, which owns the command and the
+        mapping. Nothing about being *reachable* enters here: a Session is
+        listed because it exists, and whether this adapter holds a channel to it
+        is a question `answer_relay` answers with a receipt (#68).
+        """
+        return await claude_discovery.discover()
+
+    async def inspect(self, target: SessionTarget) -> SessionInspection:
+        """One Session, freshly read from the same roster `discover` reads.
+
+        Answering from the roster rather than from anything held here is what
+        keeps this the *same* value `discover` yields — one reader, one shape.
+        A Session the roster no longer lists reads as `ENDED`, which is the
+        honest answer to "what is it doing" for a Session that is not there.
+        """
+        lane = await self.discover()
+        for row in lane.rows:
+            if row.target == target:
+                return row
+        return SessionInspection(
+            target=target,
+            workspace=Path(),
+            lifecycle=SessionLifecycle.ENDED,
+            state=SessionState.IDLE,
+        )
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Deliver only, and honestly so: the channel is refused mid-turn."""

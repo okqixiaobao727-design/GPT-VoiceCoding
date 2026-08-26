@@ -30,7 +30,12 @@ from gpt_voicecoding.control_plane.client import ask
 from gpt_voicecoding.control_plane.server import AlreadyServing
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
-from gpt_voicecoding.seams.agent import ReplyWindow, ReplyWindowChanged
+from gpt_voicecoding.seams.agent import (
+    LaneDiscovery,
+    ReplyWindow,
+    ReplyWindowChanged,
+    SessionInspection,
+)
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
@@ -448,6 +453,65 @@ class TestTheTick:
         asyncio.run(scenario())
 
         assert ticks
+
+
+class TestTheDiscoveryLoop:
+    """How a Session gets onto the roster at all: nobody announces one (#68)."""
+
+    def test_the_engine_asks_the_lanes_on_its_own(self, home: Path) -> None:
+        engine = assembled(home)
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert engine.adapters.agents[AgentKind.CODEX].discoveries  # type: ignore[union-attr]
+
+    def test_what_a_lane_reports_reaches_the_roster(self, home: Path) -> None:
+        engine = assembled(home)
+        agent = engine.adapters.agents[AgentKind.CODEX]
+        agent.discovery = LaneDiscovery(  # type: ignore[union-attr]
+            rows=(SessionInspection(target=CODEX, workspace=Path("/tmp/workspace")),)
+        )
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert [held.target for held in engine.core.status().sessions] == [CODEX]
+
+    def test_a_lane_that_raises_does_not_stop_the_loop(self, home: Path) -> None:
+        """An adapter is meant to report its trouble; one that raises is a defect."""
+        engine = assembled(home)
+        agent = engine.adapters.agents[AgentKind.CODEX]
+        calls: list[int] = []
+
+        async def raising() -> LaneDiscovery:
+            calls.append(1)
+            raise RuntimeError("this lane is broken")
+
+        agent.discover = raising  # type: ignore[union-attr,method-assign]
+
+        async def scenario() -> None:
+            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            try:
+                await asyncio.sleep(0.06)
+            finally:
+                await engine.aclose()
+
+        asyncio.run(scenario())
+
+        assert len(calls) > 1
 
 
 def with_cli(stated: Path) -> str:
