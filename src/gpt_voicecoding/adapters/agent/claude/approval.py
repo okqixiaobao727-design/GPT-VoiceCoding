@@ -57,6 +57,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Final
 
+from gpt_voicecoding.adapters.agent.claude import stop_analysis
 from gpt_voicecoding.adapters.agent.claude.privacy import (
     PRIVATE_SOCKET_MODE,
     ChannelPathError,
@@ -198,29 +199,6 @@ def approval_socket_path(directory: Path, pid: int) -> Path:
     return directory / f"{APPROVAL_DIRECTORY_PREFIX}{pid}" / APPROVAL_SOCKET_NAME
 
 
-def summary_of(tool_input: Any) -> str:
-    """One line saying what is actually about to happen, in the tool's own words.
-
-    The fields are tried in the order that puts the most specific thing first: a
-    shell command says everything, a path says most of it, and a description is
-    the tool's own summary of itself. Anything else is left to the tool name,
-    which the announcement already carries — inventing a sentence out of an
-    arbitrary input object would be guessing at the user's risk.
-
-    **It is not shortened here.** How long a thing may be before it is read aloud
-    or pushed to a phone is a presentation decision, and presentation decisions
-    are Bridge Core's (ADR 0001). The Codex spoke's equivalent takes the same
-    position; an adapter that trimmed would be two components deciding one thing.
-    """
-    if not isinstance(tool_input, dict):
-        return ""
-    for key in ("command", "file_path", "path", "url", "description"):
-        value = tool_input.get(key)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())
-    return ""
-
-
 def request_from(
     payload: Mapping[str, Any], *, target: SessionTarget, approval_id: str
 ) -> ApprovalRequest:
@@ -231,13 +209,27 @@ def request_from(
     `permission_suggestions` is deliberately not consulted — every suggestion it
     carries is a *rule*, and a rule outlives the one call the user was asked
     about.
+
+    **`detail` is P5's extractor, and there is only one of it.** This module had
+    its own until #75, which read `command` first and returned it whole — so the
+    Approval Relay spoke a shell command into a Live Call and pushed it to a
+    phone, while the transcript-derived `WaitingFor.detail` excluded exactly
+    that. The signed port table rules the reference implementation's way
+    (`legacy@1d32845:bridge/transcript.py:1779-1811,126-143`): the arguments
+    proper — command text, file contents, edit strings — never appear, and
+    anything over 200 characters is passed over rather than cut, because a cut
+    lands mid-secret as readily as mid-word. Both of the old arguments held less
+    than they looked: the exclusion is not about length, so Bridge Core could not
+    have made it later. What the user hears when nothing readable is left is the
+    tool's name, which is enough to say *allow*, *deny*, or `ASK` — the verdict
+    that hands the dialog back to the screen in front of them.
     """
     tool_name = payload.get(TOOL_NAME_FIELD)
     return ApprovalRequest(
         approval_id=approval_id,
         target=target,
         tool_name=tool_name if isinstance(tool_name, str) and tool_name.strip() else "a tool",
-        detail=summary_of(payload.get(TOOL_INPUT_FIELD)),
+        detail=stop_analysis.summarise(payload.get(TOOL_INPUT_FIELD)),
     )
 
 
@@ -310,6 +302,23 @@ class ApprovalListener:
     def pending(self) -> tuple[ApprovalRequest, ...]:
         """Every dialog currently parked on this socket, in arrival order."""
         return tuple(waiting.request for waiting in self._waiting.values())
+
+    def newest_for(self, target: SessionTarget) -> ApprovalRequest | None:
+        """The dialog one exact Session is held up on, or `None` for none.
+
+        The newest, because a Session that raised two is held up on the one it
+        raised last. Keyed by the exact target rather than the session id:
+        `--resume` forks two processes under one id, and a dialog belongs to one
+        of them.
+
+        Asked of this listener rather than filtered out of `pending()` by a
+        caller, because which parked dialog belongs to a Session is a question
+        about what this listener is holding.
+        """
+        for waiting in reversed(self._waiting.values()):
+            if waiting.request.target == target:
+                return waiting.request
+        return None
 
     async def start(self) -> None:
         """Bind the socket, in a directory only this user can enter."""
