@@ -19,6 +19,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -719,3 +720,83 @@ class TestTheWireItself:
             call("getMe", {}, timeout_seconds=5.0)
 
         assert "secret-token-value" not in refused.value.detail
+
+
+#: How long the stuck transport below holds its thread. Comfortably longer than
+#: the patience the assertion allows, so "the process left without it" and "the
+#: request happened to finish first" cannot be confused.
+STUCK_SECONDS = 5.0
+
+
+class TestACallInFlightDoesNotHoldTheProcessOpen:
+    """#96: a Bot API call still running at shutdown must not delay the exit.
+
+    `asyncio.run` joins the default executor before it returns, so a `send` on
+    `asyncio.to_thread` held the interpreter for the rest of its
+    `request_timeout_seconds` — measured at 28.04s after SIGTERM, against a
+    twenty-second grace before SIGKILL. The reader was moved off the default
+    executor for this reason long ago; `send` and `verify` were left on it
+    because "a request timeout bounds them", which bounds the call and not the
+    process.
+    """
+
+    def test_the_loop_is_left_while_the_request_is_still_running(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def stuck(method: str, payload: dict, *, timeout_seconds: float) -> Any:
+            started.set()
+            release.wait(STUCK_SECONDS)
+            return {"ok": True, "result": {}}
+
+        async def scenario() -> bool:
+            sending = asyncio.ensure_future(
+                channel(stuck).send("some words", request_id=new_request_id())  # type: ignore[arg-type]
+            )
+            await until(started.is_set, what="the request reached the transport")
+            # The shutdown: whoever was awaiting this let go of it.
+            sending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sending
+            return sending.cancelled()
+
+        began = time.monotonic()
+        try:
+            cancelled = asyncio.run(scenario())
+            left_in = time.monotonic() - began
+        finally:
+            release.set()
+
+        assert cancelled is True
+        assert left_in < STUCK_SECONDS / 2, (
+            f"leaving the loop took {left_in:.2f}s with a request in flight; the "
+            "process is being held by the thread that request runs on"
+        )
+
+    def test_an_abandoned_send_reports_no_outcome_at_all(self) -> None:
+        """Never a success for words that may not have left, nor a failure for
+        words that may already have arrived. #77 settles what Core does with it.
+        """
+        started = threading.Event()
+        release = threading.Event()
+
+        def stuck(method: str, payload: dict, *, timeout_seconds: float) -> Any:
+            started.set()
+            release.wait(STUCK_SECONDS)
+            return {"ok": True, "result": {}}
+
+        async def scenario() -> object:
+            sending = asyncio.ensure_future(
+                channel(stuck).send("some words", request_id=new_request_id())  # type: ignore[arg-type]
+            )
+            await until(started.is_set, what="the request reached the transport")
+            sending.cancel()
+            try:
+                return await sending
+            except asyncio.CancelledError:
+                return None
+
+        try:
+            assert asyncio.run(scenario()) is None
+        finally:
+            release.set()

@@ -420,3 +420,111 @@ class TestTheDeadlineIsNeverLeftToTheCallSite:
         asyncio.run(scenario())
 
         assert recorded == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
+
+
+class TestStoppingWithASurfaceStillConnected:
+    """#96: a peer that is merely connected may not hold the engine open.
+
+    Since Python 3.12 `asyncio.Server.wait_closed()` waits for every live
+    connection handler, and this server's handler reads until the peer goes
+    away — so one idle surface pinned `aclose` forever. It was not a slow
+    shutdown but an unbounded one, and because the control plane closes before
+    the adapters, the Codex app-server the engine had spawned was then never
+    terminated: the engine outlived SIGTERM, was SIGKILLed, and left a process
+    holding the socket that refused the acceptance run after it.
+
+    The two states a handler can be in are covered separately, because the
+    right answer differs: waiting for the next request means stop now, and
+    writing a reply means finish it first.
+    """
+
+    def test_an_idle_peer_does_not_hold_the_stop_open(self, socket_dir: Path) -> None:
+        async def scenario() -> None:
+            server = await serving(socket_dir, StubPlane())
+            reader, writer = await asyncio.open_unix_connection(str(server.path))
+            try:
+                # One exchange, so this is a real surface rather than a socket
+                # nobody ever spoke on — and then silence, which is exactly what
+                # a surface between commands looks like.
+                writer.write(json.dumps(Request(action=Action.STATUS).as_document()).encode())
+                writer.write(b"\n")
+                await writer.drain()
+                assert Reply.of(json.loads(await reader.readline())).ok
+                async with asyncio.timeout(5):
+                    await server.aclose()
+            finally:
+                writer.close()
+
+        asyncio.run(scenario())
+
+    def test_a_reply_being_written_is_finished_before_the_stop(self, socket_dir: Path) -> None:
+        """A stop that cut a reply in half would answer a surface with a hole."""
+        held = Held(Action.RELAY)
+        plane = StubPlane(held=held)
+
+        async def scenario() -> Reply:
+            server = await serving(socket_dir, plane)
+            reader, writer = await asyncio.open_unix_connection(str(server.path))
+            try:
+                writer.write(json.dumps(Request(action=Action.RELAY).as_document()).encode())
+                writer.write(b"\n")
+                await writer.drain()
+                await asyncio.wait_for(held.reached.wait(), 5)
+
+                # The stop begins while the handler is inside `handle`, which is
+                # the moment the old code had no way to distinguish from idle.
+                stopping = asyncio.ensure_future(server.aclose())
+                await asyncio.sleep(0)
+                held.release.set()
+                async with asyncio.timeout(5):
+                    answer = await reader.readline()
+                    await stopping
+                return Reply.of(json.loads(answer))
+            finally:
+                held.release.set()
+                writer.close()
+
+        assert asyncio.run(scenario()).action is Action.RELAY
+
+    def test_the_stop_says_which_surfaces_were_still_connected(
+        self, socket_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one fact #96's artifacts could not recover, written down at the time."""
+
+        async def scenario() -> None:
+            server = await serving(socket_dir, StubPlane())
+            reader, writer = await asyncio.open_unix_connection(str(server.path))
+            try:
+                writer.write(json.dumps(Request(action=Action.STATUS).as_document()).encode())
+                writer.write(b"\n")
+                await writer.drain()
+                await reader.readline()
+                with caplog.at_level("INFO", logger="gpt_voicecoding.control_plane.server"):
+                    # Bounded like every other stop here: a test that hangs
+                    # reads as `pending` and holds a macOS runner (#65).
+                    async with asyncio.timeout(5):
+                        await server.aclose()
+            finally:
+                writer.close()
+
+        asyncio.run(scenario())
+
+        stopped = [line for line in caplog.messages if "stopping the control plane" in line]
+        assert stopped, caplog.messages
+        # This process is on both ends of the socket, so the pid it names is
+        # this one — which is what makes the reading verifiable at all.
+        assert f"pid {os.getpid()}" in stopped[0]
+
+    def test_a_server_that_stopped_may_serve_again(self, socket_dir: Path) -> None:
+        """The stop is a state, so it has to be left as well as entered."""
+
+        async def scenario() -> Reply:
+            server = await serving(socket_dir, StubPlane())
+            await server.aclose()
+            await server.start()
+            try:
+                return await ask(Request(action=Action.STATUS), path=server.path, timeout=5)
+            finally:
+                await server.aclose()
+
+        assert asyncio.run(scenario()).ok

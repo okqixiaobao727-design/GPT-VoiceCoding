@@ -28,17 +28,32 @@ for as long as the outage lasts. A missing *token*, by contrast, refuses the
 start — a variable that is not set never heals on its own, and that refusal
 happens in the factory, before this class exists.
 
-**The reader is a daemon thread this adapter owns, and that is measured rather
-than preferred.** `asyncio.run` joins the default executor before it returns, so
-a poll parked on `asyncio.to_thread` holds the *process* open long after the
-engine let go of it — measured at 0.20s to close the adapter and 3.01s to leave
-`asyncio.run`, with a 3s request in flight. At the default 25s poll that is a quit
-which visibly hangs, in a process the menu-bar shell spawns as its own child
-(ADR 0005). A daemon thread cannot hold an exit open, and what it loses when the
-interpreter takes it mid-flight is a read-only GET: the cursor lives in memory
-and dies with the process either way, and Telegram re-serves anything it was
-never acknowledged for. `send` and `verify` stay on `asyncio.to_thread`, where a
-request timeout bounds them.
+**Every Bot API call runs on a daemon thread this adapter owns, and that is
+measured rather than preferred.** `asyncio.run` joins the default executor before
+it returns, so anything parked on `asyncio.to_thread` holds the *process* open
+long after the engine let go of it — measured at 0.20s to close the adapter and
+3.01s to leave `asyncio.run`, with a 3s request in flight. At the default 25s
+poll that is a quit which visibly hangs, in a process the menu-bar shell spawns
+as its own child (ADR 0005). A daemon thread cannot hold an exit open, and what
+it loses when the interpreter takes it mid-flight is one HTTP request: the cursor
+lives in memory and dies with the process either way, and Telegram re-serves
+anything it was never acknowledged for.
+
+This rule used to apply to the *reader* alone. `send` and `verify` stayed on
+`asyncio.to_thread` on the ground that "a request timeout bounds them", and that
+sentence was wrong in a way worth recording: the request timeout bounds the
+**call**, not the **process exit**. A `sendMessage` parked on the network when
+SIGTERM arrives holds the interpreter for the rest of its 30s
+`request_timeout_seconds` — measured at 28.04s after SIGTERM on the bundle's own
+Python 3.12.14 — while whoever stopped the engine is holding a grace of 20s
+(`tests/acceptance/support.py`) and then sends SIGKILL. A bound that is longer
+than the grace is not a bound; it is the same hang with a number on it (#96).
+
+**An abandoned call reports nothing.** A `send` whose await is cancelled on the
+way out raises through `send`, so no `DeliveryReceipt` is invented for it —
+neither a success for words that may never have left, nor a failure for words
+that may already have arrived. What became of a Relay the engine did not live to
+hear about is Bridge Core's question, not this adapter's, and #77 settles it.
 
 **Inbound is filtered to the configured chat, and a stranger is met with
 silence.** Bridge Core routes inbound text into the control-plane command set,
@@ -395,7 +410,42 @@ class TelegramCompanionChannel:
             self._offset = max(self._offset or 0, update_id + 1)
 
     async def _ask(self, method: str, payload: dict, *, timeout_seconds: float) -> object:
-        """One Bot API call, on a worker thread so the engine's loop keeps turning."""
-        return await asyncio.to_thread(
-            self._transport, method, payload, timeout_seconds=timeout_seconds
-        )
+        """One Bot API call, on a thread of this adapter's own.
+
+        Its own rather than `asyncio.to_thread`'s, for the reason in the module
+        docstring: the default executor is joined by `asyncio.run` on the way
+        out, so a request still in flight there holds the whole process past
+        whatever grace it was given. A daemon thread is abandoned instead, and
+        the caller awaiting this is cancelled with the rest of the shutdown.
+        """
+        loop = asyncio.get_running_loop()
+        answer: asyncio.Future[object] = loop.create_future()
+
+        def call() -> None:
+            try:
+                outcome: object = self._transport(method, payload, timeout_seconds=timeout_seconds)
+            except BaseException as raised:  # noqa: BLE001 - handed back whole, judged there
+                outcome = raised
+            try:
+                loop.call_soon_threadsafe(_settle, answer, outcome)
+            except RuntimeError:
+                pass  # the loop has gone; there is nobody left to tell
+
+        threading.Thread(target=call, name=f"telegram-{method}", daemon=True).start()
+        return await answer
+
+
+def _settle(answer: asyncio.Future[object], outcome: object) -> None:
+    """Hand one call's result back, unless nobody is waiting for it any more.
+
+    Runs on the event loop, put there by the worker. A future that was already
+    cancelled is the ordinary shutdown case rather than an error: the engine let
+    go of this call, and setting a result on it would raise where nothing is
+    listening.
+    """
+    if answer.done():
+        return
+    if isinstance(outcome, BaseException):
+        answer.set_exception(outcome)
+    else:
+        answer.set_result(outcome)

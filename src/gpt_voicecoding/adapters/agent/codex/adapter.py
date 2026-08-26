@@ -155,18 +155,29 @@ class CodexAgentAdapter:
         In that order, and every thread gets its turn even if one objects: the
         Sessions belong to the user and are merely being let go of, while the
         engine's own app-server is the only process here that must actually die.
+
+        **The detaching happens all at once**, because it is what stands between
+        a SIGTERM and that app-server actually being told to go. Sequentially,
+        the wait before the one process that must die grew with the number of
+        Sessions the user happened to have open — so the shutdown budget held on
+        a machine with two and not on a machine with nine, which is the kind of
+        bound that passes every test and fails on somebody's Tuesday (#96).
         """
         for task in list(self._retrying):
             task.cancel()
         self._retrying.clear()
-        for watched in list(self._threads.values()):
-            try:
-                await watched.connection.aclose()
-            except Exception:  # a connection objecting must not strand the rest
-                _log.exception("closing the connection to %s raised", watched.socket_path)
+        watching = list(self._threads.values())
         self._threads.clear()
+        await asyncio.gather(*(self._detached(watched) for watched in watching))
         await self._own.aclose()
         self._opened = False
+
+    async def _detached(self, watched: WatchedThread) -> None:
+        """Let go of one Session, saying so if it objects. Never raises."""
+        try:
+            await watched.connection.aclose()
+        except Exception:  # a connection objecting must not strand the rest
+            _log.exception("closing the connection to %s raised", watched.socket_path)
 
     # -- the Session roster this adapter watches --------------------------
 
@@ -283,6 +294,13 @@ class CodexAgentAdapter:
         `LaunchAgent` that #83 installs, and #74 does not start daemons. Until
         then this returns `None` and the lane reads the machine instead, which
         is exactly what it does for a TUI the daemon never adopted anyway.
+
+        **`None` here means "nothing was dialled", and the roster says exactly
+        that** (`discovery.NO_CLIENT`). It used to say the daemon had not
+        answered, which is a claim about the daemon that this build is in no
+        position to make — and on a machine where `bridge-install status` really
+        does dial one and really does get an answer, the two readings look like
+        a contradiction rather than like two builds (#96).
         """
         return None
 

@@ -63,10 +63,37 @@ STATUS_TYPES: Final = {
     "systemError": SessionState.IDLE,
 }
 
-#: Said on every row that came from the process table rather than the daemon.
-NO_DAEMON = (
-    "the shared Codex app-server daemon did not answer, so these rows come from the "
-    "process table and the rollouts on disk"
+#: What every degraded reading ends with: where the rows actually came from.
+#: The *reason* is a separate sentence, because there are two of them and they
+#: are not the same fact.
+FROM_THE_MACHINE = "so these rows come from the process table and the rollouts on disk"
+
+#: This build never dials. `CodexAdapter._shared_daemon` returns `None` until
+#: #77 builds the client, so there is no connection to try and nothing answers
+#: or fails to answer.
+#:
+#: **The distinction is not pedantry; it cost a session** (#96). This used to be
+#: the same sentence as `NO_DAEMON` below, so a roster reading "the daemon did
+#: not answer" was produced without a single byte being sent — while
+#: `bridge-install status`, on the same machine at the same moment, really did
+#: dial the daemon and really did get an answer. The two readings looked like a
+#: contradiction to be investigated, and a session went and investigated it.
+NO_CLIENT = (
+    f"this build does not connect to the shared Codex app-server daemon yet, {FROM_THE_MACHINE}"
+)
+
+#: The daemon was dialled and did not answer. Only ever said after a request was
+#: actually made — which is what makes it different from `NO_CLIENT`.
+NO_DAEMON = f"the shared Codex app-server daemon did not answer, {FROM_THE_MACHINE}"
+
+#: The daemon answered, and this build could not read what it said. A third
+#: sentence rather than a parenthesis on the second, for the reason the second
+#: exists at all: "did not answer (it answered a shape this build cannot read)"
+#: contradicts itself inside one sentence, and the half a reader carries away is
+#: the half that blames the daemon. The fault here is this build's.
+UNREADABLE_ROSTER = (
+    f"the shared Codex app-server daemon answered {ROSTER_METHOD} in a shape this build "
+    f"cannot read, {FROM_THE_MACHINE}"
 )
 
 
@@ -123,9 +150,16 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
     A daemon that is absent, refusing or answering nonsense all mean one thing
     to this lane: the rows will be thinner than usual. None of them is a reason
     to report no Sessions, because the process table has already been read.
+
+    **There are three ways to end up thin here, and three sentences.** Nothing
+    was dialled; the daemon was dialled and did not answer; the daemon answered
+    and this build could not read it. The consequence is the same every time and
+    the causes are not, and reporting the second when the first or the third is
+    true is a false claim about the daemon's health — one that contradicts every
+    other surface that really does dial it (#96).
     """
     if client is None:
-        return [], NO_DAEMON
+        return [], NO_CLIENT
     try:
         answer = await client.request(ROSTER_METHOD, {})
     except Exception as unreachable:  # noqa: BLE001 - any failure is the same fact here
@@ -134,7 +168,7 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
 
     ids = answer.get("data") if isinstance(answer, dict) else None
     if not isinstance(ids, list):
-        return [], f"{NO_DAEMON} ({ROSTER_METHOD} answered a shape this build cannot read)"
+        return [], UNREADABLE_ROSTER
 
     found: list[dict[str, Any]] = []
     for thread_id in ids:

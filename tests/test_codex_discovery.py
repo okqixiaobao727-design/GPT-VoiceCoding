@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent.codex import discovery
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.seams.agent import SessionState, WaitingKind
@@ -166,13 +167,31 @@ class TestWhenTheDaemonIsNotThere:
         assert lane.degraded is not None
         assert lane.error is None  # the lane looked; it just looked with less
 
-    def test_a_daemon_that_refuses_is_the_same_fact_as_one_that_is_absent(self) -> None:
+    def test_a_lane_with_no_client_says_so_rather_than_blaming_the_daemon(self) -> None:
+        """#96: "did not answer" was said without a byte being sent.
+
+        `CodexAdapter._shared_daemon` returns `None` until #77 builds the
+        client, so this reading is produced without dialling anything — while
+        `bridge-install status`, on the same machine, dials the real daemon and
+        gets a real answer. Saying the daemon was silent made those two look
+        like a contradiction, and a session went looking for a fault that was
+        not there. The consequence is identical; the claim is not.
+        """
+        lane = found(None, running(101, "/tmp/w"))
+        assert lane.degraded == discovery.NO_CLIENT
+        assert "does not connect" in lane.degraded
+        assert "did not answer" not in lane.degraded
+
+    def test_a_daemon_that_refuses_is_still_a_daemon_that_did_not_answer(self) -> None:
+        """The other sentence, and the only one that may claim the daemon was silent."""
         lane = found(
             FakeDaemon({}, raises=ConnectionRefusedError("no socket")),
             running(101, "/tmp/w"),
         )
         assert [row.target.pid for row in lane.rows] == [101]
         assert lane.degraded is not None
+        assert lane.degraded.startswith(discovery.NO_DAEMON)
+        assert "no socket" in lane.degraded  # the daemon's own words, not a summary
 
     def test_a_roster_shape_this_build_cannot_read_falls_back_rather_than_failing(self) -> None:
         class Odd(FakeDaemon):
@@ -182,6 +201,24 @@ class TestWhenTheDaemonIsNotThere:
         lane = found(Odd({}), running(101, "/tmp/w"))
         assert [row.target.pid for row in lane.rows] == [101]
         assert lane.degraded is not None
+
+    def test_a_daemon_that_answered_unreadably_is_not_reported_as_silent(self) -> None:
+        """The third sentence. #96's part B, in the branch it was first missed in.
+
+        This used to read "the daemon did not answer … (`thread/loaded/list`
+        answered a shape this build cannot read)" — a sentence that contradicts
+        itself inside one parenthesis, and whose first half is the half a reader
+        carries away. The daemon answered; this build could not read it.
+        """
+
+        class Odd(FakeDaemon):
+            async def request(self, method: str, params: dict | None = None) -> dict:
+                return {"data": "not a list"}
+
+        lane = found(Odd({}), running(101, "/tmp/w"))
+        assert lane.degraded == discovery.UNREADABLE_ROSTER
+        assert "did not answer" not in lane.degraded
+        assert "cannot read" in lane.degraded
 
     def test_no_daemon_and_no_process_is_an_empty_answer_not_a_failure(self) -> None:
         """It has to be able to end rows: an empty machine is a real reading."""
