@@ -138,7 +138,13 @@ class TestTheConnection:
     """Attached once, kept, and re-attached when the far side goes away."""
 
     def daemon(
-        self, attached: list[Path], *, fails: Exception | None = None, slow: bool = False
+        self,
+        attached: list[Path],
+        *,
+        fails: Exception | None = None,
+        slow: bool = False,
+        made: list[object] | None = None,
+        order: list[str] | None = None,
     ) -> SharedDaemon:
         class _Connection:
             def __init__(self) -> None:
@@ -157,9 +163,15 @@ class TestTheConnection:
                 # race between two callers cannot happen in a test that never
                 # lets the second one start.
                 await asyncio.sleep(0)
+                await asyncio.sleep(0)
             if fails is not None:
                 raise fails
-            return _Connection()
+            if order is not None:
+                order.append("dial finished")
+            one = _Connection()
+            if made is not None:
+                made.append(one)
+            return one
 
         return SharedDaemon(
             settings=CodexSettings(),
@@ -232,24 +244,52 @@ class TestTheConnection:
         assert attached == [SOCKET]
 
     def test_letting_go_while_a_dial_is_in_flight_leaves_nothing_attached(self) -> None:
-        """Shutdown waits for the dial rather than racing it.
+        """Shutdown invalidates the dial rather than waiting for it.
 
-        An `aclose` that cleared the field while a dial was in flight would have
-        that dial write its connection back afterwards, and this engine would
-        walk away from a client it had just made.
+        Waiting would be the obvious answer and it is the wrong one: #96 derives
+        `runner.SHUTDOWN_SECONDS` from the phases it bounds, and a phase that
+        could sit out a ten-second daemon lookup is not one that sum has room
+        for. So `aclose` returns at once and the dial finds its generation stale
+        — and closes what it made, because clearing the field alone would leave
+        a client nothing holds and nothing closes.
         """
         attached: list[Path] = []
-        daemon = self.daemon(attached, slow=True)
+        made: list[object] = []
+        daemon = self.daemon(attached, slow=True, made=made)
+
+        async def dial_and_let_go() -> object:
+            dialling = asyncio.ensure_future(daemon.client())
+            await asyncio.sleep(0)
+            await daemon.aclose()
+            return await dialling
+
+        answered = asyncio.run(dial_and_let_go())
+
+        assert answered is None
+        assert daemon._connection is None  # noqa: SLF001 - the field is the leak
+        assert [one.closed for one in made] == [1]  # type: ignore[attr-defined]
+
+    def test_letting_go_does_not_wait_behind_a_dial(self) -> None:
+        """The budget, asserted rather than described (#96, `runner.py:95-117`).
+
+        A `aclose` that took the dial's lock would finish only after the dial
+        did. Held here as an ordering fact, so a later change that reaches for
+        the obvious lock fails rather than quietly spending the shutdown budget.
+        """
+        attached: list[Path] = []
+        order: list[str] = []
+        daemon = self.daemon(attached, slow=True, order=order)
 
         async def dial_and_let_go() -> None:
             dialling = asyncio.ensure_future(daemon.client())
             await asyncio.sleep(0)
             await daemon.aclose()
+            order.append("let go")
             await dialling
 
         asyncio.run(dial_and_let_go())
 
-        assert daemon._connection is None  # noqa: SLF001 - the field is the leak
+        assert order.index("let go") < order.index("dial finished")
 
     def test_letting_go_closes_this_engine_s_client_and_nothing_else(self) -> None:
         """The daemon lives on: the user's TUIs are attached to it (#83's rule)."""

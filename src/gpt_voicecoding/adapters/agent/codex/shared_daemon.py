@@ -197,6 +197,11 @@ class SharedDaemon:
         #: for a live connection is separated from writing the new one by two
         #: awaits, which is room enough for both to find none and both to attach.
         self._dialling = asyncio.Lock()
+        #: Bumped by every `aclose`. A dial that finishes on an older number is
+        #: one the engine has already said goodbye to, so it closes what it made
+        #: rather than writing it back. This is what lets `aclose` skip the lock
+        #: instead of waiting behind a dial — see its docstring for why it must.
+        self._generation = 0
 
     @property
     def note(self) -> str:
@@ -234,6 +239,7 @@ class SharedDaemon:
             if held is not None and held.is_open:
                 return held
             self._connection = None
+            began = self._generation
 
             address, reason = await self._locate(self._settings.executable)
             if address is None:
@@ -249,6 +255,12 @@ class SharedDaemon:
                     f"connection: {unreachable}"
                 )
                 return None
+            if self._generation != began:
+                # Let go of while this was in flight. A dial does not get to
+                # resurrect a connection the engine has already said goodbye to,
+                # and what it made is closed here rather than left for nobody.
+                await connection.aclose()
+                return None
             _log.info("joined the shared Codex daemon at %s", address.socket_path)
             self._connection = connection
             self._note = address.note
@@ -257,14 +269,22 @@ class SharedDaemon:
     async def aclose(self) -> None:
         """Let go of this engine's end. The daemon and its Sessions carry on.
 
-        Behind the same lock as the dial, so shutdown waits for a dial in flight
-        rather than racing it: clearing the field while one was running would
-        have that dial write its connection back afterwards, and this engine
-        would walk away from a client it had just made.
+        **It never waits for a dial in flight, and that is #96's arithmetic
+        rather than a preference.** `runner.SHUTDOWN_SECONDS` is sixteen seconds
+        because the phases it bounds sum to 13.2 and it must exceed them, and a
+        test computes that sum from the constants themselves. A shutdown phase
+        that could sit out a ten-second daemon lookup is not one that sum has
+        room for — and an overrun does not buy a tidier stop, it buys a SIGKILL
+        with nothing written down, which is the failure #96 exists to end.
+
+        So the dial is **invalidated instead of waited on**: the generation
+        moves, and a dial that finishes afterwards closes what it made rather
+        than writing it back. Clearing the field alone would have left exactly
+        that client behind, with nothing holding it and nothing to close it.
         """
-        async with self._dialling:
-            connection, self._connection = self._connection, None
-            self._note = ""
+        self._generation += 1
+        connection, self._connection = self._connection, None
+        self._note = ""
         if connection is not None:
             await connection.aclose()
 
