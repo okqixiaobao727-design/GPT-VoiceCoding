@@ -36,6 +36,12 @@ it happens: `relay` and `approval` observe the *same* turn from two ends — the
 words arriving and the permission that turn raises — because a relayed
 instruction that needs a permission is exactly the shape the product has to
 survive, and running it twice would prove less at twice the cost.
+
+The Codex lane runs a sixth that no step drives: it is *launched* with a prompt,
+because that is what carries it past Codex's update gate (#110), and a prompt on
+the command line is a turn. No step observes it and `Walk.settle_boot_turn` waits
+it out before the walk begins — a turn still running when the first step types is
+a turn whose Stop lands where a later step is looking for a different one.
 """
 
 from __future__ import annotations
@@ -77,6 +83,15 @@ NAME_READS = 3
 #: simply empty is an answer rather than a wait. Re-derive it from #74's own
 #: cadence once there is one.
 DISCOVERY_SECONDS = 30.0
+
+#: How long a boot turn gets, as a multiple of the far side's turn figure.
+#: Derived rather than guessed: `settle_boot_turn` waits out a TUI's **boot and**
+#: its first turn, and boot alone has been measured at the whole turn figure on
+#: this machine — a `codex` sat in `starting MCP servers` for a full 180s
+#: ground-truth wait on 2026-08-26 (`hand_started.codex_ground_truth`). So two of
+#: them, one for each half, and a lane still unsettled after that is blocked
+#: rather than typed into.
+BOOT_TURN_ALLOWANCE = 2.0
 
 #: What the escalated permission announcement says (`core/approvals.py:43-46`).
 #: Matched rather than quoted whole: the tool name and the detail are the agent's,
@@ -214,6 +229,12 @@ class Lane:
     binary: str
     #: Arguments the *person* would not normally type, and why each is here.
     arguments: tuple[str, ...]
+    #: Words the lane's TUI is **launched with**, or None when it is launched
+    #: silent. Not one of `arguments`, because it is not a flag: it starts a turn
+    #: nobody drove, before the walk has asked for anything. `hand_started.
+    #: launch_arguments` puts it last on the command line and refuses an empty
+    #: one; `Walk.settle_boot_turn` waits it out before a word is typed.
+    boot_prompt: str | None
     #: The words that make this lane's agent spawn a Child Process. "subagent"
     #: and "sub-agent" appear here on purpose: this string is spoken *to* the
     #: agent, where it is the agent's own mechanism word and the thing that makes
@@ -267,6 +288,10 @@ CLAUDE = Lane(
     agent="claude",
     binary="claude",
     arguments=("--permission-mode", "default"),
+    # Launched silent. No boot gate of the Codex kind has been measured here —
+    # `claude` boots into an empty composer — and a Session nobody has typed into
+    # is what `roster` and `stable name`'s three reads want to find.
+    boot_prompt=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
     # The flag the harness passes *is* the whole policy on this lane, and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
@@ -302,11 +327,10 @@ CLAUDE = Lane(
 #: own rollout, `turn_context.sandbox_policy = workspace-write`), so the flag
 #: fixes the ground rather than moving it.
 #:
-#: The last argument is the **initial prompt**, and it is here to get past the
-#: update gate rather than to ask for anything (#110; the measurement is in
-#: `hand_started`'s module docstring). `codex [OPTIONS] [PROMPT]` — the prompt is
-#: positional, so it goes after the flags and stays last. Two things follow, and
-#: both are stated because a reader will otherwise meet them as surprises:
+#: The **boot prompt** is not a flag and is not here to ask for anything: it is
+#: what gets this lane past the update gate (#110; the measurement is in
+#: `hand_started`'s module docstring). Three things follow, and each is stated
+#: because a reader will otherwise meet it as a surprise:
 #:
 #: * **It is an extra turn, not a replacement.** `stable name` still types
 #:   `ACKNOWLEDGE` itself, because it requires a name held across a Stop it
@@ -317,6 +341,10 @@ CLAUDE = Lane(
 #:   raise a permission before `approval` is there to answer it, and it leaves
 #:   `codex_turn_policy` reading the same ground: the sandbox is this lane's pin
 #:   and the `turn_context` that step grades is `relay`'s, the last one written.
+#: * **The walk waits it out first** (`Walk.settle_boot_turn`). Two turns of the
+#:   same words are not two turns the harness can tell apart: a boot turn still
+#:   running when `stop notice`'s mark is taken puts *its* Stop Notice after the
+#:   mark, and the step would pass on the notice for a turn nobody drove.
 #: * **The rollout now exists before `roster` runs.** Codex writes its rollout
 #:   when the first *turn* starts, so this lane's `ground_truth` carries a real
 #:   `session_id` at the first read instead of the `""` it used to carry — the
@@ -326,7 +354,8 @@ CODEX = Lane(
     name="codex",
     agent="codex",
     binary="codex",
-    arguments=("--sandbox", "workspace-write", ACKNOWLEDGE.words),
+    arguments=("--sandbox", "workspace-write"),
+    boot_prompt=ACKNOWLEDGE.words,
     # Measured 2026-08-27 through the shared daemon with the product's own pin
     # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a
     # 0.149.1 app-server: a write to a path outside the workspace raises
@@ -426,6 +455,7 @@ class Walk:
         )
         try:
             self.arm_switches()
+            self.settle_boot_turn()
         except LaneBlocked as unarmed:
             self.journey.skip_rest(str(unarmed))
             return
@@ -442,6 +472,51 @@ class Walk:
             "turns measured",
             "; ".join(f"{turn.what} {turn.seconds:.1f}s ended={turn.ended}" for turn in self.turns)
             or "no turn ran",
+        )
+
+    def settle_boot_turn(self) -> None:
+        """Wait out the turn the *launch* started, before a word is typed at it.
+
+        Not a step, for `arm_switches`' reason: it is how this lane is put in the
+        state the walk assumes, not a claim about the product. But it is not
+        optional either, and the failure it prevents is a **false green** rather
+        than a red.
+
+        A lane with a `boot_prompt` is running a turn from the moment it starts
+        (#110 — the prompt is what carries it past the update gate). Nothing may
+        be typed into a Session that is mid-turn, and no chat mark may be taken
+        while one is in flight: `stable name` drives the walk's first turn and
+        hands `stop notice` the mark from just before it, so a boot turn that
+        ends *after* that mark puts its own Stop Notice on the far side of it —
+        and `stop notice` passes on a notice for a turn nobody drove, having
+        proved nothing. The two turns carry the same words, so no reader of the
+        chat could tell them apart afterwards either.
+
+        Over means what it means everywhere else here (`_turn_ended`): the
+        agent's own record grew and then stopped growing. Nothing is typed and
+        nothing is asked — this only watches.
+        """
+        if self.lane.boot_prompt is None:
+            return
+        started = time.monotonic()
+        # Resolves the record this waits on. It is the ordinary first call: every
+        # step reads ground truth through here, and it is cached after the first.
+        truth = self._ground_truth()
+        deadline = started + self.far_side.agent_turn_seconds * BOOT_TURN_ALLOWANCE
+        turn = self._measured("boot prompt", started, self._turn_ended(deadline=deadline))
+        if not turn.ended:
+            raise LaneBlocked(
+                f"the turn this lane was launched with had not ended after {turn.seconds:.0f}s, "
+                f"so the walk cannot type into this Session without racing it. The agent "
+                f"reports {truth.describe()}; its record is {self._record_size()} bytes. "
+                f"Screen tail: {self.session.screen_tail()[-600:]!r}"
+            )
+        self.journey.observe(
+            "boot turn",
+            f"the Session was launched with {self.lane.boot_prompt!r} — the words `stable name` "
+            f"types anyway — because a non-empty prompt is what skips Codex's update gate "
+            f"(#110). Waited out before anything was typed: {turn.seconds:.1f}s, record "
+            f"{self._record_size()} bytes. Arranged by the harness, not judged by it.",
         )
 
     def arm_switches(self) -> None:
@@ -1033,15 +1108,25 @@ class Walk:
         """
         started = time.monotonic()
         self.session.submit(instruction.words)
+        ended = self._turn_ended(
+            deadline=started + self.far_side.agent_turn_seconds, expect_waiting=expect_waiting
+        )
+        return self._measured(what, started, ended)
+
+    def _turn_ended(self, *, deadline: float, expect_waiting: bool = False) -> bool:
+        """Whether the turn in flight is over by `deadline`, read from outside.
+
+        Shared by the turns the walk drives and the one the launch starts
+        (`settle_boot_turn`), because "over" has to mean the same thing for both:
+        a boot turn judged by a looser rule than the turns it runs ahead of is a
+        boot turn that can still be running when the next one starts.
+        """
         settled_for = 0.0
         last = self._record_size()
-        ended = False
-        deadline = started + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
             time.sleep(3.0)
             if expect_waiting and self._roster_field("state") == "waiting":
-                ended = True
-                break
+                return True
             size = self._record_size()
             if size != last:
                 last, settled_for = size, 0.0
@@ -1050,8 +1135,11 @@ class Walk:
             # A record that has not grown for two polls after growing at all is a
             # turn that is over; before it grows at all there is nothing to settle.
             if size > 0 and settled_for >= 9.0:
-                ended = True
-                break
+                return True
+        return False
+
+    def _measured(self, what: str, started: float, ended: bool) -> Turn:
+        """Record one turn on the walk, whoever asked for it."""
         turn = Turn(what, time.monotonic() - started, ended)
         self.turns.append(turn)
         self.journal("turn", lane=self.lane.name, what=what, seconds=turn.seconds, ended=turn.ended)

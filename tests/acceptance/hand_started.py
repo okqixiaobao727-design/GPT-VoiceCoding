@@ -61,7 +61,10 @@ A fourth, measured on #110 (2026-08-27, `codex-cli` 0.150.0):
 
   This gate is *skipped*, not arranged, and that is what makes it unlike
   `TrustGate`: nothing of the user's is edited, `version.json` is not written, and
-  there is nothing for the run to revoke afterwards.
+  there is nothing for the run to revoke afterwards. What it *is* unlike an
+  ordinary flag in is that **a prompt on the command line is a turn**, running
+  before the walk has asked for anything — so `journey.Walk.settle_boot_turn`
+  waits it out before a word is typed or a chat mark is taken.
 """
 
 from __future__ import annotations
@@ -141,6 +144,32 @@ def resolve(binary: str, path_value: str) -> Path | None:
     """Where the ordinary command really is — the binary, never the shell function."""
     found = shutil.which(binary, path=path_value)
     return Path(found) if found else None
+
+
+def launch_arguments(flags: tuple[str, ...], boot_prompt: str | None) -> tuple[str, ...]:
+    """A lane's argv: its flags, then its boot prompt — last, and never empty.
+
+    The two rules this holds are both load-bearing and neither is visible in a
+    tuple literal. **Last**, because both agents take the prompt as a positional
+    (`codex [OPTIONS] [PROMPT]`), so a prompt written before a flag is read as
+    that flag's value. **Never empty**, because emptiness is what the update gate
+    tests (see the fourth measurement above): `""` is a prompt that starts no
+    turn and skips no gate, and the TUI would stop at the update prompt exactly
+    as if nothing had been passed — silently, and only in the weeks after a
+    release, which is the worst way for a harness to be wrong.
+
+    A lane with no boot prompt passes `None` and gets its flags back. That is the
+    Claude lane, and it is the ordinary case: a Session nobody has typed into is
+    what the walk's first step wants to find.
+    """
+    if boot_prompt is None:
+        return flags
+    if not boot_prompt.strip():
+        raise ValueError(
+            "a boot prompt must be non-empty: an empty PROMPT is not a skipped update gate, "
+            "it is a launch that stops at the gate with nothing to show for it"
+        )
+    return (*flags, boot_prompt)
 
 
 class SessionRefused(RuntimeError):
