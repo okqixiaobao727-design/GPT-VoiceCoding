@@ -166,6 +166,13 @@ REASON_FIELD: Final = "reason"
 #: hook its place (#71): Claude Code's own registry does not carry it, and it
 #: cannot be derived without guessing at the directory-name flattening — which
 #: replaces `/`, `.` **and** `_` with `-` (#73, measured the hard way).
+#: The pid of the `claude` process this hook ran under. Load-bearing rather than
+#: informational: a Claude `SessionTarget` needs a pid (`seams/identity.py:124`)
+#: because `--resume` forks a second process under one session id, and the hook
+#: payload has never carried one. Measured 2026-08-26: Claude Code exports it as
+#: `CLAUDE_PID`, and it is the same number the official roster reports and the
+#: same number the Session's inbox socket is named after.
+PID_FIELD: Final = "pid"
 TRANSCRIPT_PATH_FIELD: Final = "transcript_path"
 MESSAGING_SOCKET_FIELD: Final = "messaging_socket"
 MESSAGING_TOKEN_FIELD: Final = "messaging_token"

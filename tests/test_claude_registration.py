@@ -9,6 +9,12 @@ And it does nothing else. A user-scope hook fires for every Session in the
 config directory, so a Session no engine is holding must cost the process it
 started and nothing more: no socket, no writes, nothing on stdout — where
 Claude Code would read it as context to add to the user's own conversation.
+
+**Reachability and existence stay two questions.** What the hook moves is the
+first one: it hands over an inbox address nothing outside that Session could
+discover. It adds no roster row, and it could not — the roster is
+`claude agents --json` alone, which is `test_claude_discovery.py`'s subject and
+sees Sessions whose hook never ran.
 """
 
 from __future__ import annotations
@@ -28,8 +34,14 @@ from gpt_voicecoding.adapters.agent.claude.approval import REGISTRATION_TYPE, TY
 from gpt_voicecoding.adapters.agent.claude.bootstrap import publish_address
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.locations import address_path
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 SESSION_ID = "d3a776ae-3b60-437d-bc70-ba57a2b280c6"
+
+#: The pid #73 measured beside that session id in `claude agents --json`.
+PID = 3538
+
+TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION_ID, pid=PID)
 
 #: A `SessionStart` payload, in the shape Claude Code sends one.
 PAYLOAD = {
@@ -42,6 +54,9 @@ PAYLOAD = {
 ENVIRONMENT = {
     registration.MESSAGING_SOCKET_VARIABLE: "/tmp/claude-inbox.sock",
     registration.MESSAGING_TOKEN_VARIABLE: "a-token",
+    # Measured 2026-08-26 in a sandbox config directory: a `SessionStart` hook
+    # process sees `CLAUDE_PID`, and its own `os.getppid()` is that number.
+    registration.PID_VARIABLE: str(PID),
 }
 
 
@@ -118,40 +133,62 @@ class TestReachingTheEngineOverTheOneIngress:
             )
         )
 
-    def run(self, tmp_path: Path, payload: dict) -> ClaudeAgentAdapter:
+    def run(
+        self,
+        tmp_path: Path,
+        payload: dict,
+        *,
+        environment: dict[str, str] | None = None,
+        expect: bool = True,
+    ) -> ClaudeAgentAdapter:
         adapter = self.adapter(tmp_path)
+        reached: list[SessionTarget] = []
 
         async def scenario() -> None:
             await adapter.connect()
             try:
-                environment = dict(ENVIRONMENT)
-                environment["GPT_VOICECODING_CLAUDE_CHANNEL_CONFIG"] = json.dumps(
+                environment_ = dict(ENVIRONMENT if environment is None else environment)
+                environment_["GPT_VOICECODING_CLAUDE_CHANNEL_CONFIG"] = json.dumps(
                     {
                         "approvalSocketPath": str(adapter.approval_socket_path()),
                         "dialTimeoutSeconds": 5,
                     }
                 )
                 await asyncio.get_running_loop().run_in_executor(
-                    None, registration.register, payload, environment
+                    None, registration.register, payload, environment_
                 )
                 # The hook does not wait for the engine, so the test does.
                 for _ in range(50):
-                    if adapter.reported(SESSION_ID) is not None:
+                    if (adapter.reported(TARGET) is not None) == expect:
                         break
                     await asyncio.sleep(0.02)
+                # `aclose` takes every channel down with it, so what this
+                # adapter could reach has to be read while it is still up.
+                reached.extend(adapter.reachable())
             finally:
                 await adapter.aclose()
 
         asyncio.run(scenario())
+        self.reached = tuple(reached)
         return adapter
 
     def test_the_engine_records_what_the_session_reported(self, socket_root: Path) -> None:
         adapter = self.run(socket_root, PAYLOAD)
-        report = adapter.reported(SESSION_ID)
+        report = adapter.reported(TARGET)
         assert report is not None
         assert report.transcript_path == Path(str(PAYLOAD["transcript_path"]))
         assert report.messaging_socket == Path("/tmp/claude-inbox.sock")
         assert report.messaging_token == "a-token"
+
+    def test_the_report_names_an_exact_process_not_just_a_session_id(
+        self, socket_root: Path
+    ) -> None:
+        """`--resume` forks two processes under one session id; the pid tells them apart."""
+        adapter = self.run(socket_root, PAYLOAD)
+        report = adapter.reported(TARGET)
+        assert report is not None
+        assert report.pid == PID
+        assert report.target == TARGET
 
     def test_it_says_so_in_the_log(
         self, socket_root: Path, caplog: pytest.LogCaptureFixture
@@ -161,10 +198,40 @@ class TestReachingTheEngineOverTheOneIngress:
             self.run(socket_root, PAYLOAD)
         assert any("registration received for" in record.message for record in caplog.records)
 
-    def test_no_roster_row_is_created_by_a_registration(self, socket_root: Path) -> None:
-        """The roster is `claude agents --json`, which sees Sessions whose hook never ran."""
-        adapter = self.run(socket_root, PAYLOAD)
-        assert adapter.reachable() == ()
+    def test_the_session_becomes_reachable(self, socket_root: Path) -> None:
+        """The point of the hook: the inbox address exists only inside that Session.
+
+        Nothing outside a Session can discover where its inbox listens — the
+        reference implementation learned it from a launch wrapper it owned, and
+        v1.0 does not launch Sessions (#72). A registration that only recorded
+        the report would leave `_channels` empty, so every Relay and every
+        approval would be refused by an engine that had been told the address.
+        """
+        self.run(socket_root, PAYLOAD)
+        assert self.reached == (TARGET,)
+
+    def test_a_registration_with_no_socket_reaches_nothing_and_still_records(
+        self, socket_root: Path
+    ) -> None:
+        """A build exporting no messaging variables: the transcript path is still worth having."""
+        environment = {registration.PID_VARIABLE: str(PID)}
+        adapter = self.run(socket_root, PAYLOAD, environment=environment)
+
+        assert self.reached == ()
+        report = adapter.reported(TARGET)
+        assert report is not None
+        assert report.transcript_path == Path(str(PAYLOAD["transcript_path"]))
+
+    def test_a_registration_with_no_pid_names_no_session_at_all(self, socket_root: Path) -> None:
+        """A Claude target needs a pid, so there is nothing to attach the report to."""
+        environment = {
+            registration.MESSAGING_SOCKET_VARIABLE: "/tmp/claude-inbox.sock",
+            registration.MESSAGING_TOKEN_VARIABLE: "a-token",
+        }
+        adapter = self.run(socket_root, PAYLOAD, environment=environment, expect=False)
+
+        assert self.reached == ()
+        assert adapter.reported(TARGET) is None
 
 
 class TestWhatTheHookIsInstalledAs:

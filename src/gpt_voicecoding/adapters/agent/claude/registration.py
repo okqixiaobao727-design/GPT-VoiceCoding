@@ -48,6 +48,7 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     CWD_FIELD,
     MESSAGING_SOCKET_FIELD,
     MESSAGING_TOKEN_FIELD,
+    PID_FIELD,
     REGISTRATION_TYPE,
     SESSION_ID_FIELD,
     TRANSCRIPT_PATH_FIELD,
@@ -64,6 +65,17 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
 #: this hook exists for.
 MESSAGING_SOCKET_VARIABLE = "CLAUDE_CODE_MESSAGING_SOCKET"
 MESSAGING_TOKEN_VARIABLE = "CLAUDE_CODE_MESSAGING_TOKEN"
+
+#: The pid of the `claude` this hook is a child of. Measured on 2026-08-26 by
+#: firing a real `SessionStart` in a sandbox config directory: the hook process
+#: sees `CLAUDE_PID`, and its own `os.getppid()` is that same number. Confirmed
+#: against the live machine, where every `claude agents --json` row's pid is
+#: also the name of that Session's socket under `/tmp/cc-socks/`.
+#:
+#: The hook *payload* carries no pid, and a Claude `SessionTarget` cannot be
+#: built without one, so this variable is what turns a registration from a note
+#: about a session id into an address for an exact process.
+PID_VARIABLE = "CLAUDE_PID"
 
 #: How long the engine is given to take the line. Short on purpose: this runs on
 #: the path that opens a Session, and an engine that is not answering must cost
@@ -88,6 +100,7 @@ def registration_for(
     message: dict[str, Any] = {
         TYPE_FIELD: REGISTRATION_TYPE,
         SESSION_ID_FIELD: session_id.strip(),
+        PID_FIELD: _pid(environ.get(PID_VARIABLE)),
         CWD_FIELD: _text(payload.get(CWD_FIELD)),
         TRANSCRIPT_PATH_FIELD: _text(payload.get(TRANSCRIPT_PATH_FIELD)),
         MESSAGING_SOCKET_FIELD: _text(environ.get(MESSAGING_SOCKET_VARIABLE)),
@@ -165,6 +178,20 @@ def main(argv: list[str] | None = None) -> int:
 
 def _text(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _pid(value: Any) -> int | None:
+    """`CLAUDE_PID` as a number, or `None` for anything that is not one.
+
+    Absent is not an error here for the same reason the messaging variables are
+    not: this hook runs under whatever build the user has, and a registration
+    that carries less is better than a Session that never registers. What the
+    engine does with a pidless one is the engine's decision, not this process's.
+    """
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return None
+    pid = int(value.strip())
+    return pid if pid > 0 else None
 
 
 if __name__ == "__main__":  # pragma: no cover - the process entry point
