@@ -13,6 +13,8 @@ from pathlib import Path
 
 from gpt_voicecoding.core.sessions import SessionRegistry
 from gpt_voicecoding.seams.agent import (
+    ChildClassification,
+    ChildKind,
     LaneDiscovery,
     SessionInspection,
     SessionLifecycle,
@@ -300,6 +302,37 @@ class TestTheNameARowKeeps:
         )
 
         assert str(registry.live()[0].name) == "GPT-VoiceCoding · the second thread"
+
+    def test_a_child_process_is_listed_and_never_named(self) -> None:
+        """#78's table risk 1: a name the user could say and nothing could answer."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(
+                codex_row(
+                    session_id="abc",
+                    pid=10,
+                    name=named("a task"),
+                    child=ChildClassification(kind=ChildKind.CHILD, parent="the parent"),
+                )
+            ),
+            now=NOW,
+        )
+
+        assert len(registry.live()) == 1
+        assert registry.live()[0].name is None
+
+    def test_a_child_seen_again_is_still_not_named(self) -> None:
+        registry = SessionRegistry()
+        child = ChildClassification(kind=ChildKind.CHILD, parent="the parent")
+        for tick in (NOW, NOW + 5):
+            registry.observe(
+                AgentKind.CODEX,
+                seeing(codex_row(session_id="abc", pid=10, name=named("a task"), child=child)),
+                now=tick,
+            )
+
+        assert registry.live()[0].name is None
 
     def test_a_tick_with_only_process_evidence_keeps_the_name(self) -> None:
         """The identity did not change, so neither does the name it was given."""

@@ -10,9 +10,9 @@ reference implementation asked (`legacy@1d32845:bridge/labels.py:28-70`), and it
 is the right question: it answers with the *repository's* directory from any
 worktree or subdirectory, so two Sessions in `repo/` and `repo/src/` are working
 on one project and are named for it. Legacy then raised when the answer was not
-a repository at all, and the label never existed. That is **adapted** here: v1.0
+a repository at all, and legacy's label never existed. That is **adapted** here: v1.0
 bridges every Session the user starts, so one in `~/scratch` is named
-`scratch · <title>` from the directory's own basename rather than left unnamed
+`scratch · <task>` from the directory's own basename rather than left unnamed
 and unspeakable. The basename is a fact about the Session, not a guess.
 
 **Cached per resolved workspace, for the life of the adapter.** A workspace does

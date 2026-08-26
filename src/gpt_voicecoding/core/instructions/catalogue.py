@@ -325,7 +325,7 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/announcing.md:64-94",
             gist=(
-                "Label and state first, then the question in one sentence, then each option "
+                "Name and state first, then the question in one sentence, then each option "
                 "by name, then whose recommendation it is, then what is needed from the "
                 "user — and when the detail is known to be stale, say the gap out loud."
             ),

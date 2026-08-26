@@ -146,7 +146,7 @@ def session_document(session: Session) -> dict[str, Any]:
     return {
         "target": target_document(session.target),
         # One name, rendered as the one string the user hears and types after
-        # `@` — `<project> · <title>`. #78 collapsed the `label`/`name` pair
+        # `@` — `<project> · <task>`. #78 collapsed the `label`/`name` pair
         # that used to travel here into it; a surface that wants the halves
         # parses them back with `SessionName.parse`.
         "name": str(session.name) if session.name is not None else None,

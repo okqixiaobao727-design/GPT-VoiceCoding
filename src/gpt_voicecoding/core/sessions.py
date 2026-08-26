@@ -20,7 +20,9 @@ implementation carried:
   same session id — so the refusal names the pids that *are* live instead of
   pretending the session id was never seen.
 - **A Child Process is seen, not spoken to.** It is listed like any other row and
-  refused as a Relay target, by the registry rather than by a caller's memory.
+  refused as a Relay target, by the registry rather than by a caller's memory —
+  and it is never named, whatever a lane composed for it (#78, #79). A name is
+  what the user says to reach a Session, and there is nothing here to reach.
 - **A Session Name disambiguates or asks.** Names are for matching and for
   speech; two candidates are answered by refusing and naming both, never by
   picking.
@@ -75,7 +77,7 @@ class Session:
     user's side composed and a `name` the agent reported — which is two fields
     meaning almost the same thing and two answers to "what is this Session
     called". #78 collapsed them into the glossary's single *Session Name*
-    (`CONTEXT.md`): `<project> · <title>`, composed by the lane that saw the
+    (`CONTEXT.md`): `<project> · <task>`, composed by the lane that saw the
     Session and frozen here.
     """
 
@@ -135,6 +137,11 @@ class Session:
     def _named_as(self, row: SessionInspection, target: SessionTarget) -> SessionName | None:
         """The Session Name this row keeps — **the first one it accepted**.
 
+        A Child Process keeps none. It is listed and it is never a target, so a
+        name for it would be a name the user could say and nothing could answer
+        — the risk #78's own table names, held here rather than in each lane so
+        it holds however #79 comes to find children.
+
         A name is composed once per exact `SessionTarget` and never changes
         after that (`legacy@1d32845:bridge/store.py:1875-1902`, *ported*: first
         write wins, an exact repeat is a no-op, a different one is refused).
@@ -150,6 +157,8 @@ class Session:
         second is a new thread; naming it after the old one is the failure this
         rule exists to prevent, not the one it would be protecting.
         """
+        if not row.child.is_main:
+            return None
         if target != self.target:
             return row.name
         if self.name is None:
@@ -204,12 +213,16 @@ def _normalise(text: str) -> str:
 
 
 def session_from(row: SessionInspection, *, first_seen: float) -> Session:
-    """A row a lane just saw, as a roster entry seen for the first time."""
+    """A row a lane just saw, as a roster entry seen for the first time.
+
+    A Child Process arrives unnamed for the reason `Session._named_as` gives:
+    the roster lists it and nothing can be said to it.
+    """
     return Session(
         target=row.target,
         workspace=row.workspace,
         first_seen=first_seen,
-        name=row.name,
+        name=row.name if row.child.is_main else None,
         lifecycle=row.lifecycle,
         state=row.state,
         waiting_for=row.waiting_for,
@@ -430,9 +443,13 @@ class SessionRegistry:
         wanted = _normalise(query)
         if not wanted:
             # Every name contains the empty fragment, so an empty query would
-            # match the whole roster — and match a single unnamed Session
-            # *exactly*, which is a silent delivery into a Session the user
-            # never named.
+            # match the whole roster — and match a single Session *exactly*,
+            # which is a silent delivery into a Session the user never named.
+            # The reference implementation has no matching behaviour at all to
+            # cite here: gen-1 addressed a session by its id inside a tool call
+            # and its labels were only ever spoken (`legacy@1d32845` composes a
+            # label in `bridge/labels.py` and never looks one up), so spoken
+            # matching and every refusal in it are this generation's.
             raise NoNameMatchError(query)
         candidates = [
             held

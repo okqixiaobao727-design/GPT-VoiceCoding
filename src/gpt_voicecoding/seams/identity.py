@@ -73,7 +73,7 @@ class AgentKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SessionName:
-    """``<project name> · <task title>`` — for matching and for speech only.
+    """``<project> · <task>`` — for matching and for speech only.
 
     The one name the user and the system have for a Session (`CONTEXT.md`,
     *Session Name*). Deliberately holds nothing a command could address: see

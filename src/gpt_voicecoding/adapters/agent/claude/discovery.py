@@ -171,25 +171,25 @@ async def _named(
 ) -> SessionInspection:
     """The same row, carrying its Session Name.
 
-    **The title half is the roster's own `name`** — `workspace-claude-ed` and the
+    **The task half is the roster's own `name`** — `workspace-claude-ed` and the
     like — which is the official answer to "what is this Session called" and is
     on every row from the moment the Session exists (#73). Nothing is asked of
     the Session to get it and no transcript is opened for it, which is what makes
     it stable enough to be the name the user speaks
-    (`legacy@1d32845:bridge/hook.py:215-253` had the Session report its own title
+    (`legacy@1d32845:bridge/hook.py:215-253` had the Session report a task title
     over the hook instead — *dropped, because* the amended #67 port table removed
     that route on 2026-08-25).
 
     The project half is the workspace's, resolved here because this is the lane
     that knows the workspace. A row with neither half stays unnamed.
     """
-    title = _name(row)
-    if title is None:
+    task = _name(row)
+    if task is None:
         return inspection
     project = await projects.of(inspection.workspace)
     if project is None:
         return inspection
-    return replace(inspection, name=_naming.compose(project, title))
+    return replace(inspection, name=_naming.compose(project, task))
 
 
 def _inspection(row: dict[str, Any]) -> SessionInspection | None:
@@ -244,6 +244,6 @@ def _waiting_for(state: SessionState) -> WaitingFor:
 
 
 def _name(row: dict[str, Any]) -> str | None:
-    """The title half of this Session's name, straight off the official roster."""
+    """The task half of this Session's name, straight off the official roster."""
     name = row.get("name")
     return name.strip() if isinstance(name, str) and name.strip() else None

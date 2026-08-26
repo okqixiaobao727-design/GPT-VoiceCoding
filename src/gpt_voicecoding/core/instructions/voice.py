@@ -94,7 +94,7 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                 Block(
                     covers=("voice.identity.speak-names",),
                     text=(
-                        "Every session has a Session Label — its project and its task — and "
+                        "Every session has a Session Name — its project and its task — and "
                         "that is what you say out loud, the way a person would say it in a "
                         "sentence. Machine identities stay inside your commands; hearing one "
                         'tells the user nothing. When they point by position — "the third '

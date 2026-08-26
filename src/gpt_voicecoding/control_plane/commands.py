@@ -8,7 +8,7 @@ have, and how a legacy alias survives a rewrite.
 Two shapes are worth naming:
 
 - **An address, not a name.** `codex:abc` and `claude:def:1234` are how a
-  surface writes a `SessionTarget` on one line. A Session Label is for speech and
+  surface writes a `SessionTarget` on one line. A Session Name is for speech and
   for matching, and turning one into a target is the router's job on the way in
   — never this parser's, which would be addressing by name through the back
   door.

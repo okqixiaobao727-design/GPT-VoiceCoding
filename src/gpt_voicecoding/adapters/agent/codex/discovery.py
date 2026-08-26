@@ -74,7 +74,7 @@ STATUS_TYPES: Final = {
 
 #: How much of a thread id stands in for a name the daemon does not have. Eight
 #: characters of a UUID, which is what `codex` itself shows and short enough to
-#: say out loud — the fallback title of every unnamed thread (#78). It is
+#: say out loud — the fallback task of every unnamed thread (#78). It is
 #: composed here, from a fact this lane already holds: nothing is asked of the
 #: Session, and the route that used to ask one (`legacy@1d32845:bridge/hook.py:
 #: 215-253`, `bridge/daemon.py:1504-1544`) was *dropped* from the #67 port table
@@ -248,7 +248,7 @@ async def discover(
             else None
         )
         rows.append(
-            await _named(_from_thread(thread, pid, progress), names, title=_thread_name(thread))
+            await _named(_from_thread(thread, pid, progress), names, task=_thread_name(thread))
         )
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
@@ -413,12 +413,12 @@ def _thread_name(thread: Mapping[str, Any]) -> str | None:
 
 
 async def _named(
-    row: SessionInspection, projects: ProjectNames, *, title: str | None = None
+    row: SessionInspection, projects: ProjectNames, *, task: str | None = None
 ) -> SessionInspection:
     """The same row, carrying its Session Name.
 
     One rule for both sources, because there is one kind of Codex Session: the
-    title is the daemon's `Thread.name` when the daemon has one, and the first
+    task is the daemon's `Thread.name` when the daemon has one, and the first
     `SHORT_THREAD_ID_CHARACTERS` of the thread id when it does not. A row read
     off the process table simply never has the first, so it takes the second —
     and a Session that has not taken its first turn has neither, because it has
@@ -426,7 +426,7 @@ async def _named(
     reach problem: an unnamed row is listed, and what it can be addressed by is
     its target, which it has had all along.
     """
-    chosen = title or _short_thread_id(row.target.session_id)
+    chosen = task or _short_thread_id(row.target.session_id)
     if chosen is None:
         return row
     project = await projects.of(row.workspace)

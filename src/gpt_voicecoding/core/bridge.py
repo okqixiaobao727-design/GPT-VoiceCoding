@@ -104,19 +104,6 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def name_for(session: Session | None, target: SessionTarget) -> str:
-    """What to call one Session out loud: its Session Name, else its address.
-
-    Two rungs rather than three, since #78 collapsed the composed label and the
-    agent's own name into one *Session Name*. The address is still the floor,
-    because a notice that names nothing is a notice the user cannot answer — and
-    a Session with no name is ordinary rather than broken (`core/sessions.py`).
-    """
-    if session is not None:
-        return spoken_name(session)
-    return spoken_target(target)
-
-
 def stop_notice_for(
     session: Session | None, target: SessionTarget, waiting_for: WaitingFor | None = None
 ) -> str:
@@ -130,7 +117,10 @@ def stop_notice_for(
     """
     stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
     tail = f" — {stopped_on}" if stopped_on else ""
-    return f"{name_for(session, target)} stopped and may need you{tail}"
+    # What to call it is `core/sessions.py`'s answer, and its floor is the
+    # address: a notice that names nothing is a notice the user cannot answer.
+    called = spoken_name(session) if session is not None else spoken_target(target)
+    return f"{called} stopped and may need you{tail}"
 
 
 def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
