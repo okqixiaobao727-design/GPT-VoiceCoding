@@ -97,14 +97,17 @@ class Instruction:
     """
 
     words: str
-    #: Where the effect lands. A bare name is read inside the workspace; an
-    #: absolute path is read where it says, which is how the Codex lane asks for
-    #: a file its sandbox will not let it write (`writing_at`).
-    filename: str | None = None
+    #: Where the effect lands: relative to the workspace, or absolute. Both are
+    #: real cases — the Codex lane asks for a file *outside* the workspace,
+    #: because that is what its sandbox will not let it write (`writing_at`) —
+    #: and `path_in` resolves the one against the other.
+    target: Path | None = None
     content: str | None = None
 
     def path_in(self, workspace: Path) -> Path | None:
-        return workspace / self.filename if self.filename is not None else None
+        if self.target is None:
+            return None
+        return self.target if self.target.is_absolute() else workspace / self.target
 
     def effect_in(self, workspace: Path) -> str | None:
         target = self.path_in(workspace)
@@ -125,7 +128,7 @@ def writing(filename: str, content: str) -> Instruction:
             f"contents are the single word {content}. Do nothing else, and do not "
             f"ask any questions."
         ),
-        filename=filename,
+        target=Path(filename),
         content=content,
     )
 
@@ -143,7 +146,7 @@ def writing_at(path: Path, content: str) -> Instruction:
             f"Create a file at the absolute path {path} whose entire contents are the "
             f"single word {content}. Do nothing else, and do not ask any questions."
         ),
-        filename=str(path),
+        target=path,
         content=content,
     )
 
@@ -753,16 +756,16 @@ class Walk:
         if not performed:
             raise StepFailed(
                 f"message {sent.id} addressed to @{name} was sent to the bot but "
-                f"{INBOUND.filename} never appeared in {self.config.workspace}; engine.log "
+                f"{INBOUND.target} never appeared in {self.config.workspace}; engine.log "
                 f"inbound lines: {inbound_lines[-3:] or 'none'}"
             )
         if not inbound_lines:
             raise StepFailed(
-                f"{INBOUND.filename} was written, so the words arrived, but engine.log carries "
+                f"{INBOUND.target} was written, so the words arrived, but engine.log carries "
                 f"no inbound line — #48's requirement"
             )
         return (
-            f"message {sent.id} → @{name} → {INBOUND.filename} contains {INBOUND.content}; "
+            f"message {sent.id} → @{name} → {INBOUND.target} contains {INBOUND.content}; "
             f"engine.log: {inbound_lines[-1]!r}"
         )
 
