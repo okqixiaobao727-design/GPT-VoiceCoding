@@ -12,8 +12,20 @@ appending to — the same argument that put P3, P4 and P5 in one pass.
 `claude agents --json` does not carry it, and the directory-name flattening
 replaces `/`, `.` *and* `_` with `-`, which #73 rediscovered the hard way.
 
-**Cached on `(size, mtime_ns)` rather than on time.** Discovery runs on a five-
-second cadence over every Session on the machine, and a transcript that has not
+**Against legacy** (ADR 0010, `CLAUDE.md`). The read itself is **ported** from
+`legacy@1d32845:bridge/transcript.py:1125-1140` and its `_read_jsonl`: one pass
+over the JSONL in the order the Session wrote it, skipping a line that does not
+parse. The **cache is new, and legacy had no analogue on this lane** — it read a
+Claude transcript only when a stop asked it to, on demand
+(`legacy@1d32845:bridge/daemon.py:2115-2167`), so there was nothing to cache
+against. v2 reads on a five-second discovery cadence over the whole machine, and
+that cadence is what makes an unchanged file worth not re-parsing. Legacy's one
+cache of this shape is on the *Codex* rollout reader, which #74 left behind with
+the rest of the durable state. **Dropped** with the rest of that reader: the
+whole-file identity check, the read deadline, and the `TranscriptReadError`
+taxonomy — a caller that gets `None` asks again on the next tick.
+
+**Cached on `(size, mtime_ns)` rather than on time.** A transcript that has not
 changed cannot have changed what its tail says. The key is the file's own
 identity as the filesystem reports it, so the cache is invalidated by the writer
 rather than by a clock this module would have to guess the right length for.

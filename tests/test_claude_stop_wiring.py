@@ -43,6 +43,13 @@ TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=3538)
 ROSTER_WAITING = WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
 
 
+class _Parked:
+    """One dialog held open, as `ApprovalListener._waiting` holds it."""
+
+    def __init__(self, request: ApprovalRequest) -> None:
+        self.request = request
+
+
 def transcript(tmp_path: Path, records: list[dict[str, Any]]) -> Path:
     path = tmp_path / "session.jsonl"
     path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
@@ -64,8 +71,30 @@ def adapter_holding(
     adapter._reported[TARGET] = SessionReport(  # noqa: SLF001 - seeding one registration
         session_id=SESSION, pid=TARGET.pid, transcript_path=transcript_path
     )
-    adapter._approvals.pending = lambda: parked  # type: ignore[method-assign]  # noqa: SLF001
+    for index, request in enumerate(parked):
+        # Parked the way a hook parks one, minus the socket: `newest_for` reads
+        # this dict, and `test_claude_approval.py` owns proving a real hook gets
+        # a request into it.
+        adapter._approvals._waiting[request.approval_id] = _Parked(request)  # noqa: SLF001
+        del index
     return adapter
+
+
+@pytest.fixture
+def roster(monkeypatch: pytest.MonkeyPatch):
+    """Make `claude agents --json` answer with exactly this lane, for one test.
+
+    The command itself is `discovery.py`'s and is tested there; what is under
+    test here is what the adapter adds to the rows it comes back with.
+    """
+
+    def answering(lane: LaneDiscovery) -> None:
+        async def stub() -> LaneDiscovery:
+            return lane
+
+        monkeypatch.setattr(claude_adapter.claude_discovery, "discover", stub)
+
+    return answering
 
 
 def dialog(tool_name: str = "Bash", detail: str = "push the branch") -> ApprovalRequest:
@@ -209,37 +238,24 @@ class TestWhenTheRecordSaysNothing:
 class TestTheRosterRow:
     """`discover` is the verb Bridge Core calls, so it is where this lands."""
 
-    @staticmethod
-    def rows_from(adapter: ClaudeAgentAdapter, lane: LaneDiscovery) -> LaneDiscovery:
-        async def stub() -> LaneDiscovery:
-            return lane
-
-        original = claude_adapter.claude_discovery.discover
-        claude_adapter.claude_discovery.discover = stub  # type: ignore[assignment]
-        try:
-            return asyncio.run(adapter.discover())
-        finally:
-            claude_adapter.claude_discovery.discover = original  # type: ignore[assignment]
-
     def row(self, state: SessionState, waiting: WaitingFor) -> SessionInspection:
         return SessionInspection(
             target=TARGET, workspace=Path("/tmp/workspace"), state=state, waiting_for=waiting
         )
 
-    def test_a_stopped_row_says_what_it_stopped_on(self, tmp_path: Path) -> None:
+    def test_a_stopped_row_says_what_it_stopped_on(self, tmp_path: Path, roster) -> None:
         adapter = adapter_holding(
             transcript(tmp_path, [*turn(), asked("q1", ("Which base?", ["main", "feature"]))])
         )
-        lane = self.rows_from(
-            adapter, LaneDiscovery(rows=(self.row(SessionState.WAITING, ROSTER_WAITING),))
-        )
+        roster(LaneDiscovery(rows=(self.row(SessionState.WAITING, ROSTER_WAITING),)))
+        lane = asyncio.run(adapter.discover())
         assert lane.rows[0].waiting_for.kind is WaitingKind.QUESTION
         assert [option.text for option in lane.rows[0].waiting_for.options] == [
             "main",
             "feature",
         ]
 
-    def test_a_session_mid_turn_is_not_read_at_all(self, tmp_path: Path) -> None:
+    def test_a_session_mid_turn_is_not_read_at_all(self, tmp_path: Path, roster) -> None:
         """A Session that is working is not stopped on anything, so no file is opened.
 
         This is what keeps the five-second cadence off the hot path: on a machine
@@ -255,52 +271,35 @@ class TestTheRosterRow:
             return original(argument)
 
         adapter._transcripts.records = watched  # type: ignore[method-assign]  # noqa: SLF001
-        lane = self.rows_from(
-            adapter, LaneDiscovery(rows=(self.row(SessionState.RUNNING, WaitingFor()),))
-        )
+        roster(LaneDiscovery(rows=(self.row(SessionState.RUNNING, WaitingFor()),)))
+        lane = asyncio.run(adapter.discover())
         assert opened == []
         assert lane.rows[0].waiting_for.kind is WaitingKind.NONE
 
-    def test_a_lane_that_could_not_look_is_passed_through_whole(self) -> None:
+    def test_a_lane_that_could_not_look_is_passed_through_whole(self, roster) -> None:
         """A failed enumeration has no rows to read, and must not gain any."""
         adapter = adapter_holding()
-        lane = self.rows_from(adapter, LaneDiscovery(error="`claude` is not on the PATH"))
+        roster(LaneDiscovery(error="`claude` is not on the PATH"))
+        lane = asyncio.run(adapter.discover())
         assert lane.error == "`claude` is not on the PATH"
         assert lane.rows == ()
 
-    def test_inspect_answers_from_the_same_rows(self, tmp_path: Path) -> None:
+    def test_inspect_answers_from_the_same_rows(self, tmp_path: Path, roster) -> None:
         """One reader, one shape — `inspect` reads what `discover` produced."""
         adapter = adapter_holding(
             transcript(tmp_path, [*turn(), called("Bash", "b1", {"description": "push"})])
         )
-        lane = LaneDiscovery(rows=(self.row(SessionState.WAITING, ROSTER_WAITING),))
-
-        async def stub() -> LaneDiscovery:
-            return lane
-
-        original = claude_adapter.claude_discovery.discover
-        claude_adapter.claude_discovery.discover = stub  # type: ignore[assignment]
-        try:
-            found = asyncio.run(adapter.inspect(TARGET))
-        finally:
-            claude_adapter.claude_discovery.discover = original  # type: ignore[assignment]
+        roster(LaneDiscovery(rows=(self.row(SessionState.WAITING, ROSTER_WAITING),)))
+        found = asyncio.run(adapter.inspect(TARGET))
         assert found.waiting_for.kind is WaitingKind.PERMISSION
         assert found.waiting_for.detail == "push"
 
-    def test_a_lane_that_could_not_look_still_raises_from_inspect(self) -> None:
+    def test_a_lane_that_could_not_look_still_raises_from_inspect(self, roster) -> None:
         """#74's rule survives the overlay: `LaneUnavailable` is not `UNKNOWN`."""
         adapter = adapter_holding()
-
-        async def stub() -> LaneDiscovery:
-            return LaneDiscovery(error="`claude` is not on the PATH")
-
-        original = claude_adapter.claude_discovery.discover
-        claude_adapter.claude_discovery.discover = stub  # type: ignore[assignment]
-        try:
-            with pytest.raises(LaneUnavailable):
-                asyncio.run(adapter.inspect(TARGET))
-        finally:
-            claude_adapter.claude_discovery.discover = original  # type: ignore[assignment]
+        roster(LaneDiscovery(error="`claude` is not on the PATH"))
+        with pytest.raises(LaneUnavailable):
+            asyncio.run(adapter.inspect(TARGET))
 
 
 class TestTheStopNotice:

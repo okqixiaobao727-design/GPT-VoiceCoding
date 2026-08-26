@@ -43,7 +43,6 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     approval_socket_path,
     hook_decision,
     request_from,
-    summary_of,
 )
 from gpt_voicecoding.adapters.agent.claude.approval_hook import decide, request_for
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
@@ -187,38 +186,50 @@ class TestWhatTheHookPrints:
 
 
 class TestWhatIsAnnounced:
+    """What `request_from` puts in front of the user, and what it refuses to.
+
+    Asserted through `request_from` rather than through the extractor, because
+    what matters here is that *this route* carries the rule; the extractor's own
+    field order and bound are `test_claude_stop_analysis.py`'s.
+    """
+
+    @staticmethod
+    def detail_for(**tool_input: Any) -> str:
+        payload = {**dialog(), "tool_input": tool_input}
+        return request_from(payload, target=TARGET, approval_id="a-1").detail
+
     def test_the_detail_is_the_tool_s_own_words(self) -> None:
-        assert summary_of({"description": "clean the build directory"}) == (
+        assert self.detail_for(description="clean the build directory") == (
             "clean the build directory"
         )
-        assert summary_of({"file_path": "/tmp/x"}) == "/tmp/x"
+        assert self.detail_for(file_path="/tmp/x") == "/tmp/x"
 
     def test_an_input_that_says_nothing_readable_adds_nothing(self) -> None:
         """The tool name is already announced; inventing a sentence would be guessing."""
-        assert summary_of({"weird": 12}) == ""
-        assert summary_of("not an object") == ""
+        assert self.detail_for(weird=12) == ""
+        assert (
+            request_from(
+                {**dialog(), "tool_input": "not an object"}, target=TARGET, approval_id="a-1"
+            ).detail
+            == ""
+        )
 
     def test_the_command_the_user_is_being_asked_about_is_never_in_the_words(self) -> None:
         """P5's exclusion, on the path that actually speaks and pushes (#75).
 
-        This asserted the opposite until #75: `command` was read first and
-        returned whole. The signed port table rules the reference
-        implementation's way (`legacy@1d32845:bridge/transcript.py:1779-1790`) —
-        the arguments proper are the code and shell text that must not be read
-        into a Live Call or pushed to a phone, and the user decides *allow / deny
-        / ask* from the tool's name and its own one-line description.
+        This asserted the opposite until #75: this module had its own extractor,
+        which read `command` first and returned it whole — so a shell command was
+        spoken into a Live Call and pushed to a phone, while the
+        transcript-derived `WaitingFor.detail` excluded exactly that. The signed
+        port table rules the reference implementation's way
+        (`legacy@1d32845:bridge/transcript.py:1779-1790`), and there is now one
+        extractor rather than two disagreeing ones.
         """
         leak = "curl -H 'Authorization: Bearer sk-live-secret' https://example.test"
-        assert summary_of({"command": leak}) == ""
-        assert summary_of({"content": leak}) == ""
-        assert summary_of({"old_string": leak, "new_string": leak}) == ""
-        assert leak not in summary_of({"command": leak, "description": "call the API"})
-        assert (
-            request_from(
-                {**dialog(), "tool_input": {"command": leak}}, target=TARGET, approval_id="a-1"
-            ).detail
-            == ""
-        )
+        assert self.detail_for(command=leak) == ""
+        assert self.detail_for(content=leak) == ""
+        assert self.detail_for(old_string=leak, new_string=leak) == ""
+        assert leak not in self.detail_for(command=leak, description="call the API")
 
     def test_a_detail_over_the_bound_is_passed_over_rather_than_cut(self) -> None:
         """The other half of P5, and the reason it rejects instead of trimming.
@@ -227,9 +238,9 @@ class TestWhatIsAnnounced:
         Bridge Core's decision. It is not a trimming rule: a cut lands mid-secret
         as readily as mid-word, so something over the bound is not the one-line
         summary this reads for and is passed over whole. What the user hears then
-        is the tool's name, which is what the announcement already carries.
+        is the tool's name, which the announcement already carries.
         """
-        assert summary_of({"file_path": "/x" * 4000}) == ""
+        assert self.detail_for(file_path="/x" * 4000) == ""
 
     def test_the_route_offers_no_menu_and_says_so(self) -> None:
         """`options` empty is the honest report: this route has allow and deny."""

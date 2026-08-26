@@ -119,8 +119,8 @@ def summarise(tool_input: Any) -> str:
     """The one readable thing a tool call says about itself, or nothing.
 
     P5, and the **only** extractor of this field in the product: the Approval
-    Relay's summary delegates here (`approval.summary_of`), so one safety rule
-    cannot be enforced on one path and not the other.
+    Relay builds its own `detail` with it (`approval.request_from`), so one safety
+    rule cannot be enforced on one path and not the other.
 
     Empty is the honest answer for an input carrying none of these fields — the
     announcement then names the tool and nothing more, rather than describing an

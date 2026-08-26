@@ -441,7 +441,7 @@ class ClaudeAgentAdapter:
             # The transcript is not held up on anything, which the roster may
             # still know to be a Session waiting on the user. Its word stands.
             found = base
-        dialog = self._parked_for(target)
+        dialog = self._approvals.newest_for(target)
         if dialog is None or found.kind is WaitingKind.QUESTION:
             return found
         if found.kind is WaitingKind.PERMISSION:
@@ -464,16 +464,6 @@ class ClaudeAgentAdapter:
             detail=dialog.detail or None,
             approval_id=dialog.approval_id,
         )
-
-    def _parked_for(self, target: SessionTarget) -> ApprovalRequest | None:
-        """The newest dialog this engine is holding open for that exact Session.
-
-        The newest, because a Session that raised two is held up on the one it
-        raised last; keyed by the exact target, because `--resume` forks two
-        processes under one session id and a dialog belongs to one of them.
-        """
-        parked = [request for request in self._approvals.pending() if request.target == target]
-        return parked[-1] if parked else None
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
         """One Session, freshly read from the same roster `discover` reads.
