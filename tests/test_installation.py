@@ -6,6 +6,12 @@ beside ours and the ones *inside our own matcher group*. That is what makes it
 safe to write into a file the user owns, and it is asserted here rather than
 described, because a merge that eats somebody else's hook does not look wrong
 until the day they need it.
+
+Every `main` call below supplies a `home` and a `launchd`. Without the first, the
+Codex item resolves the real `~/Library/LaunchAgents`; without the second, it
+loads what it finds there into the real login session. Both happened while #83
+was being written, which is why `conftest.py` now refuses the real `launchctl`
+outright — these arguments are what a test says instead.
 """
 
 from __future__ import annotations
@@ -16,9 +22,11 @@ from pathlib import Path
 
 import pytest
 
+from conftest import FakeLaunchd, codex_home
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.installation import Outcome, State, read_intent, replace_text, write_intent
 from gpt_voicecoding.installation import claude_hooks as hooks
+from gpt_voicecoding.installation import codex_launch_agent as codex
 from gpt_voicecoding.installation.__main__ import EXIT_FAILED, EXIT_OK, main
 
 INTERPRETER = Path("/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/python3")
@@ -52,6 +60,18 @@ def config_directory(root: Path, document: dict | None = None) -> Path:
 
 def settings(directory: Path) -> str:
     return (directory / "settings.json").read_text(encoding="utf-8")
+
+
+def _run(verb: str, environ: dict, base: Path, launchd: FakeLaunchd, home: Path) -> int:
+    """One `bridge-install` verb, against nothing the machine running this owns."""
+    return main(
+        [verb],
+        environ=environ,
+        base_dir=base,
+        interpreter=INTERPRETER,
+        home=home,
+        launchd=launchd.launchd,
+    )
 
 
 # -- the round trip ------------------------------------------------------
@@ -208,7 +228,9 @@ def test_a_concurrent_writer_is_reported_and_not_retried(tmp_path: Path, monkeyp
 # -- the recorded intent -------------------------------------------------
 
 
-def test_reconcile_installs_on_a_first_run_and_records_it(tmp_path: Path) -> None:
+def test_reconcile_installs_on_a_first_run_and_records_it(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
     directory = config_directory(tmp_path, FOREIGN)
     base = tmp_path / "support"
 
@@ -218,6 +240,8 @@ def test_reconcile_installs_on_a_first_run_and_records_it(tmp_path: Path) -> Non
         environ={"CLAUDE_CONFIG_DIR": str(directory)},
         base_dir=base,
         interpreter=INTERPRETER,
+        home=tmp_path,
+        launchd=launchd.launchd,
     )
 
     assert code == EXIT_OK
@@ -225,33 +249,37 @@ def test_reconcile_installs_on_a_first_run_and_records_it(tmp_path: Path) -> Non
     assert hooks.APPROVAL_MODULE in settings(directory)
 
 
-def test_reconcile_leaves_an_uninstalled_machine_alone(tmp_path: Path) -> None:
+def test_reconcile_leaves_an_uninstalled_machine_alone(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
     """Without this, the next launch puts back what the user just took away."""
     directory = config_directory(tmp_path, FOREIGN)
     base = tmp_path / "support"
     environ = {"CLAUDE_CONFIG_DIR": str(directory)}
 
-    main(["install"], environ=environ, base_dir=base, interpreter=INTERPRETER)
-    main(["uninstall"], environ=environ, base_dir=base, interpreter=INTERPRETER)
+    _run("install", environ, base, launchd, tmp_path)
+    _run("uninstall", environ, base, launchd, tmp_path)
     untouched = settings(directory)
 
     assert read_intent(base).wanted is False
-    assert main(["reconcile"], environ=environ, base_dir=base, interpreter=INTERPRETER) == EXIT_OK
+    assert _run("reconcile", environ, base, launchd, tmp_path) == EXIT_OK
     assert settings(directory) == untouched
 
 
-def test_install_overrides_a_recorded_uninstall(tmp_path: Path) -> None:
+def test_install_overrides_a_recorded_uninstall(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory = config_directory(tmp_path, FOREIGN)
     base = tmp_path / "support"
     environ = {"CLAUDE_CONFIG_DIR": str(directory)}
 
     write_intent(False, base)
-    assert main(["install"], environ=environ, base_dir=base, interpreter=INTERPRETER) == EXIT_OK
+    assert _run("install", environ, base, launchd, tmp_path) == EXIT_OK
     assert read_intent(base).wanted is True
     assert hooks.APPROVAL_MODULE in settings(directory)
 
 
-def test_a_failed_uninstall_does_not_record_that_it_worked(tmp_path: Path) -> None:
+def test_a_failed_uninstall_does_not_record_that_it_worked(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
     """`wanted: false` is what stops every later reconcile from touching this
     machine. Recorded over a failed uninstall, it would leave our hooks in the
     user's file with nothing left that would ever repair or remove them."""
@@ -259,16 +287,14 @@ def test_a_failed_uninstall_does_not_record_that_it_worked(tmp_path: Path) -> No
     base = tmp_path / "support"
     environ = {"CLAUDE_CONFIG_DIR": str(directory)}
 
-    main(["install"], environ=environ, base_dir=base, interpreter=INTERPRETER)
+    _run("install", environ, base, launchd, tmp_path)
     (directory / "settings.json").write_text("{not json any more", encoding="utf-8")
 
-    assert main(["uninstall"], environ=environ, base_dir=base, interpreter=INTERPRETER) == (
-        EXIT_FAILED
-    )
+    assert _run("uninstall", environ, base, launchd, tmp_path) == (EXIT_FAILED)
     assert read_intent(base).wanted is True, "an uninstall that failed recorded that it worked"
 
 
-def test_a_failed_install_still_records_the_want(tmp_path: Path) -> None:
+def test_a_failed_install_still_records_the_want(tmp_path: Path, launchd: FakeLaunchd) -> None:
     """The other direction, and the asymmetry is deliberate: this file holds what
     the user wants, and a failed install is a want the next reconcile retries."""
     directory = config_directory(tmp_path)
@@ -280,11 +306,13 @@ def test_a_failed_install_still_records_the_want(tmp_path: Path) -> None:
         environ={"CLAUDE_CONFIG_DIR": str(directory)},
         base_dir=base,
         interpreter=INTERPRETER,
+        home=tmp_path,
+        launchd=launchd.launchd,
     )
     assert read_intent(base).wanted is True
 
 
-def test_status_writes_nothing(tmp_path: Path) -> None:
+def test_status_writes_nothing(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory = config_directory(tmp_path, FOREIGN)
     base = tmp_path / "support"
     original = settings(directory)
@@ -294,6 +322,8 @@ def test_status_writes_nothing(tmp_path: Path) -> None:
         environ={"CLAUDE_CONFIG_DIR": str(directory)},
         base_dir=base,
         interpreter=INTERPRETER,
+        home=tmp_path,
+        launchd=launchd.launchd,
     )
 
     assert code == EXIT_OK
@@ -301,7 +331,7 @@ def test_status_writes_nothing(tmp_path: Path) -> None:
     assert read_intent(base).first_run is True
 
 
-def test_a_failed_item_makes_the_run_fail(tmp_path: Path) -> None:
+def test_a_failed_item_makes_the_run_fail(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory = config_directory(tmp_path)
     (directory / "settings.json").write_text("{not json", encoding="utf-8")
 
@@ -310,6 +340,8 @@ def test_a_failed_item_makes_the_run_fail(tmp_path: Path) -> None:
         environ={"CLAUDE_CONFIG_DIR": str(directory)},
         base_dir=tmp_path / "support",
         interpreter=INTERPRETER,
+        home=tmp_path,
+        launchd=launchd.launchd,
     )
     assert code == EXIT_FAILED
 
@@ -325,3 +357,105 @@ def test_an_unreadable_record_reads_as_never_recorded(tmp_path: Path) -> None:
 def test_a_failed_outcome_says_so_on_its_line() -> None:
     line = Outcome("claude-hooks", State.STALE, ok=False, note="a reason").line()
     assert line == "claude-hooks: FAILED — a reason"
+
+
+# -- both items, on the one boundary -------------------------------------
+
+
+def test_a_clean_install_lands_both_items(tmp_path: Path, launchd: FakeLaunchd) -> None:
+    """ADR 0012's registry is a list of calls, and this is the list being two."""
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path)
+    base = tmp_path / "support"
+
+    assert (
+        _run("install", {"CLAUDE_CONFIG_DIR": str(directory)}, base, launchd, tmp_path) == EXIT_OK
+    )
+
+    assert hooks.APPROVAL_MODULE in settings(directory)
+    assert codex.plist_path(tmp_path / "Library" / "LaunchAgents").exists()
+    assert launchd.held is True
+
+
+def test_an_uninstall_takes_both_items_back(tmp_path: Path, launchd: FakeLaunchd) -> None:
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path)
+    base, environ = tmp_path / "support", {"CLAUDE_CONFIG_DIR": str(directory)}
+    before = settings(directory)
+
+    _run("install", environ, base, launchd, tmp_path)
+    assert _run("uninstall", environ, base, launchd, tmp_path) == EXIT_OK
+
+    assert settings(directory) == before
+    assert not codex.plist_path(tmp_path / "Library" / "LaunchAgents").exists()
+    assert launchd.held is True, "the uninstall stopped a daemon the user's Sessions are on"
+
+
+def test_a_reconcile_that_agrees_writes_nothing_and_asks_launchd_for_nothing(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path)
+    base, environ = tmp_path / "support", {"CLAUDE_CONFIG_DIR": str(directory)}
+    _run("install", environ, base, launchd, tmp_path)
+    settled = settings(directory)
+    plist = codex.plist_path(tmp_path / "Library" / "LaunchAgents").read_bytes()
+    launchd.commands.clear()
+
+    assert _run("reconcile", environ, base, launchd, tmp_path) == EXIT_OK
+
+    assert settings(directory) == settled
+    assert codex.plist_path(tmp_path / "Library" / "LaunchAgents").read_bytes() == plist
+    assert "bootstrap" not in launchd.verbs
+
+
+def test_one_item_refusing_does_not_take_the_other_back_out(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """ADR 0012: nothing rolls back. A Claude hook block that landed is not made
+    wrong by a LaunchAgent that did not, and the run still exits non-zero."""
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path)
+    launchd.refuses = True
+
+    code = _run(
+        "install", {"CLAUDE_CONFIG_DIR": str(directory)}, tmp_path / "support", launchd, tmp_path
+    )
+
+    assert code == EXIT_FAILED
+    assert hooks.APPROVAL_MODULE in settings(directory), "a refused item took a landed one with it"
+
+
+def test_a_user_with_no_codex_package_is_not_a_failed_install(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """The mirror of "no Claude config directory": a machine with only one of the
+    two agents on it is a machine this product installs onto successfully."""
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path, managed=False)
+
+    code = _run(
+        "install", {"CLAUDE_CONFIG_DIR": str(directory)}, tmp_path / "support", launchd, tmp_path
+    )
+
+    assert code == EXIT_OK
+    assert launchd.commands == []
+    assert not codex.plist_path(tmp_path / "Library" / "LaunchAgents").exists()
+
+
+def test_status_reports_both_items_and_the_daemon(
+    tmp_path: Path, launchd: FakeLaunchd, capsys
+) -> None:
+    """#83: start and version errors surface through the existing vocabulary."""
+    directory = config_directory(tmp_path, FOREIGN)
+    codex_home(tmp_path, managed=False)
+
+    assert _run("status", {"CLAUDE_CONFIG_DIR": str(directory)}, tmp_path, launchd, tmp_path) == (
+        EXIT_OK
+    )
+
+    said = capsys.readouterr()
+    printed = said.out + said.err
+    assert hooks.NAME in printed
+    assert printed.count(codex.NAME) >= 2, "the item's line, and the daemon's own"
+    assert "no managed Codex binary" in printed
