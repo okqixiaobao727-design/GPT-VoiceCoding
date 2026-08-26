@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import Final
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
@@ -147,6 +148,12 @@ def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
     return held if held is SessionState.WAITING else SessionState.RUNNING
 
 
+#: What a notice says about something this engine can announce and cannot answer.
+#: One sentence, used by both such cases, because they are one fact: a notice the
+#: user tries to answer remotely and cannot is worse than no notice at all.
+ANSWER_IT_AT_THE_TERMINAL: Final = "answer it in the terminal; it cannot be answered from here"
+
+
 def _stopped_on(waiting_for: WaitingFor) -> str:
     """One line describing what a Session is waiting for, or nothing to add."""
     match waiting_for.kind:
@@ -156,7 +163,13 @@ def _stopped_on(waiting_for: WaitingFor) -> str:
                 parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
             if waiting_for.recommendation:
                 parts.append(f"it recommends {waiting_for.recommendation}")
-            return "; ".join(parts)
+            # A question has no answering route at all on this build: the inbox
+            # carries words and never authority (#71), so a Relay cannot answer
+            # one, and the hook that holds the dialog open is deliberately not
+            # announced as an approval — a spoken "deny" there would be consumed
+            # by the Session as the user's answer (#77). #103 gives the question
+            # its own route, and takes this clause off when it does.
+            return "; ".join(parts) + f" — {ANSWER_IT_AT_THE_TERMINAL}"
         case WaitingKind.PERMISSION:
             named = waiting_for.tool_name or "a tool"
             asked = f"{named} needs your permission" + (
@@ -168,7 +181,7 @@ def _stopped_on(waiting_for: WaitingFor) -> str:
             # nothing is parked on the approval socket to answer into. Saying so
             # is the whole difference between a notice the user can act on and
             # one they try to answer from their phone and cannot.
-            return f"{asked} — answer it in the terminal; it cannot be answered from here"
+            return f"{asked} — {ANSWER_IT_AT_THE_TERMINAL}"
         case WaitingKind.UNKNOWN:
             # The honest answer while the record has not flushed (#73): say that
             # rather than invent a reason the Session never gave.

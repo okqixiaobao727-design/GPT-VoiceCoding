@@ -480,6 +480,17 @@ class ClaudeAgentAdapter:
         Two sources, and they are ranked rather than merged, because they can
         disagree and the ranking is the behaviour (#75):
 
+        0. **A question parked on the approval socket wins over everything**
+           (#77). `AskUserQuestion` raises the same `PermissionRequest` hook a
+           `Write` does (measured on 2.1.246), so the dialog arrives here with
+           the whole prompt, its options and the `prompt_id` a verdict would be
+           addressed with — while the transcript says nothing about the call
+           until it has flushed, and by then the person at the keyboard has
+           usually answered it. The hook's question is the thing itself and the
+           record's is a reconstruction of it, so the hook wins whether the two
+           name the same prompt or different ones. Nothing carries a verdict
+           into it: `as_approval_request` still answers `None` for a QUESTION,
+           and the notice sends the user to their own terminal until #103.
         1. **A readable question wins outright.** The reference implementation's
            precedence — a decision only the user can supply outranks a permission
            call beside it (`legacy@1d32845:bridge/transcript.py:1691-1692`) — and
@@ -502,6 +513,9 @@ class ClaudeAgentAdapter:
            Session the roster calls `waiting`, which is the seam's way of saying
            *ask again, never guess*.
         """
+        parked_question = self._approvals.newest_question_for(target)
+        if parked_question is not None:
+            return parked_question
         found = base if records is None else stop_analysis.analyse(records)
         if found.kind is WaitingKind.NONE:
             # The transcript is not held up on anything, which the roster may

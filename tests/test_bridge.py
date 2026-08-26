@@ -688,6 +688,25 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
         (notice,) = hub.channel.sent
         assert "terminal" in notice
 
+    def test_a_question_sends_the_user_to_the_terminal_too(self) -> None:
+        """Until #103 there is no route that can answer one, so the notice says so.
+
+        The same reasoning as the permission with no handle: a notice that reads
+        out a question and its options, and does not say where it is answered,
+        invites the user to try a voice menu that does not exist.
+        """
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        (notice,) = hub.channel.sent
+        assert "terminal" in notice
+
     def test_a_question_is_always_announced(self) -> None:
         """It has no other route at all — that is the whole point of the new edge."""
         hub = Hub(voice=False)

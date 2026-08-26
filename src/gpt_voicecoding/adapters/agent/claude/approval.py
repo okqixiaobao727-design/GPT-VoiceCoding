@@ -54,6 +54,7 @@ import logging
 import os
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -70,6 +71,8 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
@@ -96,7 +99,20 @@ PROVEN_AGAINST_VERSION: Final = "2.1.238"
 #: What a denied tool call is told. The user said no; the Session hears why.
 DENIED_BY_VOICE: Final = "denied by the user, by voice, through GPT-VoiceCoding"
 
+#: The dialog's own correlator, undocumented and carried on every payload —
+#: the same field #71 recorded. It is what `WaitingFor.approval_id` holds for a
+#: question, and what #103 will address an answer with.
+PROMPT_ID_FIELD: Final = "prompt_id"
 
+
+# **Drift in this shape is silent, and that is why the receipt is where it is.**
+# Measured on 2.1.246 (#77): the `permissionDecision` / `permissionDecisionReason`
+# shape the public hooks reference reaches for has *no effect at all* — the dialog
+# simply stands there, for `AskUserQuestion` and for `Write` alike. The shape
+# below is the one Claude Code consumes, and a build that stopped consuming it
+# would be indistinguishable from a hook that answered `ask`. Nothing on the wire
+# would say so, which is exactly why this route's proof of delivery is the
+# `approval_ack` frame over our own socket (`ACK_TYPE`) and never the hook's exit.
 def hook_decision(verdict: ApprovalVerdict) -> dict[str, Any] | None:
     """What the hook prints for one verdict, or `None` when it prints nothing.
 
@@ -233,6 +249,43 @@ def request_from(
     )
 
 
+def question_from(payload: Mapping[str, Any]) -> WaitingFor | None:
+    """One `AskUserQuestion` dialog as a `WaitingFor`, or `None` for anything else.
+
+    **`AskUserQuestion` rides the permission hook**, measured on 2.1.246 (#77):
+    the payload carries the whole structured question in `tool_input.questions`,
+    with a `prompt_id` beside it. That is a fact about the wire, not about
+    permissions, and it is the only route a question has — the transcript only
+    says a question was asked once the tool call has flushed, and by then the
+    person at the keyboard has usually answered it.
+
+    **The shape is parsed by #75's parser and nothing else.** The hook's
+    `tool_input` and the transcript's `tool_use.input` are the same object, so a
+    second projector here would be two readings of one payload that could
+    disagree about what an option is — the thing `stop_analysis.question_in`
+    exists to prevent. What this adds is the one field the transcript cannot
+    carry: the dialog's handle. `Option.recommended` therefore comes from #75's
+    label marker, which this payload does not use, and is never inferred from
+    the order the options were written in.
+
+    **An unreadable question is still a question**, which is where this parts
+    company with the transcript route. There, a call whose input has not
+    finished being written is skipped, because a reader may not claim a kind it
+    has not read. Here the payload *is* the record: the dialog is provably on
+    screen and provably an `AskUserQuestion`, so it is announced as a question
+    with nothing to read out rather than falling back to a permission — which
+    would restore the allow/deny menu this route exists to withhold.
+    """
+    if payload.get(TOOL_NAME_FIELD) != stop_analysis.QUESTION_TOOL:
+        return None
+    prompt_id = payload.get(PROMPT_ID_FIELD)
+    approval_id = prompt_id if isinstance(prompt_id, str) and prompt_id.strip() else None
+    asked = stop_analysis.question_in(payload.get(TOOL_INPUT_FIELD))
+    if asked is None:
+        return WaitingFor(kind=WaitingKind.QUESTION, approval_id=approval_id)
+    return replace(asked, approval_id=approval_id)
+
+
 class ApprovalError(Exception):
     """The approval socket could not be bound, or could not be taken back out."""
 
@@ -240,11 +293,20 @@ class ApprovalError(Exception):
 class _Waiting:
     """One hook process, parked mid-dialog, and the connection it is holding open."""
 
-    __slots__ = ("acknowledged", "answered", "gone", "request", "writer")
+    __slots__ = ("acknowledged", "answered", "gone", "question", "request", "writer")
 
-    def __init__(self, request: ApprovalRequest, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        request: ApprovalRequest,
+        writer: asyncio.StreamWriter,
+        question: WaitingFor | None = None,
+    ) -> None:
         self.request = request
         self.writer = writer
+        #: What this dialog asked, when it is an `AskUserQuestion` rather than a
+        #: permission. Parsed once, here, when the payload arrives: two parses of
+        #: one message are two answers that can disagree.
+        self.question = question
         #: Set once a verdict has been written to this hook. It is what tells the
         #: connection's own task that the end it is about to see is an ordinary
         #: goodbye rather than a human winning the race.
@@ -318,6 +380,20 @@ class ApprovalListener:
         for waiting in reversed(self._waiting.values()):
             if waiting.request.target == target:
                 return waiting.request
+        return None
+
+    def newest_question_for(self, target: SessionTarget) -> WaitingFor | None:
+        """The question one exact Session's newest parked dialog asked, if it is one.
+
+        `None` covers both "nothing is parked for that Session" and "what is
+        parked is a permission" — a Session held up on a permission is not held
+        up on a question, whatever older dialog is still on this socket.
+
+        The newest, and keyed by the exact target, for `newest_for`'s reasons.
+        """
+        for waiting in reversed(self._waiting.values()):
+            if waiting.request.target == target:
+                return waiting.question
         return None
 
     async def start(self) -> None:
@@ -481,12 +557,35 @@ class ApprovalListener:
 
             approval_id = str(uuid.uuid4())
             request = request_from(payload, target=target, approval_id=approval_id)
-            waiting = _Waiting(request, writer)
+            question = question_from(payload)
+            waiting = _Waiting(request, writer, question)
             self._waiting[approval_id] = waiting
 
-            # Raised only once the request is parked, so a verdict answered the
-            # same tick has somewhere to land.
-            self._emit(AwaitingApproval(request=request))
+            if question is None:
+                # Raised only once the request is parked, so a verdict answered
+                # the same tick has somewhere to land.
+                self._emit(AwaitingApproval(request=request))
+            else:
+                # **A question is parked and not announced as an approval**, and
+                # this is the branch #103 turns into the question's own route —
+                # not a place where questions are ignored. It is parked exactly
+                # as a permission is: the hook stays held open, so the dialog
+                # reaches the screen and the person at the keyboard can answer
+                # it, and this connection is released when they do or when this
+                # listener closes. What it does not do is enter the approval
+                # budget, fallback and closing (`core/approvals.py`), because
+                # those carry an allow/deny menu — and on this wire a spoken
+                # "deny" is consumed by the Session *as the user's answer*
+                # (2.1.246, #77), so that menu would put `DENIED_BY_VOICE` into
+                # the conversation as a choice the user never made. It is
+                # announced once instead, by the Stop Notice, through the
+                # `WaitingFor` the adapter reads back out of here.
+                _log.info(
+                    "a question is parked for %s (prompt_id=%s); announced by the Stop "
+                    "Notice, not as an approval",
+                    target,
+                    question.approval_id,
+                )
 
             # From here this task does exactly one thing: watch for the hook's
             # end of the socket to close. The verdict is written by `answer`, on

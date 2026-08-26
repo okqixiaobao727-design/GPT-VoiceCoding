@@ -30,6 +30,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     LaneDiscovery,
     LaneUnavailable,
+    Option,
     ReplyWindowChanged,
     SessionEnded,
     SessionInspection,
@@ -53,8 +54,9 @@ ROSTER_WAITING = WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
 class _Parked:
     """One dialog held open, as `ApprovalListener._waiting` holds it."""
 
-    def __init__(self, request: ApprovalRequest) -> None:
+    def __init__(self, request: ApprovalRequest, question: WaitingFor | None = None) -> None:
         self.request = request
+        self.question = question
 
 
 def transcript(tmp_path: Path, records: list[dict[str, Any]]) -> Path:
@@ -64,7 +66,10 @@ def transcript(tmp_path: Path, records: list[dict[str, Any]]) -> Path:
 
 
 def adapter_holding(
-    transcript_path: Path | None = None, *, parked: tuple[ApprovalRequest, ...] = ()
+    transcript_path: Path | None = None,
+    *,
+    parked: tuple[ApprovalRequest, ...] = (),
+    asking: WaitingFor | None = None,
 ) -> ClaudeAgentAdapter:
     """An adapter that has heard one Session's registration and holds `parked`.
 
@@ -82,7 +87,9 @@ def adapter_holding(
         # Parked the way a hook parks one, minus the socket: `newest_for` reads
         # this dict, and `test_claude_approval.py` owns proving a real hook gets
         # a request into it.
-        adapter._approvals._waiting[request.approval_id] = _Parked(request)  # noqa: SLF001
+        adapter._approvals._waiting[request.approval_id] = _Parked(  # noqa: SLF001
+            request, asking
+        )
         del index
     return adapter
 
@@ -127,6 +134,95 @@ def parallel(*calls: tuple[str, str, Any]) -> dict[str, Any]:
             ],
         },
     }
+
+
+class TestAParkedQuestionWinsOutright:
+    """The fifth row, and the top of the table (#77 B).
+
+    `AskUserQuestion` raises the same `PermissionRequest` hook a `Write` does
+    (measured on 2.1.246), so a question is parked on this engine's approval
+    socket with the whole prompt, its options and a `prompt_id` — while the
+    transcript says nothing about it until the tool call has flushed, by which
+    time the person at the keyboard has usually answered it. The hook's question
+    is the thing itself; the transcript's is a reconstruction of it. So the hook
+    wins whether the two name the same prompt or different ones.
+    """
+
+    @staticmethod
+    def asking(prompt: str = "Tabs or spaces?", *labels: str) -> WaitingFor:
+        return WaitingFor(
+            kind=WaitingKind.QUESTION,
+            prompt=prompt,
+            options=tuple(Option(text=label) for label in labels or ("Spaces", "Tabs")),
+            approval_id="7333021c-1ab7-451d-9eee-91617bc4838d",
+        )
+
+    def test_it_wins_over_a_record_that_has_not_flushed_the_call(self, tmp_path: Path) -> None:
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn()]),
+            parked=(dialog(tool_name="AskUserQuestion", detail=""),),
+            asking=self.asking(),
+        )
+
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+
+        assert waiting.kind is WaitingKind.QUESTION
+        assert waiting.prompt == "Tabs or spaces?"
+        assert [option.text for option in waiting.options] == ["Spaces", "Tabs"]
+        assert waiting.caught_up is True, "the hook payload is the record it read"
+
+    def test_it_wins_over_the_records_reconstruction_of_the_same_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        """Same question, two readings. The parked one is what is on the screen."""
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn(), asked("q1", ("Tabs or spaces?", ["Spaces", "Tabs"]))]),
+            parked=(dialog(tool_name="AskUserQuestion", detail=""),),
+            asking=self.asking(),
+        )
+
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+
+        assert waiting.approval_id == "7333021c-1ab7-451d-9eee-91617bc4838d"
+
+    def test_it_wins_over_a_different_question_the_record_is_still_holding(
+        self, tmp_path: Path
+    ) -> None:
+        """Different prompts: the hook still wins, because it is what is parked."""
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn(), asked("q1", ("Which base?", ["main", "feature"]))]),
+            parked=(dialog(tool_name="AskUserQuestion", detail=""),),
+            asking=self.asking(),
+        )
+
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+
+        assert waiting.prompt == "Tabs or spaces?"
+
+    def test_nothing_carries_a_verdict_into_a_question(self, tmp_path: Path) -> None:
+        """The handle is there for #103, and the Approval Relay still cannot use it."""
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn()]),
+            parked=(dialog(tool_name="AskUserQuestion", detail=""),),
+            asking=self.asking(),
+        )
+
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+
+        assert waiting.approval_id
+        assert waiting.as_approval_request(TARGET) is None
+
+    def test_a_parked_permission_is_ranked_as_it_always_was(self, tmp_path: Path) -> None:
+        """The control: `asking` is what distinguishes the two, not the tool name."""
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn(), called("Edit", "e1", {"file_path": "/tmp/notes.md"})]),
+            parked=(dialog(tool_name="Edit", detail="notes.md"),),
+        )
+
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+
+        assert waiting.kind is WaitingKind.PERMISSION
+        assert waiting.approval_id == "a-1"
 
 
 class TestTheRanking:
