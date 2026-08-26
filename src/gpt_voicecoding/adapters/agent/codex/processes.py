@@ -19,16 +19,28 @@ a process running any of those is doing a job rather than holding a Session.
 Anything else — no subcommand, a bare `[PROMPT]`, `resume` or `fork` — is a TUI.
 
 **Every candidate is a Session nobody has spoken to yet.** This source knows a
-pid and a cwd and nothing else; it has no thread id, because Codex writes the
-rollout that carries one at the first turn (#73). Tying a candidate back to a
-thread is `rollouts.newest_for`'s job, and it only ever succeeds once the
-Session has done something.
+pid, a cwd and when the process started, and nothing else; it has no thread id,
+because Codex writes the rollout that carries one at the first turn (#73). Tying
+a candidate back to a thread is `rollouts.newest_for`'s job, and it only ever
+succeeds once the Session has done something.
+
+**The start time is here because the workspace outlives the Session.** The join
+`discovery.py` makes is workspace-to-rollout, and yesterday's rollout sits in
+the same directory as today's fresh TUI — so without a start time the newest
+rollout there is claimed by whoever is running there now, naming an
+un-spoken-to Session with a dead thread's id. `ps` supplies it as `etime`
+rather than `etimes`, which macOS does not have (measured 2026-08-26), and as
+an *elapsed* duration rather than an instant, so every row on one reading is
+subtracted from the **same** clock reading: two rows of one `ps` are one moment,
+and letting them drift apart would be inventing an ordering the table does not
+have.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +52,20 @@ _log = logging.getLogger(__name__)
 #: ChatGPT.app's bundled `Codex Framework` helpers do not match — they did match
 #: `ps -o comm=` on this machine, which is why the exact form is the one used.
 EXECUTABLE: Final = "codex"
+
+#: The build the two tables below were read off `codex --help` on, on Simon's
+#: machine on 2026-08-26. Same shape as the Claude lane's pins
+#: (`claude/discovery.py:56`, `claude/registry.py:47`, `claude/approval.py:93`):
+#: documentation for the next re-probe, never a gate.
+#:
+#: **They are transcribed, not derived, and that is the decision.** Reading
+#: `codex --help` at discovery time would cost a subprocess on every pass and
+#: put a free-form help text on the path that decides which processes are
+#: Sessions — and it would fail *silently* on an upgrade that reworded it, which
+#: is the failure this module exists to prevent. Transcribing means an upgrade
+#: that adds a subcommand shows up as a job listed as a Session until someone
+#: re-probes, which is loud, bounded, and recorded here.
+PROVEN_AGAINST_VERSION: Final = "0.149.1"
 
 #: `codex --help` on 0.149.1, verbatim, minus the two that open a TUI (`resume`
 #: and `fork`) and minus `help`. A process whose first non-flag argument is one
@@ -111,6 +137,17 @@ VALUE_TAKING_OPTIONS: Final = frozenset(
 #: How long the process table and the cwd lookups get, together.
 COMMAND_TIMEOUT_SECONDS: Final = 10.0
 
+#: `etime` counts in whole seconds, so a process that started 4.9 s ago reads as
+#: 4 and the start time derived from it lands *after* the true one. The rollout
+#: filter compares against that start time, so erring late would discard a
+#: rollout the Session really wrote; erring early can at worst re-admit one
+#: second of a previous Session that Codex cannot have written a turn into. One
+#: second of slack buys the cheaper of those two mistakes.
+START_TIME_GRANULARITY_SECONDS: Final = 1.0
+
+#: Reads the wall clock. Injected so a test can hold one moment still.
+Clock = Callable[[], float]
+
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
@@ -118,6 +155,10 @@ class Candidate:
 
     pid: int
     workspace: Path
+    #: When this process began, in epoch seconds, derived from `ps`'s elapsed
+    #: time. Required rather than defaulted: a candidate that cannot say when it
+    #: started cannot be joined to a rollout without risking a dead thread's id.
+    started_at: float
 
 
 #: Runs one command and returns its stdout, or raises. Injected for tests.
@@ -143,15 +184,18 @@ async def run_command(argv: list[str]) -> str:
     return out.decode("utf-8", errors="replace")
 
 
-async def enumerate_sessions(*, run: Runner = run_command) -> tuple[Candidate, ...]:
-    """Every running `codex` TUI this user owns, by pid and workspace.
+async def enumerate_sessions(
+    *, run: Runner = run_command, now: Clock = time.time
+) -> tuple[Candidate, ...]:
+    """Every running `codex` TUI this user owns, by pid, workspace and start time.
 
     Raises `OSError` or `TimeoutError` if the process table cannot be read at
     all — the caller turns that into a lane error, because not being able to
     look is not the same as there being nothing to see.
     """
+    reading = now()
     found: list[Candidate] = []
-    for pid in await _interactive_pids(run):
+    for pid, elapsed in await _interactive_pids(run):
         workspace = await _cwd_of(pid, run)
         if workspace is None:
             # A process that ended between the listing and the lookup, or one
@@ -159,22 +203,53 @@ async def enumerate_sessions(*, run: Runner = run_command) -> tuple[Candidate, .
             # name a workspace for, and a row without one cannot be joined to
             # anything.
             continue
-        found.append(Candidate(pid=pid, workspace=workspace))
+        found.append(
+            Candidate(
+                pid=pid,
+                workspace=workspace,
+                started_at=reading - elapsed - START_TIME_GRANULARITY_SECONDS,
+            )
+        )
     return tuple(found)
 
 
-async def _interactive_pids(run: Runner) -> list[int]:
-    """The pids of `codex` processes that are Sessions rather than jobs."""
-    listing = await run(["/bin/ps", "-axo", "pid=,args="])
-    pids: list[int] = []
+async def _interactive_pids(run: Runner) -> list[tuple[int, float]]:
+    """The `codex` processes that are Sessions, with how long each has been up.
+
+    A row whose elapsed time cannot be read is dropped rather than defaulted:
+    the only safe default would be "started at the beginning of time", which is
+    exactly the claim that lets it adopt a dead Session's rollout.
+    """
+    listing = await run(["/bin/ps", "-axo", "pid=,etime=,args="])
+    found: list[tuple[int, float]] = []
     for line in listing.splitlines():
-        pid, argv = _split(line)
+        pid, elapsed, argv = _split(line)
         if pid is None or not argv:
             continue
         if Path(argv[0]).name != EXECUTABLE or not is_interactive(argv):
             continue
-        pids.append(pid)
-    return pids
+        if elapsed is None:
+            _log.info("codex pid %s reported an elapsed time this reader cannot parse", pid)
+            continue
+        found.append((pid, elapsed))
+    return found
+
+
+def _elapsed_seconds(field: str) -> float | None:
+    """`ps`'s `etime`, `[[dd-]hh:]mm:ss`, as seconds. `None` if it is not that.
+
+    macOS `ps` has no `etimes`, so the duration arrives formatted and has to be
+    read back (measured 2026-08-26). `lstart` would give an instant rather than
+    a duration, but it is a localised date and would move with the machine.
+    """
+    days, _, clock = field.partition("-")
+    if not clock:
+        days, clock = "0", days
+    parts = clock.split(":")
+    if not days.isdigit() or not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return None
+    hours, minutes, seconds = ([0] * (3 - len(parts))) + [int(p) for p in parts]
+    return int(days) * 86_400 + hours * 3_600 + minutes * 60 + seconds
 
 
 def is_interactive(argv: list[str]) -> bool:
@@ -208,13 +283,18 @@ def is_interactive(argv: list[str]) -> bool:
     return True
 
 
-def _split(line: str) -> tuple[int | None, list[str]]:
-    """`  1234 /path/to/codex resume --last` → `(1234, [...])`."""
-    stripped = line.strip()
-    head, _, rest = stripped.partition(" ")
+def _split(line: str) -> tuple[int | None, float | None, list[str]]:
+    """`  1234 05:00 /path/to/codex resume --last` → `(1234, 300.0, [...])`.
+
+    Split on the two leading fields only, because `args=` is last precisely so
+    that a path with spaces in it stays one field's problem rather than the
+    parser's.
+    """
+    head, _, rest = line.strip().partition(" ")
     if not head.isdigit():
-        return None, []
-    return int(head), rest.split()
+        return None, None, []
+    elapsed, _, argv = rest.strip().partition(" ")
+    return int(head), _elapsed_seconds(elapsed), argv.split()
 
 
 async def _cwd_of(pid: int, run: Runner) -> Path | None:

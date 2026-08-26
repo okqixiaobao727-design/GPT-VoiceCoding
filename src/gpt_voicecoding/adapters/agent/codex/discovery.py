@@ -178,8 +178,7 @@ def _pid_for(
     matches = [
         candidate.pid
         for candidate in candidates
-        if candidate.pid not in claimed
-        and os.path.realpath(candidate.workspace) == wanted
+        if candidate.pid not in claimed and os.path.realpath(candidate.workspace) == wanted
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -211,8 +210,17 @@ def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspecti
     """One running TUI the daemon does not hold, named as well as disk allows.
 
     Its thread id comes from the newest rollout whose own `cwd` is this
-    workspace, and only once the Session has taken a turn — before that there is
-    genuinely no id, and the row is addressed by pid.
+    workspace **and which was written after this process started**, and only
+    once the Session has taken a turn — before that there is genuinely no id,
+    and the row is addressed by pid.
+
+    The start-time bound is what keeps the workspace join honest. A workspace
+    outlives the Sessions run in it and rollouts stay on disk, so the newest one
+    in a directory is only *this* Session's if this Session could have written
+    it. Without the bound a fresh TUI adopts the id of whatever ran there last,
+    and `core.sessions._better_known` — which refuses to let a known id be
+    overwritten by `None` — then protects that wrong id from every later,
+    honest reading.
 
     **The state is `RUNNING` because nothing here can see one.** A process is
     not evidence of a Reply Window, and `RUNNING` is the reading that holds a
@@ -220,7 +228,7 @@ def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspecti
     matters more here than anywhere: this Session's Relay would fail at the wire
     anyway (#82), and a held Relay is one the user gets back.
     """
-    rollout = rollouts.newest_for(candidate.workspace, home=home)
+    rollout = rollouts.newest_for(candidate.workspace, home=home, since=candidate.started_at)
     meta = rollouts.session_meta(rollout) if rollout is not None else None
     return SessionInspection(
         target=SessionTarget(

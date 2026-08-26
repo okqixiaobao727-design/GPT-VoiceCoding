@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
@@ -22,6 +23,15 @@ from gpt_voicecoding.seams.agent import SessionState, WaitingKind
 
 THREAD = "01a03b06-f995-7b60-bc9f-e2152ee4ed32"
 OTHER_THREAD = "01a0385e-4872-7353-bdc5-8966c6165a8e"
+
+#: When the processes in this file started. Rollouts written before it belong to
+#: a Session that is over; ones written after it belong to the process reading.
+STARTED_AT = 1_787_700_000.0
+
+
+def running(pid: int, workspace: Path | str, *, started_at: float = STARTED_AT) -> Candidate:
+    """One TUI in the process table, as `processes.enumerate_sessions` yields it."""
+    return Candidate(pid=pid, workspace=Path(workspace), started_at=started_at)
 
 
 class FakeDaemon:
@@ -44,6 +54,21 @@ class FakeDaemon:
 
 def thread(thread_id: str, *, cwd: str, status: str = "idle", name: str | None = None) -> dict:
     return {"id": thread_id, "cwd": cwd, "status": {"type": status}, "name": name}
+
+
+def write_rollout(home: Path, thread_id: str, workspace: Path) -> Path:
+    """One rollout on disk, in the 0.149.1 shape, written now unless moved."""
+    directory = home / "sessions"
+    directory.mkdir(exist_ok=True)
+    path = directory / f"rollout-2026-08-26T10-25-08-{thread_id}.jsonl"
+    path.write_text(
+        json.dumps(
+            {"type": "session_meta", "payload": {"session_id": thread_id, "cwd": str(workspace)}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def listing(*candidates: Candidate) -> object:
@@ -101,7 +126,7 @@ class TestJoiningAThreadToItsProcess:
     def test_the_tui_running_a_thread_is_found_by_its_workspace(self) -> None:
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
-            Candidate(pid=101, workspace=Path("/tmp/w")),
+            running(101, "/tmp/w"),
         )
         assert len(lane.rows) == 1
         assert lane.rows[0].target.pid == 101
@@ -109,7 +134,7 @@ class TestJoiningAThreadToItsProcess:
     def test_a_claimed_process_does_not_also_get_a_row_of_its_own(self) -> None:
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
-            Candidate(pid=101, workspace=Path("/tmp/w")),
+            running(101, "/tmp/w"),
         )
         assert [row.target.pid for row in lane.rows] == [101]
 
@@ -117,8 +142,8 @@ class TestJoiningAThreadToItsProcess:
         """A row addressed by the wrong pid is worse than one addressed by its id."""
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
-            Candidate(pid=101, workspace=Path("/tmp/w")),
-            Candidate(pid=102, workspace=Path("/tmp/w")),
+            running(101, "/tmp/w"),
+            running(102, "/tmp/w"),
         )
         by_id = next(row for row in lane.rows if row.target.session_id == THREAD)
         assert by_id.target.pid is None
@@ -133,18 +158,18 @@ class TestJoiningAThreadToItsProcess:
 class TestWhenTheDaemonIsNotThere:
     def test_a_running_tui_is_still_listed(self) -> None:
         """#82: a TUI started while the daemon was down is never adopted later."""
-        lane = found(None, Candidate(pid=101, workspace=Path("/tmp/w")))
+        lane = found(None, running(101, "/tmp/w"))
         assert [row.target.pid for row in lane.rows] == [101]
 
     def test_those_rows_say_where_they_came_from(self) -> None:
-        lane = found(None, Candidate(pid=101, workspace=Path("/tmp/w")))
+        lane = found(None, running(101, "/tmp/w"))
         assert lane.degraded is not None
         assert lane.error is None  # the lane looked; it just looked with less
 
     def test_a_daemon_that_refuses_is_the_same_fact_as_one_that_is_absent(self) -> None:
         lane = found(
             FakeDaemon({}, raises=ConnectionRefusedError("no socket")),
-            Candidate(pid=101, workspace=Path("/tmp/w")),
+            running(101, "/tmp/w"),
         )
         assert [row.target.pid for row in lane.rows] == [101]
         assert lane.degraded is not None
@@ -154,7 +179,7 @@ class TestWhenTheDaemonIsNotThere:
             async def request(self, method: str, params: dict | None = None) -> dict:
                 return {"data": "not a list"}
 
-        lane = found(Odd({}), Candidate(pid=101, workspace=Path("/tmp/w")))
+        lane = found(Odd({}), running(101, "/tmp/w"))
         assert [row.target.pid for row in lane.rows] == [101]
         assert lane.degraded is not None
 
@@ -168,35 +193,50 @@ class TestWhenTheDaemonIsNotThere:
 class TestASessionNobodyHasSpokenToYet:
     def test_it_is_addressed_by_its_pid_alone(self, tmp_path: Path) -> None:
         """Measured (#73): `codex` writes the rollout naming it at its first turn."""
-        lane = found(None, Candidate(pid=101, workspace=Path("/tmp/w")), home=tmp_path)
+        lane = found(None, running(101, "/tmp/w"), home=tmp_path)
         assert lane.rows[0].target.session_id is None
         assert lane.rows[0].target.pid == 101
 
     def test_once_it_has_a_rollout_the_row_carries_its_thread_id(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        directory = tmp_path / "sessions"
-        directory.mkdir()
-        (directory / f"rollout-2026-08-26T10-25-08-{THREAD}.jsonl").write_text(
-            json.dumps(
-                {
-                    "type": "session_meta",
-                    "payload": {"session_id": THREAD, "cwd": str(workspace)},
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        write_rollout(tmp_path, THREAD, workspace)
 
-        lane = found(None, Candidate(pid=101, workspace=workspace), home=tmp_path)
+        lane = found(None, running(101, workspace), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
         assert lane.rows[0].target.pid == 101
 
     def test_it_holds_its_relay_rather_than_delivering_into_a_turn_it_cannot_see(self) -> None:
         """A process is not evidence of a Reply Window."""
-        assert found(None, Candidate(pid=101, workspace=Path("/tmp/w"))).rows[0].state is (
-            SessionState.RUNNING
-        )
+        assert found(None, running(101, "/tmp/w")).rows[0].state is (SessionState.RUNNING)
+
+    def test_it_does_not_inherit_the_thread_the_last_session_here_left_behind(
+        self, tmp_path: Path
+    ) -> None:
+        """A workspace outlives the Sessions run in it, and a rollout stays on disk.
+
+        The failure this closes: a fresh TUI in a directory somebody worked in
+        yesterday takes yesterday's thread id, so the roster addresses an
+        un-spoken-to Session as a conversation that is over — and `_better_known`
+        then refuses to let a later, honest `None` correct it.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        rollout = write_rollout(tmp_path, THREAD, workspace)
+        os.utime(rollout, (STARTED_AT - 3600, STARTED_AT - 3600))
+
+        lane = found(None, running(101, workspace), home=tmp_path)
+        assert lane.rows[0].target.session_id is None
+        assert lane.rows[0].target.pid == 101
+
+    def test_but_it_does_claim_the_rollout_it_wrote_itself(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        rollout = write_rollout(tmp_path, THREAD, workspace)
+        os.utime(rollout, (STARTED_AT + 60, STARTED_AT + 60))
+
+        lane = found(None, running(101, workspace), home=tmp_path)
+        assert lane.rows[0].target.session_id == THREAD
 
 
 class TestWhenTheLaneCannotLookAtAll:
