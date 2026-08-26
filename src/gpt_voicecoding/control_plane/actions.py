@@ -72,6 +72,7 @@ class ControlPlane:
             Action.STATUS: self._status,
             Action.SWITCH: self._switch,
             Action.SESSIONS: self._sessions,
+            Action.PROGRESS: self._progress,
             Action.LIVE: self._live,
             Action.RELAY: self._relay,
             Action.APPROVE: self._approve,
@@ -115,6 +116,20 @@ class ControlPlane:
 
     async def _sessions(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return {"sessions": payloads.status_document(self._core.status())["sessions"]}
+
+    async def _progress(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """How far along one exact Session is, rendered as one roster row.
+
+        The same document `sessions` renders, deliberately: a surface that had to
+        learn a second shape to show one Session's progress would be a second
+        reader of the same facts. What this action adds is *when* — the row comes
+        back read at the moment it was asked for, rather than at the last tick.
+        """
+        return {
+            "session": payloads.session_document(
+                await self._core.progress(payloads.read_target(payload))
+            )
+        }
 
     async def _switch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         name = payloads.read_text(payload, "name")

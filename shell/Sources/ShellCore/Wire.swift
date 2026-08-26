@@ -9,8 +9,10 @@ public let maxRequestBytes = 65536
 /// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
 public let controlPlaneProtocolVersion = 4
 
-/// Every action this engine has. Seven, and the set is closed — adding one is a
-/// contract change, so the shell names them rather than composing strings.
+/// Every action this engine has. Eight, and the set is closed — adding one is a
+/// contract change, so the shell names them rather than composing strings. The
+/// two spellings are held to each other by `tests/test_app_bundle.py`, which
+/// reads this enum and compares it with the engine's own.
 ///
 /// `launch` and `close` were here until protocol 4, and are parked with the code
 /// behind them: the engine answers `unknown_action` for either now, so naming
@@ -18,6 +20,8 @@ public let controlPlaneProtocolVersion = 4
 public enum Action: String, Sendable, CaseIterable {
     case status
     case sessions
+    /// How far along one exact Session is, read now. A question, never a turn.
+    case progress
     case `switch`
     /// The Live Toggle. One action: it ends the call the system owns, or starts
     /// one if none is up. Bridge Core owns that policy; no surface holds call state.

@@ -87,7 +87,15 @@ the user is told.
 
 ## The actions
 
-Seven, and the set is closed. Adding one is a contract change.
+Eight, and the set is closed. Adding one is a contract change.
+
+`progress` is the eighth. It did **not** move the protocol version, and the
+reason is what the version is for: a surface built against 4 can tell an engine
+that disagrees from one too old to have been asked, and the failure it guards
+against is a surface sending something the engine does not have. Adding an action
+cannot cause that — a surface built against 4 never sends `progress`, and one
+that does is talking to an engine that has it. *Removing* an action can, which is
+what 4 was for.
 
 `launch` and `close` were the eighth and ninth until protocol 4. They are parked
 with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
@@ -113,26 +121,88 @@ Payload: none. Data:
 }
 ```
 
-A session:
+A session — every field of one roster row, because a surface that had to ask a
+second question to render one line would be a second reader of the same Session:
 
 ```json
 {"target": {"agent": "claude", "session_id": "abc", "pid": 1234},
  "label": "gpt-voicecoding · build the control plane",
- "workspace": "/Users/…", "registered_at": 1787222000.0,
- "state": "live", "reply_window": "closed"}
+ "name": "workspace-claude-ed",
+ "workspace": "/Users/…", "first_seen": 1787222000.0,
+ "lifecycle": "live", "state": "idle",
+ "waiting_for": {"kind": "question", "caught_up": true, "prompt": "Which base?",
+                 "options": [{"text": "main", "recommended": true}],
+                 "recommendation": "main", "tool_name": null, "detail": null,
+                 "approval_id": null},
+ "progress": {"recent": [{"role": "user", "text": "do the thing"},
+                         {"role": "assistant", "text": "done"}],
+              "truncated": false, "read_at": "2026-08-26T02:44:39+00:00"},
+ "last_activity": "2026-08-26T02:44:39+00:00",
+ "child": {"kind": "main", "parent": null},
+ "reply_window": "open"}
 ```
 
 `target` is the **address**; `label` is for speech and for matching. A label
 never crosses the wire as an address — resolving one to a target is Bridge
 Core's router, on the way in from the Companion Channel.
 
-`registered_at` is wall-clock seconds: it is written to disk and read back by the
-next engine.
+`first_seen` is wall-clock seconds, and it is when *this engine* first saw the
+Session — no agent knows it.
+
+`waiting_for` is what a stopped Session stopped on, as structure rather than as a
+rendered sentence. `kind` is one of `none`, `question`, `permission`, `unknown`;
+`unknown` always comes with `caught_up: false`, and means *ask again*, never
+*nothing is happening*.
+
+`progress` is `null` when nobody read it, and an object with an **empty**
+`recent` when it was read and the Session had said nothing — a surface that
+collapses the two reports a working Session as an idle one. Each entry says which
+side spoke it, so `"make it blue"` and `"I made it blue"` cannot read the same.
+It is bounded to the newest 3 entries and 3 KB per row: `truncated` says
+something older was dropped, and entries are dropped whole, never cut.
+
+`last_activity` is separate from `progress` on purpose. A Session can have moved
+without saying anything a reader would show, and this is the field that says so.
+It is `null` when nothing read one.
+
+`reply_window` is derived on the row and rendered here, so no surface re-derives
+it and no two surfaces can disagree about one Session.
 
 ### `sessions`
 
 Payload: none. Data: `{"sessions": [...]}` — the same rows `status` carries, for a
 surface that renders only the roster.
+
+### `progress`
+
+Payload: `{"target": {"agent": "codex", "session_id": "abc", "pid": null}}`. Data:
+`{"session": { … }}` — one roster row, in exactly the shape above.
+
+It is a **read**: it resolves one exact identity, asks that lane and no other,
+and never starts a turn. What it adds over the same row in `sessions` is *when* —
+the Session is read at the moment it was asked about, rather than at the last
+discovery. A Session mid-turn is answered here and is deliberately not carried on
+the roster: reading it is the expensive half, and "how far along is it" is the
+question a user asks precisely while it works.
+
+**It refuses rather than answering emptily**, and the four refusals are four
+different facts:
+
+| Code | When |
+| --- | --- |
+| `unknown_session` | No Session by that identity was ever registered here. |
+| `stale_session` | The identity names a different process now, **or** the Session has ended. The row is not ended by this action: `sessions` is the whole-lane reading and is the only thing that ends one. |
+| `refused` | The lane could not be read at all. The message is the lane's own words, and the row stands exactly as the roster last saw it: not being able to look is not a sighting. |
+| `refused` | Nothing could read how far it has got — a Codex Session the shared daemon does not hold, or one whose first turn has written no record yet. |
+
+The last one is the line this whole action is drawn around. A Session that *was*
+read and had said nothing answers normally, with an empty `recent`; a Session
+nobody could read is a refusal. A surface handed the second as the first would
+render a working Session as an idle one.
+
+A Session the Codex daemon does not hold therefore never gets an invented
+reading. Its rollout is on disk and reading it would be a second source answering
+the same question with worse evidence.
 
 ### `switch`
 
@@ -219,6 +289,7 @@ by one parser, so neither can grow a command the other lacks.
 status
 switch <name> on|off
 sessions
+progress <agent>:<session id>[:<pid>]
 live
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
 approve <approval id> allow|deny|ask

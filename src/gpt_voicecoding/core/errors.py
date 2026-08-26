@@ -77,6 +77,34 @@ class ChildSessionError(SessionError):
         self.parent = parent
 
 
+class ProgressUnavailable(SessionError):
+    """Nothing on this machine can say how far that Session has got.
+
+    The honest error #76 asks the `progress` verb for, and it is a refusal rather
+    than an answer carrying no progress for the reason the whole ticket turns on:
+    "nobody could read it" and "it has said nothing" are different facts, and a
+    surface handed the first as the second reports a working Session as an idle
+    one. A Session that *was* read and had said nothing comes back as an ordinary
+    answer with an empty reading.
+
+    Two ways to arrive here, and neither may be papered over: a Codex Session the
+    shared daemon does not hold — its rollout is on disk and reading it would be
+    a second source answering with worse evidence (port table P6, P13) — and a
+    Session whose first turn has not written a record yet (#73).
+
+    **Ported** from the reference implementation, which rejected the same verb
+    with the source's own reason rather than falling back to a terminal, a screen
+    or the other agent (`legacy@1d32845:bridge/daemon.py:2222-2246`).
+    """
+
+    def __init__(self, target: SessionTarget) -> None:
+        super().__init__(
+            f"nothing has read how far {target} has got: this engine reads a Session's "
+            "own record and never infers one"
+        )
+        self.target = target
+
+
 class DuplicateSessionError(SessionError):
     """That identity is already registered. Registering it again would split truth."""
 
@@ -167,3 +195,30 @@ class VoiceInstructionsMissing(BridgeCoreError):
 
     def __init__(self) -> None:
         super().__init__("this engine generated no voice instructions, so it cannot start a call")
+
+
+class LaneUnreadable(BridgeCoreError):
+    """A lane could not be read at all, so nothing can be said about its Sessions.
+
+    The hub's translation of the Agent seam's `LaneUnavailable`, which is the one
+    thing on that seam that raises. It is deliberately *not* an answer with empty
+    progress: "I could not look" and "it has said nothing" are different facts,
+    and a surface that rendered the first as the second would report a working
+    Session as an idle one every time `claude` fell off the PATH.
+
+    It carries the lane's own words rather than a rephrasing, and the row it was
+    asked about is left exactly as the roster last saw it (`seams/agent.py`,
+    `LaneUnavailable`).
+
+    **Ported** from the reference implementation's own rule for the same verb:
+    a progress source that could not answer produced a rejection carrying its
+    reason, and never a fallback to a terminal, a screen or the other agent
+    (`legacy@1d32845:bridge/daemon.py:2222-2246`). **Adapted**: legacy's
+    rejection was a reply document built by the daemon, and this is a refusal the
+    control plane maps onto the closed error set.
+    """
+
+    def __init__(self, agent: str, reason: str) -> None:
+        super().__init__(f"the {agent} lane could not be read: {reason}")
+        self.agent = agent
+        self.reason = reason

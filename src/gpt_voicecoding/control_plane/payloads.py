@@ -185,7 +185,10 @@ def progress_document(progress: Progress | None) -> dict[str, Any] | None:
     if progress is None:
         return None
     return {
-        "recent": list(progress.recent),
+        # Each entry says which side spoke it. Carried rather than inferred: a
+        # roster of bare strings reads "make it blue" and "I made it blue" the
+        # same way, and every surface would have to guess (#76).
+        "recent": [{"role": str(entry.role), "text": entry.text} for entry in progress.recent],
         "truncated": progress.truncated,
         "read_at": progress.read_at.isoformat() if progress.read_at is not None else None,
     }

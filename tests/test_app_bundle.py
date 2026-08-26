@@ -22,7 +22,7 @@ from app_bundle import run as bundle_run
 from app_bundle.plan import BuildPlan
 
 from gpt_voicecoding import config
-from gpt_voicecoding.seams.control_plane import PROTOCOL_VERSION
+from gpt_voicecoding.seams.control_plane import PROTOCOL_VERSION, Action
 
 #: What every binary in a current arm64 tree actually starts with.
 MACH_O = b"\xcf\xfa\xed\xfe"
@@ -414,6 +414,21 @@ class TestTheThingsThatMustAgree:
 
         assert declaration is not None, "Wire.swift no longer declares the supported protocol"
         assert int(declaration["version"]) == PROTOCOL_VERSION
+
+    def test_the_shell_and_the_engine_have_the_same_action_set(self) -> None:
+        """A closed set spelled in two languages is two sets until something says so.
+
+        The engine's set is the contract (`docs/control-plane.md`); the shell
+        names each one rather than composing strings, so it can offer an action
+        this engine does not have, or miss one it does, and nothing would fail
+        until a person clicked. That is `#47`'s shape, one file over.
+        """
+        swift = (inputs.SHELL_PACKAGE / "Sources/ShellCore/Wire.swift").read_text()
+        body = re.search(r"public enum Action: String.*?\n\}", swift, re.DOTALL)
+
+        assert body is not None, "Wire.swift no longer declares the action set as one enum"
+        named = set(re.findall(r"^\s*case `?(?P<name>\w+)`?\s*$", body[0], re.MULTILINE))
+        assert named == {str(action) for action in Action}
 
     def test_the_shell_and_the_engine_name_the_same_default_socket_path(self) -> None:
         """The Swift shell and Python engine must meet at the same default address.

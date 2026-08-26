@@ -29,6 +29,7 @@ USAGE: dict[Action, str] = {
     Action.STATUS: "status",
     Action.SWITCH: "switch <name> on|off",
     Action.SESSIONS: "sessions",
+    Action.PROGRESS: "progress <agent>:<session id>[:<pid>]",
     Action.LIVE: "live",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
     Action.APPROVE: "approve <approval id> allow|deny|ask",
@@ -69,6 +70,9 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
         case Action.APPROVE:
             approval_id, verdict = _exactly(action, arguments, 2)
             return {"approval_id": approval_id, "verdict": verdict}
+        case Action.PROGRESS:
+            (address,) = _exactly(action, arguments, 1)
+            return {"target": parse_address(address)}
     raise CommandError(f"no command called {action!r}")  # unreachable: the set is closed
 
 
@@ -145,6 +149,8 @@ def render(reply: Reply) -> str:
             return "\n".join(_status_lines(data))
         case Action.SESSIONS:
             return "\n".join(_roster_lines(data["sessions"]))
+        case Action.PROGRESS:
+            return "\n".join(_progress_lines(data["session"]))
         case Action.SWITCH:
             was = "on" if data["previous"] else "off"
             return f"{data['name']} is {'on' if data['on'] else 'off'} (was {was})"
@@ -190,6 +196,31 @@ def _roster_lines(sessions: object) -> list[str]:
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions
     ]
+
+
+def _progress_lines(session: object) -> list[str]:
+    """One Session's own words, newest last, and when they were read.
+
+    `read_at` is said out loud rather than left implicit: a progress line's whole
+    meaning is when it was true, and a surface that printed it bare would let a
+    reading taken before a five-minute silence read as one taken just now.
+    """
+    assert isinstance(session, dict)
+    #: The same one-line summary the roster prints for this Session, without the
+    #: `sessions:` heading a list of them carries — so the two surfaces cannot
+    #: describe one Session two ways.
+    lines = _roster_lines([session])[1:]
+    progress = session["progress"]
+    if progress is None:
+        return [*lines, "  progress: not read"]
+    lines.append(f"  last activity: {session['last_activity'] or 'not read'}")
+    if progress["truncated"]:
+        lines.append("  (older entries dropped)")
+    lines.extend(f"  {entry['role']}: {entry['text']}" for entry in progress["recent"])
+    if not progress["recent"]:
+        lines.append("  nothing said yet")
+    lines.append(f"  read at {progress['read_at']}")
+    return lines
 
 
 def _lane_lines(lanes: object) -> list[str]:

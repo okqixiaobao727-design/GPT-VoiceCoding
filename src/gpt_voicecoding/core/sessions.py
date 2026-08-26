@@ -246,7 +246,7 @@ class SessionRegistry:
                     row.target,
                 )
                 continue
-            seen.add(self._admit(row, now=now).target)
+            seen.add(self.observed_one(row, now=now).target)
 
         ended: list[SessionTarget] = []
         for held in [row for row in self._of(agent) if row.target not in seen]:
@@ -274,8 +274,16 @@ class SessionRegistry:
         """
         return dict(self._lane_degradations)
 
-    def _admit(self, row: SessionInspection, *, now: float) -> Session:
-        """Fold one freshly-read row into the roster, in place where it belongs."""
+    def observed_one(self, row: SessionInspection, *, now: float) -> Session:
+        """Fold one freshly-read row into the roster, in place where it belongs.
+
+        Public because the per-target read is a caller too (#76's `progress`
+        verb): it looked at one Session and at no others, so it may correct that
+        Session's entry and may conclude nothing about the rest. **`observe` is
+        the whole-lane verb and stays the only one that ends a row** — a verb
+        that ended rows because it was asked about one Session would end the
+        whole lane every time somebody asked about one of its members.
+        """
         held = self._same_row(row)
         if held is None:
             fresh = session_from(row, first_seen=now)

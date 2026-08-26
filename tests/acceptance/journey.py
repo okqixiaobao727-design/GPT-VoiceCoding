@@ -461,11 +461,21 @@ class Walk:
         it does not make the Session work. The second is checked the only way it
         can be from outside — the agent's own record does not grow across the
         read, and the roster's state does not leave `idle`.
+
+        **Both surfaces are exercised, because #76 built both and they are one
+        reading.** `bridgectl progress <target>` is the verb the ticket names,
+        and it reads the Session *now*; the roster row carries the same fields so
+        a Control Panel can render them without asking a second question. The
+        step fails if either is absent, and fails if they disagree.
         """
         if self.address is None:
             raise LaneBlocked("no Session to read progress from")
         before_size = self._record_size()
         before_state = self._roster_field("state")
+
+        answer = self.bridgectl("progress", self.address)
+        if not answer.ok:
+            raise StepFailed(f"`bridgectl progress {self.address}` refused: {answer.text}")
 
         row = self._roster_row()
         if row is None:
@@ -479,6 +489,17 @@ class Walk:
         reported = row["progress"]
         if not reported or not (reported.get("recent") if isinstance(reported, dict) else None):
             raise StepFailed(f"progress for {self.address} is {reported!r} after a turn that ran")
+        said = support.flatten(
+            f"{entry.get('role')}: {entry.get('text')}"
+            for entry in reported["recent"]
+            if isinstance(entry, dict)
+        )
+        newest = reported["recent"][-1]
+        if isinstance(newest, dict) and str(newest.get("text", ""))[:40] not in answer.text:
+            raise StepFailed(
+                f"the verb and the roster describe {self.address} differently — "
+                f"`bridgectl progress` said {answer.text[:200]!r} and the row says {said[:200]!r}"
+            )
 
         time.sleep(2.0)
         after_size = self._record_size()
@@ -489,8 +510,9 @@ class Walk:
                 f"{after_size} bytes — that is a turn, and #76 forbids one"
             )
         return (
-            f"progress read without a turn: {support.flatten(reported.get('recent'))[:160]!r}; "
-            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}"
+            f"progress read without a turn, through `bridgectl progress` and the roster row: "
+            f"{said[:160]!r}; record steady at {after_size} bytes; "
+            f"state {before_state!r} → {after_state!r}"
         )
 
     # --- stop notice ------------------------------------------------------

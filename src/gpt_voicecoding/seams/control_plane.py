@@ -38,6 +38,13 @@ from typing import Any
 #: once every seam a hub verb reaches became one configuration requires. A
 #: surface built against 3 would send an action this engine no longer has, so
 #: the disagreement has to be visible before the request is made.
+#:
+#: **Not bumped for `progress` (#76).** A version exists so a surface can tell an
+#: engine that disagrees from one too old to have been asked, and the failure it
+#: guards against is a surface sending something the engine does not have.
+#: Adding an action cannot cause that: a surface built against 4 never sends it,
+#: and one that does is talking to an engine that has it. Removing one can, which
+#: is what 4 was for.
 PROTOCOL_VERSION = 4
 
 #: The longest line either side will read. Generous for a roster, small enough
@@ -59,6 +66,9 @@ class Action(StrEnum):
     SWITCH = "switch"
     #: The Session roster on its own, for a surface that only renders that.
     SESSIONS = "sessions"
+    #: How far along one exact Session is, read now. A status query like every
+    #: other one here: it never starts a turn and never touches the Session.
+    PROGRESS = "progress"
     #: The Live Toggle: end the call the system owns, or start one if none is up.
     LIVE = "live"
     #: An Answer Relay — the user's own words, for one exact Session.

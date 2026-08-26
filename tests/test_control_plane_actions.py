@@ -14,12 +14,16 @@ words, under a code a surface can branch on.
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
+from gpt_voicecoding.adapters.agent._progress import encoded_size
 from gpt_voicecoding.control_plane.actions import ControlPlane
+from gpt_voicecoding.control_plane.payloads import progress_document
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
@@ -29,8 +33,17 @@ from gpt_voicecoding.core.verification import SeamLoad
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     AwaitingApproval,
+    ChildClassification,
+    ChildKind,
+    LaneDiscovery,
+    LaneUnavailable,
+    Progress,
+    ProgressEntry,
+    ProgressRole,
     ReplyWindow,
     ReplyWindowChanged,
+    SessionInspection,
+    SessionState,
 )
 from gpt_voicecoding.seams.control_plane import Action, ErrorCode, Reply, Request
 from gpt_voicecoding.seams.identity import AgentKind, SessionLabel, SessionTarget
@@ -42,6 +55,9 @@ CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="claude-abc", pid=1234)
 SECOND_CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="def")
 CODEX_ADDRESS = {"agent": "codex", "session_id": "abc", "pid": None}
+
+#: One fixed moment, so a rendered reading is compared against a value and not a clock.
+READ_AT = datetime(2026, 8, 26, 2, 44, 39, tzinfo=UTC)
 
 
 class Surface:
@@ -94,6 +110,19 @@ class TestWithEverySwitchOff:
     def test_every_action_succeeds_with_duty_voice_and_message_off(self) -> None:
         surface = Surface(duty=False)
         surface.register()
+        # `progress` needs something to have been read, or it refuses for a real
+        # reason — which is not this test's subject. The subject is that no
+        # *switch* refuses anything, so the lane is given a reading to answer.
+        surface.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.IDLE,
+                    progress=Progress(read_at=READ_AT),
+                ),
+            )
+        )
         asyncio.run(
             surface.core.approvals.opened(
                 ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
@@ -104,6 +133,7 @@ class TestWithEverySwitchOff:
             Action.STATUS: surface.ask(Action.STATUS),
             Action.SWITCH: surface.ask(Action.SWITCH, name="duty", on=False),
             Action.SESSIONS: surface.ask(Action.SESSIONS),
+            Action.PROGRESS: surface.ask(Action.PROGRESS, target=CODEX_ADDRESS),
             Action.LIVE: surface.ask(Action.LIVE),
             Action.RELAY: surface.ask(Action.RELAY, target=CODEX_ADDRESS, text="carry on"),
             Action.APPROVE: surface.ask(Action.APPROVE, approval_id="a1", verdict="allow"),
@@ -283,3 +313,202 @@ class TestTheCommandSetIsOne:
 def test_every_action_is_dispatchable(action: Action) -> None:
     """A closed action set with a handler missing is a wire that lies."""
     assert action in ControlPlane(Surface().core).handlers
+
+
+class TestProgress:
+    """#76's verb: one exact Session, read now, and never a turn."""
+
+    def stopped(self, *, said: str = "done") -> LaneDiscovery:
+        return LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.IDLE,
+                    progress=Progress(
+                        recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text=said),),
+                        truncated=True,
+                        read_at=READ_AT,
+                    ),
+                    last_activity=READ_AT,
+                ),
+            )
+        )
+
+    def test_one_session_is_read_now_and_rendered_as_a_roster_row(self) -> None:
+        """The same document `sessions` renders: a surface learns no second shape."""
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = self.stopped()
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.ok
+        session = reply.data["session"]
+        assert session["target"] == CODEX_ADDRESS
+        assert session["progress"] == {
+            "recent": [{"role": "assistant", "text": "done"}],
+            "truncated": True,
+            "read_at": READ_AT.isoformat(),
+        }
+        assert session["last_activity"] == READ_AT.isoformat()
+
+    def test_it_asks_the_lane_rather_than_answering_from_the_roster(self) -> None:
+        """A cached answer would make the verb no fresher than the tick beside it."""
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = self.stopped()
+
+        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert surface.agent.inspections == [CODEX]
+
+    def test_the_reading_becomes_the_rosters_truth(self) -> None:
+        """Asking for progress then asking for status cannot say two things."""
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = self.stopped(said="halfway")
+
+        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        roster = surface.ask(Action.SESSIONS).data["sessions"]
+
+        assert roster[0]["progress"]["recent"] == [{"role": "assistant", "text": "halfway"}]
+
+    def test_it_ends_nothing_it_did_not_look_at(self) -> None:
+        """A verb asked about one Session concludes nothing about the others."""
+        surface = Surface()
+        surface.register()
+        surface.register(SECOND_CODEX)
+        surface.agent.discovery = self.stopped()
+
+        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert len(surface.ask(Action.SESSIONS).data["sessions"]) == 2
+
+    def test_a_session_nobody_registered_is_refused_by_identity(self) -> None:
+        surface = Surface()
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.UNKNOWN_SESSION
+
+    def test_a_lane_that_could_not_look_refuses_rather_than_saying_nothing_happened(
+        self,
+    ) -> None:
+        """ "I could not look" and "it has said nothing" are different facts."""
+        surface = Surface()
+        surface.register()
+        surface.agent.inspect_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "`codex` is not on PATH" in reply.error.message
+
+    def test_a_lane_that_could_not_look_leaves_the_row_as_it_was(self) -> None:
+        surface = Surface()
+        surface.register()
+        surface.agent.inspect_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
+
+        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert surface.ask(Action.SESSIONS).data["sessions"][0]["lifecycle"] == "live"
+
+    def test_a_session_with_no_readable_progress_refuses_rather_than_says_nothing(
+        self,
+    ) -> None:
+        """An unattached Codex row, or one whose first turn wrote no record (#73).
+
+        The refusal is #76's "honest error for an unattached or ended row": a
+        surface handed a successful reply carrying no progress would render a
+        Session nobody could read as one that has said nothing.
+        """
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = LaneDiscovery(
+            rows=(SessionInspection(target=CODEX, workspace=WORKSPACE, state=SessionState.IDLE),)
+        )
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "never infers one" in reply.error.message
+
+    def test_a_session_read_and_found_silent_answers_rather_than_refuses(self) -> None:
+        """The other side of that line, and the whole reason it is drawn."""
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.IDLE,
+                    progress=Progress(read_at=READ_AT),
+                ),
+            )
+        )
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.ok
+        assert reply.data["session"]["progress"]["recent"] == []
+
+    def test_a_session_that_has_ended_is_a_stale_target_not_an_empty_answer(self) -> None:
+        """#76's other honest error."""
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = LaneDiscovery()  # a lane that looked and found nothing
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.STALE_SESSION
+
+    def test_it_does_not_end_the_row_itself(self) -> None:
+        """Ending a row is `observe`'s, and only `observe`'s.
+
+        The value an `inspect` answers for a Session it could not find carries no
+        workspace and no name, so folding it into the roster would strip the very
+        fields a surface needs to say what happened to it. The next discovery
+        ends it properly, within one cadence.
+        """
+        surface = Surface()
+        held = surface.register()
+        surface.agent.discovery = LaneDiscovery()
+
+        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert surface.state.sessions.all() == (held,)
+
+    def test_a_child_process_is_refused_before_any_lane_is_touched(self) -> None:
+        """Seen, never spoken to — and never asked on its own behalf either (#68)."""
+        surface = Surface()
+        surface.state.sessions.register(
+            Session(
+                target=CODEX,
+                workspace=WORKSPACE,
+                first_seen=0.0,
+                child=ChildClassification(kind=ChildKind.CHILD, parent=SECOND_CODEX),
+            )
+        )
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert surface.agent.inspections == []
+
+    def test_the_budget_is_measured_on_the_document_that_travels(self) -> None:
+        """`_progress.encoded_size` and `progress_document` are one shape (#47's lesson)."""
+        entries = (
+            ProgressEntry(role=ProgressRole.USER, text="do the thing"),
+            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
+        )
+        rendered = progress_document(Progress(recent=entries))
+
+        assert encoded_size(entries) == len(
+            json.dumps(rendered["recent"], ensure_ascii=False).encode("utf-8")
+        )

@@ -29,11 +29,23 @@ class TestTheActionSet:
             "status",
             "switch",
             "sessions",
+            "progress",
             "live",
             "relay",
             "approve",
             "verify",
         }
+
+    def test_adding_an_action_did_not_move_the_protocol_version(self) -> None:
+        """`progress` is additive, and the version guards the other direction (#76).
+
+        A version exists so a surface can tell an engine that disagrees from one
+        too old to have been asked, and what it guards against is a surface
+        sending something the engine does not have. A surface built against 4
+        never sends `progress`; one that does is talking to an engine that has
+        it. Removing an action can strand a surface, which is what 4 was for.
+        """
+        assert PROTOCOL_VERSION == 4
 
     def test_launching_and_closing_are_not_actions_this_engine_has(self) -> None:
         """Parked with the launcher (#72), and their absence is asserted, not assumed.

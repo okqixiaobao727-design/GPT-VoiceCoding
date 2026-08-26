@@ -35,7 +35,13 @@ from dataclasses import dataclass
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
-from gpt_voicecoding.core.errors import BridgeCoreError, UnknownRelayError
+from gpt_voicecoding.core.errors import (
+    BridgeCoreError,
+    LaneUnreadable,
+    ProgressUnavailable,
+    StaleSessionError,
+    UnknownRelayError,
+)
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
@@ -60,11 +66,13 @@ from gpt_voicecoding.seams.agent import (
     AgentAdapter,
     ApprovalVerdict,
     AwaitingApproval,
+    LaneUnavailable,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionLifecycle,
     SessionState,
     SessionStopped,
     WaitingFor,
@@ -286,6 +294,61 @@ class BridgeCore:
             pending_relays=self._state.relays.pending(),
             pending_approvals=self.approvals.pending(),
         )
+
+    async def progress(self, target: SessionTarget) -> Session:
+        """How far along one exact Session is, read now. Never starts a turn.
+
+        A hub verb, and a *read*: it resolves one identity, asks that lane and
+        no other, and returns the same `Session` row `status` renders. The
+        reference implementation's own rule, ported —
+        `legacy@1d32845:bridge/daemon.py:2202-2271` resolved one exact registered
+        identity, asked only that agent's own authority, and never fell back to
+        another lane, a terminal or a screen when its source could not answer.
+
+        **It is not a Relay and it costs no turn.** The router says so of the
+        whole class (`core/router.py:31-32`) and the seam keeps it true:
+        `inspect` reads what the agent has already written down.
+
+        **Three more refusals, and each is a different fact** — #76 asks for an
+        honest error rather than an answer that says nothing:
+
+        - *The lane could not be read.* `LaneUnreadable`, carrying the lane's own
+          words. The roster's row is left exactly as it stood: not being able to
+          look is not a sighting.
+        - *The Session has ended.* `StaleSessionError`. The row is **not** ended
+          here: `SessionRegistry.observe` is the one component that ends rows,
+          and the value an `inspect` returns for a Session it could not find
+          carries no workspace and no name — folding it in would strip the very
+          fields a surface needs to say what happened to it. The next discovery
+          ends it properly, within one cadence.
+        - *Nothing could read how far it has got.* `ProgressUnavailable` — an
+          unattached Codex Session, or one whose first turn has written no record
+          yet. A Session that *was* read and had said nothing is not this: it
+          answers normally, with an empty reading.
+
+        Two further refusals are the resolver's and are not restated here — an
+        identity nobody registered, and a Child Process, which is seen and never
+        spoken to (#68).
+
+        Whatever is read is folded back into the roster before it is answered, so
+        a surface that asks for progress and then asks for `status` cannot be
+        told two different things about one Session.
+        """
+        session = self._state.sessions.resolve(target)
+        adapter = self._agents.get(target.agent)
+        if adapter is None:
+            raise LaneUnreadable(str(target.agent), "this engine has no adapter for that agent")
+        try:
+            row = await adapter.inspect(session.target)
+        except LaneUnavailable as unread:
+            raise LaneUnreadable(str(unread.agent), unread.reason) from None
+
+        if row.lifecycle is not SessionLifecycle.LIVE:
+            raise StaleSessionError(target, reason=f"that Session is {row.lifecycle}")
+        read = self._state.sessions.observed_one(row, now=self._stamp())
+        if read.progress is None:
+            raise ProgressUnavailable(target)
+        return read
 
     async def flip_switch(self, name: str, on: bool) -> bool:
         """Flip a switch and report the state it held before.
