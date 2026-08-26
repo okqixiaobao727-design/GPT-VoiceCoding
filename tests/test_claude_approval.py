@@ -842,13 +842,33 @@ class TestAQuestionIsNotAPermission:
         assert [option.text for option in waiting.options] == ["Spaces", "Tabs"]
         assert waiting.approval_id == "p-1", "the dialog's own correlator, for #103"
 
-    def test_no_option_is_recommended_because_this_payload_marks_none(self) -> None:
-        """`Option.recommended` has no source here, and order is not a source."""
+    def test_the_session_s_own_mark_on_a_label_is_read_as_one(self) -> None:
+        """`AskUserQuestion` has no recommendation field; the mark is in the label.
+
+        The tool's own instructions tell the model to end that option's label
+        with `(recommended)`, so the payload carries it whenever there is one and
+        reading it is the Session's own words rather than an inference. Advisor,
+        2026-08-26: one parser, one reading — the earlier "always `False` on this
+        route" was written believing the payload could not carry the mark.
+        """
+        waiting = question_from(
+            question_dialog(group("Which base?", "main (recommended)", "develop"))
+        )
+
+        assert waiting is not None
+        assert [(o.text, o.recommended) for o in waiting.options] == [
+            ("main", True),
+            ("develop", False),
+        ]
+        assert waiting.recommendation == "main"
+
+    def test_order_is_never_a_recommendation(self) -> None:
+        """The half of the rule that stands: no mark, no recommendation, ever."""
         waiting = question_from(question_dialog(group("Which base?", "main", "develop")))
 
         assert waiting is not None
-        assert [option.recommended for option in waiting.options] == [False, False]
         assert waiting.recommendation is None
+        assert not any(option.recommended for option in waiting.options)
 
     def test_a_multi_question_call_says_everything_it_asked(self) -> None:
         """One parser of this shape, so the two routes cannot disagree (#75)."""

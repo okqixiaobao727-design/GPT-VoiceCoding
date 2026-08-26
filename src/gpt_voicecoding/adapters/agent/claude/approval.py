@@ -264,9 +264,18 @@ def question_from(payload: Mapping[str, Any]) -> WaitingFor | None:
     second projector here would be two readings of one payload that could
     disagree about what an option is — the thing `stop_analysis.question_in`
     exists to prevent. What this adds is the one field the transcript cannot
-    carry: the dialog's handle. `Option.recommended` therefore comes from #75's
-    label marker, which this payload does not use, and is never inferred from
-    the order the options were written in.
+    carry: the dialog's handle.
+
+    **`Option.recommended` is read, and it is a fact rather than an inference.**
+    `AskUserQuestion` has no recommendation *field* — the tool's own instructions
+    tell the model to put `(recommended)` at the end of that option's label
+    (`stop_analysis.RECOMMENDED_MARKER`), so the mark travels inside the label
+    and this payload carries it whenever the model wrote one. Reading it here is
+    therefore the Session's own words, not a guess, and it is the same reading
+    the roster row gets from the same object — a payload with no marker yields
+    `False` throughout, and the order the options were written in is never
+    consulted on either route. What the user hears and says back is the label
+    without the mark, which is what `WaitingFor.options` carries.
 
     **An unreadable question is still a question**, which is where this parts
     company with the transcript route. There, a call whose input has not

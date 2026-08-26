@@ -1104,7 +1104,6 @@ def _receipts_in(readback: Message, thread_id: str, request_id: str) -> int | No
     return found
 
 
-
 def _dialog_waiting(watched: WatchedThread | None) -> WaitingFor | None:
     """The dialog this adapter is holding for one thread, in the seam's vocabulary.
 
@@ -1132,6 +1131,7 @@ def _dialog_waiting(watched: WatchedThread | None) -> WaitingFor | None:
         approval_id=request.approval_id,
         options=tuple(Option(text=one) for one in request.options),
     )
+
 
 def _failed(request_id: RequestId, reason: str) -> DeliveryReceipt:
     return DeliveryReceipt(request_id=request_id, outcome=Delivery.FAILED, reason=reason)
