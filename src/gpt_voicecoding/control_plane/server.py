@@ -34,9 +34,11 @@ the acceptance run after it.
 
 The stop is therefore a **state this server enters**, not a wait on peers: a
 handler parked on the *next* request returns at once, and a handler *mid-reply*
-finishes the reply it is writing and then finds the same state. Nothing is
-truncated and nothing is waited out, so no grace period is needed and none is
-written here.
+finishes the reply it is writing and then finds the same state. No reply is cut
+in half and nothing is waited out, so no grace period is needed and none is
+written here. A request whose bytes had not yet reached the reader when the stop
+landed is the one thing that does not survive — it gets EOF rather than an
+answer, which `_next_line` explains.
 
 **Adapted from legacy, which never had this bug and is worth saying why.**
 `legacy@1d32845:bridge/daemon.py:472-498` served one request per connection and
@@ -210,10 +212,15 @@ class ControlPlaneServer:
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """One connection: read lines until the peer goes away, or this server stops."""
         self._live.add(writer)
+        # One waiter for the life of the connection, not one per request.
+        # `asyncio.wait` does not consume a completed future, so this can be
+        # raced against every read in turn — and the alternative appended and
+        # removed an `Event._waiters` entry on each one.
+        stopping = asyncio.ensure_future(self._stopping.wait())
         try:
             while True:
                 try:
-                    line = await self._next_line(reader)
+                    line = await self._next_line(reader, stopping)
                 except asyncio.IncompleteReadError:
                     return  # the peer closed, with or without a trailing line
                 except (asyncio.LimitOverrunError, ValueError):
@@ -242,10 +249,13 @@ class ControlPlaneServer:
         except (ConnectionResetError, BrokenPipeError):
             _log.info("a control-plane surface went away mid-exchange")
         finally:
+            stopping.cancel()
             self._live.discard(writer)
             writer.close()
 
-    async def _next_line(self, reader: asyncio.StreamReader) -> bytes | None:
+    async def _next_line(
+        self, reader: asyncio.StreamReader, stopping: asyncio.Future[bool]
+    ) -> bytes | None:
         """The next request on this connection, or `None` once the server stops.
 
         The read is raced against the stop rather than interrupted by it, so the
@@ -254,17 +264,26 @@ class ControlPlaneServer:
         or somewhere below, writing a reply, which finishes and arrives here
         next. Whatever `readuntil` raised is raised here, so one bad line still
         costs one request.
+
+        **A request already on the wire when the stop lands is answered with
+        EOF, not with a refusal.** If the bytes have not reached the reader yet,
+        the race is decided in the stop's favour and the peer sees the
+        connection close mid-flight — which `client.ask` reports as "the engine
+        closed without replying". That is honest and it is the ordinary shape of
+        racing a shutdown, but it is not "nothing is truncated", so it is said
+        here rather than left for somebody to find. Nothing is *consumed*:
+        `readuntil` removes from its buffer only once it has found the
+        separator, so a cancelled read costs no bytes.
         """
         reading = asyncio.ensure_future(reader.readuntil(b"\n"))
-        stopping = asyncio.ensure_future(self._stopping.wait())
         abandoned = False
         try:
             await asyncio.wait({reading, stopping}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            # Both are cancelled here rather than after, because this `await`
-            # can also end by *this* handler being cancelled — and a read left
-            # pending then outlives the loop that owns it.
-            stopping.cancel()
+            # Cancelled here rather than after, because this `await` can also end
+            # by *this* handler being cancelled — and a read left pending then
+            # outlives the loop that owns it. `stopping` belongs to `_serve`,
+            # whose own `finally` retires it.
             if not reading.done():
                 reading.cancel()
                 abandoned = True

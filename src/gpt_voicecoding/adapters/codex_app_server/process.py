@@ -44,12 +44,23 @@ together, and there is no signal this can send that leaves the binary holding
 `codex-app-server.sock`. A leaked one refuses the next engine outright — that is
 the failure #96 was raised for, and the socket claim is right to refuse it.
 
+**The session costs something, and it is not nothing.** Sharing the engine's
+process group meant Ctrl-C, a closed terminal's SIGHUP and any `kill -- -PGID`
+reached the app-server directly, without this code running at all. Its own
+session has none of that: if the engine is SIGKILLed — the very case #96
+observed — nothing reaches the app-server any more. The trade is deliberate.
+The backstop only ever worked for signals aimed at a *group*, which is not how
+the menu-bar shell, launchd or the acceptance harness stop this engine; what it
+buys is that every orderly stop now reaches the whole tree instead of a shim
+that may not forward. An orderly stop is the case that happens.
+
 **New, not ported.** Legacy owned an app-server too and stopped it with the same
 two signals (`legacy@1d32845:bridge/codex.py:640-666`), but it signalled the
-process alone — there is no `killpg`, no `getpgid` and no `start_new_session`
-anywhere in that tree, and its own spawn (`bridge/codex.py:290-300`) takes no
-session either. What it had instead was ownership re-proved before every signal,
-against pid reuse; this holds a `Popen` and cannot be fooled that way. The
+process alone — nothing under `legacy@1d32845:bridge/` calls `killpg` or
+`getpgid`, and its own spawn (`bridge/codex.py:290-300`) takes no session
+either. What it had instead was ownership re-proved before every signal,
+against pid reuse; this records the group at spawn, and a group id is released
+only when the group empties, so it cannot be fooled that way either. The
 group-signalling half has no legacy analogue and is written fresh.
 """
 
@@ -91,11 +102,11 @@ REALTIME_FEATURE = "realtime_conversation"
 
 #: How long the app-server gets after each signal on the way out. Deliberately
 #: **not** `startup_timeout_seconds`, which is what this used to reach for: that
-#: is thirty seconds, it is spent twice here, and the engine's whole shutdown is
-#: given twelve (`engine/runner.py`) inside a grace of twenty
-#: (`tests/acceptance/support.py`). A local process that has been signalled and
-#: is coming back does so in well under a second; one that has not moved in five
-#: is not going to, and waiting longer only converts a stop into a SIGKILL.
+#: is thirty seconds, and the engine's whole shutdown is bounded
+#: (`engine/runner.py` § SHUTDOWN_SECONDS) inside a grace of twenty
+#: (`tests/acceptance/support.py:455`). A local process that has been signalled
+#: and is coming back does so in well under a second; one that has not moved in
+#: five is not going to, and waiting longer only converts a stop into a SIGKILL.
 #:
 #: **Ported.** Legacy had exactly this constant and exactly this reasoning —
 #: `catalog_termination_timeout_seconds`, spent "after SIGTERM and again after
@@ -106,6 +117,15 @@ REALTIME_FEATURE = "realtime_conversation"
 #: `bridge/codex.py:640-666`). The rewrite dropped it and reached for the
 #: startup number instead, which is how a stop came to cost up to a minute.
 STOP_TIMEOUT_SECONDS = 5.0
+
+#: And how long after the SIGKILL. Much shorter, because SIGKILL cannot be
+#: ignored, forwarded or handled: a process that has not gone is in
+#: uninterruptible sleep, which no amount of waiting here shortens. This was
+#: `STOP_TIMEOUT_SECONDS` spent a second time, which put ten seconds into a
+#: shutdown budget that had not counted them and could cancel before the
+#: SIGKILL was ever sent — the leak this ticket exists to close, reintroduced
+#: by its own fix.
+KILL_TIMEOUT_SECONDS = 1.0
 
 _log = logging.getLogger(__name__)
 
@@ -278,6 +298,10 @@ class OwnedAppServer:
         self._log_path = log_path
         self._version = version
         self._process: subprocess.Popen[bytes] | None = None
+        #: The process group `_spawn` created, recorded while the leader is
+        #: certainly alive. `aclose` signals this rather than the leader,
+        #: because the leader may die before the child that holds the socket.
+        self._group: int | None = None
         self._log: IO[bytes] | None = None
         self._owns_socket = False
         self._connection: AppServerConnection | None = None
@@ -364,15 +388,26 @@ class OwnedAppServer:
                 await connection.aclose()
 
         process, self._process = self._process, None
-        if process is not None and process.poll() is None:
-            _signal_the_group(process, signal.SIGTERM)
-            if not await self._waited_for(process):
+        group, self._group = self._group, None
+        if group is not None:
+            # **Signalled on the group's own account, not on the leader's.** The
+            # leader is a shim whose child is the process that binds the socket,
+            # and a shim can die first — crash, OOM, or simply be reaped by an
+            # earlier `poll()`. Gating this on the leader still being alive is
+            # how the tree that matters ends up signalled with nothing.
+            #
+            # Safe after the leader is gone: a process-group id is released only
+            # when the group is *empty*, so as long as anything this engine
+            # spawned is still in it the id cannot have been reused. An empty
+            # group answers ESRCH and is caught.
+            _signal_the_group(group, signal.SIGTERM)
+            if not await self._waited_for(group, process, STOP_TIMEOUT_SECONDS):
                 _log.warning(
                     "the codex app-server did not stop within %.0fs; killing its process group",
                     STOP_TIMEOUT_SECONDS,
                 )
-                _signal_the_group(process, signal.SIGKILL)
-                if not await self._waited_for(process):
+                _signal_the_group(group, signal.SIGKILL)
+                if not await self._waited_for(group, process, KILL_TIMEOUT_SECONDS):
                     # Said out loud because of what it costs: whatever is still
                     # bound to the socket refuses the next engine's start.
                     _log.error(
@@ -386,8 +421,28 @@ class OwnedAppServer:
                 log.close()
 
         if self._owns_socket:
-            self._socket_path.unlink(missing_ok=True)
+            self._unlink_if_free()
             self._owns_socket = False
+
+    def _unlink_if_free(self) -> None:
+        """Take the socket file back, unless something is still answering on it.
+
+        **Never unlink a socket somebody is listening on.** The file is the only
+        thing standing between an orphan and the next engine: `_claim_socket_path`
+        refuses a path something answers on, and that refusal is what turned #96
+        into a stopped acceptance run rather than a second app-server quietly
+        binding a fresh inode at the same name while the first one kept the old
+        one. Removing it here would be deleting the evidence the sentence
+        immediately above has just finished writing down.
+        """
+        if _something_listens(self._socket_path):
+            _log.error(
+                "leaving %s in place: something is still listening on it, and the file "
+                "is what makes the next engine refuse to start rather than shadow it",
+                self._socket_path,
+            )
+            return
+        self._socket_path.unlink(missing_ok=True)
 
     def _spawn(self, executable: str) -> None:
         """Start the process, with its output going somewhere it cannot fill a pipe."""
@@ -418,6 +473,11 @@ class OwnedAppServer:
             # that ends up holding the socket is its child.
             start_new_session=True,
         )
+        # Recorded now, while the leader is certainly alive, because `aclose`
+        # must be able to reach the group after the leader has gone — and
+        # `getpgid` of a reaped pid either fails or answers about somebody else.
+        # `start_new_session` makes this equal to the child's own pid.
+        self._group = os.getpgid(self._process.pid)
         self._owns_socket = True
 
     async def _await_socket(self) -> None:
@@ -453,20 +513,39 @@ class OwnedAppServer:
             raise AppServerError(f"a live process is already listening on {path}")
         path.unlink(missing_ok=True)
 
-    async def _waited_for(self, process: subprocess.Popen[bytes]) -> bool:
-        """Wait for a process to go, without blocking the whole event loop.
+    async def _waited_for(
+        self, group: int, process: subprocess.Popen[bytes] | None, seconds: float
+    ) -> bool:
+        """Wait for a whole process group to empty, without blocking the loop.
 
-        Held to `STOP_TIMEOUT_SECONDS` rather than to how long a *start* may
-        take: they were the same number, which put up to a minute inside a
-        shutdown that has ten seconds (#96).
+        The *group*, not the leader: the leader is a shim and the process this
+        engine actually needs gone is its child, so a leader that exits first
+        would otherwise read as "stopped" while the socket is still held.
+
+        **The leader is reaped on every pass, and that is not housekeeping — it
+        is what makes this terminate.** A dead child that nobody has waited on is
+        a zombie, a zombie is still a member of its process group, and
+        `_group_lives` asks the group. Reaping only afterwards made every stop
+        spend its entire budget and then send a pointless SIGKILL: measured at
+        6.03s for an app-server that had in fact gone in milliseconds. Nothing
+        reaps the *grandchild* here and nothing needs to — it reparents to
+        launchd, which does.
+
+        Held to its own budget rather than to how long a *start* may take. Those
+        were the same number, which put up to a minute inside a shutdown that
+        has far less (#96), and legacy had already learnt this — see
+        `STOP_TIMEOUT_SECONDS`.
         """
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + STOP_TIMEOUT_SECONDS
-        while loop.time() < deadline:
-            if process.poll() is not None:
+        deadline = loop.time() + seconds
+        while True:
+            if process is not None:
+                process.poll()
+            if not _group_lives(group):
                 return True
+            if loop.time() >= deadline:
+                return False
             await asyncio.sleep(0.05)
-        return process.poll() is not None
 
 
 def _something_listens(path: Path) -> bool:
@@ -485,7 +564,7 @@ def _something_listens(path: Path) -> bool:
         probe.close()
 
 
-def _signal_the_group(process: subprocess.Popen[bytes], number: int) -> None:
+def _signal_the_group(group: int, number: int) -> None:
     """Signal the whole tree this engine spawned, not only the process it holds.
 
     The spawn asked for its own session, so the child is a process-group leader
@@ -493,18 +572,26 @@ def _signal_the_group(process: subprocess.Popen[bytes], number: int) -> None:
     the same reach as signalling the child *plus* whatever the child spawned —
     which on this machine is the process that actually binds the socket (#96).
 
-    Falls back to the child alone rather than raising: a group that has already
-    gone, or one this process may no longer signal, is a stop that is already
-    happening, and `aclose` promises never to raise on the way out.
+    Never raises. A group that is already empty answers `ESRCH`, and an empty
+    group is the outcome this was going to ask for anyway; `aclose` promises not
+    to raise on the way out, and there is nothing here a caller could do.
     """
     try:
-        os.killpg(os.getpgid(process.pid), number)
-        return
-    except (ProcessLookupError, PermissionError, OSError) as ungroupable:
-        _log.info(
-            "could not signal the codex app-server's process group (%s); signalling pid %d alone",
-            ungroupable,
-            process.pid,
-        )
-    with contextlib.suppress(ProcessLookupError, OSError):
-        process.send_signal(number)
+        os.killpg(group, number)
+    except OSError as ungroupable:  # ESRCH when empty, EPERM if it is not ours
+        _log.debug("could not signal process group %d: %s", group, ungroupable)
+
+
+def _group_lives(group: int) -> bool:
+    """Whether anything is left in that process group.
+
+    Signal 0 delivers nothing and only asks the question. `ESRCH` is the answer
+    this is waiting for; anything else means somebody is still there.
+    """
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # it exists and is not ours to signal, which is still "there"
+    return True

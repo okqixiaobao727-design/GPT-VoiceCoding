@@ -89,26 +89,32 @@ from gpt_voicecoding.engine.logfile import own_the_log, strip_environment
 EXIT_OK = 0
 EXIT_REFUSED = 2
 
-#: The whole orderly shutdown's ceiling, and the outer guarantee behind every
-#: bound inside it. Derived rather than chosen, from two directions that have to
-#: meet:
+#: The whole orderly shutdown's ceiling, and the last resort behind every bound
+#: inside it. Derived rather than chosen, from two directions that have to meet:
 #:
 #: - **From above**, whoever stops this engine gives it a finite grace and then
 #:   kills it — twenty seconds for the acceptance harness
-#:   (`tests/acceptance/support.py`), twenty for launchd's default `ExitTimeOut`.
-#:   Overrunning that grace is how #96 lost its `codex app-server`, so this has
-#:   to leave real margin under it rather than sit at it.
-#: - **From below**, the phases each carry their own bound and they add up:
-#:   3s for the control plane (`control_plane/server.py`), then the adapters,
-#:   of which the Codex one dominates at 1s + 1s to let the Sessions go
-#:   (`codex_app_server/wire.py`, and they go concurrently) plus 5s for the
-#:   app-server itself (`codex_app_server/process.py`) — about eleven seconds if
-#:   every single one is hit at once, which nothing has ever done.
+#:   (`tests/acceptance/support.py:455`), twenty for launchd's default
+#:   `ExitTimeOut`. Overrunning that grace is how #96 lost its `codex
+#:   app-server`, so this has to leave real margin under it rather than sit at
+#:   it.
+#: - **From below**, it has to exceed everything it bounds. Every phase carries
+#:   its own bound and they add up; the sum is 13.2s, and
+#:   `test_the_shutdown_deadline_exceeds_everything_it_bounds` computes it from
+#:   the constants themselves rather than from this comment.
 #:
-#: Twelve is the smallest round number above the second and comfortably below
-#: the first. A phase that overruns it is named and abandoned, because the
-#: alternative is not a tidier shutdown — it is a SIGKILL with nothing written.
-SHUTDOWN_SECONDS = 12.0
+#: **That second direction is the one this was first written the wrong way
+#: round.** The derivation omitted a phase, counted another once where it is
+#: spent twice, and landed on twelve — under the real sum. A shutdown that hit
+#: its bounds would then have been cancelled *between* the app-server's SIGTERM
+#: and its SIGKILL, orphaning the process holding the socket: #96's exact leak,
+#: reintroduced by #96's own fix, in the arithmetic of a docstring. Hence the
+#: test: a sum nobody can check is a sum that drifts.
+#:
+#: Sixteen leaves 2.8s over the sum and 4s under the grace. A phase that
+#: overruns it is named and abandoned, because the alternative is not a tidier
+#: shutdown — it is a SIGKILL with nothing written down.
+SHUTDOWN_SECONDS = 16.0
 
 _log = logging.getLogger(__name__)
 

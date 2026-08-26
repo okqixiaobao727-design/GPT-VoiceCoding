@@ -638,3 +638,179 @@ class TestStoppingTheWholeTreeItSpawned:
 
         theirs, ours = asyncio.run(scenario())
         assert theirs != ours
+
+
+#: A shim that starts the real server, records it, and then leaves — the case a
+#: shim crashing, being OOM-killed, or simply exiting first produces. The wait is
+#: only long enough that `start` completes against a live leader; nothing in the
+#: adapter depends on how long it lives after that.
+DYING_SHIM = """\
+{python} {runner} "$@" &
+echo $! > {pidfile}
+sleep 1
+"""
+
+
+def dying_shim(tmp_path: Path, pidfile: Path) -> str:
+    """A `codex` that hands the socket to a child and then dies itself."""
+    runner = tmp_path / "stand_in.py"
+    runner.write_text(STAND_IN.format(tests=str(Path(__file__).parent)))
+    where = tmp_path / "codex"
+    where.write_text(
+        "#!/bin/sh\n"
+        + DYING_SHIM.format(python=sys.executable, runner=str(runner), pidfile=str(pidfile))
+    )
+    where.chmod(where.stat().st_mode | stat.S_IXUSR)
+    return str(where)
+
+
+class TestAShimThatDiesBeforeItsChild:
+    """#96: the group is signalled on its own account, not on the leader's.
+
+    The first fix gated the whole signalling block on the *shim* still being
+    alive, which is the one process that does not matter — the socket is held by
+    its child. A shim that crashed, was OOM-killed, or was reaped by an earlier
+    `poll()` meant `aclose` sent no signal at all and then unlinked the socket
+    file out from under a process still bound to it, which is worse than the
+    original leak: the next engine finds no file, so `_claim_socket_path` never
+    runs its listener check and binds a fresh inode at the same name while the
+    orphan keeps the old one.
+    """
+
+    def test_the_child_still_goes_when_the_shim_is_already_gone(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        pidfile = tmp_path / "server.pid"
+
+        async def scenario() -> int:
+            owned = OwnedAppServer(
+                settings=quick(executable=dying_shim(tmp_path, pidfile)), socket_path=socket_path
+            )
+            await owned.start()
+            await _until(lambda: pidfile.exists() and pidfile.read_text().strip())
+            server_pid = int(pidfile.read_text().strip())
+
+            leader = owned._process  # noqa: SLF001 - the premise is about this process
+            assert leader is not None
+            await _until(lambda: leader.poll() is not None, timeout=5.0)
+            assert running(server_pid), "the child was meant to outlive its shim"
+
+            await owned.aclose()
+            return server_pid
+
+        server_pid = asyncio.run(scenario())
+        deadline = time.monotonic() + 5
+        while running(server_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not running(server_pid), (
+            f"pid {server_pid} outlived the engine because its shim died first, and is "
+            f"still holding {socket_path}"
+        )
+
+    def test_the_socket_file_is_left_when_something_still_answers_on_it(
+        self, socket_path: Path
+    ) -> None:
+        """The file is what makes the next engine refuse rather than shadow it.
+
+        `_claim_socket_path` only reaches its listener check if the path exists.
+        Removing a socket somebody is still bound to converts a loud refusal
+        into two engines with one name, which is the failure mode #96's leak was
+        *protecting* against.
+        """
+
+        async def scenario() -> bool:
+            answering = await FakeAppServer(socket_path).start()
+            try:
+                owned = OwnedAppServer(
+                    settings=quick(executable="/bin/true"), socket_path=socket_path
+                )
+                owned._owns_socket = True  # noqa: SLF001 - as if this run had bound it
+                await owned.aclose()
+                return socket_path.exists()
+            finally:
+                await answering.aclose()
+
+        assert asyncio.run(scenario()) is True
+
+
+#: A shim that behaves the way the real npm one does: it starts the binary, then
+#: forwards SIGTERM to it and waits. Used to prove the *tree* case stops
+#: promptly, not merely eventually.
+FORWARDING_SHIM = """\
+{python} {runner} "$@" &
+child=$!
+echo $child > {pidfile}
+trap 'kill -TERM $child' TERM
+wait $child
+"""
+
+
+def forwarding_shim(tmp_path: Path, pidfile: Path) -> str:
+    """A `codex` shim that does its job: passes the signal on and goes."""
+    runner = tmp_path / "stand_in.py"
+    runner.write_text(STAND_IN.format(tests=str(Path(__file__).parent)))
+    where = tmp_path / "codex"
+    where.write_text(
+        "#!/bin/sh\n"
+        + FORWARDING_SHIM.format(python=sys.executable, runner=str(runner), pidfile=str(pidfile))
+    )
+    where.chmod(where.stat().st_mode | stat.S_IXUSR)
+    return str(where)
+
+
+class TestAnOrdinaryStopIsQuick:
+    """A stop that always spends its whole budget is a bug, not a slow machine.
+
+    Waiting on a *group* to empty and reaping the leader only afterwards did
+    exactly that: a dead child nobody has waited on is a zombie, a zombie is
+    still in its process group, so the wait never saw the group empty. Every
+    stop cost `STOP_TIMEOUT_SECONDS` and then sent a pointless SIGKILL —
+    measured at 6.03s against a real app-server that had gone in milliseconds,
+    and invisible to every test here, because they all asked whether the
+    process was gone and none asked how long it took.
+    """
+
+    #: What "prompt" means. Far below `STOP_TIMEOUT_SECONDS` so this can only
+    #: fail on the bug rather than on a loaded machine, and far above the
+    #: 0.05s poll so it is not a race with the interval itself.
+    PROMPT_SECONDS = 2.0
+
+    def test_a_server_that_takes_the_signal_stops_at_once(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        async def scenario() -> float:
+            owned = OwnedAppServer(
+                settings=quick(executable=stand_in(tmp_path)), socket_path=socket_path
+            )
+            await owned.start()
+            began = time.monotonic()
+            await owned.aclose()
+            return time.monotonic() - began
+
+        took = asyncio.run(scenario())
+        assert took < self.PROMPT_SECONDS, (
+            f"stopping took {took:.2f}s for a server that exits on SIGTERM; the stop is "
+            f"spending its whole {process.STOP_TIMEOUT_SECONDS:.0f}s budget on every shutdown"
+        )
+
+    def test_a_shim_that_forwards_the_signal_stops_at_once_too(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """The real topology: the socket is held by a grandchild, and both go."""
+        pidfile = tmp_path / "server.pid"
+
+        async def scenario() -> tuple[float, int]:
+            owned = OwnedAppServer(
+                settings=quick(executable=forwarding_shim(tmp_path, pidfile)),
+                socket_path=socket_path,
+            )
+            await owned.start()
+            await _until(lambda: pidfile.exists() and pidfile.read_text().strip())
+            server_pid = int(pidfile.read_text().strip())
+            began = time.monotonic()
+            await owned.aclose()
+            return time.monotonic() - began, server_pid
+
+        took, server_pid = asyncio.run(scenario())
+        assert took < self.PROMPT_SECONDS, f"stopping the tree took {took:.2f}s"
+        assert not running(server_pid)

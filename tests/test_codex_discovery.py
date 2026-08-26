@@ -202,6 +202,24 @@ class TestWhenTheDaemonIsNotThere:
         assert [row.target.pid for row in lane.rows] == [101]
         assert lane.degraded is not None
 
+    def test_a_daemon_that_answered_unreadably_is_not_reported_as_silent(self) -> None:
+        """The third sentence. #96's part B, in the branch it was first missed in.
+
+        This used to read "the daemon did not answer … (`thread/loaded/list`
+        answered a shape this build cannot read)" — a sentence that contradicts
+        itself inside one parenthesis, and whose first half is the half a reader
+        carries away. The daemon answered; this build could not read it.
+        """
+
+        class Odd(FakeDaemon):
+            async def request(self, method: str, params: dict | None = None) -> dict:
+                return {"data": "not a list"}
+
+        lane = found(Odd({}), running(101, "/tmp/w"))
+        assert lane.degraded == discovery.UNREADABLE_ROSTER
+        assert "did not answer" not in lane.degraded
+        assert "cannot read" in lane.degraded
+
     def test_no_daemon_and_no_process_is_an_empty_answer_not_a_failure(self) -> None:
         """It has to be able to end rows: an empty machine is a real reading."""
         lane = found(None)

@@ -86,6 +86,16 @@ NO_CLIENT = (
 #: actually made — which is what makes it different from `NO_CLIENT`.
 NO_DAEMON = f"the shared Codex app-server daemon did not answer, {FROM_THE_MACHINE}"
 
+#: The daemon answered, and this build could not read what it said. A third
+#: sentence rather than a parenthesis on the second, for the reason the second
+#: exists at all: "did not answer (it answered a shape this build cannot read)"
+#: contradicts itself inside one sentence, and the half a reader carries away is
+#: the half that blames the daemon. The fault here is this build's.
+UNREADABLE_ROSTER = (
+    f"the shared Codex app-server daemon answered {ROSTER_METHOD} in a shape this build "
+    f"cannot read, {FROM_THE_MACHINE}"
+)
+
 
 class DaemonClient(Protocol):
     """The one verb this module needs of a connection to the shared daemon."""
@@ -141,10 +151,12 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
     to this lane: the rows will be thinner than usual. None of them is a reason
     to report no Sessions, because the process table has already been read.
 
-    **"Nothing dialled" and "dialled, no answer" are different sentences.** They
-    have the same consequence and different causes, and saying the second when
-    the first is true is a false report about the daemon's health — one that
-    contradicts every other surface that really does dial it (#96).
+    **There are three ways to end up thin here, and three sentences.** Nothing
+    was dialled; the daemon was dialled and did not answer; the daemon answered
+    and this build could not read it. The consequence is the same every time and
+    the causes are not, and reporting the second when the first or the third is
+    true is a false claim about the daemon's health — one that contradicts every
+    other surface that really does dial it (#96).
     """
     if client is None:
         return [], NO_CLIENT
@@ -156,7 +168,7 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
 
     ids = answer.get("data") if isinstance(answer, dict) else None
     if not isinstance(ids, list):
-        return [], f"{NO_DAEMON} ({ROSTER_METHOD} answered a shape this build cannot read)"
+        return [], UNREADABLE_ROSTER
 
     found: list[dict[str, Any]] = []
     for thread_id in ids:

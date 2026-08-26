@@ -32,8 +32,17 @@ from pathlib import Path
 
 import pytest
 
+from gpt_voicecoding.adapters.codex_app_server import process, wire
+from gpt_voicecoding.adapters.companion_channel.telegram import adapter as telegram_adapter
 from gpt_voicecoding.config import load
-from gpt_voicecoding.engine.runner import EXIT_OK, EXIT_REFUSED, adopt_the_log, main
+from gpt_voicecoding.control_plane import server as control_plane_server
+from gpt_voicecoding.engine.runner import (
+    EXIT_OK,
+    EXIT_REFUSED,
+    SHUTDOWN_SECONDS,
+    adopt_the_log,
+    main,
+)
 
 TESTS_DIR = Path(__file__).resolve().parent
 
@@ -403,3 +412,70 @@ class TestStoppingIsWrittenDownAndBounded:
         assert "stopping: closing the control plane" in written
         assert "stopping: closing the adapters" in written
         assert "stopped in " in written
+
+
+class TestTheShutdownBudgetAddsUp:
+    """#96: the deadline has to exceed everything it bounds, or it cuts one short.
+
+    The first version of this derivation was written in a docstring, and it was
+    wrong three ways — a phase omitted, a phase counted once where it is spent
+    twice, a deadline below the real sum. A shutdown that hit its bounds would
+    then have been cancelled *between* the app-server's SIGTERM and its SIGKILL,
+    orphaning the process holding the socket. That is the leak this whole ticket
+    exists to close, reintroduced by its own fix, in arithmetic nobody ran.
+
+    So the arithmetic is here, computed from the constants themselves. A phase
+    whose bound grows, or a new phase added without a bound, fails this rather
+    than a future acceptance run.
+    """
+
+    #: What stops this engine and how long it waits first: the acceptance harness
+    #: at `tests/acceptance/support.py` (`ENGINE_STOP_SECONDS`), and launchd's
+    #: default `ExitTimeOut`. Named here rather than imported — the acceptance
+    #: package needs an extra, and importing a test module by name is #93.
+    SHORTEST_KNOWN_GRACE_SECONDS = 20.0
+
+    def _spent(self) -> float:
+        """Every bounded wait `Engine.aclose` can hit, in the order it hits them."""
+        return (
+            # `ControlPlaneServer.aclose`, waiting out a slow action.
+            control_plane_server.STOP_TIMEOUT_SECONDS
+            # The Codex adapter lets its watched Sessions go — concurrently, so
+            # this is one connection's close (a drain and a wait) however many
+            # Sessions the user has open.
+            + 2 * wire.CLOSE_TIMEOUT_SECONDS
+            # Then the engine's own connection to its app-server, the same way.
+            + 2 * wire.CLOSE_TIMEOUT_SECONDS
+            # Then the app-server itself: once after SIGTERM, once after SIGKILL.
+            + process.STOP_TIMEOUT_SECONDS
+            + process.KILL_TIMEOUT_SECONDS
+            # And the Companion Channel's reader, the last bounded wait out.
+            + telegram_adapter.JOIN_SECONDS
+        )
+
+    def test_the_shutdown_deadline_exceeds_everything_it_bounds(self) -> None:
+        assert self._spent() < SHUTDOWN_SECONDS, (
+            f"the phases can spend {self._spent():.1f}s but the shutdown is cancelled at "
+            f"{SHUTDOWN_SECONDS:.1f}s — it would be cut off mid-phase, and the phase it "
+            "would be cut off in is the one that stops the app-server"
+        )
+
+    def test_the_shutdown_deadline_leaves_margin_under_the_grace(self) -> None:
+        """Finishing at the same moment as the SIGKILL is not finishing."""
+        assert SHUTDOWN_SECONDS < self.SHORTEST_KNOWN_GRACE_SECONDS
+
+    def test_the_app_server_is_signalled_inside_the_deadline(self) -> None:
+        """The one phase that must never be the one cut off.
+
+        Everything before it can be spent in full and the SIGKILL must still be
+        sent, because a signal not sent is a process still holding the socket.
+        """
+        before_the_app_server = (
+            control_plane_server.STOP_TIMEOUT_SECONDS
+            + 2 * wire.CLOSE_TIMEOUT_SECONDS
+            + 2 * wire.CLOSE_TIMEOUT_SECONDS
+        )
+        assert (
+            before_the_app_server + process.STOP_TIMEOUT_SECONDS + process.KILL_TIMEOUT_SECONDS
+            < SHUTDOWN_SECONDS
+        )
