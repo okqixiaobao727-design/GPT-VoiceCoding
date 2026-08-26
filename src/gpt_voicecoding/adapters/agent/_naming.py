@@ -9,13 +9,15 @@ repositories happen to be on the machine.
 
 **The task half is validated the way the reference implementation validated it**
 (`legacy@1d32845:bridge/labels.py:97-106`, *adapted*): non-empty after stripping,
-and one line. Legacy raised `SessionLabelError` on both, from a resolver called
-at the moment a Session reported its own task; here the caller is a discovery
-pass over every row on the machine every few seconds, and an exception per
-unnameable row would make a naming problem look like a lane failure. So the
-answer is `None` — "this Session has no name yet" — which is the state the
-roster already renders (`core/sessions.py`) — and the refusal is logged, so a
-name that never appears is findable rather than silent.
+and one line. Legacy *raised* `SessionLabelError` on both — and could, because
+its caller was a single self-report ingress handling one Session that had just
+spoken. This caller is a discovery pass over every row on the machine every few
+seconds, where one bad string must never cost an enumeration: an unnameable row
+is one row without a name, not a lane that failed. So the answer is `None` —
+"this Session has no name yet", the state the roster already renders
+(`core/sessions.py`) — and the reason is logged, so a name that never appears is
+findable rather than silent. (#78 writes the signature as returning a name;
+amended by advisor ruling, 2026-08-27.)
 
 **What is deliberately not here.** No transcript-derived task, no `ai-title`,
 no mutable history: legacy measured that route at 30% of Sessions never writing
