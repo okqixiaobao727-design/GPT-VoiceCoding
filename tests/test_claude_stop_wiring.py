@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -22,18 +23,24 @@ import pytest
 
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
+from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
 from gpt_voicecoding.seams.agent import (
+    AgentEvent,
     ApprovalRequest,
     LaneDiscovery,
     LaneUnavailable,
+    ReplyWindowChanged,
+    SessionEnded,
     SessionInspection,
     SessionState,
+    SessionStopped,
     WaitingFor,
     WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
-from test_claude_stop_analysis import asked, called, turn
+from test_claude_reply_window import Child, say
+from test_claude_stop_analysis import asked, called, said, turn
 
 SESSION = "d3a776ae-3b60-437d-bc70-ba57a2b280c6"
 TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=3538)
@@ -102,6 +109,26 @@ def dialog(tool_name: str = "Bash", detail: str = "push the branch") -> Approval
     return ApprovalRequest(approval_id="a-1", target=TARGET, tool_name=tool_name, detail=detail)
 
 
+def parallel(*calls: tuple[str, str, Any]) -> dict[str, Any]:
+    """One assistant record holding several `tool_use` blocks, as parallel calls arrive.
+
+    `called` writes one block, which is the shape the ranking cases used until a
+    dialog had to be matched against the right one of several.
+    """
+    return {
+        "type": "assistant",
+        "isSidechain": False,
+        "userType": "external",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": identifier, "name": tool, "input": tool_input}
+                for tool, identifier, tool_input in calls
+            ],
+        },
+    }
+
+
 class TestTheRanking:
     """Four rows. The transcript and the parked dialog are ranked, never merged."""
 
@@ -124,10 +151,18 @@ class TestTheRanking:
     def test_a_permission_read_from_the_record_keeps_its_fields_and_gains_the_handle(
         self, tmp_path: Path
     ) -> None:
-        """The handle is the one thing a transcript can never carry."""
+        """The handle is the one thing a transcript can never carry.
+
+        The dialog here names the same call, which is the ordinary case, and
+        while it does the record's own reading stands: it read the call's input
+        and the hook payload carries a summary built from a subset of it. This
+        parked a dialog naming a *different* tool until #98 — the record won
+        then, and that was the defect, because the `approval_id` beside it was
+        always the dialog's.
+        """
         adapter = adapter_holding(
             transcript(tmp_path, [*turn(), called("Edit", "e1", {"file_path": "/tmp/notes.md"})]),
-            parked=(dialog(tool_name="Bash", detail="something else"),),
+            parked=(dialog(tool_name="Edit", detail="notes.md"),),
         )
         waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
         assert waiting.kind is WaitingKind.PERMISSION
@@ -136,6 +171,59 @@ class TestTheRanking:
         assert waiting.detail == "/tmp/notes.md"
         assert waiting.approval_id == "a-1"
         assert waiting.caught_up is True
+
+    def test_the_dialog_names_the_call_the_verdict_will_reach(self, tmp_path: Path) -> None:
+        """Parallel calls in one message: the record's pick and the dialog can differ.
+
+        **The hook payload is the authority on what is parked** (advisor,
+        2026-08-26, #98). The transcript is held up on the newest outstanding
+        call, which for several calls written in one message is the last-listed
+        one; the dialog is parked on whichever the far side actually stopped to
+        ask about. Announcing the record's pick beside the dialog's
+        `approval_id` would name one tool and send the user's verdict to
+        another — an Approval carrying their authority to a call they were never
+        shown.
+        """
+        adapter = adapter_holding(
+            transcript(
+                tmp_path,
+                [
+                    *turn(),
+                    parallel(
+                        ("Read", "r1", {"file_path": "/tmp/first"}),
+                        ("Bash", "b1", {"description": "push the branch"}),
+                    ),
+                ],
+            ),
+            parked=(dialog(tool_name="Read", detail="/tmp/first"),),
+        )
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        assert waiting.kind is WaitingKind.PERMISSION
+        assert waiting.tool_name == "Read"
+        # The record's `detail` describes the record's call, so it goes with it.
+        assert waiting.detail == "/tmp/first"
+        assert waiting.approval_id == "a-1"
+
+    def test_a_record_that_named_no_tool_does_not_lend_the_dialog_its_summary(
+        self, tmp_path: Path
+    ) -> None:
+        """Naming no tool is not agreeing with the dialog about which call it is.
+
+        A `tool_use` whose `name` this reader could not read is still summarised
+        from its input, and that summary describes the call the *record* was held
+        up on. Beside a dialog naming a tool, the two are not known to be one
+        call, so the announcement takes the dialog's own words whole.
+        """
+        unnamed = called("Bash", "x1", {"description": "delete the release tag"})
+        del unnamed["message"]["content"][0]["name"]
+        adapter = adapter_holding(
+            transcript(tmp_path, [*turn(), unnamed]),
+            parked=(dialog(tool_name="Bash", detail="push the branch"),),
+        )
+        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        assert waiting.tool_name == "Bash"
+        assert waiting.detail == "push the branch"
+        assert waiting.approval_id == "a-1"
 
     def test_a_call_the_record_could_not_describe_takes_the_dialog_s_words(
         self, tmp_path: Path
@@ -373,6 +461,34 @@ class TestReadingTheFileOnce:
         assert records is not None
         assert len(records) == 2
 
+    @pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"])
+    def test_a_unicode_line_separator_inside_a_record_does_not_split_it(
+        self, tmp_path: Path, separator: str
+    ) -> None:
+        """JSONL is `\n`-delimited, and `str.splitlines` is not.
+
+        `JSON.stringify` leaves U+2028, U+2029 and U+0085 raw inside a string, so
+        they reach the file as themselves — which is why this case writes its
+        records with `ensure_ascii=False` rather than through `transcript`.
+        Splitting on them cuts a record in two, neither half parses, and the
+        record is dropped whole. Measured on 2026-08-26 over the 200 most recent
+        transcripts on this machine: 4 files losing 31 records between them
+        (1, 2, 13 and 15). A dropped `tool_result` leaves the call it closes
+        outstanding, which reads as a permanent false `PERMISSION`.
+        """
+        path = tmp_path / "session.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False) + "\n"
+                for record in [*turn(), said(f"before{separator}after")]
+            ),
+            encoding="utf-8",
+        )
+        records = TranscriptReader().records(path)
+        assert records is not None
+        assert len(records) == 3
+        assert records[2]["message"]["content"][0]["text"] == f"before{separator}after"
+
     def test_no_path_and_no_file_are_both_none_rather_than_empty(self, tmp_path: Path) -> None:
         reader = TranscriptReader()
         assert reader.records(None) is None
@@ -395,3 +511,81 @@ class TestReadingTheFileOnce:
         reader.forget(one)
         reader.forget(None)
         assert reader.records(other) is kept
+
+
+class TestWhenTheSessionEnds:
+    """What the adapter lets go of when it reports a Session ended (#98).
+
+    `forget_session` existed and nothing called it: it is not on the
+    `AgentAdapter` seam, and Bridge Core's `_session_ended` only marks state. On
+    an engine that starts at login, that made every Session that ever registered
+    keep its parsed transcript for the life of the process — records of files
+    measured at 186 MB on this machine.
+
+    The fix is neither a timer nor a seam method: the adapter that emits
+    `SessionEnded` is the one that knows, and the cache is its own. So these
+    drive the real sweep and assert on what is left behind.
+    """
+
+    def watching(
+        self, tmp_path: Path, pid: int
+    ) -> tuple[ClaudeAgentAdapter, SessionTarget, Path, list[Any]]:
+        """An adapter registered on that pid, with the transcript already parsed.
+
+        The registry stands in for `~/.claude/sessions` the way
+        `test_claude_reply_window` writes it, so the sweep below is the real one
+        rather than a stub of it.
+        """
+        (tmp_path / "sessions").mkdir()
+        say(tmp_path, "busy", pid=pid, session_id=SESSION)
+        target = replace(TARGET, pid=pid)
+        raised: list[Any] = []
+
+        class Sink:
+            def emit(self, event: AgentEvent) -> None:
+                raised.append(event)
+
+        adapter = ClaudeAgentAdapter(
+            sink=Sink(),
+            settings=ClaudeSettings(
+                registry_directory=tmp_path / "sessions", reply_window_poll_seconds=0.02
+            ),
+        )
+        path = transcript(tmp_path, [*turn(), called("Bash", "b1", {"description": "push"})])
+        adapter._reported[target] = SessionReport(  # noqa: SLF001 - seeding one registration
+            session_id=SESSION, pid=pid, transcript_path=path
+        )
+        adapter.register_session(target, tmp_path / "channel.sock")
+        assert adapter.stopped_on(target).kind is WaitingKind.PERMISSION  # warms the cache
+        return adapter, target, path, raised
+
+    def test_a_death_reported_is_a_session_forgotten(self, tmp_path: Path) -> None:
+        corpse = Child()
+        corpse.kill()
+        adapter, target, path, raised = self.watching(tmp_path, corpse.pid)
+
+        adapter._windows.poll_once()  # noqa: SLF001 - one sweep, without the timer
+
+        assert [type(event) for event in raised] == [SessionEnded]
+        assert adapter.reported(target) is None
+        assert adapter.reachable() == ()
+        # The parsed records go with it, which is the megabytes this is about.
+        assert path not in adapter._transcripts._cache  # noqa: SLF001 - the leak itself
+
+    def test_a_session_that_is_still_alive_keeps_everything(self, tmp_path: Path) -> None:
+        """The sweep runs on every watched Session; only a death may forget one.
+
+        The pid is this test's own process, which is alive by definition. Its
+        record finishes its turn between registration and the sweep, so the
+        sweep has something to report — which is what proves it looked at this
+        Session at all and still buried nothing.
+        """
+        adapter, target, path, raised = self.watching(tmp_path, os.getpid())
+        say(tmp_path, "idle", pid=os.getpid(), session_id=SESSION)
+
+        adapter._windows.poll_once()  # noqa: SLF001
+
+        assert [type(event) for event in raised] == [ReplyWindowChanged, SessionStopped]
+        assert adapter.reported(target) is not None
+        assert adapter.reachable() == (target,)
+        assert path in adapter._transcripts._cache  # noqa: SLF001

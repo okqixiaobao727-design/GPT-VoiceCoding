@@ -125,8 +125,10 @@ class CodexAgentAdapter:
         #: Prompts already resolved by somebody else, so a late verdict is
         #: refused rather than answered into a closed request.
         self._resolved: set[Any] = set()
-        #: Subscription retries in flight, so none outlives this adapter.
-        self._retrying: set[asyncio.Task[None]] = set()
+        #: Work this adapter started off a callback that could not await it — a
+        #: subscription retry, a connection being given back — held so that none
+        #: outlives the adapter.
+        self._background: set[asyncio.Task[None]] = set()
         self._own = OwnedAppServer(
             settings=self._settings,
             socket_path=own_socket_path or default_own_socket_path(self._settings),
@@ -180,9 +182,9 @@ class CodexAgentAdapter:
         a machine with two and not on a machine with nine, which is the kind of
         bound that passes every test and fails on somebody's Tuesday (#96).
         """
-        for task in list(self._retrying):
+        for task in list(self._background):
             task.cancel()
-        self._retrying.clear()
+        self._background.clear()
         watching = list(self._threads.values())
         self._threads.clear()
         await asyncio.gather(*(self._detached(watched) for watched in watching))
@@ -743,7 +745,12 @@ class CodexAgentAdapter:
                 if isinstance(settings, dict):
                     watched.read_routing(settings)
             case "thread/closed" | "thread/deleted":
-                self._emit(SessionEnded(target=watched.target, detail=str(method)))
+                self._drop_and_report_ended(watched, str(method))
+                # And the connection with it: it was opened to watch this
+                # thread, and there is no thread left to watch. The other
+                # emitter has no socket to give back — its far side is what
+                # went away.
+                self._spawn(self._detached(watched))
 
     def _asked(self, message: Message) -> None:
         """One server request. Only the permission prompts are ours to hold."""
@@ -819,12 +826,30 @@ class CodexAgentAdapter:
         restart, and dialling a dead one in a loop would be this adapter
         inventing a recovery it cannot perform.
         """
-        watched = self._threads.pop(target, None)
+        watched = self._threads.get(target)
         if watched is None:
             return
+        self._drop_and_report_ended(watched, reason)
+
+    def _drop_and_report_ended(self, watched: WatchedThread, detail: str) -> None:
+        """Stop holding one Session, and say that it ended — in that order (#98).
+
+        **The adapter that says a Session ended is the one that forgets it.**
+        `forget_session` had no caller: it is not on the `AgentAdapter` seam, and
+        Bridge Core's `_session_ended` only marks state — so anything held for a
+        Session that ended was held for the life of the process. Both emitters of
+        `SessionEnded` go through here, so a third one cannot be written that
+        forgets to.
+
+        The dropping comes first because a Relay aimed at a Session this adapter
+        has just declared ended must fail on the way out, rather than be written
+        down a connection still listed here. What each emitter does about the
+        *connection* differs, and stays with the emitter.
+        """
+        self._threads.pop(watched.target, None)
         watched.subscribed = False
         watched.pending.clear()
-        self._emit(SessionEnded(target=target, detail=reason))
+        self._emit(SessionEnded(target=watched.target, detail=detail))
 
     async def _resubscribe(self, watched: WatchedThread) -> None:
         """Try again to resume a thread that had nothing to resume."""
@@ -834,10 +859,15 @@ class CodexAgentAdapter:
             _log.info("could not subscribe to %s: %s", watched.thread_id, unreachable)
 
     def _spawn(self, work: Any) -> None:
-        """Run a retry without letting it outlive the adapter that started it."""
+        """Run work off a callback, without letting it outlive this adapter.
+
+        The callers are the notification handlers, which are synchronous and
+        cannot await: a subscription retry, and the connection given back when
+        the thread it was opened for is closed.
+        """
         task = asyncio.ensure_future(work)
-        self._retrying.add(task)
-        task.add_done_callback(self._retrying.discard)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     def _thread_for(self, thread_id: Any) -> WatchedThread | None:
         if not isinstance(thread_id, str):

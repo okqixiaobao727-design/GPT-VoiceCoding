@@ -90,6 +90,7 @@ from gpt_voicecoding.seams.agent import (
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
+    SessionEnded,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -343,7 +344,12 @@ class ClaudeAgentAdapter:
         return self._reported.get(target)
 
     def forget_session(self, target: SessionTarget) -> None:
-        """Stop holding a route to one Session. The Session itself is untouched."""
+        """Stop holding a route to one Session. The Session itself is untouched.
+
+        Called by `_emit` whenever this adapter reports a Session ended, which is
+        what keeps the caches below bounded by the machine's live Sessions rather
+        than by everything that has ever registered (#98).
+        """
         self._channels.pop(target, None)
         self._windows.forget(target)
         report = self._reported.pop(target, None)
@@ -478,10 +484,10 @@ class ClaudeAgentAdapter:
            precedence — a decision only the user can supply outranks a permission
            call beside it (`legacy@1d32845:bridge/transcript.py:1691-1692`) — and
            a hook holding a dialog open never overrides one.
-        2. **A permission read from the transcript keeps its own fields** and
-           takes the `approval_id` from the dialog, which is the only place a
-           handle exists at all. It fills a tool name the record did not carry
-           and never overwrites one it did.
+        2. **A permission read from the transcript takes the `approval_id` from
+           the dialog**, which is the only place a handle exists at all — and
+           the dialog is then also the authority on which call that handle
+           belongs to (`_announced_as`).
         3. **A dialog with nothing readable behind it is still a stop.** This is
            the first-turn case: `PermissionRequest` fires when the dialog opens,
            before the `tool_use` record is flushed. The reference implementation
@@ -505,11 +511,9 @@ class ClaudeAgentAdapter:
         if dialog is None or found.kind is WaitingKind.QUESTION:
             return found
         if found.kind is WaitingKind.PERMISSION:
+            tool_name, detail = _announced_as(found, dialog)
             return replace(
-                found,
-                tool_name=found.tool_name or dialog.tool_name or None,
-                detail=found.detail or dialog.detail or None,
-                approval_id=dialog.approval_id,
+                found, tool_name=tool_name, detail=detail, approval_id=dialog.approval_id
             )
         _log.info(
             "the transcript for %s has not flushed the call behind the dialog parked here; "
@@ -821,8 +825,57 @@ class ClaudeAgentAdapter:
         )
 
     def _emit(self, event: AgentEvent) -> None:
+        """Raise one event upward, and let go of a Session that has ended (#98).
+
+        **The adapter that says a Session ended is the one that forgets it.**
+        `forget_session` had no caller: it is not on the `AgentAdapter` seam, and
+        Bridge Core's `_session_ended` only marks state — so on an engine that
+        starts at login, every Session that ever registered kept its channel
+        address, its window and its parsed transcript for the life of the
+        process, and those records are of files measured at 186 MB on this
+        machine. It is done here rather than behind a new seam method because
+        the knowledge is already here, and rather than behind a timer because a
+        death is an observation and not an age.
+
+        Forgetting happens *before* the sink sees the event, so this adapter is
+        never holding a route to a Session it has already declared ended: a
+        Relay aimed at one has to fail on the way out rather than be written
+        into a channel still listed here.
+        """
+        if isinstance(event, SessionEnded):
+            self.forget_session(event.target)
         if self._sink is not None:
             self._sink.emit(event)
+
+
+def _announced_as(found: WaitingFor, dialog: ApprovalRequest) -> tuple[str | None, str | None]:
+    """The tool name and detail the announcement uses, when a dialog is parked here.
+
+    **The hook payload is the authority on what is parked** (advisor, 2026-08-26,
+    #98). One assistant message may carry several `tool_use` blocks; the
+    transcript reading is held up on the newest outstanding one, while the dialog
+    is parked on whichever call the far side actually stopped to ask about. The
+    two can name different tools, and the `approval_id` beside them belongs to
+    the dialog's — so a reading that kept the transcript's name would announce
+    one tool and carry the user's verdict to another, which is an Approval
+    delivered to a call they were never shown.
+
+    So the dialog's `tool_name` wins whenever it has one, and `detail` follows
+    the name it describes: **the record's summary is kept only while the two
+    agree on the call.** "Agree" means the record named the same tool, not
+    merely that it named none — a record that could not read the tool's name
+    could still summarise its input, and that summary describes whichever call
+    the record was held up on rather than the one on screen.
+    """
+    if not dialog.tool_name:
+        # The hook payload named no tool, so it contradicts nothing the record
+        # said, and #75's fill-a-gap-never-overwrite rule stands whole.
+        return found.tool_name or None, found.detail or dialog.detail or None
+    if found.tool_name == dialog.tool_name:
+        # One call, read twice. The record read the call's whole input, so its
+        # summary is the fuller of the two and the dialog's fills a gap.
+        return dialog.tool_name, found.detail or dialog.detail or None
+    return dialog.tool_name, dialog.detail or None
 
 
 def _classify(reply: dict[str, object], request_id: RequestId) -> DeliveryReceipt | None:

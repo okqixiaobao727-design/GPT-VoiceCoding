@@ -751,6 +751,27 @@ class TestWhatItRaisesUpward:
         asyncio.run(scenario())
         assert [event.target for event in sink.of(SessionEnded)] == [TARGET]
 
+    def test_a_closed_thread_is_dropped_as_well_as_reported(self, socket_path: Path) -> None:
+        """The Session ended, so nothing here goes on holding it (#98).
+
+        `forget_session` had no caller on either lane. The adapter that emits
+        `SessionEnded` is the one that knows, so it lets go at the emission
+        site — the other emitter, `_connection_lost`, already did.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all("thread/closed", {"threadId": THREAD})
+                    await _settled()
+                    return adapter.watching()
+                finally:
+                    await adapter.aclose()
+
+        assert asyncio.run(scenario()) == ()
+
     def test_a_notification_about_a_thread_nobody_watches_is_ignored(
         self, socket_path: Path
     ) -> None:
