@@ -49,10 +49,10 @@ from gpt_voicecoding.seams.identity import AgentKind, RequestId, new_request_id
 _log = logging.getLogger(__name__)
 
 
-def announcement_for(request: ApprovalRequest, called: str) -> str:
+def announcement_for(request: ApprovalRequest, spoken_as: str) -> str:
     """What the user is told is waiting. Names the Session and the tool, never the answer.
 
-    **`called` is the Session, said the way the user names it**, and it is a
+    **`spoken_as` is the Session, said the way the user names it**, and it is a
     required argument rather than an optional flourish. This sentence used to
     open "a session is waiting…", which is the one thing the user cannot act on:
     the bridge covers every Session on the machine, so on any real machine
@@ -62,7 +62,7 @@ def announcement_for(request: ApprovalRequest, called: str) -> str:
     found on a run where a stranger's permission prompt was indistinguishable
     from the lane's own).
 
-    Bridge Core composes `called` at the call site from the same two lines
+    Bridge Core composes `spoken_as` at the call site from the same two lines
     `stop_notice_for` uses — `spoken_name` where the Session is known, its
     address as the floor — because "what to call it" has one answer
     (`core/sessions.py`) and this is not a second one.
@@ -73,7 +73,7 @@ def announcement_for(request: ApprovalRequest, called: str) -> str:
     which is the class of loss ADR 0010 exists for.
     """
     detail = f" — {request.detail}" if request.detail.strip() else ""
-    return f"{called} is waiting for your permission to use {request.tool_name}{detail}"
+    return f"{spoken_as} is waiting for your permission to use {request.tool_name}{detail}"
 
 
 #: What closes the loop when the adapter **proved** the verdict arrived, per
@@ -172,7 +172,9 @@ class ApprovalPipeline:
         """Every request still inside its budget, in the order they arrived."""
         return tuple(self._pending.values())
 
-    async def opened(self, request: ApprovalRequest, called: str | None = None) -> PendingApproval:
+    async def opened(
+        self, request: ApprovalRequest, spoken_as: str | None = None
+    ) -> PendingApproval:
         """A dialog is on screen. Start the budget and announce it everywhere.
 
         The budget starts here and ticks regardless of whether any outlet took
@@ -180,7 +182,7 @@ class ApprovalPipeline:
         only ran when someone was listening would never expire on the one path
         where the fallback matters most.
 
-        `called` is what the announcement calls the Session (#109). It is the
+        `spoken_as` is what the announcement refers to the Session by (#109). It is the
         caller's because the Session *registry* is not this pipeline's — the
         dialog arrives as an `ApprovalRequest`, which carries a target and no
         name — and it is optional because the address is a complete answer on its
@@ -200,7 +202,7 @@ class ApprovalPipeline:
             Notice(
                 request_id=waiting.request_id,
                 target=request.target,
-                text=announcement_for(request, called or spoken_target(request.target)),
+                text=announcement_for(request, spoken_as or spoken_target(request.target)),
             ),
             reach=Reach.EVERY_OUTLET,
         )

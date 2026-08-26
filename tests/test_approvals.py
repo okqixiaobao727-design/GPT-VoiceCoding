@@ -90,8 +90,8 @@ class Harness:
             clock=lambda: self.now,
         )
 
-    def opened(self, req: ApprovalRequest | None = None, called: str | None = None) -> object:
-        return asyncio.run(self.pipeline.opened(req or request(), called))
+    def opened(self, req: ApprovalRequest | None = None, spoken_as: str | None = None) -> object:
+        return asyncio.run(self.pipeline.opened(req or request(), spoken_as))
 
     def answer(self, verdict: ApprovalVerdict, approval_id: str = "approval-1") -> object:
         return asyncio.run(self.pipeline.answer(approval_id, verdict))
@@ -124,7 +124,7 @@ class TestAnnouncingAPendingDialog:
         """#109. Bridge Core holds the roster; this pipeline is handed the answer."""
         harness = Harness()
 
-        harness.opened(called="GPT-VoiceCoding \u00b7 port the log")
+        harness.opened(spoken_as="GPT-VoiceCoding \u00b7 port the log")
 
         assert harness.call.spoken[0].startswith("GPT-VoiceCoding \u00b7 port the log is waiting")
 

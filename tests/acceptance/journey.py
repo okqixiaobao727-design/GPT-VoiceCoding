@@ -1538,6 +1538,15 @@ def _indistinguishable_from(forms: Sequence[str], rows: Sequence[dict], mine: st
     is to say so rather than pick: a message accepted would be a guess and a
     message rejected would be a guess too. That is the whole lesson of #109 —
     a step that passes for a reason it cannot name has not passed.
+
+    **The containment test runs one way, and the direction is the whole point.**
+    A message about the other Session carries *their* form, so this Session
+    misreads it exactly when its own form is inside theirs — `mine in theirs`.
+    The reverse, theirs inside mine, is safe here and must not refuse: their
+    notice does not carry this Session's longer form, so nothing is misread, and
+    refusing would turn a soluble case into a red. The Session that *is* at risk
+    in that pair asks this same question from its own side and gets the answer
+    then. Both directions are held by `tests/test_journey_attribution.py`.
     """
     for other in rows:
         if _address_of(other) == mine:

@@ -91,7 +91,7 @@ class TestTheProductsOwnNoticesAreAttributable:
 
         announcement = announcement_for(
             ApprovalRequest("a1", mine.target, "Write", detail="relay.txt"),
-            called="workspace-claude · port the log",
+            spoken_as="workspace-claude · port the log",
         )
 
         assert journey._named_in(announcement, journey._naming_forms(row(mine)))
@@ -158,8 +158,8 @@ class TestTwoSessionsTheChatCannotTellApart:
 
         assert shared is not None and "claude:9a11bd2e" in shared
 
-    def test_a_name_that_is_a_prefix_of_another_is_shared_too(self) -> None:
-        """Matching is substring, so `· port` is inside `· port the log`."""
+    def test_the_session_with_the_shorter_name_is_the_one_at_risk(self) -> None:
+        """`· port` is inside `· port the log`, so the long Session's notice reads as short's."""
         short = session(task="port")
         long = session(target=SessionTarget(agent=AgentKind.CODEX, session_id="abc"))
         rows = [row(short), row(long)]
@@ -169,6 +169,30 @@ class TestTwoSessionsTheChatCannotTellApart:
         )
 
         assert shared is not None
+        assert journey._named_in(
+            stop_notice_for(long, long.target), journey._naming_forms(row(short))
+        )
+
+    def test_the_session_with_the_longer_name_is_not_refused(self) -> None:
+        """The direction matters, and refusing both ways would be a red for nothing.
+
+        A notice about the short-named Session does not carry the long one's name,
+        so the long one misreads nothing and has no reason to stop. The Session
+        that *is* at risk in this pair asks the same question from its own side —
+        the test above — and gets the refusal there.
+        """
+        short = session(task="port")
+        long = session(target=SessionTarget(agent=AgentKind.CODEX, session_id="abc"))
+        rows = [row(short), row(long)]
+
+        shared = journey._indistinguishable_from(
+            journey._naming_forms(row(long)), rows, journey._address_of(row(long))
+        )
+
+        assert shared is None
+        assert not journey._named_in(
+            stop_notice_for(short, short.target), journey._naming_forms(row(long))
+        )
 
     def test_distinct_sessions_are_not_refused(self) -> None:
         mine = session()
