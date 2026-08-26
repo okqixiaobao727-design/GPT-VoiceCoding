@@ -33,6 +33,38 @@ against `claude` 2.1.246 and `codex-cli` 0.149.1):
   written to the run's artifacts as evidence a human can read; every assertion in
   `journey.py` rests on the roster, the rollout, the filesystem, `engine.log` or
   the chat.
+
+A fourth, measured on #110 (2026-08-27, `codex-cli` 0.150.0):
+
+* **The Codex lane launches with an initial prompt, and that argument is the
+  whole update gate.** From the instant `~/.codex/version.json` learns of a
+  release, every hand-started `codex` stops at `1. Update now / 2. Skip / 3. Skip
+  until next version` **before the Session registers** — no thread on the daemon,
+  no rollout, indefinitely; #105 watched one probe boot normally and the three
+  that started after the check landed die there, 90 seconds apart. Codex skips
+  that prompt outright when it is handed a non-empty `PROMPT` argument
+  (`codex [OPTIONS] [PROMPT]`), decided at `tui/src/lib.rs:995-996` and
+  byte-identical at 0.149.1 and 0.150.0 (read on #107):
+
+      let skip_update_prompt = cli.prompt.as_ref().is_some_and(|p| !p.is_empty());
+
+  So `journey.CODEX` passes the words its first turn would have typed anyway.
+  **The emptiness test is the mechanism** — an empty string is not a skip — which
+  is why the argument is the journey's own instruction and not a placeholder that
+  could quietly shrink to `""`.
+
+  The alternative, `-c check_for_update_on_startup=false`, suppresses the prompt
+  *and* makes the TUI refuse the shared daemon (`can_reuse_implicit_local_daemon`
+  requires `cli_kv_overrides.is_empty()`, `tui/src/lib.rs:919-921`): it would
+  silently destroy the attachment the run exists to measure. **Never reach for
+  `-c` to solve a boot gate.**
+
+  This gate is *skipped*, not arranged, and that is what makes it unlike
+  `TrustGate`: nothing of the user's is edited, `version.json` is not written, and
+  there is nothing for the run to revoke afterwards. What it *is* unlike an
+  ordinary flag in is that **a prompt on the command line is a turn**, running
+  before the walk has asked for anything — so `journey.Walk.settle_boot_turn`
+  waits it out before a word is typed or a chat mark is taken.
 """
 
 from __future__ import annotations
@@ -51,6 +83,7 @@ import termios
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -112,6 +145,90 @@ def resolve(binary: str, path_value: str) -> Path | None:
     """Where the ordinary command really is — the binary, never the shell function."""
     found = shutil.which(binary, path=path_value)
     return Path(found) if found else None
+
+
+@dataclass(frozen=True)
+class BootPrompt:
+    """Words a lane's TUI is *launched* with, and how to know that turn is over.
+
+    The two travel together because either alone is a trap. A prompt on the
+    command line is what carries the Codex lane past the update gate (#110), and
+    it is also a **turn**, running before the walk has asked for anything; the
+    reading is how `journey.Walk.settle_boot_turn` knows it may stop waiting. A
+    lane that gained the first without the second is exactly the false green the
+    Codex review of #110 found, so the type does not let it.
+    """
+
+    words: str
+    #: Whether the agent's own record shows **no turn in flight**, given where
+    #: that record is now (or None when there is not one yet).
+    turn_over: Callable[[Path | None], bool]
+
+
+#: How Codex brackets a turn in its own record. Measured 2026-08-27 against a
+#: real rollout on this machine (`rollout-2026-08-27T10-17-38-01a04026…jsonl`,
+#: codex-cli 0.150.0): two turns, two `task_started`, two `task_complete`, and
+#: the file's last record is the second `task_complete`.
+TURN_STARTED = "task_started"
+TURN_COMPLETE = "task_complete"
+
+
+def codex_turn_over(rollout: Path | None) -> bool:
+    """Whether Codex's own record shows no turn in flight: all started, all complete.
+
+    **Not** "the record stopped growing for a while", which is what `_drive_turn`
+    settles for and what the Codex review of #110 rejected for this use: a turn
+    waiting on the model appends nothing, so silence is a turn that may be over
+    and may be thinking. For a graded turn that ambiguity costs a slow reading;
+    for the boot turn it costs the run its meaning, because a boot turn wrongly
+    called over is a Stop landing where a later step is looking for a different
+    one. Codex says which it is, so this asks Codex.
+    """
+    if rollout is None:
+        return False
+    started = complete = 0
+    try:
+        with rollout.open() as lines:
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # a line half-written while this read it
+                if record.get("type") != "event_msg":
+                    continue
+                payload = record.get("payload")
+                kind = payload.get("type") if isinstance(payload, dict) else None
+                started += kind == TURN_STARTED
+                complete += kind == TURN_COMPLETE
+    except OSError:
+        return False
+    return started > 0 and complete >= started
+
+
+def launch_arguments(flags: tuple[str, ...], boot: BootPrompt | None) -> tuple[str, ...]:
+    """A lane's argv: its flags, then its boot prompt — last, and never empty.
+
+    The two rules this holds are both load-bearing and neither is visible in a
+    tuple literal. **Last**, because both agents take the prompt as a positional
+    (`codex [OPTIONS] [PROMPT]`), so a prompt written before a flag is read as
+    that flag's value. **Never empty**, because emptiness is what the update gate
+    tests (see the fourth measurement above): `""` is a prompt that starts no
+    turn and skips no gate, and the TUI would stop at the update prompt exactly
+    as if nothing had been passed — silently, and only in the weeks after a
+    release, which is the worst way for a harness to be wrong.
+
+    A lane with no boot prompt passes `None` and gets its flags back. That is the
+    Claude lane, and it is the ordinary case: a Session nobody has typed into is
+    what the walk's first step wants to find.
+    """
+    if boot is None:
+        return flags
+    if not boot.words.strip():
+        raise ValueError(
+            "a boot prompt must be non-empty: an empty PROMPT is not a skipped update gate, "
+            "it is a launch that stops at the gate with nothing to show for it"
+        )
+    return (*flags, boot.words)
 
 
 class SessionRefused(RuntimeError):
