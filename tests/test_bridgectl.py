@@ -24,9 +24,10 @@ from fakes import FakeCall
 from gpt_voicecoding.cli import main
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, EngineUnreachable
+from gpt_voicecoding.control_plane.commands import render
 from gpt_voicecoding.engine.composition import Engine
 from gpt_voicecoding.seams.call import CallSnapshot
-from gpt_voicecoding.seams.control_plane import Reply
+from gpt_voicecoding.seams.control_plane import Action, Reply
 
 #: Longer than any deadline these tests hand the surface, and short enough that
 #: the engine's own shutdown does not wait on it. It stands in for the real
@@ -290,3 +291,91 @@ class TestAnEngineThatTakesTooLong:
         main([*socket, "status"])
 
         assert waited == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
+
+
+class TestAskingHowFarAlongOneSessionIs:
+    """#76's command. The rendering is here; the reading is the adapters'."""
+
+    def test_a_session_that_was_never_registered_cannot_be_asked(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = main(["--config", str(engine_at), "progress", "codex:never-seen"])
+
+        assert code == 1
+        assert "unknown Session" in capsys.readouterr().err
+
+    def test_it_needs_an_address_and_says_how_to_write_one(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["--config", str(engine_at), "progress"]) == 2
+        assert "progress <agent>:<session id>" in capsys.readouterr().err
+
+
+class TestRenderingWhatProgressCameBack:
+    """One reply, several shapes, and none of them may read as another."""
+
+    def reply(self, progress: object, last_activity: object = None) -> Reply:
+        return Reply.answered(
+            Action.PROGRESS,
+            {
+                "session": {
+                    "target": {"agent": "codex", "session_id": "abc", "pid": None},
+                    "label": "GPT-VoiceCoding · build it",
+                    "name": None,
+                    "workspace": "/tmp/workspace",
+                    "state": "idle",
+                    "reply_window": "open",
+                    "progress": progress,
+                    "last_activity": last_activity,
+                }
+            },
+        )
+
+    def test_each_entry_says_which_side_spoke_it(self) -> None:
+        rendered = render(
+            self.reply(
+                {
+                    "recent": [
+                        {"role": "user", "text": "do the thing"},
+                        {"role": "assistant", "text": "done"},
+                    ],
+                    "truncated": False,
+                    "read_at": "2026-08-26T02:44:39+00:00",
+                }
+            )
+        )
+
+        assert "user: do the thing" in rendered
+        assert "assistant: done" in rendered
+
+    def test_the_reading_says_when_it_was_taken(self) -> None:
+        """A progress line's whole meaning is when it was true."""
+        rendered = render(
+            self.reply(
+                {"recent": [], "truncated": False, "read_at": "2026-08-26T02:44:39+00:00"},
+                last_activity="2026-08-26T02:44:39+00:00",
+            )
+        )
+
+        assert "read at 2026-08-26T02:44:39+00:00" in rendered
+        assert "nothing said yet" in rendered
+
+    def test_a_dropped_tail_is_admitted_rather_than_implied(self) -> None:
+        rendered = render(
+            self.reply(
+                {
+                    "recent": [{"role": "assistant", "text": "done"}],
+                    "truncated": True,
+                    "read_at": "2026-08-26T02:44:39+00:00",
+                }
+            )
+        )
+
+        assert "older entries dropped" in rendered
+
+    def test_not_read_is_never_rendered_as_said_nothing(self) -> None:
+        """`None` is "nobody looked", and a surface that collapsed the two lies."""
+        rendered = render(self.reply(None))
+
+        assert "progress: not read" in rendered
+        assert "nothing said yet" not in rendered

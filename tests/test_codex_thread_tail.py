@@ -1,0 +1,150 @@
+"""How far along a Codex thread is, read out of the daemon's own answer (#76).
+
+Every shape here was **measured**, not assumed: `thread/read` was called against
+the real shared daemon on codex 0.149.1 on 2026-08-26 and its answer copied down.
+That matters twice. The item types below (`reasoning`, `commandExecution` beside
+`agentMessage` and `userMessage`) are what a real turn actually holds, and the
+times are integers — `updatedAt: 1787712279` for a thread last touched at
+2026-08-26T02:44:39Z — where the reference implementation's own reader never read
+one at all.
+
+The bound itself is `test_progress_bound.py`'s, because both lanes share it;
+this file is what a Codex turn contributes to it.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from gpt_voicecoding.adapters.agent._progress import RECENT_LIMIT
+from gpt_voicecoding.adapters.agent.codex.thread_tail import last_activity, moment, recent
+from gpt_voicecoding.seams.agent import ProgressRole
+
+#: The moment the live probe read, and the integer the daemon spelled it as.
+MEASURED_SECONDS = 1787712279
+MEASURED = datetime(2026, 8, 26, 2, 44, 39, tzinfo=UTC)
+
+
+def spoke(text: str) -> dict[str, Any]:
+    """An `agentMessage`, as the daemon writes it."""
+    return {"type": "agentMessage", "id": "msg_0e4f", "text": text}
+
+
+def told(text: str) -> dict[str, Any]:
+    """A `userMessage`, whose words live one level down in `content`."""
+    return {
+        "type": "userMessage",
+        "id": "01a03bf3",
+        "clientId": None,
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def turn(*items: dict[str, Any], status: str = "completed") -> dict[str, Any]:
+    return {"id": "01a03bf0", "status": status, "items": list(items)}
+
+
+def thread(*turns: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"id": "01a03be8", "status": {"type": "idle"}, "turns": list(turns), **extra}
+
+
+def texts(document: dict[str, Any]) -> list[str]:
+    entries, _ = recent(document)
+    return [entry.text for entry in entries]
+
+
+class TestWhatCountsAsProgress:
+    """Ported selection: what was said, never the machinery of doing the work."""
+
+    def test_both_sides_are_carried_and_each_says_which_it_is(self) -> None:
+        entries, truncated = recent(thread(turn(told("do the thing"), spoke("done"))))
+
+        assert [(entry.role, entry.text) for entry in entries] == [
+            (ProgressRole.USER, "do the thing"),
+            (ProgressRole.ASSISTANT, "done"),
+        ]
+        assert truncated is False
+
+    def test_the_machinery_of_doing_the_work_is_not_a_report_of_it(self) -> None:
+        """`reasoning` and `commandExecution` are the two a real turn is full of."""
+        document = thread(
+            turn(
+                told("look at the diff"),
+                {"type": "reasoning", "id": "rs_0e4f", "summary": [], "content": []},
+                {
+                    "type": "commandExecution",
+                    "id": "exec-33579ceb",
+                    "command": '/bin/zsh -lc "git show"',
+                },
+                spoke("here is what I found"),
+            )
+        )
+
+        assert texts(document) == ["look at the diff", "here is what I found"]
+
+    def test_an_item_type_this_build_has_never_seen_costs_itself(self) -> None:
+        """**Adapted** from legacy, which raised: a roster row must not blank."""
+        document = thread(turn(spoke("done"), {"type": "somethingNewIn0150", "id": "x"}))
+
+        assert texts(document) == ["done"]
+
+    def test_a_user_message_that_is_only_an_image_says_nothing(self) -> None:
+        """`image` and `localImage` are the other two content shapes; neither speaks."""
+        picture = told("")
+        picture["content"] = [{"type": "image", "imageUrl": "data:..."}]
+
+        assert texts(thread(turn(picture, spoke("I see it")))) == ["I see it"]
+
+    def test_turns_are_read_in_the_order_they_happened(self) -> None:
+        document = thread(turn(spoke("first")), turn(spoke("second")))
+
+        assert texts(document) == ["first", "second"]
+
+    def test_a_turn_still_running_contributes_what_it_has(self) -> None:
+        """`turn_status` is dropped, so an in-progress turn is not a special case."""
+        assert texts(thread(turn(spoke("halfway"), status="inProgress"))) == ["halfway"]
+
+    def test_the_bound_is_the_shared_one(self) -> None:
+        """One bound, one type, whichever lane the row came from."""
+        document = thread(turn(*(spoke(f"step {index}") for index in range(RECENT_LIMIT + 2))))
+
+        entries, truncated = recent(document)
+
+        assert len(entries) == RECENT_LIMIT
+        assert truncated is True
+
+
+class TestAThreadWithNoTurns:
+    """The cheap read the roster takes every tick answers no turn list at all."""
+
+    def test_a_document_read_without_turns_is_not_an_error(self) -> None:
+        document = thread()
+        del document["turns"]
+
+        assert recent(document) == ((), False)
+
+    def test_a_thread_that_has_taken_no_turn_says_nothing_yet(self) -> None:
+        assert recent(thread()) == ((), False)
+
+
+class TestLastActivity:
+    """Epoch seconds, and only what the thread itself said."""
+
+    def test_updated_at_is_when_the_thread_last_moved(self) -> None:
+        assert last_activity(thread(updatedAt=MEASURED_SECONDS)) == MEASURED
+
+    def test_a_thread_that_named_no_time_has_none(self) -> None:
+        assert last_activity(thread()) is None
+
+    def test_a_boolean_is_not_a_time(self) -> None:
+        """`True` is an `int` in Python, and one second past the epoch is nonsense."""
+        assert moment(True) is None
+
+    def test_a_shape_this_build_cannot_read_is_no_time_at_all(self) -> None:
+        assert moment("2026-08-26T02:44:39Z") is None
+        assert moment(None) is None
+
+    def test_a_number_no_calendar_can_hold_is_no_time_either(self) -> None:
+        """A field that moved to milliseconds would arrive as one of these."""
+        assert moment(10**30) is None

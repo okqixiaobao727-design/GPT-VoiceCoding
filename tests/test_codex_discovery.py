@@ -86,9 +86,19 @@ def refusing_processes(error: Exception) -> object:
     return processes
 
 
-def found(client: object | None, *candidates: Candidate, home: Path | None = None) -> object:
+def found(
+    client: object | None,
+    *candidates: Candidate,
+    home: Path | None = None,
+    daemon_note: str = "",
+) -> object:
     return asyncio.run(
-        discover(client, processes=listing(*candidates), home=home)  # type: ignore[arg-type]
+        discover(
+            client,  # type: ignore[arg-type]
+            processes=listing(*candidates),
+            home=home,
+            daemon_note=daemon_note,
+        )
     )
 
 
@@ -170,17 +180,38 @@ class TestWhenTheDaemonIsNotThere:
     def test_a_lane_with_no_client_says_so_rather_than_blaming_the_daemon(self) -> None:
         """#96: "did not answer" was said without a byte being sent.
 
-        `CodexAdapter._shared_daemon` returns `None` until #77 builds the
-        client, so this reading is produced without dialling anything — while
-        `bridge-install status`, on the same machine, dials the real daemon and
-        gets a real answer. Saying the daemon was silent made those two look
-        like a contradiction, and a session went looking for a fault that was
-        not there. The consequence is identical; the claim is not.
+        The wording moved when #76 built the client — this build does dial now,
+        so "this build does not connect yet" stopped being true. It says only
+        what this process can see, which is the reading the Advisor fixed on #96
+        ("consequence for part B"). **#96's rule did not move**, and it is what
+        is asserted here rather than any spelling: a lane with no client may not
+        claim the daemon was silent, because being unable to reach it and it
+        having nothing to say are two facts and only one of them was observed.
+        The consequence is identical; the claim is not.
         """
         lane = found(None, running(101, "/tmp/w"))
         assert lane.degraded == discovery.NO_CLIENT
-        assert "does not connect" in lane.degraded
+        assert "holds no connection" in lane.degraded
         assert "did not answer" not in lane.degraded
+        # The sentence #96 was told not to write, held so it cannot come back.
+        assert "does not connect" not in lane.degraded
+
+    def test_a_dial_that_failed_says_why_once_and_in_its_own_words(self) -> None:
+        """The dial's reason replaces the fallback rather than following it (#76).
+
+        `SharedDaemon` sets a reason on every path that answers `None`, and that
+        reason is always more precise than `NO_CLIENT`. Printed one after the
+        other, a roster would make two claims about one failure — the shape #96
+        is the record of.
+        """
+        lane = found(
+            None, running(101, "/tmp/w"), daemon_note="codex could not be run: no such file"
+        )
+
+        assert lane.degraded is not None
+        assert lane.degraded.startswith("codex could not be run: no such file")
+        assert discovery.FROM_THE_MACHINE in lane.degraded
+        assert "holds no connection" not in lane.degraded
 
     def test_a_daemon_that_refuses_is_still_a_daemon_that_did_not_answer(self) -> None:
         """The other sentence, and the only one that may claim the daemon was silent."""

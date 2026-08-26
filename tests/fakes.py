@@ -29,6 +29,8 @@ from gpt_voicecoding.seams.agent import (
     RelayRoute,
     ReplyWindow,
     SessionInspection,
+    SessionLifecycle,
+    SessionState,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
@@ -91,6 +93,13 @@ class FakeAgent:
         self.discovery = LaneDiscovery()
         #: How many times the hub asked. A cadence is a thing a test asserts on.
         self.discoveries = 0
+        #: Every target `inspect` was asked about, in order. The per-target read
+        #: is a different verb from the cadence and is asserted separately (#76).
+        self.inspections: list[SessionTarget] = []
+        #: What `inspect` raises instead of answering. `LaneUnavailable` is the
+        #: one thing on this seam that raises, and a lane that could not look
+        #: must not be answerable as a Session that said nothing.
+        self.inspect_raises: Exception | None = None
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         return self._routes
@@ -145,11 +154,25 @@ class FakeAgent:
         return self.discovery
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
-        """The row this fake already holds for that target, or a bare live one."""
+        """The row this fake holds for that target, or the honest `ENDED`.
+
+        A lane that looked and did not find the Session answers `ENDED`, which is
+        what both real adapters answer and what Bridge Core branches on. A fake
+        that returned a bare live row instead would let a caller pass a test the
+        product fails.
+        """
+        self.inspections.append(target)
+        if self.inspect_raises is not None:
+            raise self.inspect_raises
         for row in self.discovery.rows:
             if row.target == target:
                 return row
-        return SessionInspection(target=target, workspace=Path("/nowhere"))
+        return SessionInspection(
+            target=target,
+            workspace=Path("/nowhere"),
+            lifecycle=SessionLifecycle.ENDED,
+            state=SessionState.IDLE,
+        )
 
     async def verify(self) -> VerifyResult:
         return self.verify_result

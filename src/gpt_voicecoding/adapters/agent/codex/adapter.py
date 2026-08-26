@@ -37,12 +37,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding import __version__
 from gpt_voicecoding.adapters.agent.codex import approvals as approval_wire
 from gpt_voicecoding.adapters.agent.codex import discovery as codex_discovery
+from gpt_voicecoding.adapters.agent.codex import thread_tail
+from gpt_voicecoding.adapters.agent.codex.shared_daemon import SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import (
     PINNED_POLICY,
     USER_REVIEWER,
@@ -113,6 +116,8 @@ class CodexAgentAdapter:
         settings: CodexSettings | None = None,
         own_socket_path: Path | None = None,
         own_log_path: Path | None = None,
+        daemon: SharedDaemon | None = None,
+        processes: codex_discovery.ProcessLister | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or CodexSettings()
@@ -128,6 +133,18 @@ class CodexAgentAdapter:
             log_path=own_log_path,
             version=__version__,
         )
+        #: This engine's client of the daemon somebody else owns. Joined lazily,
+        #: on the first discovery that needs it, because an engine must start on
+        #: a machine whose daemon is not up yet. Injectable for the same reason
+        #: the app-server's socket path is: a test that dialled the real one
+        #: would be a test talking to the Sessions of whoever ran it.
+        self._daemon = daemon or SharedDaemon(settings=self._settings, version=__version__)
+        #: What each loaded thread last said, read at most once per change.
+        self._turns = codex_discovery.TurnCache()
+        #: How the machine's own process table is read. Injected for the reason
+        #: the daemon is: a test that shelled out to `ps` would be a test whose
+        #: answer depends on what the person running it happens to have open.
+        self._processes = processes or codex_discovery.enumerate_sessions
         self._opened = False
 
     # -- the connection this engine owns ----------------------------------
@@ -169,6 +186,13 @@ class CodexAgentAdapter:
         watching = list(self._threads.values())
         self._threads.clear()
         await asyncio.gather(*(self._detached(watched) for watched in watching))
+        # Only this engine's end of the shared daemon: the daemon itself carries
+        # on, because the user's `codex` TUIs are its clients and stopping it
+        # would end their Sessions (#83's written rule, ADR 0012). It never waits
+        # on a dial in flight — #96's shutdown budget is derived from the phases
+        # it bounds, and a phase that could sit out a ten-second lookup is not
+        # one of them (`shared_daemon.SharedDaemon.aclose`).
+        await self._daemon.aclose()
         await self._own.aclose()
         self._opened = False
 
@@ -254,13 +278,19 @@ class CodexAgentAdapter:
     async def discover(self) -> LaneDiscovery:
         """Every Codex Session on this machine, from the daemon and from the machine.
 
-        Delegated whole to `discovery.py`. The client handed over is the shared
-        daemon's when there is one — `None` while the LaunchAgent that starts it
-        is #83's to install, which is not a gap in the roster: those Sessions are
-        listed from the process table, and a Relay into one fails at the wire
-        with its reason (#82).
+        Delegated whole to `discovery.py`. The client handed over is this
+        engine's connection to the shared daemon — `None` when the daemon is not
+        answering, which is not a gap in the roster: those Sessions are listed
+        from the process table, the lane says so on `degraded`, and a Relay into
+        one fails at the wire with its reason (#82).
         """
-        return await codex_discovery.discover(self._shared_daemon())
+        client = await self._shared_daemon()
+        return await codex_discovery.discover(
+            client,
+            processes=self._processes,
+            turns=self._turns,
+            daemon_note=self._daemon.note,
+        )
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
         """One Session, freshly read from the same sources `discover` reads.
@@ -269,17 +299,26 @@ class CodexAgentAdapter:
         a Codex Session gains its thread id at its first turn (#73), so the two
         readings of one process may name it differently.
 
+        **One live read, and exactly one** (#76). Dropping this thread's
+        remembered turns *before* enumerating is what makes that true: the
+        enumeration below then takes one fresh deep read for it, where leaving
+        the cache alone would have the cadence answer from memory and this verb
+        read a second time — two 558,875-byte reads for one question. A thread
+        mid-turn is gated out of that read and is picked up by `_turns_into`
+        instead, which is the other half of the same one-read rule.
+
         **A lane that could not look raises**, rather than reporting a Session
         it never saw as `ENDED` — the same rule `SessionRegistry.observe`
         follows for `LaneDiscovery.error`, for the same reason.
         """
+        self._turns.forget(target.session_id)
         lane = await self.discover()
         if not lane.enumerated:
             assert lane.error is not None  # `enumerated` is exactly this test
             raise LaneUnavailable(AgentKind.CODEX, lane.error)
         for row in lane.rows:
             if row.target == target or (target.pid is not None and row.target.pid == target.pid):
-                return row
+                return await self._turns_into(row)
         return SessionInspection(
             target=target,
             workspace=Path(),
@@ -287,22 +326,66 @@ class CodexAgentAdapter:
             state=SessionState.IDLE,
         )
 
-    def _shared_daemon(self) -> codex_discovery.DaemonClient | None:
-        """A connection to the shared app-server daemon, when this engine holds one.
+    async def _shared_daemon(self) -> codex_discovery.DaemonClient | None:
+        """This engine's connection to the shared app-server daemon, if it has one.
 
-        There is none yet, and deliberately: the daemon's lifecycle is a login
-        `LaunchAgent` that #83 installs, and #74 does not start daemons. Until
-        then this returns `None` and the lane reads the machine instead, which
-        is exactly what it does for a TUI the daemon never adopted anyway.
+        The lane's one door to the daemon, and the reason it is a method rather
+        than a field: #77 takes its Relay and Approval routes through this same
+        connection, and its pre-wire `FAILED` is what `None` here means. A second
+        caller opening its own client would be a second thing for the daemon to
+        drop and a second thing to notice it had.
 
-        **`None` here means "nothing was dialled", and the roster says exactly
-        that** (`discovery.NO_CLIENT`). It used to say the daemon had not
-        answered, which is a claim about the daemon that this build is in no
-        position to make — and on a machine where `bridge-install status` really
-        does dial one and really does get an answer, the two readings look like
-        a contradiction rather than like two builds (#96).
+        `None` is honest and ordinary: the daemon may not be up yet, and the lane
+        then reads the machine instead — which is exactly what it does for a TUI
+        the daemon never adopted anyway (#82).
+
+        **`None` no longer means "nothing was dialled", and the roster had to
+        stop saying it did.** #96 split that sentence out precisely because this
+        method returned `None` without a byte being sent, so a roster reading
+        "the daemon did not answer" contradicted `bridge-install status` dialling
+        the same daemon on the same machine and getting an answer. #76 builds the
+        client, so something is now always attempted — and what the roster says
+        is the dial's own reason (`SharedDaemon.note`), which is more precise
+        than either sentence #96 had to choose between.
         """
-        return None
+        return await self._daemon.client()
+
+    async def _turns_into(self, row: SessionInspection) -> SessionInspection:
+        """One row with its turns read live, for the verb that asks about one Session.
+
+        **The cadence's gate is not this verb's** (#76). A thread mid-turn carries
+        no progress on the roster, because reading turns costs 558,875 bytes per
+        thread per read (measured, `discovery.TurnCache`) and a working Session is
+        not stopped on anything — but "how far along is it" is the question a user
+        asks *precisely* while it works, so here it is read.
+
+        **A row that already carries a reading keeps it, and that is the one-read
+        rule rather than a shortcut.** `inspect` dropped this thread's cached
+        turns before enumerating, so a reading on the row is one taken moments
+        ago in this same call. Reading again would be the second of two
+        half-megabyte reads for one question.
+
+        **An unattached row keeps `progress=None`, and never a guessed one.** Its
+        rollout is on disk and reading it would be a second source answering the
+        same question with worse evidence — the port table left exactly that
+        behind (P6, P13). Bridge Core turns that `None` into the honest error #76
+        asks for; it is not this adapter's to invent one.
+        """
+        if row.progress is not None or row.target.session_id is None:
+            return row
+        client = await self._shared_daemon()
+        if client is None:
+            return row
+        described = await codex_discovery.read_thread(
+            client, row.target.session_id, with_turns=True
+        )
+        if described is None:
+            return row
+        return replace(
+            row,
+            progress=codex_discovery.progress_from(described),
+            last_activity=thread_tail.last_activity(described) or row.last_activity,
+        )
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         """Both. `turn/steer` is stable in the codex this adapter is built against."""

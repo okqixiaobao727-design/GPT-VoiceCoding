@@ -36,6 +36,7 @@ ACTION_GIST: dict[Action, str] = {
     Action.STATUS: "everything the engine knows right now: switches, sessions, call, pending work",
     Action.SWITCH: "flip one switch on or off",
     Action.SESSIONS: "the session roster on its own",
+    Action.PROGRESS: "how far along one exact session is, read now — never a turn",
     Action.LIVE: "the Live Toggle — end the call that is up, or start one when none is",
     Action.RELAY: "carry the user's own words into one exact session",
     Action.APPROVE: "carry the user's verdict on one pending permission request",
