@@ -919,11 +919,26 @@ class Walk:
         permission would report a missing file where the truth is a waiting
         dialog, and that is a worse lie than a longer journal. `approval` grades
         what this returns.
+
+        **Only this lane's own dialog is answered, and that is not tidiness.**
+        The engine this run spawns discovers every Session on the machine, and
+        since #77 that includes every Codex Session on the shared daemon — so
+        `pending_approvals` routinely holds dialogs belonging to somebody's open
+        work. Answering the first of them, as this did until the 2026-08-26 run,
+        grants `allow` to a stranger's permission and leaves this lane's own
+        dialog unanswered behind it: measured, on that run, as a real Codex
+        command approved by the harness and this lane's Write answered four
+        minutes late, which failed `relay` and `companion inbound` downstream.
+        The address is the filter, exactly as it is everywhere else here.
         """
         deadline = time.monotonic() + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
             data = support.control_plane_status(self.config.socket_path, self.journal)
-            pending = list(data.get("pending_approvals", []))
+            pending = [
+                waiting
+                for waiting in data.get("pending_approvals", [])
+                if _address_of(waiting) == self.address
+            ]
             if pending:
                 announced = self.person.await_message(
                     mark,
