@@ -385,12 +385,88 @@ def codex_ground_truth(pid: int, workspace: Path, since: float) -> GroundTruth:
     meta = _first_session_meta(rollout) if rollout else None
     return GroundTruth(
         session_id=str(meta.get("session_id", "")) if meta else "",
-        pid=pid,
+        pid=tui_pid(pid),
         workspace=workspace,
         name=None,
         status=None,
         record=rollout,
     )
+
+
+def tui_pid(started: int) -> int:
+    """The process that *is* the Session, starting from the one the harness ran.
+
+    **Measured on 2026-08-26: `codex` on this machine is an npm shim.** The
+    thing on `PATH` is a node script that spawns the real binary as a child, so
+    the pid the harness holds is the shim's and the TUI — the process that draws
+    the interface and writes the rollout — is one level down:
+
+        70191   1      node …/@openai/codex/bin/codex
+        70196   70191  …/@openai/codex-darwin-arm64/vendor/…/bin/codex
+
+    The product reports the **native** one, and that is the right answer rather
+    than a discrepancy to paper over: a Homebrew or direct install has no shim
+    at all, so a `SessionTarget` built on the shim would change shape with how
+    Codex happened to be installed. The oracle resolves down to meet it.
+
+    **The join is ancestry, and only then the argv.** The search is restricted
+    to descendants of the pid this harness itself started, which is what makes
+    the answer *this* Session rather than a coincidence; the argument vector
+    only picks which descendant. A pid that is already the native binary — the
+    no-shim install — is returned unchanged.
+
+    **Deliberately not shared with `adapters/agent/codex/processes.py`**, which
+    makes the same judgement for the product. An oracle that imported the
+    classifier it is checking would turn `roster` into the product agreeing with
+    itself. The rule is written out again here, in eight lines, on purpose.
+    """
+    if _is_native_codex(started):
+        return started
+    for pid in _descendants(started):
+        if _is_native_codex(pid):
+            return pid
+    return started
+
+
+def _is_native_codex(pid: int) -> bool:
+    """Whether that process is the Codex binary itself rather than a launcher."""
+    argv = _argv_of(pid)
+    return bool(argv) and Path(argv[0]).name == "codex" and Path(argv[0]).suffix == ""
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every process below this one, breadth first. Empty if `ps` cannot say."""
+    try:
+        listing = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid="], capture_output=True, text=True, timeout=10.0
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    queue = list(children.get(pid, ()))
+    while queue:
+        current = queue.pop(0)
+        found.append(current)
+        queue.extend(children.get(current, ()))
+    return found
+
+
+def _argv_of(pid: int) -> list[str]:
+    try:
+        listing = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return listing.strip().split()
 
 
 def codex_rollout(workspace: Path, since: float) -> Path | None:

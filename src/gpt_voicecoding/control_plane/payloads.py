@@ -228,6 +228,7 @@ def status_document(status: Status) -> dict[str, Any]:
     return {
         "switches": status.switches.as_mapping(),
         "sessions": [session_document(session) for session in status.sessions],
+        "lanes": {str(agent): reason for agent, reason in status.lanes.items()},
         "call_id": status.call_id,
         "pending_relays": [pending_relay_document(item) for item in status.pending_relays],
         "pending_approvals": [pending_approval_document(item) for item in status.pending_approvals],

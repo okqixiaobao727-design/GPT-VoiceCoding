@@ -172,6 +172,7 @@ def _status_lines(data: dict[str, object]) -> list[str]:
     call_id = data["call_id"]
     lines.append(f"call: {call_id}" if call_id else "call: none")
     lines.extend(_roster_lines(data["sessions"]))
+    lines.extend(_lane_lines(data.get("lanes")))
     pending_relays = data["pending_relays"]
     pending_approvals = data["pending_approvals"]
     assert isinstance(pending_relays, list) and isinstance(pending_approvals, list)
@@ -189,6 +190,13 @@ def _roster_lines(sessions: object) -> list[str]:
         f"({session['state']}, window {session['reply_window']})"
         for session in sessions
     ]
+
+
+def _lane_lines(lanes: object) -> list[str]:
+    """Said only when a lane is down, because silence is what "fine" looks like."""
+    if not isinstance(lanes, dict) or not lanes:
+        return []
+    return [f"  {agent} lane unavailable — {reason}" for agent, reason in sorted(lanes.items())]
 
 
 def _relay_line(data: dict[str, object]) -> str:

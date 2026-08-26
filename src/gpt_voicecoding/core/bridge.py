@@ -168,6 +168,12 @@ class Status:
 
     switches: SwitchSnapshot
     sessions: tuple[Session, ...]
+    #: Why a lane could not be enumerated at its last attempt, by agent. Empty
+    #: is the ordinary case. It is here and not on a row because it is news
+    #: about the lane: an unavailable lane's Sessions are not *missing*, they
+    #: are unknown, and a roster that showed nothing without saying so would be
+    #: claiming the machine is empty.
+    lanes: Mapping[AgentKind, str]
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
@@ -268,6 +274,7 @@ class BridgeCore:
         return Status(
             switches=self._state.switches.snapshot(),
             sessions=self._state.sessions.all(),
+            lanes=self._state.sessions.lane_errors(),
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
             pending_approvals=self.approvals.pending(),
