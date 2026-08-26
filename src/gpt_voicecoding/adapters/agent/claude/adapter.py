@@ -44,10 +44,11 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
-from gpt_voicecoding.adapters.agent.claude import stop_analysis
+from gpt_voicecoding.adapters.agent.claude import stop_analysis, transcript_tail
 from gpt_voicecoding.adapters.agent.claude.approval import (
     CWD_FIELD,
     MESSAGING_SOCKET_FIELD,
@@ -73,7 +74,7 @@ from gpt_voicecoding.adapters.agent.claude.protocol import (
     channel_kind_for,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
-from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
+from gpt_voicecoding.adapters.agent.claude.transcript import Record, TranscriptReader
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 from gpt_voicecoding.adapters.agent.claude.wire import (
     ChannelConnection,
@@ -85,6 +86,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     LaneDiscovery,
     LaneUnavailable,
+    Progress,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -393,20 +395,81 @@ class ClaudeAgentAdapter:
         return replace(lane, rows=tuple(self._row_with_stop(row) for row in lane.rows))
 
     def _row_with_stop(self, row: SessionInspection) -> SessionInspection:
-        """One roster row, with what it stopped on read in.
+        """One roster row, with everything its own transcript says about it.
 
         **A Session mid-turn is not stopped on anything**, so a `RUNNING` row is
         returned untouched and its transcript is never opened. That is what keeps
         this off the hot path: on a machine of busy Sessions, the five-second
-        cadence costs one roster command and no file reads at all.
+        cadence costs one roster command and no file reads at all. #76 rides on
+        the same gate rather than a wider one of its own — a roster row is the
+        cheap projection, and the `progress` verb is where a running Session can
+        still be asked (`inspect`).
         """
         if row.state is SessionState.RUNNING:
             return row
-        waiting = self.stopped_on(row.target, row.waiting_for)
-        return row if waiting == row.waiting_for else replace(row, waiting_for=waiting)
+        return self._read_into(row)
+
+    def _read_into(self, row: SessionInspection) -> SessionInspection:
+        """One row, filled from one read of the transcript its Session named.
+
+        **One read answers both questions.** What the Session stopped on (#75)
+        and how far along it is (#76) come from the same records at the same
+        moment; two reads would be two whole-file parses per tick describing two
+        moments of a file the Session is still appending to.
+
+        **Nothing here bypasses the reader's cache, and nothing needs to.** That
+        cache is keyed on the file's own identity as the filesystem reports it
+        (`transcript.py:36-40`), so a hit means the Session has not written a
+        byte since — and a transcript that has not changed cannot have changed
+        what its tail says. Forgetting the parse first would buy no freshness and
+        cost a second pass over a file measured at 186 MB on this machine.
+
+        **A `RUNNING` row is read for progress and never for a stop.** The two
+        questions do not have the same answer mid-turn: an outstanding `tool_use`
+        with no result yet is a tool *running*, and reading it as a stop would
+        report a working Session as one waiting on the user's permission. Only
+        `inspect` gets here with a `RUNNING` row at all — the cadence returns one
+        untouched — and that is the row the gate exists for.
+        """
+        records = self._transcripts.records(self._transcript_path(row.target))
+        waiting = (
+            row.waiting_for
+            if row.state is SessionState.RUNNING
+            else self._overlay(row.target, row.waiting_for, records)
+        )
+        if records is None:
+            # No path, no file yet, or a read that failed. The roster's own word
+            # stands, and `progress` stays `None` — "not read", never "read and
+            # found nothing".
+            return row if waiting == row.waiting_for else replace(row, waiting_for=waiting)
+        entries, truncated, moved = transcript_tail.recent(records)
+        return replace(
+            row,
+            waiting_for=waiting,
+            progress=Progress(recent=entries, truncated=truncated, read_at=datetime.now(UTC)),
+            last_activity=moved,
+        )
+
+    def _transcript_path(self, target: SessionTarget) -> Path | None:
+        """Where this Session's own record is, as its registration named it."""
+        report = self._reported.get(target)
+        return report.transcript_path if report else None
 
     def stopped_on(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
         """What one Session stopped on, from its transcript and any parked dialog.
+
+        The Reply Window watcher's route to the same answer (`window.py:308-311`),
+        and the reason the overlay below is a method rather than inline: a stop
+        raised by the watcher and a stop read off the roster must be the one
+        reading, not two that agree most of the time.
+        """
+        records = self._transcripts.records(self._transcript_path(target))
+        return self._overlay(target, roster if roster is not None else WaitingFor(), records)
+
+    def _overlay(
+        self, target: SessionTarget, base: WaitingFor, records: tuple[Record, ...] | None
+    ) -> WaitingFor:
+        """What these records and any parked dialog say this Session stopped on.
 
         Two sources, and they are ranked rather than merged, because they can
         disagree and the ranking is the behaviour (#75):
@@ -433,9 +496,6 @@ class ClaudeAgentAdapter:
            Session the roster calls `waiting`, which is the seam's way of saying
            *ask again, never guess*.
         """
-        base = roster if roster is not None else WaitingFor()
-        report = self._reported.get(target)
-        records = self._transcripts.records(report.transcript_path if report else None)
         found = base if records is None else stop_analysis.analyse(records)
         if found.kind is WaitingKind.NONE:
             # The transcript is not held up on anything, which the roster may
@@ -473,6 +533,17 @@ class ClaudeAgentAdapter:
         A Session the roster no longer lists reads as `ENDED`, which is the
         honest answer to "what is it doing" for a Session that is not there.
 
+        **This one is asked about a running Session too, and `discover` is not.**
+        The cadence skips a `RUNNING` row because a Session mid-turn has not
+        stopped on anything; but "how far along is it" is the question a user
+        asks *precisely* while it works, so the per-target read has no such gate
+        (#76, the `progress` verb), and every row that reaches it is read here
+        rather than taken from the cadence's pass. What that costs is one pure
+        walk of records already in memory: the file itself is opened again only
+        if the Session has written to it since, because the reader's cache is
+        keyed on the file's own identity. Bypassing that cache is deliberately
+        *not* done — a hit is the proof of freshness, not a stale answer.
+
         **A roster that could not be read is not a roster that lists nothing.**
         The two are one value apart here and a whole verdict apart for the
         caller, so a failed enumeration raises rather than answering `ENDED`.
@@ -483,7 +554,7 @@ class ClaudeAgentAdapter:
             raise LaneUnavailable(AgentKind.CLAUDE, lane.error)
         for row in lane.rows:
             if row.target == target:
-                return row
+                return self._read_into(row)
         return SessionInspection(
             target=target,
             workspace=Path(),

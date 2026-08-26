@@ -30,14 +30,16 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from gpt_voicecoding.adapters.agent.codex import rollouts
+from gpt_voicecoding.adapters.agent.codex import rollouts, thread_tail
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
+    Progress,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -48,10 +50,14 @@ from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 _log = logging.getLogger(__name__)
 
-#: The daemon's roster, and the per-thread read. `includeTurns` is off: this is
-#: discovery, and a turn list is #76's business and a much larger answer.
+#: The daemon's roster, and the per-thread read.
 ROSTER_METHOD: Final = "thread/loaded/list"
 READ_METHOD: Final = "thread/read"
+
+#: What a thread's status is called while a turn is running. Named because two
+#: rules turn on it: the row reads as `RUNNING`, and the cadence does not read
+#: its turns.
+ACTIVE_STATUS: Final = "active"
 
 #: What a thread's `status.type` can be, as the Codex spoke has observed it.
 #: `systemError` is a thread whose turn ended badly — still reachable, still
@@ -59,7 +65,7 @@ READ_METHOD: Final = "thread/read"
 #: something that must be waited out.
 STATUS_TYPES: Final = {
     "idle": SessionState.IDLE,
-    "active": SessionState.RUNNING,
+    ACTIVE_STATUS: SessionState.RUNNING,
     "systemError": SessionState.IDLE,
 }
 
@@ -68,19 +74,24 @@ STATUS_TYPES: Final = {
 #: are not the same fact.
 FROM_THE_MACHINE = "so these rows come from the process table and the rollouts on disk"
 
-#: This build never dials. `CodexAdapter._shared_daemon` returns `None` until
-#: #77 builds the client, so there is no connection to try and nothing answers
-#: or fails to answer.
+#: The dial produced no connection, and the dial did not say why. **The fallback
+#: sentence, and it should be the rarest of the three** — `SharedDaemon.client()`
+#: sets a reason on `note` on every path that answers `None`, and `_degraded`
+#: prefers that reason over this one because the dial's own words are always more
+#: precise than this is.
 #:
-#: **The distinction is not pedantry; it cost a session** (#96). This used to be
-#: the same sentence as `NO_DAEMON` below, so a roster reading "the daemon did
-#: not answer" was produced without a single byte being sent — while
-#: `bridge-install status`, on the same machine at the same moment, really did
-#: dial the daemon and really did get an answer. The two readings looked like a
-#: contradiction to be investigated, and a session went and investigated it.
-NO_CLIENT = (
-    f"this build does not connect to the shared Codex app-server daemon yet, {FROM_THE_MACHINE}"
-)
+#: **What this used to say, and why it may not say it again** (#96). Until #76,
+#: `CodexAgentAdapter._shared_daemon()` returned `None` unconditionally, and this
+#: sentence was the same one as `NO_DAEMON` below — so a roster reading "the
+#: daemon did not answer" was produced without a single byte being sent, while
+#: `bridge-install status` on the same machine at the same moment really did dial
+#: the daemon and really did get an answer. The two readings looked like a
+#: contradiction to be investigated, and a session went and investigated it. #76
+#: builds the client, so "nothing was dialled" is no longer true either; what
+#: survives from #96 is its rule, which is the one that mattered: **never claim
+#: the daemon was silent, and never claim anything about it this build did not
+#: observe.**
+NO_CLIENT = f"the shared Codex app-server daemon could not be dialled, {FROM_THE_MACHINE}"
 
 #: The daemon was dialled and did not answer. Only ever said after a request was
 #: actually made — which is what makes it different from `NO_CLIENT`.
@@ -109,11 +120,86 @@ class DaemonClient(Protocol):
 ProcessLister = Callable[[], Awaitable[tuple[Candidate, ...]]]
 
 
+class TurnCache:
+    """Every loaded thread's `Progress`, read at most once per change (#76).
+
+    **The cache is the whole reason this class exists, and it was measured.** A
+    `thread/read` with `includeTurns: true` answered **558,875 bytes** for a
+    thread of two turns against the real daemon on codex 0.149.1 (2026-08-26),
+    where the same read without turns answered 3,600. `numTurns` is not a
+    parameter of this method — passing it changed nothing — so there is no way
+    to ask for a smaller answer. On a five-second cadence over a machine of
+    stopped Sessions, reading turns every tick would be megabytes a minute for
+    an answer that had not changed.
+
+    **Keyed on the thread's own `updatedAt`,** which is the same argument the
+    Claude lane's transcript cache makes from `(size, mtime)`: a thread that has
+    not been touched cannot have changed what its tail says, and the key is the
+    far side's own account rather than a clock this module would have to guess
+    the right length for. A thread that names no `updatedAt` is never cached —
+    without a time there is nothing to say it has not moved.
+
+    **`updatedAt` is epoch seconds, so its resolution is one second**, and two
+    changes to a thread inside the same second are one change to this cache. That
+    is written down rather than defended against: the rows it keys are *stopped*
+    threads, so the next thing that moves one moves the second too, and a row
+    somebody asks about through the `progress` verb is read live regardless.
+
+    `read_at` is kept from the reading that was taken, not refreshed on a hit.
+    That is what it means: when this was true.
+    """
+
+    def __init__(self) -> None:
+        #: thread id → (the `updatedAt` it was read at, what was read).
+        self._cache: dict[str, tuple[Any, Progress]] = {}
+
+    async def progress_for(self, client: DaemonClient, thread: dict[str, Any]) -> Progress | None:
+        """This thread's progress, read or remembered — or `None` for a live turn.
+
+        A thread mid-turn is not read on the cadence, for the reason the Claude
+        lane does not open a `RUNNING` Session's transcript: it is the expensive
+        read, and the roster row is the cheap projection beside the per-target
+        verb (#76, advisor ruling Q3).
+        """
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or _status_of(thread) == ACTIVE_STATUS:
+            return None
+        stamp = thread.get(thread_tail.UPDATED_AT)
+        cached = self._cache.get(thread_id)
+        if stamp is not None and cached is not None and cached[0] == stamp:
+            return cached[1]
+        described = await read_thread(client, thread_id, with_turns=True)
+        if described is None:
+            return None
+        progress = progress_from(described)
+        if stamp is not None:
+            self._cache[thread_id] = (stamp, progress)
+        return progress
+
+    def forget(self, thread_id: str | None) -> None:
+        """Drop one thread's remembered reading, so the next look is a fresh one.
+
+        The per-target verb's doing (#76). It is how "read this Session now"
+        stays **one** read: the enumeration that follows takes the fresh deep
+        read for this thread, instead of the cadence answering from the cache
+        and the verb then reading a second time.
+        """
+        if thread_id is not None:
+            self._cache.pop(thread_id, None)
+
+    def retain(self, thread_ids: set[str]) -> None:
+        """Forget every thread the daemon no longer holds, so this stays roster-sized."""
+        for gone in set(self._cache) - thread_ids:
+            del self._cache[gone]
+
+
 async def discover(
     client: DaemonClient | None = None,
     *,
     processes: ProcessLister = enumerate_sessions,
     home: Path | None = None,
+    turns: TurnCache | None = None,
+    daemon_note: str = "",
 ) -> LaneDiscovery:
     """Every Codex Session on this machine, however well it can be described.
 
@@ -134,14 +220,53 @@ async def discover(
         pid = _pid_for(thread, candidates, claimed)
         if pid is not None:
             claimed.add(pid)
-        rows.append(_from_thread(thread, pid))
+        progress = (
+            await turns.progress_for(client, thread)
+            if turns is not None and client is not None
+            else None
+        )
+        rows.append(_from_thread(thread, pid, progress))
+    if turns is not None:
+        turns.retain({str(thread.get("id")) for thread in threads})
 
     rows.extend(
         _from_process(candidate, home=home)
         for candidate in candidates
         if candidate.pid not in claimed
     )
-    return LaneDiscovery(rows=tuple(rows), degraded=daemon_error)
+    return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
+
+
+def progress_from(thread: Mapping[str, Any]) -> Progress:
+    """One `thread/read` answer, as the seam holds it.
+
+    The one place a thread document becomes a `Progress`, so the cadence's cached
+    read and the verb's live one cannot come back describing it two ways.
+    `read_at` is stamped here because it belongs to the *reading*: it is when this
+    was true, and a value carried forward from a cache hit keeps its own moment.
+    """
+    entries, truncated = thread_tail.recent(thread)
+    return Progress(recent=entries, truncated=truncated, read_at=datetime.now(UTC))
+
+
+def _degraded(daemon_error: str | None, note: str) -> str | None:
+    """Why these rows are thinner than usual — from both things that can say so.
+
+    A lane can be reading from the process table *and* joined to a daemon whose
+    version disagrees with the CLI's, and neither fact is allowed to hide the
+    other. There is deliberately no `error` path here: a missing daemon has
+    never been a reason to report no Sessions (#74).
+
+    **A dial that failed says why in its own words, once.** When there is no
+    client and the dial left a reason, that reason replaces `NO_CLIENT` rather
+    than following it: "could not be dialled; codex did not answer within 10
+    seconds" is two sentences making one claim, and #96 is the record of what a
+    roster that makes more claims than it observed costs to read.
+    """
+    if daemon_error == NO_CLIENT and note:
+        return f"{note}, {FROM_THE_MACHINE}"
+    reasons = [reason for reason in (daemon_error, note) if reason]
+    return "; ".join(reasons) or None
 
 
 async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], str | None]:
@@ -174,16 +299,24 @@ async def _threads(client: DaemonClient | None) -> tuple[list[dict[str, Any]], s
     for thread_id in ids:
         if not isinstance(thread_id, str) or not thread_id.strip():
             continue
-        described = await _read(client, thread_id.strip())
+        described = await read_thread(client, thread_id.strip())
         if described is not None:
             found.append(described)
     return found, None
 
 
-async def _read(client: DaemonClient, thread_id: str) -> dict[str, Any] | None:
-    """One thread as the daemon describes it, or `None` if it cannot describe it."""
+async def read_thread(
+    client: DaemonClient, thread_id: str, *, with_turns: bool = False
+) -> dict[str, Any] | None:
+    """One thread as the daemon describes it, or `None` if it cannot describe it.
+
+    `with_turns` is the expensive half and is asked for only by `TurnCache`,
+    which is where the measurement justifying that word lives.
+    """
     try:
-        answer = await client.request(READ_METHOD, {"threadId": thread_id, "includeTurns": False})
+        answer = await client.request(
+            READ_METHOD, {"threadId": thread_id, "includeTurns": with_turns}
+        )
     except Exception as unreadable:  # noqa: BLE001 - one bad thread is not a bad roster
         _log.info("the daemon could not describe thread %s: %s", thread_id, unreadable)
         return None
@@ -217,10 +350,18 @@ def _pid_for(
     return matches[0] if len(matches) == 1 else None
 
 
-def _from_thread(thread: dict[str, Any], pid: int | None) -> SessionInspection:
-    """One daemon-held thread as the seam holds it."""
+def _status_of(thread: Mapping[str, Any]) -> str | None:
+    """What this thread says it is doing, in its own word."""
     status = thread.get("status")
-    kind = status.get("type") if isinstance(status, dict) else None
+    kind = status.get("type") if isinstance(status, Mapping) else None
+    return kind if isinstance(kind, str) else None
+
+
+def _from_thread(
+    thread: dict[str, Any], pid: int | None, progress: Progress | None = None
+) -> SessionInspection:
+    """One daemon-held thread as the seam holds it."""
+    kind = _status_of(thread)
     state = STATUS_TYPES.get(str(kind), SessionState.RUNNING)
     cwd = thread.get("cwd")
     name = thread.get("name")
@@ -236,6 +377,11 @@ def _from_thread(thread: dict[str, Any], pid: int | None) -> SessionInspection:
             if kind == "systemError"
             else WaitingFor()
         ),
+        progress=progress,
+        # Free on the cheap read, and honest for a thread mid-turn too: it is
+        # the thread's own account of when it last moved, which is exactly the
+        # case `last_activity` exists to answer when nothing was said (#76).
+        last_activity=thread_tail.last_activity(thread),
         name=name.strip() if isinstance(name, str) and name.strip() else None,
     )
 
