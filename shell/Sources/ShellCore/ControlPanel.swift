@@ -80,8 +80,9 @@ public struct LiveReading: Equatable, Sendable {
 ///
 /// It holds no policy and no state of its own. Every value it shows is read from
 /// Bridge Core over the same JSON-over-UDS control plane every other surface
-/// speaks, and every action it offers is one of the nine — there is no private
-/// protocol here, and no second path to anything.
+/// speaks, and every action it offers is one the control plane already
+/// publishes — there is no private protocol here, and no second path to
+/// anything.
 ///
 /// It reads on demand: when the dropdown opens, while it stays open, and after
 /// every action. No background timer — a poll nobody is reading is a permanent

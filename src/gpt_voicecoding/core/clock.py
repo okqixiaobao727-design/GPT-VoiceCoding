@@ -10,16 +10,18 @@ questions: "has this waited past its ceiling" must not be answerable differently
 because the system clock stepped, and a laptop that sleeps and wakes must not
 report a queued Relay as ten minutes stale when it was thirty seconds.
 
-**Nothing durable may be stamped from this clock.** A monotonic reading means
-nothing after a restart, and the durable subset — switch state and the Session
-registry — outlives the process. Those timestamps come from the surface that
-records them; this clock measures durations inside one engine run.
+**Nothing that will be read outside this process may be stamped from this
+clock.** A monotonic reading is an offset from an origin only this process
+knows, so it survives neither a restart nor the trip across the control plane,
+and on the far side it names no moment at all. This clock measures durations
+inside one engine run and answers no question asked from outside it.
 
 So there are two, and they are never interchangeable: `default_clock` measures
-elapsed time inside one run, and `wall_clock` stamps a record that outlives the
-run. A Session's `registered_at` is written to disk and read back by the next
-engine, so it is stamped from the second — a monotonic reading there would come
-back after a restart as a moment in the future.
+elapsed time inside one run, and `wall_clock` stamps a fact read outside it.
+A Session's `first_seen` is stamped from the second: the roster is not
+written to disk (#74), but every row of it travels to every surface in the
+`sessions` payload, and `first_seen` is the one field on that row this engine
+authored rather than observed.
 """
 
 from __future__ import annotations

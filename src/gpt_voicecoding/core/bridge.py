@@ -223,9 +223,10 @@ class BridgeCore:
         #: Empty when this hub generated none, and the interlock refuses to open
         #: a call on an empty one rather than this being checked at each caller.
         self._voice_instructions = self._instructions.voice.text if self._instructions else ""
-        #: Durations are measured with `clock`; anything written to disk is
-        #: stamped with `stamp`. A Session's `registered_at` is read back by the
-        #: next engine, and a monotonic reading would come back as the future.
+        #: Durations are measured with `clock`; anything read outside this
+        #: process is stamped with `stamp`. A Session's `first_seen` travels to
+        #: every surface in the `sessions` payload, and a monotonic reading
+        #: would name no moment on the far side.
         self._stamp = stamp
 
         self.interlock = CallInterlock(call)
