@@ -34,6 +34,7 @@ from codex_fake import FakeAppServer
 from gpt_voicecoding.adapters.codex_app_server import process
 from gpt_voicecoding.adapters.codex_app_server.process import (
     CLIENT_NAME,
+    PRIVATE_SOCKET_MODE,
     REALTIME_FEATURE,
     AppServerError,
     OwnedAppServer,
@@ -814,3 +815,22 @@ class TestAnOrdinaryStopIsQuick:
         took, server_pid = asyncio.run(scenario())
         assert took < self.PROMPT_SECONDS, f"stopping the tree took {took:.2f}s"
         assert not running(server_pid)
+
+
+def test_the_fake_app_server_binds_as_privately_as_the_real_one(
+    socket_path: Path, mode_at_bind: dict[str, int]
+) -> None:
+    """#116: the double is only honest while it has the property under inspection.
+
+    `verify_private_socket` is the thing these tests exercise, so a fake that
+    bound wide and narrowed afterwards left a window the adapter could land in —
+    which is what turned a loaded runner red.
+    """
+
+    async def scenario() -> None:
+        server = await FakeAppServer(socket_path).start()
+        await server.aclose()
+
+    asyncio.run(scenario())
+
+    assert oct(mode_at_bind[str(socket_path)]) == oct(PRIVATE_SOCKET_MODE)

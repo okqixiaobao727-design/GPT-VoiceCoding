@@ -70,6 +70,7 @@ from gpt_voicecoding.adapters.agent.claude.privacy import (
     verify_private_directory,
     verify_private_socket,
 )
+from gpt_voicecoding.private_socket import start_private_unix_server
 
 _log = logging.getLogger(__name__)
 
@@ -298,8 +299,9 @@ class ReplyInbox:
         with contextlib.suppress(OSError):
             self.path.unlink()
         try:
-            self._server = await asyncio.start_unix_server(self._serve, path=str(self.path))
-            os.chmod(self.path, PRIVATE_SOCKET_MODE)
+            self._server = await start_private_unix_server(
+                self._serve, self.path, mode=PRIVATE_SOCKET_MODE
+            )
             self._publish_key()
         except OSError as refused:
             await self.aclose()

@@ -19,7 +19,7 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -323,6 +323,39 @@ class TestTruthAcrossARestart:
         assert asyncio.run(read()).data["switches"]["duty"] is True
 
 
+#: The cadence these tests drive a loop at when that loop is the thing under test.
+LOOP_INTERVAL = 0.01
+
+#: The cadence for a loop in the same engine that is *not* under test: long
+#: enough never to run during one of these tests, so a pass being counted can
+#: only be the loop that was asked for.
+QUIET_INTERVAL = 10.0
+
+#: How long a bounded wait gives a loop before it counts as stopped. Derived from
+#: the interval rather than written beside it, because the two drifting apart is
+#: the defect: `sleep(0.06)` against a 0.01s interval asserted that six passes fit
+#: in sixty milliseconds, which is a claim about the runner's scheduler and not
+#: about this engine, and one starved pass on CI made it false (#116). Generous
+#: on purpose — this is not a deadline the product must meet, it is the point
+#: past which "not yet" has become "never".
+LOOP_PATIENCE = LOOP_INTERVAL * 500
+
+
+async def _until(settled: Callable[[], bool], *, patience: float = LOOP_PATIENCE) -> None:
+    """Wait for a loop to do the thing, rather than for a stretch of clock to pass.
+
+    Returns either way: the test's own `assert` is left to state the property and
+    to fail saying what it saw, which a raise from in here would replace with a
+    worse sentence.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + patience
+    while loop.time() < deadline:
+        if settled():
+            return
+        await asyncio.sleep(LOOP_INTERVAL / 2)
+
+
 class TestEventsReachTheHub:
     def test_an_adapter_event_is_dispatched_while_the_engine_runs(self, home: Path) -> None:
         engine = assembled(home)
@@ -332,7 +365,14 @@ class TestEventsReachTheHub:
             try:
                 put_on_the_roster(engine)
                 engine.core.events.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
-                await asyncio.sleep(0.05)  # the dispatch loop is the thing under test
+                # The dispatch loop is the thing under test, so wait for it to
+                # have dispatched rather than for a stretch of clock.
+                await _until(
+                    lambda: any(
+                        held.reply_window is ReplyWindow.OPEN
+                        for held in engine.core.status().sessions
+                    )
+                )
                 return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
             finally:
                 await engine.aclose()
@@ -349,7 +389,7 @@ class TestEventsReachTheHub:
             await engine.start()
             try:
                 engine.core.events.emit(InboundText(text="/status"))
-                await asyncio.sleep(0.05)
+                await _until(lambda: bool(engine.adapters.channel.sent))
                 return list(engine.adapters.channel.sent)
             finally:
                 await engine.aclose()
@@ -366,7 +406,7 @@ class TestEventsReachTheHub:
             await engine.start()
             try:
                 engine.core.events.emit(InboundText(text="> summarise the diff"))
-                await asyncio.sleep(0.05)
+                await _until(lambda: bool(engine.adapters.call.delegated_on))
                 return list(engine.adapters.call.delegated_on)
             finally:
                 await engine.aclose()
@@ -384,7 +424,7 @@ class TestEventsReachTheHub:
             await engine.start()
             try:
                 engine.core.events.emit(InboundText(text="> summarise the diff"))
-                await asyncio.sleep(0.05)
+                await _until(lambda: bool(engine.adapters.call.delegated))
                 return list(engine.adapters.call.delegated)
             finally:
                 await engine.aclose()
@@ -444,9 +484,9 @@ class TestTheTick:
         engine.core.tick = counted  # type: ignore[method-assign]
 
         async def scenario() -> None:
-            await engine.start(tick_seconds=0.01)
+            await engine.start(tick_seconds=LOOP_INTERVAL)
             try:
-                await asyncio.sleep(0.06)
+                await _until(lambda: bool(ticks))
             finally:
                 await engine.aclose()
 
@@ -462,9 +502,11 @@ class TestTheDiscoveryLoop:
         engine = assembled(home)
 
         async def scenario() -> None:
-            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            await engine.start(tick_seconds=QUIET_INTERVAL, discovery_seconds=LOOP_INTERVAL)
             try:
-                await asyncio.sleep(0.06)
+                await _until(
+                    lambda: bool(engine.adapters.agents[AgentKind.CODEX].discoveries)  # type: ignore[union-attr]
+                )
             finally:
                 await engine.aclose()
 
@@ -480,9 +522,9 @@ class TestTheDiscoveryLoop:
         )
 
         async def scenario() -> None:
-            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            await engine.start(tick_seconds=QUIET_INTERVAL, discovery_seconds=LOOP_INTERVAL)
             try:
-                await asyncio.sleep(0.06)
+                await _until(lambda: bool(engine.core.status().sessions))
             finally:
                 await engine.aclose()
 
@@ -503,9 +545,9 @@ class TestTheDiscoveryLoop:
         agent.discover = raising  # type: ignore[union-attr,method-assign]
 
         async def scenario() -> None:
-            await engine.start(tick_seconds=10.0, discovery_seconds=0.01)
+            await engine.start(tick_seconds=QUIET_INTERVAL, discovery_seconds=LOOP_INTERVAL)
             try:
-                await asyncio.sleep(0.06)
+                await _until(lambda: len(calls) > 1)
             finally:
                 await engine.aclose()
 
