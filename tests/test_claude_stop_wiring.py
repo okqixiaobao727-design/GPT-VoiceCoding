@@ -113,7 +113,13 @@ def roster(monkeypatch: pytest.MonkeyPatch):
 
 def dialog(tool_name: str = "Bash", detail: str = "push the branch") -> ApprovalRequest:
     """One `PermissionRequest` hook's dialog, as `approval.request_from` builds it."""
-    return ApprovalRequest(approval_id="a-1", target=TARGET, tool_name=tool_name, detail=detail)
+    return ApprovalRequest(
+        approval_id="a-1",
+        target=TARGET,
+        tool_name=tool_name,
+        kind=WaitingKind.PERMISSION,
+        detail=detail,
+    )
 
 
 def parallel(*calls: tuple[str, str, Any]) -> dict[str, Any]:
@@ -199,8 +205,8 @@ class TestAParkedQuestionWinsOutright:
 
         assert waiting.prompt == "Tabs or spaces?"
 
-    def test_nothing_carries_a_verdict_into_a_question(self, tmp_path: Path) -> None:
-        """The handle is there for #103, and the Approval Relay still cannot use it."""
+    def test_the_question_projects_into_103s_approval_relay(self, tmp_path: Path) -> None:
+        """The hook handle, prompt and option labels are the answerable request."""
         adapter = adapter_holding(
             transcript(tmp_path, [*turn()]),
             parked=(dialog(tool_name="AskUserQuestion", detail=""),),
@@ -209,8 +215,12 @@ class TestAParkedQuestionWinsOutright:
 
         waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
 
-        assert waiting.approval_id
-        assert waiting.as_approval_request(TARGET) is None
+        request = waiting.as_approval_request(TARGET)
+        assert request is not None
+        assert request.approval_id == "7333021c-1ab7-451d-9eee-91617bc4838d"
+        assert request.kind is WaitingKind.QUESTION
+        assert request.prompt == "Tabs or spaces?"
+        assert request.options == ("Spaces", "Tabs")
 
     def test_a_parked_permission_is_ranked_as_it_always_was(self, tmp_path: Path) -> None:
         """The control: `asking` is what distinguishes the two, not the tool name."""

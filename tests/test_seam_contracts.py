@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from typing import Any
 
 import pytest
@@ -31,7 +31,9 @@ from gpt_voicecoding.seams.agent import (
     AgentAdapter,
     ApprovalRequest,
     ApprovalVerdict,
+    ApprovalVerdictKind,
     RelayRoute,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.call import CallAdapter, CallState
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
@@ -101,6 +103,32 @@ def test_every_pluggable_seam_can_be_asked_what_it_loaded(
 
 
 class TestTheAgentContract:
+    def test_a_question_answer_is_a_typed_verdict_carrying_the_users_words(self) -> None:
+        verdict = ApprovalVerdict.answer("tabs")
+
+        assert (verdict.kind, verdict.text) == (ApprovalVerdictKind.ANSWER, "tabs")
+
+    def test_a_question_answer_is_immutable(self) -> None:
+        verdict = ApprovalVerdict.answer("tabs")
+
+        with pytest.raises(FrozenInstanceError):
+            verdict.text = "spaces"  # type: ignore[misc]
+
+    @pytest.mark.parametrize(
+        ("document", "verdict"),
+        [
+            ("allow", ApprovalVerdict.ALLOW),
+            ("deny", ApprovalVerdict.DENY),
+            ("ask", ApprovalVerdict.ASK),
+            ({"kind": "answer", "text": " tabs "}, ApprovalVerdict.answer(" tabs ")),
+        ],
+    )
+    def test_one_codec_owns_every_approval_verdict_wire_shape(
+        self, document: str | dict[str, str], verdict: ApprovalVerdict
+    ) -> None:
+        assert ApprovalVerdict.from_document(document) == verdict
+        assert verdict.to_document() == document
+
     def test_a_relay_returns_a_receipt_in_the_four_state_vocabulary(self) -> None:
         agent = FakeAgent()
         receipt = asyncio.run(agent.answer_relay(CODEX, "ship it", request_id=new_request_id()))
@@ -138,7 +166,11 @@ class TestTheAgentContract:
     def test_an_approval_verdict_is_carried_not_decided(self) -> None:
         agent = FakeAgent()
         request = ApprovalRequest(
-            approval_id="dialog-1", target=CLAUDE, tool_name="Bash", detail="rm -rf build"
+            approval_id="dialog-1",
+            target=CLAUDE,
+            tool_name="Bash",
+            kind=WaitingKind.PERMISSION,
+            detail="rm -rf build",
         )
         asyncio.run(
             agent.approval_relay(request, ApprovalVerdict.ALLOW, request_id=new_request_id())
@@ -146,7 +178,12 @@ class TestTheAgentContract:
         assert agent.calls[0].verdict is ApprovalVerdict.ALLOW
 
     def test_a_budget_expiry_has_a_verdict_that_is_not_deny(self) -> None:
-        assert ApprovalVerdict.ASK in set(ApprovalVerdict)
+        assert ApprovalVerdict.ASK != ApprovalVerdict.DENY
+
+    def test_an_approval_request_must_name_what_the_session_is_waiting_for(self) -> None:
+        parameters = inspect.signature(ApprovalRequest).parameters
+
+        assert parameters["kind"].default is inspect.Parameter.empty
 
 
 class TestTheCallContract:

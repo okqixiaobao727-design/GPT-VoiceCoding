@@ -119,11 +119,11 @@ def read_route(payload: Mapping[str, Any], key: str = "route") -> RelayRoute:
 
 
 def read_verdict(payload: Mapping[str, Any], key: str = "verdict") -> ApprovalVerdict:
+    raw = payload.get(key)
     try:
-        return ApprovalVerdict(read_text(payload, key))
-    except ValueError:
-        known = ", ".join(str(verdict) for verdict in ApprovalVerdict)
-        raise InvalidPayload(f"{payload.get(key)!r} is not a verdict: {known}") from None
+        return ApprovalVerdict.from_document(raw, strip_bare=True)
+    except ValueError as unusable:
+        raise InvalidPayload(str(unusable)) from None
 
 
 # ----------------------------------------------------------------------
@@ -222,6 +222,8 @@ def pending_approval_document(pending: PendingApproval) -> dict[str, Any]:
     return {
         "approval_id": pending.request.approval_id,
         "target": target_document(pending.request.target),
+        "kind": str(pending.request.kind),
+        "prompt": pending.request.prompt,
         "tool_name": pending.request.tool_name,
         "detail": pending.request.detail,
         "options": list(pending.request.options),
@@ -263,7 +265,7 @@ def approval_document(outcome: ApprovalOutcome) -> dict[str, Any]:
     return {
         "approval_id": outcome.request.approval_id,
         "target": target_document(outcome.request.target),
-        "verdict": str(outcome.verdict),
+        "verdict": outcome.verdict.to_document(),
         "state": str(outcome.state),
         "outcome": str(outcome.outcome),
         "closing_notice": outcome.closing_notice,

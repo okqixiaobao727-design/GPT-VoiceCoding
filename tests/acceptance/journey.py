@@ -238,6 +238,25 @@ INBOUND = writing("inbound.txt", "CHARLIE")
 SWITCH_FILE = "switches.txt"
 SWITCH_WORD = "DELTA"
 
+#: #103's real Claude question. The answer and continuation are the ticket's
+#: measured values, not text copied out of this implementation.
+CLAUDE_QUESTION = "Tabs or spaces?"
+CLAUDE_OPTIONS = ("spaces", "tabs")
+CLAUDE_ANSWER = "tabs"
+CLAUDE_ANSWERED = "You answered tabs."
+
+
+def asking_the_claude_question(_: Path) -> Instruction:
+    """Raise the exact `AskUserQuestion` route #103 adds, with no file side effect."""
+    return Instruction(
+        words=(
+            "Use AskUserQuestion to ask `Tabs or spaces?` with exactly two option labels, "
+            "`spaces` and `tabs`. After the question is answered, reply with exactly "
+            "`You answered tabs.` and do nothing else."
+        )
+    )
+
+
 #: Turn 5 — `child`. The main Session is asked to do the one thing that produces a
 #: second agent process under it. What each lane calls that differs, so the words
 #: live on the lane.
@@ -321,10 +340,17 @@ class Lane:
     #: the two agents' policies refuse different actions, and an instruction that
     #: asks one of them for permission asks the other for nothing (#105).
     relayed: Callable[[Path], Instruction]
-    #: The fresh permission `switches` leaves pending while Duty is off. It has
-    #: the same lane-specific policy shape as `relayed`, but a different target
-    #: so both agents have an action left to ask about.
+    #: The fresh authority dialog `switches` leaves pending while Duty is off:
+    #: a Claude question or a Codex permission.
     actionable: Callable[[Path], Instruction]
+    #: What that action waits on, and the exact `approve` arguments that release
+    #: it. Lane data rather than `if agent == ...`: the wait and its answer are
+    #: wire facts that differ between the two adapters.
+    actionable_kind: str
+    actionable_answer: tuple[str, ...]
+    #: A real question must prove the Session continued on the hook's words.
+    #: Permissions already prove continuation through their filesystem effect.
+    actionable_continuation: str | None
     #: The ground the permission was measured on, given the agent's own record of
     #: the Session. `approval` says its `named` half in the evidence line, so a
     #: green step states the ground it stood on rather than implying some
@@ -372,7 +398,10 @@ CLAUDE = Lane(
     # is what `roster` and `stable name`'s three reads want to find.
     boot=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
-    actionable=lambda workspace: writing(SWITCH_FILE, SWITCH_WORD),
+    actionable=asking_the_claude_question,
+    actionable_kind="question",
+    actionable_answer=("answer", CLAUDE_ANSWER),
+    actionable_continuation=CLAUDE_ANSWERED,
     # The flag the harness passes *is* the whole policy on this lane, and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
     # nothing that can disagree. Sound by construction, and said out loud here so
@@ -451,6 +480,9 @@ CODEX = Lane(
     actionable=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / SWITCH_FILE, SWITCH_WORD
     ),
+    actionable_kind="permission",
+    actionable_answer=("allow",),
+    actionable_continuation=None,
     policy_at=lambda record: hand_started.codex_turn_policy(record),
     asks_about=(
         "a write to a path outside the Session's writable roots raises "
@@ -1061,19 +1093,16 @@ class Walk:
         observations: silence over a derived window with Duty off, and — with
         Duty back on — a notice naming this Session.
 
-        Both lanes use a real permission here. It is answerable through the
-        Approval Relay already delivered by #77, so this Session is idle again
-        before the fixed next step (`child`). A Claude `AskUserQuestion` would
-        instead be held by its PermissionRequest hook with no answer path until
-        #103, making the following step impossible; Advisor withdrew that route
-        on #80 after the conflict was measured on Claude Code 2.1.247.
+        Claude uses a real `AskUserQuestion` here, answered through #103's typed
+        verdict; Codex still uses the real permission its adapter supports. In
+        both lanes the Session is idle again before the fixed next step (`child`).
 
         The interval before release is derived from `agent_turn_seconds` +
         `absence_window_seconds` + `DISCOVERY_SECONDS` +
         `telegram_round_trip_seconds`; the acceptance configuration keeps that
-        sum below the Approval Relay budget. The file effect is not graded here
-        — `approval` owns that assertion; this step approves only to release the
-        Session for `child`.
+        sum below the Approval Relay budget. Codex's file effect is not graded
+        here — `approval` owns that assertion. Claude instead grades the
+        ticket's measured continuation after `answer tabs`.
 
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
@@ -1090,17 +1119,24 @@ class Walk:
 
         actionable = self.lane.actionable(self.config.workspace)
         target = actionable.path_in(self.config.workspace)
-        if target is None:
-            raise StepFailed("the switches permission names no filesystem effect")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        if target is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
         mark = self.person.latest_message_id()
-        turn = self._drive_turn("wait for permission", actionable, expect_waiting=True)
+        turn = self._drive_turn(
+            f"wait for {self.lane.actionable_kind}", actionable, expect_waiting=True
+        )
+
+        def reached_actionable_wait() -> bool:
+            seen = self._roster_field("waiting_for")
+            return isinstance(seen, dict) and seen.get("kind") == self.lane.actionable_kind
+
+        support.wait_for(reached_actionable_wait, deadline_seconds=DISCOVERY_SECONDS)
         waiting = self._roster_field("waiting_for")
-        if not isinstance(waiting, dict) or waiting.get("kind") != "permission":
+        if not isinstance(waiting, dict) or waiting.get("kind") != self.lane.actionable_kind:
             self.bridgectl("switch", "duty", "on")
             raise StepFailed(
-                f"the switches turn did not stop on a permission (turn ended={turn.ended}, "
-                f"roster waiting_for={waiting!r})"
+                f"the switches turn did not stop on a {self.lane.actionable_kind} "
+                f"(turn ended={turn.ended}, roster waiting_for={waiting!r})"
             )
         pending = self._own_pending_approvals()
         if len(pending) != 1:
@@ -1109,6 +1145,18 @@ class Walk:
                 f"the switches turn left {len(pending)} pending approvals for this Session, "
                 f"not exactly one: {pending!r}"
             )
+        if self.lane.actionable_kind == "question":
+            projected = {
+                "prompt": pending[0].get("prompt"),
+                "options": tuple(pending[0].get("options", [])),
+            }
+            expected = {"prompt": CLAUDE_QUESTION, "options": CLAUDE_OPTIONS}
+            if projected != expected:
+                self.bridgectl("switch", "duty", "on")
+                raise StepFailed(
+                    f"the real question did not cross status verbatim: "
+                    f"expected {expected!r}, got {projected!r}"
+                )
         approval_id = str(pending[0]["approval_id"])
         status = self.bridgectl("status")
         if not status.ok:
@@ -1127,22 +1175,37 @@ class Walk:
         back_on = self.bridgectl("switch", "duty", "on")
         if not back_on.ok:
             raise StepFailed(f"`switch duty on` refused: {back_on.text}")
+        announcement_matches = (
+            (
+                lambda seen: (
+                    CLAUDE_QUESTION in seen.text
+                    and all(option in seen.text for option in CLAUDE_OPTIONS)
+                )
+            )
+            if self.lane.actionable_kind == "question"
+            else (lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)))
+        )
         reconciled = self._await_own_message(
             mark,
             deadline_seconds=DISCOVERY_SECONDS + self.far_side.telegram_round_trip_seconds,
-            matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
+            matching=announcement_matches,
         )
         if reconciled is None:
             raise StepFailed(
                 f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
                 f"(correct), but turning Duty back on reported nothing about a Session that "
-                f"was still waiting on permission {approval_id}. The bot said "
+                f"was still waiting on {self.lane.actionable_kind} {approval_id}. The bot said "
                 f"{self._other_traffic(mark)} in that window, none of it about this Session"
             )
-        approval_evidence = self._answer_pending_approval(mark)
+        approval_evidence = self._answer_pending_approval(
+            mark,
+            verdict=self.lane.actionable_answer,
+            announcement_matches=announcement_matches,
+        )
         if approval_evidence is None or approval_id not in approval_evidence:
             raise StepFailed(
-                f"the reconciled permission {approval_id} could not be released through the "
+                f"the reconciled {self.lane.actionable_kind} {approval_id} could not be "
+                "released through the "
                 f"Approval Relay: {approval_evidence!r}"
             )
         if not support.wait_for(
@@ -1150,26 +1213,39 @@ class Walk:
             deadline_seconds=self.far_side.agent_turn_seconds,
         ):
             raise StepFailed(
-                f"permission {approval_id} was approved, but the Session did not return to "
+                f"{self.lane.actionable_kind} {approval_id} was answered, but the Session "
+                "did not return to "
                 "idle before `child`"
+            )
+        if self.lane.actionable_continuation and not support.wait_for(
+            lambda: self._record_contains(self.lane.actionable_continuation or ""),
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed(
+                f"the hook accepted {self.lane.actionable_answer!r}, but the Session's own "
+                f"record never contained {self.lane.actionable_continuation!r}"
             )
         forms = _naming_forms(self._own_row())
         announcements = [
             message
             for message in self.person.messages_after(mark)
-            if message.from_bot
-            and _named_in(message.text, forms)
-            and APPROVAL_ANNOUNCEMENT.search(message.text)
+            if message.from_bot and _named_in(message.text, forms) and announcement_matches(message)
         ]
         if len(announcements) != 1:
             raise StepFailed(
-                f"Duty on produced {len(announcements)} permission announcements for "
+                f"Duty on produced {len(announcements)} {self.lane.actionable_kind} "
+                "announcements for "
                 f"{approval_id}, not exactly one: {[message.text for message in announcements]!r}"
             )
         return (
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
             f"still answered ({status.text.splitlines()[0]!r}); Duty on: message "
             f"{reconciled.id} {reconciled.text!r}; {approval_evidence}; Session returned idle"
+            + (
+                f" and said {self.lane.actionable_continuation!r}"
+                if self.lane.actionable_continuation
+                else ""
+            )
         )
 
     # --- child ------------------------------------------------------------
@@ -1496,6 +1572,13 @@ class Walk:
         record = self._record_now()
         return record.stat().st_size if record and record.exists() else 0
 
+    def _record_contains(self, text: str) -> bool:
+        """Whether the Session's own record contains the expected continuation."""
+        record = self._record_now()
+        if record is None or not record.exists():
+            return False
+        return text in record.read_text(encoding="utf-8", errors="replace")
+
     def _drive_turn(
         self, what: str, instruction: Instruction, *, expect_waiting: bool = False
     ) -> Turn:
@@ -1536,8 +1619,14 @@ class Walk:
         self.journal("turn", lane=self.lane.name, what=what, seconds=turn.seconds, ended=turn.ended)
         return turn
 
-    def _answer_pending_approval(self, mark: int) -> str | None:
-        """Answer, through the bridge, whatever permission the current turn raises.
+    def _answer_pending_approval(
+        self,
+        mark: int,
+        *,
+        verdict: tuple[str, ...] = ("allow",),
+        announcement_matches: Callable[..., bool] | None = None,
+    ) -> str | None:
+        """Answer, through the bridge, whatever authority dialog the turn raises.
 
         Journaled rather than asserted here: a lane that stalled on an unanswered
         permission would report a missing file where the truth is a waiting
@@ -1565,25 +1654,30 @@ class Walk:
         (`core/approvals.py:52-76`).
         """
         deadline = time.monotonic() + self.far_side.agent_turn_seconds
+        matches = announcement_matches or (
+            lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text))
+        )
         while time.monotonic() < deadline:
             pending = self._own_pending_approvals()
             if pending:
                 announced = self._await_own_message(
                     mark,
                     deadline_seconds=self.far_side.telegram_round_trip_seconds,
-                    matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
+                    matching=matches,
                 )
                 approval_id = str(pending[0]["approval_id"])
-                answer = self.bridgectl("approve", approval_id, "allow")
+                answer = self.bridgectl("approve", approval_id, *verdict)
                 self.journal(
                     "approval.answered",
                     lane=self.lane.name,
                     approval_id=approval_id,
+                    verdict=verdict,
                     announced=bool(announced),
                     reply=answer.text,
                 )
                 if not answer.ok:
-                    raise StepFailed(f"`approve {approval_id} allow` refused: {answer.text}")
+                    command = " ".join(("approve", approval_id, *verdict))
+                    raise StepFailed(f"`{command}` refused: {answer.text}")
                 if announced is None:
                     # The design says the permission "is escalated to every outlet
                     # — with Voice off, the Companion Channel — and the real bot's
@@ -1594,8 +1688,7 @@ class Walk:
                     raise StepFailed(
                         f"approval {approval_id} was answered through `bridgectl approve` "
                         f"({answer.text!r}), but it never reached the Companion Channel within "
-                        f"{self.far_side.telegram_round_trip_seconds:.0f}s — no chat message "
-                        f"matched {APPROVAL_ANNOUNCEMENT.pattern!r}"
+                        f"{self.far_side.telegram_round_trip_seconds:.0f}s"
                     )
                 return (
                     f"approval {approval_id}: announced as chat message {announced.id} "

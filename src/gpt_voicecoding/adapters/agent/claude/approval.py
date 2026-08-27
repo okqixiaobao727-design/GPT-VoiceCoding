@@ -1,13 +1,13 @@
 """The Approval Relay: a hook process holds the dialog open, and we answer into it.
 
 **The route is a `PermissionRequest` hook, and the hook is the wire.** Claude Code
-runs it when — and only when — a permission dialog is displayed, hands it the
-tool and its input on stdin, and waits up to its own budget for the process to
-print a decision. So the hook is not a notifier that reports and leaves: it is a
-held-open connection whose *return value* is the verdict, and the whole design
-falls out of that. The hook dials this listener, this listener parks it, Bridge
-Core takes as long as the user needs, and the answer travels back down the same
-connection the dialog is still waiting on.
+runs it for a displayed permission and for `AskUserQuestion`, hands it the tool
+and its input on stdin, and waits up to its own budget for the process to print a
+decision. So the hook is not a notifier that reports and leaves: it is a held-open
+connection whose *return value* is the verdict, and the whole design falls out of
+that. The hook dials this listener, this listener parks it, Bridge Core takes as
+long as the user needs, and the answer travels back down the same connection the
+dialog is still waiting on.
 
 **`ask` is silence, and that is a wire fact rather than a preference.** Read out
 of Claude Code 2.1.238: both the interactive and the headless permission paths
@@ -18,10 +18,10 @@ denial wearing the wrong word. Handing a request back is therefore implemented b
 printing nothing at all — the same shape the Codex spoke's approvals module
 arrived at independently, for the same reason.
 
-The ticket's own wording, "output is `allow` / `deny` / `ask`", is true at the
-seam and false at the wire. Both stay: `ApprovalVerdict` keeps three members
-because Bridge Core has three things to say, and exactly one of them is said by
-saying nothing.
+At the seam, a permission uses `allow`, `deny`, or `ask`, while a question uses
+`answer(text)`. At the wire, the answer is a denial whose message is that text,
+because Claude consumes it as the question's tool result; `ask` is the one
+verdict said by saying nothing.
 
 **Nothing here has a clock.** The hook waits for this listener and this listener
 waits for Bridge Core, whose `approval_budget_seconds` is the one budget in the
@@ -71,6 +71,7 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
+    ApprovalVerdictKind,
     AwaitingApproval,
     WaitingFor,
     WaitingKind,
@@ -102,7 +103,7 @@ DENIED_BY_VOICE: Final = "denied by the user, by voice, through GPT-VoiceCoding"
 
 #: The dialog's own correlator, undocumented and carried on every payload —
 #: the same field #71 recorded. It is what `WaitingFor.approval_id` holds for a
-#: question, and what #103 will address an answer with.
+#: question, and what #103 addresses an answer with.
 PROMPT_ID_FIELD: Final = "prompt_id"
 
 
@@ -122,13 +123,17 @@ def hook_decision(verdict: ApprovalVerdict) -> dict[str, Any] | None:
     something else; the second is a session-scoped rule, and the locked ceiling
     for a spoken grant is one call.
     """
-    if verdict is ApprovalVerdict.ASK:
+    if verdict.kind is ApprovalVerdictKind.ASK:
         return None
-    decision: dict[str, Any] = (
-        {"behavior": ALLOW_BEHAVIOR}
-        if verdict is ApprovalVerdict.ALLOW
-        else {"behavior": DENY_BEHAVIOR, "message": DENIED_BY_VOICE}
-    )
+    if verdict.kind is ApprovalVerdictKind.ANSWER:
+        decision: dict[str, Any] = {
+            "behavior": DENY_BEHAVIOR,
+            "message": verdict.answer_text,
+        }
+    elif verdict.kind is ApprovalVerdictKind.ALLOW:
+        decision = {"behavior": ALLOW_BEHAVIOR}
+    else:
+        decision = {"behavior": DENY_BEHAVIOR, "message": DENIED_BY_VOICE}
     return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "decision": decision}}
 
 
@@ -246,6 +251,7 @@ def request_from(
         approval_id=approval_id,
         target=target,
         tool_name=tool_name if isinstance(tool_name, str) and tool_name.strip() else "a tool",
+        kind=WaitingKind.PERMISSION,
         detail=stop_analysis.summarise(payload.get(TOOL_INPUT_FIELD)),
     )
 
@@ -495,14 +501,14 @@ class ApprovalListener:
             await self._write_verdict(waiting, verdict)
         except (OSError, ConnectionError) as broken:
             self._answered_elsewhere.add(approval_id)
-            if verdict is ApprovalVerdict.ASK:
+            if verdict.kind is ApprovalVerdictKind.ASK:
                 # Nothing was owed to the hook here: `ask` asks it to do nothing,
                 # and a hook that has already gone has already done it.
                 return held
             return _failed(request_id, f"the hook holding that dialog went away: {broken}")
 
         acknowledged = await self._hook_acknowledged(waiting)
-        if verdict is ApprovalVerdict.ASK:
+        if verdict.kind is ApprovalVerdictKind.ASK:
             return held
         if not acknowledged:
             return _unknown(
@@ -514,7 +520,10 @@ class ApprovalListener:
 
     async def _write_verdict(self, waiting: _Waiting, verdict: ApprovalVerdict) -> None:
         """Put one verdict on one hook's connection. Raises if it did not go."""
-        await self._reply(waiting.writer, {TYPE_FIELD: VERDICT_TYPE, VERDICT_FIELD: str(verdict)})
+        await self._reply(
+            waiting.writer,
+            {TYPE_FIELD: VERDICT_TYPE, VERDICT_FIELD: verdict.to_document()},
+        )
         waiting.answered.set()
 
     async def _hook_acknowledged(self, waiting: _Waiting) -> bool:
@@ -564,36 +573,40 @@ class ApprovalListener:
                 await self._refuse(writer, "no Session this engine holds reported that dialog")
                 return
 
-            approval_id = str(uuid.uuid4())
-            request = request_from(payload, target=target, approval_id=approval_id)
             question = question_from(payload)
+            if question is not None:
+                approval_id = question.approval_id or str(uuid.uuid4())
+                request = ApprovalRequest(
+                    approval_id=approval_id,
+                    target=target,
+                    tool_name=stop_analysis.QUESTION_TOOL,
+                    kind=WaitingKind.QUESTION,
+                    prompt=question.prompt or "",
+                    options=tuple(option.text for option in question.options),
+                    recommendation=question.recommendation,
+                )
+            else:
+                approval_id = str(uuid.uuid4())
+                request = request_from(payload, target=target, approval_id=approval_id)
             waiting = _Waiting(request, writer, question)
             self._waiting[approval_id] = waiting
 
-            if question is None:
-                # Raised only once the request is parked, so a verdict answered
-                # the same tick has somewhere to land.
+            # Raised only once the request is parked, so a verdict answered the
+            # same tick has somewhere to land. A question enters the same
+            # Approval Relay only under its own prompt id (#103); without that
+            # correlator it remains observable but cannot honestly be addressed.
+            if question is None or question.approval_id is not None:
                 self._emit(AwaitingApproval(request=request))
-            else:
-                # **A question is parked and not announced as an approval**, and
-                # this is the branch #103 turns into the question's own route —
-                # not a place where questions are ignored. It is parked exactly
-                # as a permission is: the hook stays held open, so the dialog
-                # reaches the screen and the person at the keyboard can answer
-                # it, and this connection is released when they do or when this
-                # listener closes. What it does not do is enter the approval
-                # budget, fallback and closing (`core/approvals.py`), because
-                # those carry an allow/deny menu — and on this wire a spoken
-                # "deny" is consumed by the Session *as the user's answer*
-                # (2.1.246, #77), so that menu would put `DENIED_BY_VOICE` into
-                # the conversation as a choice the user never made. It is
-                # announced once instead, by the Stop Notice, through the
-                # `WaitingFor` the adapter reads back out of here.
+            if question is not None and question.approval_id is not None:
                 _log.info(
-                    "a question is parked for %s (prompt_id=%s); announced by the Stop "
-                    "Notice, not as an approval",
+                    "a question is parked for %s (prompt_id=%s); entered the Approval Relay",
                     target,
                     question.approval_id,
+                )
+            elif question is not None:
+                _log.info(
+                    "a question is parked for %s without a prompt_id; left to the on-screen dialog",
+                    target,
                 )
 
             # From here this task does exactly one thing: watch for the hook's

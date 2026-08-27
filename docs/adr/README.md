@@ -13,6 +13,7 @@
 | [0011](0011-the-claude-hooks-are-a-fingerprinted-block-in-the-user-settings-file.md) | The Claude hooks are a fingerprinted block in the user's settings file |
 | [0012](0012-installation-runs-at-first-launch.md) | Installation runs at first launch, from a package that needs no engine |
 | [0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md) | The Claude Answer Relay rides the Session's own inbox socket, and an accepted write is not a receipt |
+| [0014](0014-question-answers-ride-the-approval-hook.md) | A question answer rides the Approval Relay as a typed verdict |
 
 0008 (headless direct-child launcher) and 0009 (a launch carries its Opening Instruction) were removed with the launcher when v1.0 became a bridge over Sessions the user starts ([#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67), [#68](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/68)); they return with the launch map, from git history.
 

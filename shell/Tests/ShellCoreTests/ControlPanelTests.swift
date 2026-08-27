@@ -8,13 +8,18 @@ final class ScriptedControlPlane: ControlPlaneDialing, @unchecked Sendable {
     private let lock = NSLock()
     private var answers: [Action: Result<String, ControlPlaneFailure>]
     private(set) var asked: [String] = []
+    private(set) var sentLines: [String] = []
 
     init(_ answers: [Action: Result<String, ControlPlaneFailure>]) {
         self.answers = answers
     }
 
     func ask(_ request: Request) async throws -> Reply {
-        lock.withLock { asked.append(request.action.rawValue) }
+        let line = String(decoding: try request.line(), as: UTF8.self)
+        lock.withLock {
+            asked.append(request.action.rawValue)
+            sentLines.append(line)
+        }
         let answer =
             lock.withLock { answers[request.action] }
             ?? .failure(.engineUnreachable("nothing scripted for \(request.action.rawValue)"))
@@ -25,6 +30,7 @@ final class ScriptedControlPlane: ControlPlaneDialing, @unchecked Sendable {
     }
 
     func requests() -> [String] { lock.withLock { asked } }
+    func lines() -> [String] { lock.withLock { sentLines } }
 }
 
 private let allSwitchesOff = """
@@ -46,6 +52,55 @@ private let allSwitchesOff = """
         #expect(status.switches.map(\.name) == ["duty", "voice", "message"])
         #expect(status.switches.allSatisfy { !$0.on })
         #expect(!status.callIsUp)
+    }
+
+    @Test func pendingQuestionsCarryTheExistingApprovalStateWithoutPermissions() async {
+        let statusReply = """
+            {"ok": true, "action": "status", "protocol": 4, "data": {
+              "switches": {"duty": false, "voice": false, "message": false},
+              "sessions": [], "call_id": null, "pending_relays": [],
+              "pending_approvals": [
+                {"approval_id": "prompt-1", "kind": "question",
+                 "prompt": "Indent with?", "options": ["Spaces", "Tabs"]},
+                {"approval_id": "permission-1", "kind": "permission",
+                 "prompt": "", "options": []}]}}
+            """
+        let panel = ControlPanel(
+            client: ScriptedControlPlane([.status: .success(statusReply)]))
+
+        await panel.refresh()
+
+        guard case .read(let status) = panel.reading else {
+            Issue.record("expected a reading")
+            return
+        }
+        #expect(status.pendingApprovals == 2)
+        #expect(
+            status.pendingQuestions == [
+                PendingQuestion(
+                    approvalID: "prompt-1", prompt: "Indent with?",
+                    options: ["Spaces", "Tabs"])
+            ])
+    }
+
+    @Test func optionAndFreeTextAnswersUseTheSameStructuredVerdictVerbatim() async {
+        let engine = ScriptedControlPlane([
+            .approve: .success(
+                #"{"ok": true, "action": "approve", "protocol": 4, "data": {}}"#),
+            .status: .success(allSwitchesOff),
+        ])
+        let panel = ControlPanel(client: engine)
+
+        await panel.answer("prompt-1", text: "Tabs")
+        await panel.answer("prompt-1", text: " custom words ")
+
+        #expect(
+            engine.lines() == [
+                #"{"action":"approve","payload":{"approval_id":"prompt-1","verdict":{"kind":"answer","text":"Tabs"}}}"#,
+                #"{"action":"status"}"#,
+                #"{"action":"approve","payload":{"approval_id":"prompt-1","verdict":{"kind":"answer","text":" custom words "}}}"#,
+                #"{"action":"status"}"#,
+            ])
     }
 
     @Test func theControlPlaneIsNeverGated() async {

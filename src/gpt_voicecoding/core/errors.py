@@ -22,6 +22,15 @@ class BridgeCoreError(Exception):
     """Base for every refusal Bridge Core's state components raise."""
 
 
+class ApprovalVerdictMismatch(BridgeCoreError):
+    """The verdict shape cannot resolve the kind of request that is waiting."""
+
+    def __init__(self, *, waiting_kind: str, verdict_kind: str) -> None:
+        super().__init__(f"a {waiting_kind} wait cannot be resolved with a {verdict_kind} verdict")
+        self.waiting_kind = waiting_kind
+        self.verdict_kind = verdict_kind
+
+
 class UnknownSwitchError(BridgeCoreError):
     """No switch by that name is registered on this board."""
 

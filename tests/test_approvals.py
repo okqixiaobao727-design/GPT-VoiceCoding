@@ -33,7 +33,12 @@ from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
-from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict
+from gpt_voicecoding.seams.agent import (
+    ApprovalRequest,
+    ApprovalVerdict,
+    ApprovalVerdictKind,
+    WaitingKind,
+)
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
@@ -47,7 +52,19 @@ def request(approval_id: str = "approval-1") -> ApprovalRequest:
         approval_id=approval_id,
         target=CODEX,
         tool_name="Bash",
+        kind=WaitingKind.PERMISSION,
         detail="rm -rf build",
+    )
+
+
+def question_request(approval_id: str = "approval-1") -> ApprovalRequest:
+    return ApprovalRequest(
+        approval_id=approval_id,
+        target=CODEX,
+        tool_name="AskUserQuestion",
+        kind=WaitingKind.QUESTION,
+        prompt="Tabs or spaces?",
+        options=("tabs", "spaces"),
     )
 
 
@@ -123,6 +140,22 @@ class TestAnnouncingAPendingDialog:
         harness.opened(spoken_as="GPT-VoiceCoding \u00b7 port the log")
 
         assert harness.call.spoken[0].startswith("GPT-VoiceCoding \u00b7 port the log is waiting")
+
+    def test_a_question_announcement_keeps_the_sessions_recommendation(self) -> None:
+        harness = Harness()
+        pending_question = ApprovalRequest(
+            approval_id="approval-1",
+            target=CODEX,
+            tool_name="AskUserQuestion",
+            kind=WaitingKind.QUESTION,
+            prompt="Tabs or spaces?",
+            options=("tabs", "spaces"),
+            recommendation="tabs",
+        )
+
+        harness.opened(pending_question)
+
+        assert "It recommends tabs" in harness.call.spoken[0]
 
     def test_a_caller_with_no_name_to_give_still_names_the_session(self) -> None:
         """The address is the floor `spoken_name` itself falls back to.
@@ -203,7 +236,14 @@ class TestCarryingTheVerdict:
     def test_no_operation_class_is_barred_from_voice(self) -> None:
         """The mechanism ceiling is the adapters'; Core bars nothing."""
         harness = Harness()
-        harness.opened(ApprovalRequest(approval_id="approval-1", target=CODEX, tool_name="Write"))
+        harness.opened(
+            ApprovalRequest(
+                approval_id="approval-1",
+                target=CODEX,
+                tool_name="Write",
+                kind=WaitingKind.PERMISSION,
+            )
+        )
 
         harness.answer(ApprovalVerdict.ALLOW)
 
@@ -288,7 +328,7 @@ class TestTheBudget:
 
         assert harness.verdicts == [ApprovalVerdict.ASK]
         assert outcome.verdict is ApprovalVerdict.ASK
-        assert outcome.verdict is not ApprovalVerdict.DENY
+        assert outcome.verdict != ApprovalVerdict.DENY
 
     def test_expiry_reports_the_fallback_rather_than_leaving_the_user_hanging(self) -> None:
         harness = Harness()
@@ -377,8 +417,8 @@ class TestWhatTheClosingNoticeMayClaim:
 
         outcome = harness.answer(ApprovalVerdict.ALLOW)
 
-        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.ALLOW]
-        assert outcome.closing_notice != CLOSING_NOTICES[ApprovalVerdict.ALLOW]
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdictKind.ALLOW]
+        assert outcome.closing_notice != CLOSING_NOTICES[ApprovalVerdictKind.ALLOW]
 
     def test_a_deny_the_session_never_confirmed_is_not_announced_as_denied(self) -> None:
         harness = Harness(outcome=Delivery.FAILED)
@@ -386,7 +426,7 @@ class TestWhatTheClosingNoticeMayClaim:
 
         outcome = harness.answer(ApprovalVerdict.DENY)
 
-        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.DENY]
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdictKind.DENY]
 
     def test_a_held_verdict_is_not_confirmed_either(self) -> None:
         """HELD is parked in front of the human. It is the dialog's, not ours."""
@@ -395,7 +435,18 @@ class TestWhatTheClosingNoticeMayClaim:
 
         outcome = harness.answer(ApprovalVerdict.ALLOW)
 
-        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdict.ALLOW]
+        assert outcome.closing_notice == UNCONFIRMED_NOTICES[ApprovalVerdictKind.ALLOW]
+
+    def test_an_unconfirmed_answer_points_at_the_on_screen_dialog(self) -> None:
+        harness = Harness(outcome=Delivery.UNKNOWN)
+        harness.opened(question_request())
+
+        outcome = harness.answer(ApprovalVerdict.answer("tabs"))
+
+        assert outcome.closing_notice == (
+            "your answer was not confirmed to have reached the session — if the dialog is "
+            "still on screen, answer it there"
+        )
 
     def test_the_unconfirmed_wording_points_at_the_dialog_that_can_still_resolve_it(
         self,
@@ -417,11 +468,14 @@ class TestWhatTheClosingNoticeMayClaim:
 
         outcome = harness.answer(ApprovalVerdict.ALLOW)
 
-        assert outcome.closing_notice == CLOSING_NOTICES[ApprovalVerdict.ALLOW]
+        assert outcome.closing_notice == CLOSING_NOTICES[ApprovalVerdictKind.ALLOW]
 
     def test_an_expiry_says_the_same_thing_on_every_grade(self) -> None:
         """`ask` carried no verdict, so no receipt can fail to confirm one."""
-        assert UNCONFIRMED_NOTICES[ApprovalVerdict.ASK] == CLOSING_NOTICES[ApprovalVerdict.ASK]
+        assert (
+            UNCONFIRMED_NOTICES[ApprovalVerdictKind.ASK] == CLOSING_NOTICES[ApprovalVerdictKind.ASK]
+        )
 
     def test_every_verdict_has_an_unconfirmed_wording(self) -> None:
-        assert set(UNCONFIRMED_NOTICES) == set(ApprovalVerdict)
+        assert set(UNCONFIRMED_NOTICES) == set(ApprovalVerdictKind)
+        assert set(CLOSING_NOTICES) == set(ApprovalVerdictKind)

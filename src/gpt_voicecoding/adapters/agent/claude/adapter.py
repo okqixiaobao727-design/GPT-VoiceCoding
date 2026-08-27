@@ -558,9 +558,9 @@ class ClaudeAgentAdapter:
            until it has flushed, and by then the person at the keyboard has
            usually answered it. The hook's question is the thing itself and the
            record's is a reconstruction of it, so the hook wins whether the two
-           name the same prompt or different ones. Nothing carries a verdict
-           into it: `as_approval_request` still answers `None` for a QUESTION,
-           and the notice sends the user to their own terminal until #103.
+           name the same prompt or different ones. With a `prompt_id`, #103
+           addresses it through the Approval Relay; without that correlator it
+           remains observable and the on-screen dialog is still the only route.
         1. **A readable question wins outright.** The reference implementation's
            precedence — a decision only the user can supply outranks a permission
            call beside it (`legacy@1d32845:bridge/transcript.py:1691-1692`) — and
