@@ -20,8 +20,7 @@ The ones that hold state:
   configuration declares beneath it.
 - ``sessions`` — the Session registry: exact targets, stale ones refused, Session
   Names that disambiguate or ask.
-- ``relay_queue`` — the *one* ledger of everything undelivered, retained Stop
-  Notices included.
+- ``relay_queue`` — undelivered Answer Relays waiting on a Reply Window.
 - ``persistence`` — the durable subset, and the only component that touches disk.
 - ``state`` — the three of them assembled, and the single persistence path.
 - ``events`` — the one queue every seam's events arrive on.
@@ -32,8 +31,7 @@ The ones that decide — the policy, all of it:
   by the control plane (ADR 0002).
 - ``interlock`` — one call at a time, above the Call seam. The only door to
   opening one.
-- ``escalation`` — the Stop Notice route matrix, and the retention that makes
-  no-loss true.
+- ``escalation`` — the Stop Notice route matrix for one delivery attempt.
 - ``relays`` — queueing the user's own words against the Reply Window, and the
   ceiling on how long they may wait.
 - ``approvals`` — the Approval Relay budget, its never-deny fallback, and the
@@ -43,7 +41,7 @@ The ones that decide — the policy, all of it:
   (ADR 0003); only the hub knows the configured side.
 - ``bridge`` — the five of them assembled, and the one dispatch that feeds them.
 
-And the substrate all of them share: ``lifecycle`` (the four state names for
+And the substrate all of them share: ``lifecycle`` (the five state names for
 anything pending), ``policy`` (every configurable duration), ``clock`` (where a
 duration is measured from), and ``errors`` (what a refusal looks like).
 

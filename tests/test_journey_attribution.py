@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import journey
+import support
 
 from gpt_voicecoding.control_plane.payloads import session_document
 from gpt_voicecoding.core.approvals import announcement_for
@@ -78,6 +79,45 @@ class TestWhatTheHarnessThinksNamesASession:
         """Not an empty pass: `_await_message_naming` refuses on this rather than waiting."""
         assert journey._naming_forms({}) == ()
         assert journey._naming_forms({"target": "not a mapping", "name": ""}) == ()
+
+
+class TestTheSwitchesWaitIsAResolvablePermission:
+    """#80 must leave the journey Session usable for the following `child` step."""
+
+    def test_claude_uses_a_fresh_write_in_its_workspace(self, tmp_path: Path) -> None:
+        instruction = journey.CLAUDE.actionable(tmp_path)
+
+        assert instruction.path_in(tmp_path) == tmp_path / journey.SWITCH_FILE
+        assert instruction.content == journey.SWITCH_WORD
+
+
+class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
+    def test_each_run_gets_a_distinct_workspace_basename(self, tmp_path: Path) -> None:
+        run = tmp_path / "20260827T091500Z"
+        run.mkdir()
+
+        workspace = support.fresh_workspace(run, "codex", "/usr/bin:/bin")
+
+        assert workspace.name == f"workspace-codex-{run.name}"
+
+    def test_an_absolute_write_explicitly_attempts_apply_patch_without_a_bypass(
+        self, tmp_path: Path
+    ) -> None:
+        instruction = journey.writing_at(tmp_path / "outside.txt", "DELTA")
+        words = instruction.words.casefold()
+
+        assert "`apply_patch`" in instruction.words
+        assert "leave any approval request pending" in words
+        assert "sandbox" not in words
+        assert "danger-full-access" not in words
+
+    def test_codex_uses_a_fresh_write_outside_its_sandbox(self, tmp_path: Path) -> None:
+        instruction = journey.CODEX.actionable(tmp_path)
+
+        assert instruction.path_in(tmp_path) == (
+            tmp_path.parent / journey.OUTSIDE_THE_SANDBOX / journey.SWITCH_FILE
+        )
+        assert instruction.content == journey.SWITCH_WORD
 
 
 class TestTheProductsOwnNoticesAreAttributable:

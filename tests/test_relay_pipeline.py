@@ -22,10 +22,9 @@ import pytest
 
 from fakes import FakeAgent
 from gpt_voicecoding.core.errors import StaleSessionError, UnknownSessionError
-from gpt_voicecoding.core.escalation import NO_DEADLINE
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
-from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
+from gpt_voicecoding.core.relay_queue import RelayKind, RelayQueue
 from gpt_voicecoding.core.relays import (
     CEILING_REPORT,
     CEILING_UNPROVEN_REPORT,
@@ -39,7 +38,7 @@ from gpt_voicecoding.core.relays import (
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
 from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget, new_request_id
+from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -342,27 +341,6 @@ class TestTheTenMinuteCeiling:
 
         assert len(harness.sweep()) == 1
         assert harness.sweep() == ()
-
-    def test_the_ceiling_never_touches_a_retained_stop_notice(self) -> None:
-        """A notice has no deadline at all; only a queued Relay has a ceiling."""
-        harness = Harness()
-        harness.relays.enqueue(
-            PendingRelay(
-                request_id=new_request_id(),
-                target=CODEX,
-                kind=RelayKind.NOTICE,
-                text="that session stopped and may need you",
-                queued_at=harness.now,
-                expires_at=NO_DEADLINE,
-            )
-        )
-        harness.relay("ship it")
-
-        harness.now += TEN_MINUTES
-        (outcome,) = harness.sweep()
-
-        assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert [waiting.kind for waiting in harness.relays.pending()] == [RelayKind.NOTICE]
 
 
 class TestFailingClosedOnTheTarget:

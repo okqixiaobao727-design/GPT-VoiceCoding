@@ -1,4 +1,4 @@
-"""The four state names every pending thing in Bridge Core passes through.
+"""The five state names every pending thing in Bridge Core passes through.
 
 Defined here because the policy pipelines issue was asked to define them and
 share them: the Stop Notice escalation pipeline, the Relay queue's ceiling, and
@@ -8,10 +8,12 @@ reported failure" drifted into looking like a contradiction.
 
 - **PENDING** — accepted, not yet attempted.
 - **RETAINED** — attempted or attempt-less, not delivered, and **still
-  retryable**. This is where no-loss lives: a Stop Notice with no outlet waits
-  here indefinitely and surfaces on the next available outlet.
+  retryable**. Answer Relays wait here for the Session's Reply Window.
 - **DELIVERED** — positively proven delivered. Terminal. Leaves the queue, so
   it cannot be re-attempted by anything.
+- **DROPPED** — not delivered and nothing automatic follows for this item.
+  Stop-Notice no-loss lives in Bridge Core's current-state reconciliation
+  (#80), which may create a new notice; this item is never replayed.
 - **REPORTED_FAILED** — reported to the user as terminal. **No automatic retry
   and no substitute action follows.** Also leaves the queue, so the retry
   boundary is structural rather than remembered.
@@ -30,17 +32,18 @@ from enum import StrEnum
 
 
 class Lifecycle(StrEnum):
-    """Where a notice or a Relay stands. Two of the four are terminal."""
+    """Where a notice or a Relay stands. Three of the five are terminal."""
 
     PENDING = "pending"
     RETAINED = "retained"
     DELIVERED = "delivered"
+    DROPPED = "dropped"
     REPORTED_FAILED = "reported_failed"
 
     @property
     def is_terminal(self) -> bool:
         """Whether anything further may happen to this automatically."""
-        return self in (Lifecycle.DELIVERED, Lifecycle.REPORTED_FAILED)
+        return self in (Lifecycle.DELIVERED, Lifecycle.DROPPED, Lifecycle.REPORTED_FAILED)
 
     @property
     def is_retryable(self) -> bool:

@@ -1,12 +1,10 @@
-"""The undelivered Relay queue — the one ledger of everything still pending.
+"""The undelivered Answer Relay queue.
 
-**There is exactly one of these.** The reference implementation kept two live
-stop ledgers and rendered both, and the migration looked permanently unfinished
-because of it. So a Stop Notice that could not be delivered is not a second
-table: it is a `RelayKind.NOTICE` entry in this queue, waiting for an outlet, and
-"what is pending" has one answer and one renderer.
+Stop Notices do not enter this queue. Their no-loss behaviour lives in Bridge
+Core's current-state reconciliation, which inspects live main Sessions instead
+of replaying historical notice objects.
 
-Every entry carries its classification from the one four-state vocabulary, and a
+Every entry carries its classification from the shared lifecycle vocabulary, and a
 DELIVERED entry *leaves the queue*. That is deliberate: the reference
 implementation graded an audibly spoken notice FAILED by matching another
 surface's records, retried it, and opened duplicate calls. Here, proving delivery
@@ -45,8 +43,6 @@ class RelayKind(StrEnum):
 
     #: The user's own words, carrying the user's authority.
     ANSWER = "answer"
-    #: Words the system originates — a Stop Notice with no outlet yet.
-    NOTICE = "notice"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,11 +73,6 @@ class PendingRelay:
             raise ValueError("a Relay carries words; there are none here")
         if self.expires_at <= self.queued_at:
             raise ValueError("a Relay's deadline must be after the moment it was queued")
-        if self.route is RelayRoute.SUPPLEMENT and self.kind is not RelayKind.ANSWER:
-            raise ValueError(
-                "the supplement route carries the user's authority, so it carries only "
-                "the user's own words"
-            )
 
 
 class RelayQueue:

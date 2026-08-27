@@ -32,7 +32,6 @@ from gpt_voicecoding.core.escalation import EscalationPipeline
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
-from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict
 from gpt_voicecoding.seams.delivery import Delivery
@@ -73,15 +72,12 @@ class Harness:
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
         self.agent = FakeAgent(outcome=outcome, reason="the fake carried nothing")
-        self.relays = RelayQueue()
         self.escalation = EscalationPipeline(
             call=self.call,
             channel=self.channel,
             interlock=CallInterlock(self.call),
             adjudicator=SwitchAdjudicator(self.switches),
-            relays=self.relays,
             voice_instructions=HOUSE_RULES,
-            clock=lambda: self.now,
         )
         self.pipeline = ApprovalPipeline(
             agents={AgentKind.CODEX: self.agent},
@@ -142,13 +138,16 @@ class TestAnnouncingAPendingDialog:
 
         assert harness.call.spoken[0].startswith("codex abc is waiting")
 
-    def test_it_rides_the_escalation_pipeline_rather_than_its_own_flow(self) -> None:
-        """With no outlet at all it is retained, exactly like any other notice."""
+    def test_no_outlet_drops_the_announcement_but_keeps_the_request_pending(self) -> None:
         harness = Harness(duty=False)
 
-        harness.opened()
+        waiting, outcome = harness.opened()
 
-        assert len(harness.relays.pending()) == 1
+        assert waiting.request.approval_id == "approval-1"
+        assert outcome.state is Lifecycle.DROPPED
+        assert [one.request.approval_id for one in harness.pipeline.pending()] == ["approval-1"]
+        assert harness.call.spoken == []
+        assert harness.channel.sent == []
 
     def test_message_off_announces_by_voice_alone(self) -> None:
         harness = Harness(message=False)
@@ -245,45 +244,29 @@ class TestTheClosingNotice:
         assert len(harness.channel.sent) == pushed + 1
 
 
-class TestRetiringTheAnnouncement:
-    def test_resolving_drops_the_prompt_that_never_went_out(self) -> None:
-        """Otherwise the next outlet asks for a decision already made."""
+class TestResolvingAnUnannouncedRequest:
+    def test_resolution_removes_the_request_without_creating_a_notice_ledger(self) -> None:
         harness = Harness(duty=False)
         harness.opened()
-        assert len(harness.relays.pending()) == 1
 
         harness.answer(ApprovalVerdict.ALLOW)
 
-        assert [waiting.text for waiting in harness.relays.pending()] == ["approved by voice"]
+        assert harness.pipeline.pending() == ()
+        assert harness.verdicts == [ApprovalVerdict.ALLOW]
+        assert harness.call.spoken == []
+        assert harness.channel.sent == []
 
-    def test_the_stale_prompt_is_never_spoken_once_an_outlet_returns(self) -> None:
-        harness = Harness(duty=False)
-        harness.opened()
-        harness.answer(ApprovalVerdict.ALLOW)
-
-        harness.switches.flip(SwitchName.DUTY, True)
-        asyncio.run(harness.escalation.sweep())
-
-        assert harness.call.spoken == ["approved by voice"]
-
-    def test_expiry_retires_the_prompt_too(self) -> None:
+    def test_expiry_removes_the_request_without_creating_a_notice_ledger(self) -> None:
         harness = Harness(duty=False)
         harness.opened()
 
         harness.now += TEN_MINUTES
-        harness.sweep()
+        (outcome,) = harness.sweep()
 
-        assert [waiting.text for waiting in harness.relays.pending()] == [
-            CLOSING_NOTICES[ApprovalVerdict.ASK]
-        ]
-
-    def test_a_prompt_that_did_go_out_is_not_retired_twice(self) -> None:
-        harness = Harness()
-        harness.opened()
-
-        harness.answer(ApprovalVerdict.ALLOW)
-
-        assert harness.relays.pending() == ()
+        assert outcome.verdict is ApprovalVerdict.ASK
+        assert harness.pipeline.pending() == ()
+        assert harness.call.spoken == []
+        assert harness.channel.sent == []
 
 
 class TestTheBudget:

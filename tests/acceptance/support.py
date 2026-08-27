@@ -970,7 +970,7 @@ def new_run_directory(identifier: str | None = None) -> Path:
 
 def fresh_workspace(run_directory: Path, lane: str, path_value: str) -> Path:
     """A disposable `git init` directory, one per lane, kept with the run."""
-    workspace = run_directory / f"workspace-{lane}"
+    workspace = run_directory / f"workspace-{lane}-{run_directory.name}"
     workspace.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "init", "--quiet", str(workspace)],

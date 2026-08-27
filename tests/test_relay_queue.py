@@ -1,10 +1,8 @@
-"""The undelivered Relay queue — the single ledger of everything still pending.
+"""The undelivered Answer Relay queue.
 
-The reference implementation ran two live ledgers and rendered both, and that is
-the defect this component exists to make impossible: a retained Stop Notice is
-an entry *here*, not in a second stop table. Every entry carries its
-classification from the one four-state vocabulary, and a delivered entry leaves
-the queue, so "graded FAILED after being spoken, then retried" cannot be built.
+Stop Notices are reconstructed from current Session state and never enter this
+queue. A delivered Answer Relay leaves the queue, so "graded FAILED after being
+delivered, then retried" cannot be built.
 
 The 10-minute ceiling itself is policy and belongs to the pipelines issue; the
 queue only holds the deadline it is given.
@@ -45,27 +43,10 @@ def answer(
     )
 
 
-def notice(target: SessionTarget = CODEX, *, queued_at: float = 1_000.0) -> PendingRelay:
-    return PendingRelay(
-        request_id=new_request_id(),
-        target=target,
-        kind=RelayKind.NOTICE,
-        text="that session stopped and may need you",
-        queued_at=queued_at,
-        expires_at=queued_at + TEN_MINUTES,
-    )
-
-
 class TestTheOneLedger:
-    def test_a_retained_stop_notice_lives_in_the_same_queue_as_a_relay(self) -> None:
-        queue = RelayQueue()
-        queued_answer = queue.enqueue(answer())
-        queued_notice = queue.enqueue(notice())
-        assert queue.pending() == (queued_answer, queued_notice)
-
-    def test_the_queue_holds_exactly_the_two_kinds_that_can_wait(self) -> None:
+    def test_the_queue_holds_only_user_answer_relays(self) -> None:
         """An Approval Relay has a budget and a fallback; it never waits here."""
-        assert {member.value for member in RelayKind} == {"answer", "notice"}
+        assert {member.value for member in RelayKind} == {"answer"}
 
     def test_entries_come_back_in_the_order_they_arrived(self) -> None:
         queue = RelayQueue()
@@ -123,19 +104,6 @@ class TestEnqueueing:
     def test_empty_text_is_refused(self) -> None:
         with pytest.raises(ValueError):
             answer(text="   ")
-
-    def test_only_user_authored_words_may_take_the_supplement_route(self) -> None:
-        """Supplement carries the user's authority; a Stop Notice never claims it."""
-        with pytest.raises(ValueError):
-            PendingRelay(
-                request_id=new_request_id(),
-                target=CODEX,
-                kind=RelayKind.NOTICE,
-                text="that session stopped",
-                queued_at=1_000.0,
-                expires_at=1_600.0,
-                route=RelayRoute.SUPPLEMENT,
-            )
 
     def test_an_answer_may(self) -> None:
         assert answer(route=RelayRoute.SUPPLEMENT).route is RelayRoute.SUPPLEMENT

@@ -86,7 +86,7 @@ class TestTheStopNoticePipelineEndToEnd:
         assert hub.channel.sent
         assert hub.call.calls_started == 0
 
-    def test_an_unreachable_channel_retains_the_notice_and_never_marks_it_delivered(
+    def test_an_unreachable_channel_drops_the_attempt_instead_of_replaying_it(
         self,
     ) -> None:
         hub = Hub(voice=False)
@@ -94,18 +94,38 @@ class TestTheStopNoticePipelineEndToEnd:
         hub.channel.reason = "the chat is unreachable"
 
         hub.emit(SessionStopped(target=CODEX))
+        hub.channel.outcome = Delivery.DELIVERED
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
 
-        (waiting,) = hub.state.relays.pending()
-        assert waiting.outcome.is_delivered is False
+        assert len(hub.channel.sent) == 1
+        assert hub.state.relays.pending() == ()
 
-    def test_a_retained_notice_surfaces_when_a_call_comes_up(self) -> None:
+    def test_a_current_question_surfaces_when_duty_comes_back_on(self) -> None:
         hub = Hub(duty=False)
         hub.emit(SessionStopped(target=CODEX))
-        assert len(hub.state.relays.pending()) == 1
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
 
         hub.flip(SwitchName.DUTY, True)
 
-        assert hub.call.spoken
+        assert hub.agent.inspections == []
+        assert hub.call.spoken == []
+
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
         assert hub.state.relays.pending() == ()
 
     def test_message_off_and_voice_on_never_pushes_text(self) -> None:
@@ -385,6 +405,57 @@ class TestTheOneCallInvariantEndToEnd:
         assert snapshot.state is CallState.UP
         assert hub.core.interlock.owns_call() is True
 
+    def test_a_live_toggle_that_opens_a_call_reconciles_current_stops(self) -> None:
+        hub = Hub()
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+
+        snapshot = hub.toggle()
+
+        assert snapshot.is_up
+        assert hub.agent.inspections == []
+        assert [notice for notice in hub.call.spoken if "Which base?" in notice] == []
+
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+
+    def test_a_call_started_event_reconciles_current_stops(self) -> None:
+        hub = Hub(voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+
+        hub.emit(CallStarted(call_id="call-the-user-started"))
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+
     def test_the_live_toggle_ends_the_call_the_system_owns(self) -> None:
         hub = Hub()
         hub.toggle()
@@ -440,61 +511,492 @@ class TestTheOneCallInvariantEndToEnd:
 
         assert hub.call.calls_started == 1
 
-    def test_a_notice_that_failed_is_retried_once_the_interlock_clears(self) -> None:
-        """The locked sequence: notice fails → retained → retried after it clears."""
-        hub = Hub(message=False)
-        hub.emit(CallStarted(call_id="call-the-user-started"))
-
-        hub.emit(SessionStopped(target=CODEX))
-        assert hub.call.spoken == []
-        assert len(hub.state.relays.pending()) == 1
+    def test_a_call_release_reconciles_current_stops(self) -> None:
+        hub = Hub(voice=False)
+        hub.core.interlock.note_started("call-the-user-started")
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
 
         hub.emit(CallDropped(call_id="call-the-user-started", detail="the network went away"))
 
-        assert hub.call.spoken
-        assert hub.state.relays.pending() == ()
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
 
     def test_a_stale_call_event_re_offers_nothing(self) -> None:
         """Only the interlock actually clearing is an outlet transition."""
-        hub = Hub(message=False)
-        hub.emit(CallStarted(call_id="current-call"))
-        hub.emit(SessionStopped(target=CODEX))
-        assert len(hub.state.relays.pending()) == 1
+        hub = Hub(voice=False)
+        hub.core.interlock.note_started("current-call")
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
 
         hub.emit(CallDropped(call_id="stale-old-call", detail="a late report"))
 
-        assert hub.call.calls_started == 0
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
         assert hub.core.interlock.call_id() == "current-call"
-        assert len(hub.state.relays.pending()) == 1
 
-    def test_a_channel_that_came_back_re_offers_what_was_retained(self) -> None:
+    def test_a_channel_that_came_back_reconciles_what_is_actionable_now(self) -> None:
         """The one outlet transition no event announces."""
         hub = Hub(voice=False)
-        hub.channel.outcome = Delivery.FAILED
-        hub.channel.reason = "the chat is unreachable"
-        hub.emit(SessionStopped(target=CODEX))
-        assert len(hub.state.relays.pending()) == 1
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
 
-        hub.channel.outcome = Delivery.DELIVERED
-        hub.channel.reason = "back"
         asyncio.run(hub.core.outlets_changed())
 
-        assert hub.state.relays.pending() == ()
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
 
-    def test_a_call_coming_up_re_offers_what_was_retained(self) -> None:
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+
+    def test_switch_transitions_reconcile_current_waiting_state(self) -> None:
         hub = Hub(duty=False)
         hub.emit(SessionStopped(target=CODEX))
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
         hub.flip(SwitchName.VOICE, True)
         hub.flip(SwitchName.MESSAGE, False)
-        assert len(hub.state.relays.pending()) == 1
 
         hub.flip(SwitchName.DUTY, True)
 
-        assert hub.call.spoken
+        assert hub.agent.inspections == []
+        assert hub.call.spoken == []
+
+        asyncio.run(hub.core.discover())
+
+        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
         assert hub.state.relays.pending() == ()
 
 
 class TestSwitchAdjudicationEndToEnd:
+    def test_duty_turning_on_announces_a_question_the_session_is_still_waiting_on(
+        self,
+    ) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert hub.agent.inspections == []
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+
+        asyncio.run(hub.core.discover())
+
+        assert len(hub.channel.sent) == 1
+
+    def test_duty_turning_on_does_not_announce_a_session_that_moved_on(self) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.IDLE,
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+    def test_a_transition_with_no_effective_outlet_leaves_nothing_owed(self) -> None:
+        hub = Hub(duty=False, voice=False, message=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.agent.inspections == []
+
+        asyncio.run(hub.core.discover())
+        hub.state.switches.flip(SwitchName.MESSAGE, True)
+        asyncio.run(hub.core.discover())
+
+        assert hub.channel.sent == []
+
+    def test_reconciliation_never_announces_a_child_process(self) -> None:
+        hub = Hub(duty=False, voice=False)
+        child = SessionTarget(agent=AgentKind.CODEX, session_id="child")
+        hub.state.sessions.register(
+            Session(
+                target=child,
+                workspace=Path("/tmp/workspace"),
+                first_seen=1.0,
+                state=SessionState.WAITING,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="May I act?",
+                ),
+                child=ChildClassification(kind=ChildKind.CHILD, parent=CODEX),
+            )
+        )
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.IDLE,
+                ),
+                SessionInspection(
+                    target=child,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="May I act?",
+                    ),
+                    child=ChildClassification(kind=ChildKind.CHILD, parent=CODEX),
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert hub.agent.inspections == []
+        assert hub.channel.sent == []
+
+    def test_duty_turning_on_reoffers_the_same_pending_permission(self) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.emit(
+            AwaitingApproval(
+                request=ApprovalRequest(
+                    approval_id="a1",
+                    target=CODEX,
+                    tool_name="Bash",
+                    detail="push the branch",
+                )
+            )
+        )
+        (opened,) = hub.core.approvals.pending()
+        pending = SessionInspection(
+            target=CODEX,
+            workspace=Path("/tmp/workspace"),
+            state=SessionState.RUNNING,
+            waiting_for=WaitingFor(
+                kind=WaitingKind.PERMISSION,
+                tool_name="Bash",
+                detail="push the branch",
+                approval_id="a1",
+            ),
+        )
+        hub.agent.discovery = LaneDiscovery(rows=(pending,))
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert hub.channel.sent == [
+            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash "
+            "— push the branch"
+        ]
+        assert hub.core.approvals.pending() == (opened,)
+
+        hub.flip(SwitchName.VOICE, True)
+        asyncio.run(hub.core.discover())
+
+        assert len(hub.channel.sent) == 1
+
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.RUNNING,
+                ),
+            )
+        )
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        hub.agent.discovery = LaneDiscovery(rows=(pending,))
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        assert len(hub.channel.sent) == 2
+        assert hub.channel.sent[1] == hub.channel.sent[0]
+
+    def test_an_expired_permission_is_reconciled_as_answerable_only_in_the_terminal(
+        self,
+    ) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.emit(
+            AwaitingApproval(
+                request=ApprovalRequest(
+                    approval_id="a1",
+                    target=CODEX,
+                    tool_name="Bash",
+                    detail="push the branch",
+                )
+            )
+        )
+        hub.now += TEN_MINUTES
+        hub.tick()
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.PERMISSION,
+                        tool_name="Bash",
+                        detail="push the branch",
+                        approval_id="a1",
+                    ),
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+
+        assert hub.channel.sent == []
+
+        asyncio.run(hub.core.discover())
+
+        assert hub.core.approvals.pending() == ()
+        assert len(hub.channel.sent) == 1
+        assert "terminal" in hub.channel.sent[0]
+
+    def test_consecutive_outlet_transitions_do_not_repeat_one_delivered_wait(self) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+
+        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.VOICE, True)
+        asyncio.run(hub.core.discover())
+
+        assert hub.agent.inspections == []
+        assert len(hub.channel.sent) == 1
+        assert hub.call.calls_started == 0
+
+    def test_a_wait_can_be_announced_again_after_the_session_moves_on(self) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.IDLE,
+                ),
+            )
+        )
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which release?",
+                    ),
+                ),
+            )
+        )
+
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        assert hub.agent.inspections == []
+        assert len(hub.channel.sent) == 2
+        assert "Which release?" in hub.channel.sent[-1]
+
+    def test_discovery_clears_dedup_when_the_session_moves_on_between_transitions(
+        self,
+    ) -> None:
+        hub = Hub(duty=False, voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.IDLE,
+                ),
+            )
+        )
+        asyncio.run(hub.core.discover())
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which release?",
+                    ),
+                ),
+            )
+        )
+
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        assert len(hub.channel.sent) == 2
+        assert "Which release?" in hub.channel.sent[-1]
+
+    def test_an_open_reply_window_clears_the_previous_wait(self) -> None:
+        hub = Hub(voice=False)
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="Which base?",
+                ),
+            )
+        )
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="Which release?",
+                ),
+            )
+        )
+
+        assert len(hub.channel.sent) == 2
+        assert "Which release?" in hub.channel.sent[-1]
+
     def test_duty_off_neither_speaks_nor_pushes_but_still_records_the_event(self) -> None:
         hub = Hub(duty=False)
 
@@ -503,7 +1005,7 @@ class TestSwitchAdjudicationEndToEnd:
         assert handled == 1
         assert hub.call.spoken == []
         assert hub.channel.sent == []
-        assert len(hub.state.relays.pending()) == 1
+        assert hub.state.relays.pending() == ()
 
     def test_the_control_plane_answers_with_every_switch_off(self) -> None:
         """ADR 0002 is absolute."""
@@ -545,7 +1047,7 @@ class TestSwitchAdjudicationEndToEnd:
 
         assert hub.channel.sent == []
         assert handled == 1
-        assert len(hub.state.relays.pending()) == 1
+        assert hub.state.relays.pending() == ()
         assert hub.core.status().sessions
 
     def test_a_pending_approval_pushes_without_waiting_on_the_voice_attempt(self) -> None:
@@ -642,6 +1144,26 @@ class TestWhatDiscoveryCallsAnEnding:
 
         assert self.again(hub, self.codex(session_id="xyz", pid=10)) == ()
         assert len(hub.state.sessions.live()) == 1
+
+    def test_re_keying_drops_delivered_wait_memory_for_the_old_address(self) -> None:
+        old = SessionTarget(agent=AgentKind.CODEX, session_id=None, pid=10)
+        hub = Hub(duty=False, voice=False, sessions=())
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=old,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+                ),
+            )
+        )
+        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
+
+        self.again(hub, self.codex(session_id="abc", pid=10))
+
+        assert hub.core._delivered_waits == set()  # noqa: SLF001 - the bounded cache is the contract
 
     def test_a_lane_that_could_not_look_announces_nothing(self) -> None:
         hub = self.seeing(self.codex(session_id="abc", pid=10))

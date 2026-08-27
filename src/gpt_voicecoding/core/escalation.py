@@ -13,55 +13,29 @@ pure so that the whole table can be read, and tested, without a fake in sight.
 Executing it is the pipeline's job, and permission is re-read **between**
 routes: Duty flipping off mid-escalation halts what has not gone out yet.
 
-Every row of the matrix ends in RETAIN, because no-loss is a Bridge Core
-invariant. A notice with no outlet is one `RelayKind.NOTICE` entry in the one
-ledger — never a second stop table — and it waits there **indefinitely**. There
-is no attempt cap: retention *is* the policy, and the locked words are "surfaces
-on the next available outlet". What stops that becoming a livelock is that
-attempts fire only on outlet transitions (`sweep`, called when a call starts or
-a switch turns effective-on), never on the failure of the attempt before.
-
-Two states are terminal, and both are terminal by *leaving the ledger* rather
-than by carrying a flag:
-
-- DELIVERED — an adapter positively proved it. The entry is gone, so no sweep
-  can find it and re-speak it. This is the reference implementation's worst bug
-  made structurally impossible: there, an audibly spoken notice was graded
-  FAILED by matching another surface's records and retried, opening duplicate
-  calls. Here, proving delivery and remaining retryable are mutually exclusive.
-- REPORTED_FAILED — someone told the user it failed. `report_failed` is the one
-  door, and after it no automatic retry and no substitute action follows.
+An undelivered notice is DROPPED after this attempt. Stop-Notice no-loss belongs
+to Bridge Core's current-state reconciliation: an outlet transition inspects
+live main Sessions again and may create a fresh notice for what is still
+waiting. Historical notice objects are never replayed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
 from dataclasses import dataclass
 from enum import StrEnum
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
-from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.errors import (
-    SecondCallRefused,
-    UnknownRelayError,
-    VoiceInstructionsMissing,
-)
+from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
-from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.seams.call import CallAdapter
 from gpt_voicecoding.seams.companion_channel import CompanionChannel
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
 
 _log = logging.getLogger(__name__)
-
-#: A retained notice's deadline. There is no cap on retention, and the ledger
-#: requires a deadline after the moment of queueing, so the honest value for
-#: "this waits until an outlet appears" is one that never arrives.
-NO_DEADLINE = math.inf
 
 
 class NoticeRoute(StrEnum):
@@ -73,8 +47,6 @@ class NoticeRoute(StrEnum):
     OPEN_CALL_AND_SPEAK = "open_call_and_speak"
     #: Push text through the Companion Channel.
     PUSH_TO_CHANNEL = "push_to_channel"
-    #: Hold it in the one ledger for the next available outlet. Always last.
-    RETAIN = "retain"
 
 
 class Reach(StrEnum):
@@ -115,8 +87,8 @@ class Notice:
     """
 
     request_id: RequestId
-    #: The Session this is about. A notice is always about a Session, so a
-    #: retained one can be dropped when that Session goes away.
+    #: The Session this attempt is about. Current-state reconciliation and its
+    #: delivered-wait memory belong to Bridge Core, not to this notice object.
     target: SessionTarget
     text: str
 
@@ -127,7 +99,7 @@ class Notice:
 
 @dataclass(frozen=True, slots=True)
 class NoticeAttempt:
-    """What one route proved. Graded by the adapter, in the four-state vocabulary."""
+    """What one route proved, graded in the adapter delivery vocabulary."""
 
     route: NoticeRoute
     outcome: Delivery
@@ -166,7 +138,7 @@ def route_matrix(
       off it is the only route, because messages-only is a supported state and
       not a degraded one.
 
-    Every row ends in RETAIN. Nothing here can drop a notice.
+    An empty row means this attempt has no available outlet.
     """
     routes: list[NoticeRoute] = []
     if may_touch_call:
@@ -175,12 +147,11 @@ def route_matrix(
         )
     if may_push:
         routes.append(NoticeRoute.PUSH_TO_CHANNEL)
-    routes.append(NoticeRoute.RETAIN)
     return tuple(routes)
 
 
 class EscalationPipeline:
-    """Routes notices out, and retains the ones that could not go."""
+    """Route one notice attempt through the outlets currently permitted."""
 
     def __init__(
         self,
@@ -189,9 +160,7 @@ class EscalationPipeline:
         channel: CompanionChannel,
         interlock: CallInterlock,
         adjudicator: SwitchAdjudicator,
-        relays: RelayQueue,
         voice_instructions: str = "",
-        clock: Clock = default_clock,
     ) -> None:
         self._call = call
         self._channel = channel
@@ -201,23 +170,13 @@ class EscalationPipeline:
         self._voice_instructions = voice_instructions
         self._interlock = interlock
         self._adjudicator = adjudicator
-        self._relays = relays
-        self._clock = clock
-        #: One sweep at a time, FIFO. Two overlapping sweeps would attempt the
-        #: same retained notice twice, which is the duplicate-delivery shape
-        #: this pipeline exists to prevent.
-        self._sweeping = asyncio.Lock()
 
     async def escalate(self, notice: Notice, *, reach: Reach = Reach.FIRST_OUTLET) -> NoticeOutcome:
-        """Take one notice out through the matrix, or retain it."""
-        routes = tuple(
-            route
-            for route in route_matrix(
-                call_is_up=self._interlock.owns_call(),
-                may_touch_call=self._adjudicator.may_touch_call(),
-                may_push=self._adjudicator.may_push(),
-            )
-            if route is not NoticeRoute.RETAIN
+        """Take one notice out through the matrix, or drop this attempt."""
+        routes = route_matrix(
+            call_is_up=self._interlock.owns_call(),
+            may_touch_call=self._adjudicator.may_touch_call(),
+            may_push=self._adjudicator.may_push(),
         )
         if reach is Reach.EVERY_OUTLET:
             attempts = await self._fan_out(routes, notice)
@@ -226,42 +185,15 @@ class EscalationPipeline:
         delivered = any(attempt.outcome.is_delivered for attempt in attempts)
 
         if delivered:
-            self._forget(notice.request_id)
             return NoticeOutcome(notice=notice, state=Lifecycle.DELIVERED, attempts=tuple(attempts))
 
-        self._retain(notice, attempts)
-        return NoticeOutcome(notice=notice, state=Lifecycle.RETAINED, attempts=tuple(attempts))
-
-    async def sweep(self) -> tuple[NoticeOutcome, ...]:
-        """Re-offer every retained notice. Called on an outlet transition only.
-
-        Never called from a failed attempt: an attempt that failed re-triggering
-        a sweep of itself is a livelock, and the locked wording is "surfaces on
-        the next available outlet", not "keeps trying".
-        """
-        if not self._adjudicator.outlets():
-            return ()
-
-        async with self._sweeping:
-            retained = self.retained()
-            return tuple([await self.escalate(self._as_notice(waiting)) for waiting in retained])
-
-    def retained(self) -> tuple[PendingRelay, ...]:
-        """Every notice waiting for an outlet, in the order it was retained."""
-        return tuple(
-            waiting for waiting in self._relays.pending() if waiting.kind is RelayKind.NOTICE
+        reason = attempts[-1].reason if attempts else "no outlet is available"
+        _log.info(
+            "notice not delivered; this attempt is not replayed: %s (%s)",
+            notice.request_id,
+            reason,
         )
-
-    def report_failed(self, request_id: RequestId) -> NoticeOutcome:
-        """Tell the ledger this notice was reported to the user as terminal.
-
-        The one door to REPORTED_FAILED, and it takes the entry out. After this
-        there is nothing left for a sweep to find, so "no automatic retry and no
-        substitute action after a reported failure" is structural.
-        """
-        waiting = self._relays.release(request_id)
-        _log.info("stop notice reported to the user as failed: %s", request_id)
-        return NoticeOutcome(notice=self._as_notice(waiting), state=Lifecycle.REPORTED_FAILED)
+        return NoticeOutcome(notice=notice, state=Lifecycle.DROPPED, attempts=tuple(attempts))
 
     async def _in_turn(
         self, routes: tuple[NoticeRoute, ...], notice: Notice
@@ -306,25 +238,6 @@ class EscalationPipeline:
             for route, receipt in zip(permitted, receipts, strict=True)
         ]
 
-    def retire(self, request_id: RequestId) -> Notice | None:
-        """Drop a retained notice whose reason for existing has gone away.
-
-        Distinct from both terminal states, and deliberately quiet: nothing was
-        delivered and nothing was reported, because there is no longer anything
-        worth saying. A pending approval that resolves retires the announcement
-        it may still be holding — otherwise the next outlet transition speaks a
-        prompt for a decision already made.
-
-        Returns None when nothing was waiting, because the notice going out
-        first is the ordinary case, not an error.
-        """
-        try:
-            released = self._relays.release(request_id)
-        except UnknownRelayError:
-            return None
-        _log.info("notice retired before it went out: %s", request_id)
-        return self._as_notice(released)
-
     def _still_permitted(self, route: NoticeRoute) -> bool:
         if route is NoticeRoute.PUSH_TO_CHANNEL:
             return self._adjudicator.may_push()
@@ -346,7 +259,7 @@ class EscalationPipeline:
             return await self._call.speak(notice.text, request_id=notice.request_id)
         except VoiceInstructionsMissing as refused:
             # Nothing to open a voice thread on. A positive reason the notice can
-            # carry, so it stays retained for an outlet that can actually take it.
+            # carry when this attempt is dropped.
             return DeliveryReceipt(
                 request_id=notice.request_id,
                 outcome=Delivery.FAILED,
@@ -360,34 +273,3 @@ class EscalationPipeline:
                 reason=f"the call did not come up: it is {snapshot.state}",
             )
         return await self._call.speak(notice.text, request_id=notice.request_id)
-
-    def _retain(self, notice: Notice, attempts: list[NoticeAttempt]) -> None:
-        """Hold a notice for the next available outlet. Never a second ledger."""
-        outcome = attempts[-1].outcome if attempts else Delivery.UNKNOWN
-        try:
-            self._relays.classify(notice.request_id, outcome)
-        except UnknownRelayError:
-            self._relays.enqueue(
-                PendingRelay(
-                    request_id=notice.request_id,
-                    target=notice.target,
-                    kind=RelayKind.NOTICE,
-                    text=notice.text,
-                    queued_at=self._clock(),
-                    expires_at=NO_DEADLINE,
-                    outcome=outcome,
-                )
-            )
-        _log.info("stop notice retained for the next available outlet: %s", notice.request_id)
-
-    def _forget(self, request_id: RequestId) -> None:
-        """Take a proven-delivered notice out, if it had been waiting."""
-        try:
-            self._relays.classify(request_id, Delivery.DELIVERED)
-        except UnknownRelayError:
-            # It was delivered on its first attempt and never had to wait.
-            return
-
-    @staticmethod
-    def _as_notice(waiting: PendingRelay) -> Notice:
-        return Notice(request_id=waiting.request_id, target=waiting.target, text=waiting.text)
