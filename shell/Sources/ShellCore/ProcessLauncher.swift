@@ -82,8 +82,12 @@ public struct ProcessLauncher: EngineLaunching {
         // the staleness this exists to avoid. It fails open, so a spawn is never
         // worse for having asked — and it says so, so a spawn that fell back is
         // never silent either.
+        // Timed, because the supervisor cannot see inside this call and would
+        // otherwise count the wait as uptime the engine never had.
+        let askedAt = Date()
         let path = LoginShellPath.apply(
             to: ProcessInfo.processInfo.environment, read: readPath, log: log)
+        let readCost = Date().timeIntervalSince(askedAt)
         // Every spawn, including the ones that worked: the surface clears its
         // own warning by being told the next spawn was fine, and a report that
         // only fired on failure would leave a stale one up for ever.
@@ -125,14 +129,20 @@ public struct ProcessLauncher: EngineLaunching {
             errors.abandon()
             throw error
         }
-        return SpawnedEngine(process)
+        return SpawnedEngine(process, launchOverhead: readCost)
     }
 }
 
 final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     private let process: Process
 
-    init(_ process: Process) { self.process = process }
+    /// What reading the login shell cost, so the supervisor can discount it.
+    let launchOverhead: TimeInterval
+
+    init(_ process: Process, launchOverhead: TimeInterval = 0) {
+        self.process = process
+        self.launchOverhead = launchOverhead
+    }
 
     var processIdentifier: Int32 { process.processIdentifier }
 

@@ -77,13 +77,18 @@ public enum LoginShellPath {
     /// | ~89–108 | 0.65–**5.70 s** — 5/10 over the old 2.0 s budget |
     ///
     /// Load ~107 on ten cores is ten times oversubscribed, and 5.70 s is the
-    /// worst of every read ever measured here, so this is ≈ 1.75× it. Not more,
-    /// because the budget is bounded from *both* sides: it is also the longest a
-    /// quit can wait on a spawn already in flight, since the read runs inside the
-    /// supervisor's own actor, and the supervisor gives its child 5 s to stop.
-    /// Not less, because the cost of being under is the whole product — an
-    /// engine, and every Session it launches, on a `PATH` with no coding agent
-    /// on it.
+    /// worst of every read ever measured here, so this is ≈ 1.75× it. Not less,
+    /// because the cost of being under is the whole product — an engine, and
+    /// every Session it launches, on a `PATH` with no coding agent on it.
+    ///
+    /// **What it costs, stated rather than bounded.** The read runs
+    /// synchronously inside ``EngineSupervisor``'s actor, so a quit that lands
+    /// while one is in flight waits it out before the child is even asked to
+    /// stop: up to this budget, then the supervisor's own 5 s stop grace. Ten
+    /// seconds is longer than that grace, so this is not bounded by it — it is
+    /// the price of the number, and it is paid only by a profile that is stuck,
+    /// only by a user who quits in the second it is being read, and it is now
+    /// said out loud in the menu bar when it is paid.
     ///
     /// One bounded read and no retry loop: a profile that did not finish in ten
     /// seconds is not going to finish in the next ten either.
@@ -335,8 +340,17 @@ public enum LoginShellPath {
         let reading = output.fileHandleForReading
         defer { try? reading.close() }
 
-        let collected = ReadToEnd(handle: reading)
-        guard collected.wait(timeout) else {
+        let collected = PipeReader(descriptor: reading.fileDescriptor)
+
+        // **The deadline is on the shell, not on the pipe.** A shell that has
+        // printed its answer and exited has told us everything it is going to;
+        // whether the *pipe* is closed is a different question with a different
+        // answer, because a profile that starts `ssh-agent`, `gpg-agent` or any
+        // `&`-ed job hands the write end to something that outlives the shell by
+        // hours. Waiting for EOF there spent the whole budget and then threw away
+        // a PATH that had arrived in 0.4 s — and, once this began reporting,
+        // told a user with an idle machine that their login shell was slow.
+        guard process.waitUntil(deadline: .now() + timeout) else {
             // A profile that hangs must not hang the engine's supervisor with
             // it. `terminate` first, because a shell given the chance usually
             // takes it; `SIGKILL` is what makes the bound real.
@@ -353,6 +367,16 @@ public enum LoginShellPath {
         guard process.terminationStatus == 0, process.terminationReason == .exit else {
             return .saidNothing
         }
+        // The shell's last write happened before it exited, so the bytes are in
+        // the pipe; the reader is at most a scheduling quantum behind them. It is
+        // given the same short grace a terminating shell gets, and what it has
+        // either way is what gets read. **Not** parsed as it arrives: taking the
+        // answer the moment two sentinels have been seen would, for output that
+        // ends up with three, take the gap between somebody else's sentinel and
+        // ours — the truncated PATH `delimited(in:)` exists to refuse, and which
+        // `aSentinelInTheNoiseIsNotAnAnswerEither` guards. Exactly two, over
+        // everything the shell said, stays the rule.
+        collected.settle(terminationGrace)
         guard let said = String(data: collected.data, encoding: .utf8),
             let value = delimited(in: said)
         else { return .saidNothing }
@@ -360,24 +384,48 @@ public enum LoginShellPath {
     }
 }
 
-/// Reading a pipe to EOF with a deadline, which `FileHandle` has no verb for.
-private final class ReadToEnd: @unchecked Sendable {
+/// Draining a pipe as it fills, so what has arrived is readable before whoever
+/// holds the write end has finished with it.
+///
+/// Read concurrently rather than after the wait, because a profile that printed
+/// more than the pipe's buffer would otherwise block on a pipe nobody is
+/// emptying — and the shell that blocked would then be the shell that timed out.
+///
+/// `read(2)` rather than `FileHandle`: the caller closes the descriptor on the
+/// way out while this loop may still be parked on it, which is a case
+/// `availableData` answers by raising, and a raised `NSException` here would
+/// take the app down over somebody's `ssh-agent`. A closed descriptor is `-1`
+/// and `EBADF`, and this loop ends on it like any other error.
+private final class PipeReader: @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var collected = Data()
     private let lock = NSLock()
 
-    init(handle: FileHandle) {
+    init(descriptor: Int32) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let read = (try? handle.readToEnd()) ?? Data()
-            lock.lock()
-            collected = read
-            lock.unlock()
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let got = buffer.withUnsafeMutableBytes {
+                    read(descriptor, $0.baseAddress, $0.count)
+                }
+                if got > 0 {
+                    lock.lock()
+                    collected.append(contentsOf: buffer[0..<got])
+                    lock.unlock()
+                    continue
+                }
+                if got < 0 && errno == EINTR { continue }
+                break  // 0 is EOF; anything else is a descriptor we cannot read
+            }
             finished.signal()
         }
     }
 
-    func wait(_ seconds: TimeInterval) -> Bool {
-        finished.wait(timeout: .now() + seconds) == .success
+    /// Give the reader up to `seconds` to reach EOF. Only ever called once the
+    /// shell has already gone, so this is the reader catching up and not a wait
+    /// on the shell — which is the whole distinction this class exists to make.
+    func settle(_ seconds: TimeInterval) {
+        _ = finished.wait(timeout: .now() + seconds)
     }
 
     var data: Data {

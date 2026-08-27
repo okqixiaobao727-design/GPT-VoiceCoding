@@ -157,9 +157,23 @@ import Testing
         }
         let leaked = openDescriptors() - before
 
-        // Two per failed launch if the pipe survives; the margin is for whatever
-        // else this process opens while these run beside other suites.
-        #expect(leaked < attempts / 2, "\(leaked) descriptors outlived \(attempts) failed launches")
+        // Two per failed launch if the pipe survives, so the defect this guards
+        // is `2 * attempts` — 100 — and the bound is half of that rather than a
+        // quarter of it.
+        //
+        // Re-derived, not loosened. `/dev/fd` is process-wide and swift-testing
+        // runs these suites in parallel, so the count includes whatever else is
+        // spawning at the same moment. That used to be invisible: with the real
+        // login-shell reader this loop took ~22 s and every other suite had long
+        // finished by the second sample. Reading no login shell (#36) took it to
+        // ~40 ms, which lands both samples inside the churn — measured over 20
+        // runs on the reference machine the residue was **−10 to +25**, negative
+        // included, which is proof enough that it is not this test's own. The old
+        // `attempts / 2` sat exactly on that ceiling and failed 1 run in 15.
+        //
+        // 50 clears the measured noise twice over and still catches a leak of
+        // *one* descriptor per launch, let alone the two this is about.
+        #expect(leaked < attempts, "\(leaked) descriptors outlived \(attempts) failed launches")
     }
 
     private func openDescriptors() -> Int {

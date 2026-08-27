@@ -159,6 +159,32 @@ import Testing
         #expect(elapsed < 3.0)
     }
 
+    @Test func aProfileThatBackgroundsSomethingIsNotAProfileThatIsSlow() throws {
+        // `ssh-agent`, `gpg-agent`, any `&`-ed job in `~/.zshrc`: the shell hands
+        // its stdout to a child that outlives it, so the *pipe* stays open for
+        // hours after the shell has printed its answer and exited. Waiting for
+        // EOF spent the whole budget on a machine doing nothing, threw away a
+        // PATH that had already arrived, and — once this started reporting —
+        // showed the user a panel blaming a load their machine did not have.
+        //
+        // So the deadline is on the shell. The answer is here the moment the
+        // shell is gone, whoever is still holding the pipe.
+        let backgrounding = try fakeShell(
+            #"sleep 5 & printf '%s' "$MARK/opt/homebrew/bin:/usr/bin$MARK""#)
+        defer { try? FileManager.default.removeItem(at: backgrounding) }
+
+        let budget: TimeInterval = 5.0
+        let started = Date()
+        let answer = LoginShellPath.readFromLoginShell(backgrounding.path, budget)
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(answer == .said("/opt/homebrew/bin:/usr/bin"))
+        // Well inside the budget rather than merely under it: the defect this
+        // guards spends the budget exactly, so a bound of "less than the budget"
+        // would be the one number that cannot tell them apart.
+        #expect(elapsed < budget / 2, "took \(elapsed)s of a \(budget)s budget")
+    }
+
     @Test func itTakesThePathOutFromBetweenTheSentinelsAndLeavesTheNoise() throws {
         // An interactive shell is what reads `.zshrc`, and `.zshrc` is where a
         // zsh user's `PATH` actually is — but interactive is also what lets a

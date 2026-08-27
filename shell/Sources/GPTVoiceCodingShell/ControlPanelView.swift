@@ -277,7 +277,14 @@ private struct LoginShellPathPanel: View {
             Text(detail)
                 .font(.callout).foregroundStyle(.red).textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Retry re-reads it. A machine under heavy load is the usual cause.")
+            // Not "press Retry": the state this panel exists for is a login
+            // shell that timed out and an engine that then started anyway, and
+            // in that state `Footer` renders no Retry button — it appears only
+            // for `.stopped` and `.cannotSpawn` — and `EngineSupervisor.retry()`
+            // would return at its own `guard !supervising` if it were pressed.
+            // Telling somebody to press a button that is not on screen is worse
+            // than telling them nothing.
+            Text("The login shell is asked again at every engine start.")
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
