@@ -38,6 +38,7 @@ from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, Pe
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
+    ChildSessionError,
     LaneUnreadable,
     ProgressUnavailable,
     StaleSessionError,
@@ -543,6 +544,14 @@ class BridgeCore:
             case SessionEnded():
                 await self._session_ended(event)
             case AwaitingApproval():
+                if self._spawned(event.request.target):
+                    # A Codex subagent thread can raise a real permission
+                    # prompt, and this is where it stops. Answering it would be
+                    # an Approval Relay carrying the user's authority into a
+                    # Session `resolve` refuses to address a moment later, so
+                    # the dialog stays the keyboard's — "never spoken to"
+                    # includes never answered (advisor, 2026-08-27).
+                    return
                 await self.approvals.opened(event.request, self._spoken_as(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
@@ -582,6 +591,8 @@ class BridgeCore:
         failure path. An engine silent about the one event it exists to produce
         is the gap #48 named on the inbound side, on the outbound side.
         """
+        if self._spawned(event.target):
+            return
         session = self._known(event.target)
         _log.info(
             "Session stopped: %s waiting on %s%s",
@@ -736,6 +747,42 @@ class BridgeCore:
             return self._state.sessions.resolve(target)
         except BridgeCoreError:
             return None
+
+    def _spawned(self, target: SessionTarget) -> bool:
+        """Whether the roster **positively says** this is a Child Process (#79).
+
+        A Child Process is seen, never spoken to — and never spoken *about*: a
+        Stop Notice names a Session the user is invited to answer, and the
+        answer to a child is refused. Suppressing the announcement is therefore
+        the same rule as refusing the Relay, said one step earlier so the user
+        is never asked for something the system will not carry.
+
+        **Asked of `resolve`, so there is one definition.** The registry is the
+        only thing that decides what a child is (`core/sessions.py`), and it
+        already refuses one by raising. Re-deriving the test here would be a
+        second answer to a question that has one.
+
+        **Unknown is not child, and the asymmetry is deliberate.** Discovery
+        runs on a cadence, so a Session can stop before the roster holds a row
+        for it; reading that silence as "child" would drop the one notice the
+        engine exists to send. A child wrongly announced costs one message about
+        something that is refused anyway — the cheaper mistake by far.
+
+        It is here rather than in a lane because a lane raising the event is not
+        wrong: a Codex subagent thread really does leave `active`, and its
+        adapter really does watch every thread the daemon holds. What the hub
+        does with that is the hub's.
+        """
+        try:
+            self._state.sessions.resolve(target)
+        except ChildSessionError as spawned:
+            # Said out loud, because a notice that was never sent is otherwise
+            # indistinguishable in the log from one that failed to reach anybody.
+            _log.info("%s is a Child Process, so nothing is announced about it", spawned.target)
+            return True
+        except BridgeCoreError:
+            return False
+        return False
 
     def _spoken_as(self, target: SessionTarget) -> str:
         """What a notice refers to this Session by, whether or not the roster knows it."""

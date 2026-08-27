@@ -243,6 +243,44 @@ ASK_SOMETHING = Instruction(
 #: live on the lane.
 CHILD_FILE = "child.txt"
 
+#: How often `_drive_turn` looks, and how long a record must stand still before
+#: the turn it belongs to is called over. Constants rather than literals because
+#: `CHILD_LIFETIME_SECONDS` is derived from them and a number derived from a
+#: literal somewhere else is a number that stops being derived the day the
+#: literal moves.
+TURN_POLL_SECONDS = 3.0
+TURN_SETTLE_SECONDS = 9.0
+
+#: How long the `child` step asks a Child Process to keep working, and **the
+#: step cannot be observed without it** (#79, measured 2026-08-27).
+#:
+#: A finished child is not a row: Claude's own roster has no entry for one, so
+#: the product lists a child only while it is alive and every observation of a
+#: child happens inside its life. That life has to reach as far as the roster
+#: read, and the roster read happens when `_drive_turn` returns.
+#:
+#: `_drive_turn` returns when the **parent's** record has stood still for
+#: `TURN_SETTLE_SECONDS`. Measured twice: a parent's transcript is frozen for
+#: the whole time a foreground subagent runs — 35,642 bytes, unchanged for 52 s
+#: — so the turn reads as settled while the child is still working, and the
+#: roster read lands inside the child's life. That is the whole mechanism, and
+#: without a floor it is a race: a subagent that only writes one small file can
+#: be done in under ten seconds, the parent resumes writing, the turn genuinely
+#: ends, and the roster correctly holds no child. The step then fails saying "no
+#: child row appeared", which reads exactly like the product being broken.
+#:
+#: So the step asks for a window instead of hoping for one. The floor is the
+#: settle window plus one more poll of margin, doubled: `_drive_turn` can take
+#: up to `TURN_SETTLE_SECONDS + TURN_POLL_SECONDS` to notice, and the read, the
+#: absence observation and the refused Relay all happen after it.
+#:
+#: **Precedent is #105**: the instruction is the lane's, shaped so that the
+#: situation the step judges actually exists. The three assertions are
+#: untouched — listed under its parent, no Stop Notice naming it, refused as a
+#: Relay target — so nothing that is judged is arranged. `DELTA` is still
+#: written; only *when* moved.
+CHILD_LIFETIME_SECONDS = int((TURN_SETTLE_SECONDS + TURN_POLL_SECONDS) * 2)
+
 
 # --- lanes ------------------------------------------------------------------
 
@@ -344,9 +382,10 @@ CLAUDE = Lane(
     ),
     record_now=lambda truth, since: hand_started.claude_transcript(truth.session_id),
     child_words=(
-        "Use the Task tool to start one subagent that writes a file named "
+        "Use the Task tool to start one subagent. The subagent must first wait "
+        f"{CHILD_LIFETIME_SECONDS} seconds, and only then write a file named "
         f"{CHILD_FILE} containing the single word DELTA in the current directory. "
-        "Do nothing else yourself."
+        "Wait for it to finish and do nothing else yourself."
     ),
 )
 
@@ -416,9 +455,10 @@ CODEX = Lane(
     ),
     record_now=lambda truth, since: hand_started.codex_rollout(truth.workspace, since),
     child_words=(
-        "Start one sub-agent to write a file named "
+        "Start one sub-agent. The sub-agent must first wait "
+        f"{CHILD_LIFETIME_SECONDS} seconds, and only then write a file named "
         f"{CHILD_FILE} containing the single word DELTA in the current directory. "
-        "Do nothing else yourself."
+        "Wait for it to finish and do nothing else yourself."
     ),
 )
 
@@ -1090,22 +1130,14 @@ class Walk:
         before = {_address_of(row) for row in self._roster_rows()}
         turn = self._drive_turn("child", Instruction(words=self.lane.child_words))
 
-        rows = self._roster_rows()
-        children = [
-            row
-            for row in rows
-            if _address_of(row) not in before
-            and isinstance(row.get("child"), dict)
-            and row["child"].get("kind") == "child"
-        ]
-        if not children:
+        child_row, rows = self._await_child_row(before)
+        if child_row is None:
             raise StepFailed(
                 f"no child row appeared under {self.address} within "
                 f"{self.far_side.agent_turn_seconds:.0f}s (turn ended={turn.ended}); the roster "
                 f"gained {sorted({_address_of(row) for row in rows} - before) or 'nothing'}. "
                 f"#74 locks `ChildClassification` and #79 fills it."
             )
-        child_row = children[0]
         child_address = _address_of(child_row)
         parent = child_row["child"].get("parent")
         if not parent:
@@ -1149,8 +1181,10 @@ class Walk:
                 f"the child rule being applied"
             )
         return (
-            f"{child_address} listed under {support.flatten([parent])}; no notice naming it in "
-            f"{self.far_side.absence_window_seconds:.0f}s; relay refused: {refused.text!r}"
+            f"{child_address} listed under {support.flatten([parent])} (asked to work for "
+            f"{CHILD_LIFETIME_SECONDS}s, so the window it was read in is one this step made); "
+            f"no notice naming it in {self.far_side.absence_window_seconds:.0f}s; "
+            f"relay refused: {refused.text!r}"
         )
 
     # --- plumbing ---------------------------------------------------------
@@ -1182,6 +1216,48 @@ class Walk:
             )
         self.journal("ground.truth", lane=self.lane.name, **vars(self.truth))
         return self.truth
+
+    def _await_child_row(self, before: set[str]) -> tuple[dict | None, list[dict]]:
+        """The first child row to appear, and the roster read that last looked.
+
+        **A turn ending is not the child existing**, and reading the roster once
+        when `_drive_turn` returns assumed it was. Measured on the run of
+        2026-08-27 (`20260827T015022Z`): the Codex parent reported its turn ended
+        at 14:03:18, its sub-agent was not spawned until 14:03:30, and the child's
+        rollout reached disk at 14:03:25 — so the single read happened twelve
+        seconds before there was anything to see, and the step failed saying the
+        roster "gained nothing". The child was real: `thread_source: subagent`,
+        `parent_thread_id`, depth 1, the same shape as the one an earlier run did
+        see. The ordering, not the child, was what differed.
+
+        The cause is #73's: Codex answers `spawn_agent` with a blocking
+        `wait_agent`, and a parent blocked in it reads as silent, which
+        `_drive_turn` scores as a finished turn. The claude lane cannot show this
+        — a Claude parent's transcript is frozen while its child works, so its
+        turn does not end early — which is why one lane failed and the other
+        never has.
+
+        So this waits, to the deadline the failure message already claimed. It
+        arranges nothing the step judges: the three assertions are applied to
+        whatever is found, and finding nothing within the window is still a
+        failure. **First sighting wins**, because a child is transient and a
+        later poll may find it already gone.
+        """
+        deadline = time.monotonic() + self.far_side.agent_turn_seconds
+        rows: list[dict] = []
+        while True:
+            rows = self._roster_rows()
+            for row in rows:
+                child = row.get("child")
+                if (
+                    _address_of(row) not in before
+                    and isinstance(child, dict)
+                    and child.get("kind") == "child"
+                ):
+                    return row, rows
+            if time.monotonic() >= deadline:
+                return None, rows
+            time.sleep(TURN_POLL_SECONDS)
 
     def _roster_rows(self) -> list[dict]:
         data = support.control_plane_payload(
@@ -1369,7 +1445,7 @@ class Walk:
         ended = False
         deadline = started + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
-            time.sleep(3.0)
+            time.sleep(TURN_POLL_SECONDS)
             if expect_waiting and self._roster_field("state") == "waiting":
                 ended = True
                 break
@@ -1377,10 +1453,10 @@ class Walk:
             if size != last:
                 last, settled_for = size, 0.0
                 continue
-            settled_for += 3.0
+            settled_for += TURN_POLL_SECONDS
             # A record that has not grown for two polls after growing at all is a
             # turn that is over; before it grows at all there is nothing to settle.
-            if size > 0 and settled_for >= 9.0:
+            if size > 0 and settled_for >= TURN_SETTLE_SECONDS:
                 ended = True
                 break
         return self._measured(what, started, ended)

@@ -177,7 +177,7 @@ def workspace_in(meta: dict[str, Any]) -> Path | None:
 
 
 def newest_for(workspace: Path, *, home: Path | None = None, since: float = 0.0) -> Path | None:
-    """The most recently written rollout whose own `cwd` is this workspace.
+    """The most recently written rollout **a running TUI could be running**.
 
     How a Session that has taken its first turn is tied back to the process that
     is running it: the pid is not in the rollout and the workspace is, so the
@@ -186,6 +186,18 @@ def newest_for(workspace: Path, *, home: Path | None = None, since: float = 0.0)
 
     `since` exists so a caller can refuse to match a rollout written before the
     process it is looking at started.
+
+    **A rollout the record says a person did not start is skipped, and that is
+    what P13's `thread_source` is for** (#79). A subagent runs in its parent's
+    own workspace and writes its rollout there *after* the TUI started, so on
+    `cwd` and mtime alone it is the newer match and wins — and the user's own
+    Session is then addressed by its child's thread id, which carries the user's
+    words into the child. The join is over *processes*, and a spawned thread has
+    none, so it is never the answer to "which thread is this TUI running".
+
+    Absence fails open: a rollout written by a codex older than the field says
+    nothing, and refusing those would stop this recognising Sessions it has
+    always recognised. Only an explicit non-`user` word disqualifies one.
     """
     wanted = os.path.realpath(workspace)
     found: Path | None = None
@@ -203,8 +215,20 @@ def newest_for(workspace: Path, *, home: Path | None = None, since: float = 0.0)
         cwd = workspace_in(meta)
         if cwd is None or os.path.realpath(cwd) != wanted:
             continue
+        if _spawned(meta):
+            continue
         found, newest = path, written
     return found
+
+
+def _spawned(meta: dict[str, Any]) -> bool:
+    """Whether this record says something other than a person started the thread.
+
+    Reads the same field `thread_source` does, off a `session_meta` the caller
+    has already parsed, so the locator costs no second read of the file.
+    """
+    source = meta.get("thread_source")
+    return isinstance(source, str) and source.strip() != "" and source.strip() != USER_THREAD_SOURCE
 
 
 def _rollout_files(home: Path) -> list[Path]:

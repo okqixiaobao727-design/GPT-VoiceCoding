@@ -258,9 +258,19 @@ class SessionRegistry:
         addressed. **Only this class can answer that**, and the answer is not
         recoverable by comparing the roster before and after: a Codex row gains
         its thread id at its first turn (#73) and so changes `SessionTarget`
-        without anything having ended, and a `/new` does the same. A caller
-        diffing targets would read both as a death — and the news of a death is
-        not free, because it terminates every Relay queued for that target.
+        without anything having ended, and a Codex `/new` does the same. A
+        caller diffing targets would read both as a death — and the news of a
+        death is not free, because it terminates every Relay queued for that
+        target.
+
+        **Both of those are Codex, and the qualifier is load-bearing** (#79).
+        They are cases of a reading that could not name itself being matched by
+        its process, which is what `_same_row` does for a lane that is not
+        `always_named`. Claude names every row, so a Claude row never moves
+        between targets: a `/clear` is a new session id under the same process,
+        and it ends the old row and starts a new one rather than re-keying the
+        held one. That conversation really is over, and its queued Relays are
+        answered as such.
 
         **A lane that could not look changes nothing.** `LaneDiscovery.error`
         means the roster has no newer information, not that the machine emptied:
@@ -360,17 +370,40 @@ class SessionRegistry:
     def _same_row(self, row: SessionInspection) -> Session | None:
         """The roster entry this reading is *about*, whatever it happens to name it.
 
-        **The process is the identity; the session id is a field on it.** A
-        Codex TUI exists before it has a session id (#73) and keeps its pid
-        across `/new`, so keying on the id would make one process come and go
-        from the roster every time it was read by a different source. Where
-        there is no pid — a daemon thread nobody could tie to a TUI — the id is
-        all there is, and it is the key.
+        **The process is the identity; the session id is a field on it** — for
+        an agent that does not always say its id. A Codex TUI exists before it
+        has one (#73) and keeps its pid across `/new`, so keying on the id would
+        make one process come and go from the roster every time it was read by a
+        different source. Where there is no pid — a daemon thread nobody could
+        tie to a TUI — the id is all there is, and it is the key.
+
+        **An agent that always names itself is matched on its name, never on
+        its process** (`AgentKind.always_named`). Claude's official roster
+        carries a session id on every row from the moment the Session exists, so
+        there is no Claude reading that *has* to be matched by pid — and one
+        that is matched by pid is matched wrongly, because a Claude pid is not
+        one Session. Two things share it, and #79 is how that stopped being
+        theoretical:
+
+        - **A Child Process runs inside its parent's process.** A Task subagent
+          is not a process of its own (`claude/children.py`, measured), so its
+          row carries its parent's pid. Joined on that, the child's reading
+          replaces the parent's row — one tick later the user's own Session has
+          become an unrelayable child, logged as the process having moved
+          threads.
+        - **Two children of one Session share it with each other**, so the
+          second would swallow the first however the classification was
+          compared.
+
+        What is left for Claude is the exact match above, which is what the
+        `--resume` fork already relies on: two processes under one session id
+        are two rows, and a `/clear` under one process is a new Session that
+        starts a new row while the old one ends for having left the roster.
         """
         exact = self._sessions.get(row.target)
         if exact is not None:
             return exact
-        if row.target.pid is None:
+        if row.target.pid is None or row.target.agent.always_named:
             return None
         return next(
             (held for held in self._of(row.target.agent) if held.target.pid == row.target.pid),

@@ -22,7 +22,13 @@ from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import discovery
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate
-from gpt_voicecoding.seams.agent import SessionState, WaitingKind
+from gpt_voicecoding.seams.agent import (
+    ChildClassification,
+    ChildKind,
+    SessionState,
+    WaitingKind,
+)
+from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 THREAD = "01a03b06-f995-7b60-bc9f-e2152ee4ed32"
 OTHER_THREAD = "01a0385e-4872-7353-bdc5-8966c6165a8e"
@@ -59,16 +65,25 @@ def thread(thread_id: str, *, cwd: str, status: str = "idle", name: str | None =
     return {"id": thread_id, "cwd": cwd, "status": {"type": status}, "name": name}
 
 
-def write_rollout(home: Path, thread_id: str, workspace: Path) -> Path:
-    """One rollout on disk, in the 0.149.1 shape, written now unless moved."""
+def write_rollout(
+    home: Path, thread_id: str, workspace: Path, *, source: str | None = None
+) -> Path:
+    """One rollout on disk, in the 0.149.1 shape, written now unless moved.
+
+    `source` writes `session_meta.thread_source` — P13's child evidence, and the
+    only thing on disk that says whether a rollout is a person's Session or a
+    thread one spawned. Omitted by default, because a 0.130-era rollout carries
+    no such field and every test that does not care about it should read like
+    one.
+    """
     directory = home / "sessions"
     directory.mkdir(exist_ok=True)
+    payload: dict[str, object] = {"session_id": thread_id, "cwd": str(workspace)}
+    if source is not None:
+        payload["thread_source"] = source
     path = directory / f"rollout-2026-08-26T10-25-08-{thread_id}.jsonl"
     path.write_text(
-        json.dumps(
-            {"type": "session_meta", "payload": {"session_id": thread_id, "cwd": str(workspace)}}
-        )
-        + "\n",
+        json.dumps({"type": "session_meta", "payload": payload}) + "\n",
         encoding="utf-8",
     )
     return path
@@ -324,6 +339,42 @@ class TestASessionNobodyHasSpokenToYet:
         lane = found(None, running(101, workspace), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
 
+    def test_it_does_not_take_the_thread_id_of_a_child_it_spawned(self, tmp_path: Path) -> None:
+        """#79, and the reason P13 reads `thread_source` at all.
+
+        A subagent runs in the parent's own workspace and writes its rollout
+        there, *after* the TUI started — so it is newer than the TUI's own and
+        wins a join made on `cwd` and mtime alone. The user's Session would then
+        be addressed by its child's thread id: a Relay aimed at the parent,
+        carried into the child, under the user's authority. That is the failure
+        the Child Process rule exists to prevent, arriving through the back door
+        of identity rather than through the roster.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mine = write_rollout(tmp_path, THREAD, workspace, source="user")
+        os.utime(mine, (STARTED_AT + 60, STARTED_AT + 60))
+        spawned = write_rollout(tmp_path, OTHER_THREAD, workspace, source="subagent")
+        os.utime(spawned, (STARTED_AT + 120, STARTED_AT + 120))
+
+        lane = found(None, running(101, workspace), home=tmp_path)
+        assert lane.rows[0].target.session_id == THREAD
+
+    def test_a_rollout_too_old_to_say_still_names_the_session(self, tmp_path: Path) -> None:
+        """0.130.0 wrote no `thread_source`, and its Sessions are still Sessions.
+
+        Absence fails **open** here, exactly as it does on the daemon route
+        (`_child_of`): the alternative is a build that stops recognising every
+        Session written by a codex older than the field.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        rollout = write_rollout(tmp_path, THREAD, workspace)
+        os.utime(rollout, (STARTED_AT + 60, STARTED_AT + 60))
+
+        lane = found(None, running(101, workspace), home=tmp_path)
+        assert lane.rows[0].target.session_id == THREAD
+
 
 class TestWhatEachRowIsCalled:
     """#78: `<project> · <title>`, and the title is whatever this lane can honestly say.
@@ -551,6 +602,124 @@ class TestThreadsTheDaemonRunsForItself:
         assert discovery.SESSION_THREAD_SOURCES == frozenset(
             {"user", "subagent", "guardian_review"}
         )
+
+
+class TestTheChildProcessRule:
+    """#79: a thread another thread spawned is seen, and it is not a Session.
+
+    The evidence is the same cheap `thread/read` #112 already filters on, and
+    the same keep-list: the two values it keeps and #112 does not need —
+    `subagent` and `guardian_review` — are exactly this rule's child rows
+    (advisor, 2026-08-27). They are one delegate class split by a boolean
+    (`rust-v0.150.0:codex-rs/core/src/codex_delegate.rs:111`), which is why one
+    classification covers both.
+
+    **Adapted from legacy, and the adaptation is the point** (ADR 0010).
+    `legacy@1d32845:bridge/__main__.py:876-899` read the same fact from
+    `session_meta.thread_source` and used it to *refuse registration*, so a
+    child had no row at all; `bridge/claude.py:396-409` gave it no channel and
+    `bridge/transcript.py:1477-1500` filtered its records out of the parent's
+    view. v1.0 keeps the safety outcome — no Relay, no Stop Notice, no name —
+    and drops the invisibility: the row is listed, under its parent.
+    """
+
+    def test_a_subagent_thread_is_a_child(self) -> None:
+        lane = found(daemon_holding(sourced(THREAD, "subagent")))
+        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
+
+    def test_a_guardian_review_thread_is_a_child(self) -> None:
+        lane = found(daemon_holding(sourced(THREAD, "guardian_review")))
+        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
+
+    def test_a_users_own_thread_is_main(self) -> None:
+        lane = found(daemon_holding(sourced(THREAD, "user")))
+        assert [row.child.kind for row in lane.rows] == [ChildKind.MAIN]
+
+    def test_a_thread_that_names_no_source_is_main(self) -> None:
+        """Absent is not a claim, and the roster's ordinary row is the user's.
+
+        The same reading #112 gives the field: an older daemon classifies
+        nothing, and reading its silence as "child" would make every Session on
+        that machine unaddressable — the failure mode this rule is the mirror
+        image of.
+        """
+        lane = found(daemon_holding(sourced(THREAD, None)))
+        assert [row.child.kind for row in lane.rows] == [ChildKind.MAIN]
+
+    def test_a_child_is_listed_under_the_thread_that_spawned_it(self) -> None:
+        """`parentThreadId` rides on the same read the classification does."""
+        described = dict(sourced(THREAD, "subagent"), parentThreadId=OTHER_THREAD)
+        lane = found(daemon_holding(described))
+        assert lane.rows[0].child.parent == SessionTarget(
+            agent=AgentKind.CODEX, session_id=OTHER_THREAD
+        )
+
+    def test_a_child_whose_parent_the_daemon_does_not_name_is_still_a_child(self) -> None:
+        """The locked type's own rule: demoting it over a missing link opens the Relay.
+
+        `parentThreadId` is `null` on every thread the daemon did not record one
+        for — it is `null` on the recorded phantom above — so a child that
+        arrives without one is the ordinary case and not a malformed row.
+        """
+        lane = found(daemon_holding(dict(sourced(THREAD, "subagent"), parentThreadId=None)))
+        assert lane.rows[0].child == ChildClassification(kind=ChildKind.CHILD, parent=None)
+
+    def test_a_child_is_never_named(self) -> None:
+        """#78's rule, held where the row is made as well as where it is kept.
+
+        The registry drops a child's name (`core/sessions.py:_named_as`), so a
+        lane composing one would be composing something nobody sees. Not
+        composing it is the honest half of the same rule: a Session Name is what
+        the user says to reach a Session, and there is nothing here to reach.
+        """
+        lane = found(daemon_holding(dict(sourced(THREAD, "subagent"), name="tidy the tests")))
+        assert lane.rows[0].name is None
+
+    def test_the_child_list_is_the_keep_list_without_the_user(self) -> None:
+        """Derived, not written out beside it, so the two cannot disagree (#112, #79).
+
+        The rule is one sentence: a thread that reaches the roster and is not
+        the person's own is a Child Process. Spelled as two literals, a source
+        added to the keep-list one day would have to be remembered here on the
+        same day — and the day it was not, a subagent would have become
+        addressable.
+        """
+        assert discovery.CHILD_THREAD_SOURCES == discovery.SESSION_THREAD_SOURCES - {"user"}
+        assert "user" not in discovery.CHILD_THREAD_SOURCES
+
+    def test_a_child_never_takes_the_workspaces_tui(self) -> None:
+        """A subagent runs inside the daemon; the pid in that directory is not its.
+
+        The same first-come join #112 fixed for the phantom, and it bites
+        harder here: a child *keeps* its row, so a child that claimed the pid
+        would leave the user's own Session addressable by id alone while an
+        unrelayable row held its process.
+        """
+        child = dict(sourced(THREAD, "subagent"), cwd="/tmp/w", parentThreadId=OTHER_THREAD)
+        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w")
+        lane = found(daemon_holding(child, parent), running(4321, "/tmp/w"))
+        held = {row.target.session_id: row.target.pid for row in lane.rows}
+        assert held == {THREAD: None, OTHER_THREAD: 4321}
+
+    def test_a_child_names_its_parent_by_the_address_that_parents_row_carries(self) -> None:
+        """One Session, one address — and this one has the workspace's pid in it.
+
+        `parentThreadId` names a thread, but a Session's address is that thread
+        *and* the pid `_pid_for` joined to it, so a parent named from the field
+        alone points at an address no row in the roster holds. #79's acceptance
+        `child` step reads exactly this link, and failed on exactly this
+        difference: it saw the child listed under `codex:01a040cc-…` while the
+        Session that spawned it was `codex:01a040cc-…:36628`.
+
+        The child is listed *before* its parent here, because the daemon orders
+        threads however it likes and the answer may not depend on that order.
+        """
+        child = dict(sourced(THREAD, "subagent"), cwd="/tmp/w", parentThreadId=OTHER_THREAD)
+        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w")
+        lane = found(daemon_holding(child, parent), running(4321, "/tmp/w"))
+        rows = {row.target.session_id: row for row in lane.rows}
+        assert rows[THREAD].child.parent == rows[OTHER_THREAD].target
+        assert rows[THREAD].child.parent.pid == 4321
 
 
 class TestSayingSoWithoutSayingItTwelveTimesAMinute:

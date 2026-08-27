@@ -24,17 +24,21 @@ from gpt_voicecoding.core.bridge import (
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.router import Classification
+from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.switches import SwitchName
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    ChildClassification,
+    ChildKind,
     LaneDiscovery,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
     SessionInspection,
     SessionLifecycle,
+    SessionState,
     SessionStopped,
     WaitingFor,
     WaitingKind,
@@ -140,6 +144,108 @@ class TestTheApprovalPipelineEndToEnd:
 
         assert late is None
         assert [call.verdict for call in hub.agent.calls] == [ApprovalVerdict.ASK]
+
+
+class TestAChildProcessIsNeverAnnounced:
+    """Seen, never spoken to, and never spoken *about* (#79, `CONTEXT.md`).
+
+    Both halves are in Bridge Core rather than in a lane, because the rule is
+    the hub's: **a lane that raises a stop for a child is not wrong**, it is
+    reporting what it saw. A Codex subagent thread really does transition out of
+    `active`, and the Codex adapter really does watch every thread the daemon
+    holds. What must not happen is the hub turning that into a notice the user
+    is asked to act on — a Stop Notice names a Session the user can answer, and
+    the answer to a child would be refused by `resolve` a moment later.
+
+    **The refusal is asked of `resolve`, not re-derived**, so there is one place
+    that decides what a Child Process is and this one obeys it. Unknown is
+    deliberately not treated as child: a Stop can arrive for a Session the
+    roster has not observed yet, and silence about it would be the notice the
+    engine exists to send going missing.
+
+    **Legacy is the shape being adapted, not ported**
+    (`legacy@1d32845:bridge/__main__.py:876-899`, `bridge/hook.py:1-19,68-75`):
+    it suppressed the *registration*, so a child had no row to raise anything
+    from. v1.0 lists the row and suppresses the announcement instead.
+    """
+
+    def spawned(self, hub: Hub) -> SessionTarget:
+        """One Child Process of the roster's Session, in the roster (#79)."""
+        child = SessionTarget(agent=AgentKind.CODEX, session_id="a891a18f447827175")
+        hub.state.sessions.register(
+            Session(
+                target=child,
+                workspace=Path("/tmp/workspace"),
+                first_seen=0.0,
+                state=SessionState.RUNNING,
+                child=ChildClassification(kind=ChildKind.CHILD, parent=CODEX),
+            )
+        )
+        return child
+
+    def test_a_stop_on_a_child_reaches_no_outlet(self) -> None:
+        hub = Hub()
+
+        hub.emit(SessionStopped(target=self.spawned(hub)))
+
+        assert hub.channel.sent == []
+        assert hub.call.spoken == []
+
+    def test_a_stop_on_a_child_says_so_rather_than_going_quiet(self, caplog) -> None:
+        """A notice that was never sent is otherwise a notice that failed."""
+        hub = Hub()
+        with caplog.at_level("INFO"):
+            hub.emit(SessionStopped(target=self.spawned(hub)))
+
+        assert any("Child Process" in record.message for record in caplog.records)
+
+    def test_its_parents_stop_is_announced_as_it_always_was(self) -> None:
+        """The rule is about the child. A parent working is the product working."""
+        hub = Hub()
+        self.spawned(hub)
+
+        hub.emit(SessionStopped(target=CODEX))
+
+        assert "port the log" in hub.call.spoken[0]
+
+    def test_a_stop_on_a_session_the_roster_has_not_seen_is_still_announced(self) -> None:
+        """Unknown is not child, and the asymmetry is the point.
+
+        Discovery runs on a cadence, so a Session can stop before the roster has
+        a row for it. Refusing to announce that would lose the notice entirely,
+        while announcing a child costs one message about something that is about
+        to be refused anyway.
+        """
+        hub = Hub()
+
+        hub.emit(SessionStopped(target=SessionTarget(agent=AgentKind.CODEX, session_id="new")))
+
+        assert hub.call.spoken
+
+    def test_a_permission_a_child_raises_is_not_escalated(self) -> None:
+        """A Codex subagent thread can raise a real `requestApproval`.
+
+        Accepted for v1.0 (advisor, 2026-08-27): "never spoken to" includes
+        never answered, so that dialog is the keyboard's. The alternative is an
+        Approval Relay carrying the user's authority into a Session `resolve`
+        refuses to address.
+        """
+        hub = Hub()
+        child = self.spawned(hub)
+
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", child, "Bash")))
+
+        assert hub.channel.sent == []
+        assert hub.core.approvals.pending() == ()
+
+    def test_its_parents_permission_is_escalated_as_it_always_was(self) -> None:
+        hub = Hub()
+        self.spawned(hub)
+
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+
+        assert hub.channel.sent
+        assert len(hub.core.approvals.pending()) == 1
 
 
 class TestTheRelayPipelineEndToEnd:

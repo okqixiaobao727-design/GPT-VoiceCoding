@@ -117,6 +117,35 @@ class TestOneProcessStaysOneRow:
         assert registry.live()[0].target.session_id == "xyz"
         assert registry.live()[0].first_seen == NOW
 
+    def test_a_cleared_claude_session_ends_and_a_new_row_starts(self) -> None:
+        """`/clear` is a new session id under the same process — a new Session (#79).
+
+        Decided rather than inherited: before #79 the pid join re-keyed the held
+        row and carried its `first_seen` across, so a Session the user had just
+        cleared kept the age, and could have kept the name, of the conversation
+        it replaced. The join is gone for Claude, and this is the shape that
+        replaced it — the old row ends once (so a surface can still say what
+        happened to it) and the new one starts from now.
+
+        **No legacy behaviour to cite**: gen-1 registered a Session from its
+        `SessionStart` hook and had no notion of one session id succeeding
+        another under one process, so there is nothing here that was ported or
+        dropped. Advisor-approved on 2026-08-27 with the consequence read:
+        Relays queued for the cleared id are answered by `relays.session_ended`
+        with honest failure receipts, which is correct, because that
+        conversation is gone.
+        """
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CLAUDE, seeing(claude_row(session_id="def", pid=20)), now=NOW)
+        registry.observe(
+            AgentKind.CLAUDE, seeing(claude_row(session_id="ghi", pid=20)), now=NOW + 5
+        )
+
+        held = {row.target.session_id: row for row in registry.all()}
+        assert held["def"].lifecycle is SessionLifecycle.ENDED
+        assert held["ghi"].lifecycle is SessionLifecycle.LIVE
+        assert held["ghi"].first_seen == NOW + 5
+
     def test_two_claude_processes_under_one_session_id_stay_two_rows(self) -> None:
         """`--resume` forks, and the fork is a Session of its own."""
         registry = SessionRegistry()
@@ -127,6 +156,78 @@ class TestOneProcessStaysOneRow:
         )
 
         assert sorted(held.target.pid or 0 for held in registry.live()) == [20, 21]
+
+    def test_a_child_never_takes_over_its_parents_row(self) -> None:
+        """#79: a Claude Child Process runs **inside** its parent's process.
+
+        A Task subagent is not a process of its own, so its row carries its
+        parent's pid — which is the honest address and also the exact shape this
+        join was built to collapse. Left to collapse it, the child's reading
+        would replace the parent's row: one tick later the user's own Session
+        has become an unrelayable child, under a target nothing can address, and
+        `_better_known` would have logged it as the process moving threads.
+
+        The pid join exists for a Session that gains or changes its *own* id
+        (`codex` at its first turn, and `/new`), and in both of those the two
+        readings are the same kind of thing. Two readings that disagree about
+        whether they are a Session at all are not about one row.
+        """
+        registry = SessionRegistry()
+        parent = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=20)
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(session_id="def", pid=20),
+                claude_row(
+                    session_id="a891a18f447827175",
+                    pid=20,
+                    child=ChildClassification(kind=ChildKind.CHILD, parent=parent),
+                ),
+            ),
+            now=NOW,
+        )
+
+        held = {row.target.session_id: row.child.kind for row in registry.live()}
+        assert held == {"def": ChildKind.MAIN, "a891a18f447827175": ChildKind.CHILD}
+
+    def test_and_a_parent_never_takes_over_a_childs_row(self) -> None:
+        """The same refusal read from the other end, because ordering is not promised.
+
+        Nothing says which of the two a lane lists first, and a rule that only
+        held in one direction would hold or not hold by accident.
+        """
+        registry = SessionRegistry()
+        parent = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=20)
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="a891a18f447827175",
+                    pid=20,
+                    child=ChildClassification(kind=ChildKind.CHILD, parent=parent),
+                ),
+                claude_row(session_id="def", pid=20),
+            ),
+            now=NOW,
+        )
+
+        assert len(registry.live()) == 2
+
+    def test_two_children_of_one_session_stay_two_rows(self) -> None:
+        """They share a pid with each other as well as with their parent."""
+        registry = SessionRegistry()
+        parent = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=20)
+        spawned = ChildClassification(kind=ChildKind.CHILD, parent=parent)
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(session_id="a1", pid=20, child=spawned),
+                claude_row(session_id="a2", pid=20, child=spawned),
+            ),
+            now=NOW,
+        )
+
+        assert sorted(row.target.session_id or "" for row in registry.live()) == ["a1", "a2"]
 
     def test_a_daemon_thread_with_no_process_is_keyed_by_its_id(self) -> None:
         registry = SessionRegistry()

@@ -41,6 +41,9 @@ from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import rollouts, thread_tail
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
 from gpt_voicecoding.seams.agent import (
+    MAIN_SESSION,
+    ChildClassification,
+    ChildKind,
     LaneDiscovery,
     Progress,
     SessionInspection,
@@ -118,6 +121,26 @@ STATUS_TYPES: Final = {
 EPHEMERAL: Final = "ephemeral"
 THREAD_SOURCE: Final = "threadSource"
 SESSION_THREAD_SOURCES: Final = frozenset({"user", "subagent", "guardian_review"})
+
+#: **#79's half of the keep-list above, and derived from it rather than written
+#: out beside it.** The rule is one sentence — a thread that reaches the roster
+#: and is not the person's own is a Child Process — so the two constants cannot
+#: drift into disagreeing about a value: whatever #112 keeps, this classifies.
+#: Spelled the other way round, a source added to the keep-list one day would
+#: have had to be remembered here on the same day, and the day it was not, a
+#: subagent would have become addressable.
+#:
+#: The two values it currently yields are one delegate class split by a boolean
+#: (`rust-v0.150.0:codex-rs/core/src/codex_delegate.rs:111`), which is why one
+#: classification covers both. Neither is guessed from a thread's shape:
+#: `thread_source` is the daemon's own word for what started a thread.
+#:
+#: **Adapted from legacy** (ADR 0010). `legacy@1d32845:bridge/__main__.py:
+#: 876-899` read the same fact — `session_meta.thread_source` — and refused
+#: *registration* on it, so a child had no row at all. v1.0 keeps the safety
+#: outcome and drops the invisibility (#67 port table, P11, *adapt*).
+CHILD_THREAD_SOURCES: Final = SESSION_THREAD_SOURCES - {rollouts.USER_THREAD_SOURCE}
+PARENT_THREAD_ID: Final = "parentThreadId"
 
 #: How much of a thread id stands in for a name the daemon does not have. Eight
 #: characters of a UUID, which is what `codex` itself shows and short enough to
@@ -293,7 +316,15 @@ async def discover(
     claimed: set[int] = set()
 
     for thread in threads:
-        pid = _pid_for(thread, candidates, claimed)
+        child = _child_of(thread)
+        # **A Child Process never takes a workspace's TUI.** A subagent runs
+        # inside the daemon and has no process of its own, so the one `codex`
+        # running in that directory is its parent's — and the join is
+        # first-come (`_pid_for`), so a child reaching it first would leave the
+        # user's own Session addressable by its thread id alone. #112 fixed the
+        # same first-come hazard for the phantom by dropping it before the
+        # join; a child keeps its row, so it is excluded from the join instead.
+        pid = _pid_for(thread, candidates, claimed) if child.is_main else None
         if pid is not None:
             claimed.add(pid)
         progress = (
@@ -302,8 +333,13 @@ async def discover(
             else None
         )
         rows.append(
-            await _named(_from_thread(thread, pid, progress), names, task=_thread_name(thread))
+            await _named(
+                _from_thread(thread, pid, progress, child),
+                names,
+                task=_thread_name(thread),
+            )
         )
+    rows = _linked_to_their_parents(rows)
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
 
@@ -311,6 +347,35 @@ async def discover(
         if candidate.pid not in claimed:
             rows.append(await _named(_from_process(candidate, home=home), names))
     return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
+
+
+def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspection]:
+    """Each child's parent named by the address that parent's own row carries.
+
+    `parentThreadId` names a thread, but a Session's address is the thread *and*
+    the pid `_pid_for` joined to it, so a parent named from the field alone is an
+    address no row in the roster holds. #79's acceptance `child` step reads this
+    link to say a child is listed under its parent, and it failed on exactly that
+    difference: the child pointed at `codex:01a040cc-…` while the Session that
+    spawned it was `codex:01a040cc-…:36628`.
+
+    **After the loop, not inside it**, because the pid is joined as each thread
+    is read and the daemon lists a child before its parent as readily as after.
+    Inside the loop the answer would depend on that order; here it cannot.
+
+    A parent the roster does not hold keeps the thread-only address it was read
+    with. That is what was observed, and it is the honest answer: inventing a pid
+    for a row nobody is holding would be a worse address than one naming less.
+    """
+    held = {row.target.session_id: row.target for row in rows}
+    linked = []
+    for row in rows:
+        parent = row.child.parent
+        address = held.get(parent.session_id) if parent is not None else None
+        if address is not None and address != parent:
+            row = replace(row, child=replace(row.child, parent=address))
+        linked.append(row)
+    return linked
 
 
 def progress_from(thread: Mapping[str, Any]) -> Progress:
@@ -469,9 +534,17 @@ def _status_of(thread: Mapping[str, Any]) -> str | None:
 
 
 def _from_thread(
-    thread: dict[str, Any], pid: int | None, progress: Progress | None = None
+    thread: dict[str, Any],
+    pid: int | None,
+    progress: Progress | None = None,
+    child: ChildClassification = MAIN_SESSION,
 ) -> SessionInspection:
-    """One daemon-held thread as the seam holds it."""
+    """One daemon-held thread as the seam holds it.
+
+    `child` is passed in rather than read here because the caller has already
+    asked — the answer decides whether this row may take a pid at all, and
+    asking twice would be two readings of one field.
+    """
     kind = _status_of(thread)
     state = STATUS_TYPES.get(str(kind), SessionState.RUNNING)
     cwd = thread.get("cwd")
@@ -492,6 +565,41 @@ def _from_thread(
         # the thread's own account of when it last moved, which is exactly the
         # case `last_activity` exists to answer when nothing was said (#76).
         last_activity=thread_tail.last_activity(thread),
+        child=child,
+    )
+
+
+def _child_of(thread: Mapping[str, Any]) -> ChildClassification:
+    """Whether this thread is the user's own, or one another thread spawned (#79).
+
+    Read off the same two fields `_errand_of` reads, on the same cheap
+    `thread/read`, and against `CHILD_THREAD_SOURCES` — the half of #112's
+    keep-list that exists for this rule. Everything else the daemon runs for
+    itself never reaches this function, having been dropped as an errand.
+
+    **A word decides; an absence does not.** `null`, a missing key and a shape
+    this build cannot read are all the daemon declining to classify a thread,
+    and the ordinary state of every thread an older daemon holds. Reading that
+    silence as `child` would make every Session on such a machine unaddressable
+    — the exact mirror of the phantom #112 was opened for, and the worse of the
+    two mistakes, because the roster would list Sessions nobody could reach.
+    """
+    source = thread.get(THREAD_SOURCE)
+    if not isinstance(source, str) or source not in CHILD_THREAD_SOURCES:
+        return MAIN_SESSION
+    # The parent is carried where the daemon names it and is `None` where it
+    # does not — which is ordinary, not malformed: `parentThreadId` is `null`
+    # on every thread the daemon recorded none for. The locked type settles
+    # what follows (`seams/agent.py`): a child whose parent could not be
+    # established is still a child, because demoting it over a missing link
+    # would open the very Relay this classification closes.
+    parent = thread.get(PARENT_THREAD_ID)
+    named = isinstance(parent, str) and parent.strip()
+    return ChildClassification(
+        kind=ChildKind.CHILD,
+        parent=(
+            SessionTarget(agent=AgentKind.CODEX, session_id=str(parent).strip()) if named else None
+        ),
     )
 
 
@@ -514,7 +622,16 @@ async def _named(
     no thread id yet (#73), so it stays unnamed until it does. That is not a
     reach problem: an unnamed row is listed, and what it can be addressed by is
     its target, which it has had all along.
+
+    **A Child Process is the one row that takes no name at all** (#78, #79). A
+    Session Name is what the user says to reach a Session, and there is nothing
+    here to reach; the registry drops one anyway (`core/sessions.py:_named_as`),
+    so composing it would be composing something nobody ever sees. Not
+    composing it is the same rule said where the row is made — and it keeps the
+    daemon's own `Thread.name` for a subagent out of a roster the user reads.
     """
+    if not row.child.is_main:
+        return row
     chosen = task or _short_thread_id(row.target.session_id)
     if chosen is None:
         return row
