@@ -701,6 +701,26 @@ class TestTheChildProcessRule:
         held = {row.target.session_id: row.target.pid for row in lane.rows}
         assert held == {THREAD: None, OTHER_THREAD: 4321}
 
+    def test_a_child_names_its_parent_by_the_address_that_parents_row_carries(self) -> None:
+        """One Session, one address — and this one has the workspace's pid in it.
+
+        `parentThreadId` names a thread, but a Session's address is that thread
+        *and* the pid `_pid_for` joined to it, so a parent named from the field
+        alone points at an address no row in the roster holds. #79's acceptance
+        `child` step reads exactly this link, and failed on exactly this
+        difference: it saw the child listed under `codex:01a040cc-…` while the
+        Session that spawned it was `codex:01a040cc-…:36628`.
+
+        The child is listed *before* its parent here, because the daemon orders
+        threads however it likes and the answer may not depend on that order.
+        """
+        child = dict(sourced(THREAD, "subagent"), cwd="/tmp/w", parentThreadId=OTHER_THREAD)
+        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w")
+        lane = found(daemon_holding(child, parent), running(4321, "/tmp/w"))
+        rows = {row.target.session_id: row for row in lane.rows}
+        assert rows[THREAD].child.parent == rows[OTHER_THREAD].target
+        assert rows[THREAD].child.parent.pid == 4321
+
 
 class TestSayingSoWithoutSayingItTwelveTimesAMinute:
     """A dropped row is a row somebody may come looking for, so the log keeps it.

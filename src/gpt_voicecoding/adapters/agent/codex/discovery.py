@@ -339,6 +339,7 @@ async def discover(
                 task=_thread_name(thread),
             )
         )
+    rows = _linked_to_their_parents(rows)
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
 
@@ -346,6 +347,35 @@ async def discover(
         if candidate.pid not in claimed:
             rows.append(await _named(_from_process(candidate, home=home), names))
     return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
+
+
+def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspection]:
+    """Each child's parent named by the address that parent's own row carries.
+
+    `parentThreadId` names a thread, but a Session's address is the thread *and*
+    the pid `_pid_for` joined to it, so a parent named from the field alone is an
+    address no row in the roster holds. #79's acceptance `child` step reads this
+    link to say a child is listed under its parent, and it failed on exactly that
+    difference: the child pointed at `codex:01a040cc-…` while the Session that
+    spawned it was `codex:01a040cc-…:36628`.
+
+    **After the loop, not inside it**, because the pid is joined as each thread
+    is read and the daemon lists a child before its parent as readily as after.
+    Inside the loop the answer would depend on that order; here it cannot.
+
+    A parent the roster does not hold keeps the thread-only address it was read
+    with. That is what was observed, and it is the honest answer: inventing a pid
+    for a row nobody is holding would be a worse address than one naming less.
+    """
+    held = {row.target.session_id: row.target for row in rows}
+    linked = []
+    for row in rows:
+        parent = row.child.parent
+        address = held.get(parent.session_id) if parent is not None else None
+        if address is not None and address != parent:
+            row = replace(row, child=replace(row.child, parent=address))
+        linked.append(row)
+    return linked
 
 
 def progress_from(thread: Mapping[str, Any]) -> Progress:
