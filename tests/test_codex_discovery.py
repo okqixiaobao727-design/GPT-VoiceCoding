@@ -61,8 +61,23 @@ class FakeDaemon:
         return {"thread": self.threads[str(thread_id)]}
 
 
-def thread(thread_id: str, *, cwd: str, status: str = "idle", name: str | None = None) -> dict:
-    return {"id": thread_id, "cwd": cwd, "status": {"type": status}, "name": name}
+def thread(
+    thread_id: str,
+    *,
+    cwd: str,
+    status: str = "idle",
+    name: str | None = None,
+    preview: str | None = None,
+) -> dict:
+    """One thread as the daemon describes it, with `preview` said only when asked.
+
+    Omitted rather than empty by default, because the two are different claims
+    to `_thread_name` (#113) and most of this file is about neither.
+    """
+    described = {"id": thread_id, "cwd": cwd, "status": {"type": status}, "name": name}
+    if preview is not None:
+        described["preview"] = preview
+    return described
 
 
 def write_rollout(
@@ -422,6 +437,168 @@ class TestWhatEachRowIsCalled:
         """A name with a `·` in it cannot be read back as two halves, so it is not one."""
         lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a · b")}))
         assert lane.rows[0].name is None
+
+
+#: The thread the acceptance run of record drove, **as the shared daemon
+#: describes it** — read back verbatim over `thread/read` on 2026-08-27 against
+#: the running daemon (cli 0.150.0 / app-server 0.149.1), turns dropped and
+#: nothing else touched. `01a040ee…` is the Session of run `20260827T015022Z`
+#: (its `verdict.json` names the same id and the same rollout).
+#:
+#: **`name` here is the title the daemon settled on, and it is the second one.**
+#: #79 recorded the product frozen on `workspace-codex · Reply with the single
+#: word READY. Do` for this exact thread — the raw first characters — and this
+#: readback of the same thread says `回复 READY`. So the rename #107 predicted
+#: does happen; what could not see it was #78's freeze, which is why the roster
+#: never showed it.
+SETTLED_SESSION = {
+    "id": "01a040ee-e08e-7e83-9a53-bac0531157f6",
+    "sessionId": "01a040ee-e08e-7e83-9a53-bac0531157f6",
+    "preview": "Reply with the single word READY. Do not use any tools, and do not ask anything.",
+    "ephemeral": False,
+    "historyMode": "paginated",
+    "status": {"type": "idle"},
+    "cwd": "/Users/simon/Library/Application Support/GPT-VoiceCoding/"
+    "acceptance/20260827T015022Z/workspace-codex",
+    "cliVersion": "0.149.1",
+    "source": "vscode",
+    "threadSource": "user",
+    "name": "回复 READY",
+}
+
+#: The same thread while its **provisional** title was live: the document above
+#: with the name #79 recorded the product freezing. Derived rather than captured,
+#: and it is honest to derive it — `preview` is written once, from the first user
+#: message, and later messages never overwrite it (`rust-v0.150.0:codex-rs/
+#: thread-store/src/thread_metadata_sync.rs:316-324`), so the `preview` read back
+#: today is the `preview` that stood beside that name.
+PROVISIONAL_SESSION = SETTLED_SESSION | {"name": "Reply with the single word READY. Do"}
+
+
+class TestANameThatIsOnlyThePromptReadBack:
+    """#113: the daemon's first title is the user's own words, and it is not a name.
+
+    **What 0.150.0 does.** On the first `UserMessage` of an unnamed thread the
+    TUI whitespace-collapses that message, takes 36 characters of it, and calls
+    `thread/name/set` with the result (`rust-v0.150.0:codex-rs/tui/src/app/
+    thread_routing.rs:1800-1854`, `tui/src/app/thread_title.rs:22`). A generated
+    title then replaces it — see `SETTLED_SESSION` below, which is that swap
+    caught after the fact on the run of record's own thread. How long the first
+    name is live is *not* measured and is observed on #80's run of record; it
+    cannot be read back, because the thread that generates the title is
+    ephemeral and an ephemeral thread's timestamps are stamped when it is read
+    (`rust-v0.150.0:codex-rs/app-server/src/request_processors/
+    thread_processor.rs:5999-6016`).
+
+    #78 froze the first name per target, so the product kept the truncated
+    fragment for the Session's whole life — said back in every Stop Notice and
+    typed after every `@` (#79's run of record).
+
+    **The test is the daemon's own field, not a shape.** `Thread.preview` is
+    "usually the first user message in the thread" (`rust-v0.150.0:codex-rs/
+    app-server-protocol/src/protocol/v2/thread_data.rs:211`; present identically
+    at `@0.149.1:thread_data.rs:209`), written from that same first message
+    (`codex-rs/thread-store/src/thread_metadata_sync.rs:316-324`). It rides the
+    cheap `thread/read` this lane already makes, so the rule costs no round trip,
+    no `includeTurns` and no rollout — which matters, because the provisional
+    name is set mid-turn, exactly when `TurnCache` declines to read turns.
+
+    **Upstream draws the same line**: resuming a thread refuses a stored title
+    equal to its preview rather than showing it as a name
+    (`rust-v0.150.0:codex-rs/app-server/src/request_processors/
+    thread_processor.rs:5783-5788`).
+
+    **Legacy has no behaviour of this kind, and that is the citation.** Gen 1
+    never read a daemon `Thread.name` — its Codex titles came from a Session's
+    own self-report (`legacy@1d32845:bridge/labels.py:97-106`) and its transcript
+    `ai-title`, both *dropped* from the #67 port table — so there was no
+    product-composed name for codex to overwrite. The rule is new because the
+    behaviour it answers is new.
+    """
+
+    def test_the_recorded_provisional_title_is_not_a_name(self) -> None:
+        """The whole ticket, on the run of record's own document."""
+        lane = found(daemon_holding(PROVISIONAL_SESSION))
+        assert str(lane.rows[0].name) == "workspace-codex · 01a040ee"
+
+    def test_the_title_the_daemon_settled_on_is_a_name(self) -> None:
+        """And the good one is kept, which is what makes this a filter and not a ban."""
+        lane = found(daemon_holding(SETTLED_SESSION))
+        assert str(lane.rows[0].name) == "workspace-codex · 回复 READY"
+
+    def test_a_prompt_short_enough_to_become_the_whole_name_is_still_not_a_name(self) -> None:
+        """Under 36 characters nothing is truncated, and it is the same provisional title."""
+        lane = found(
+            daemon_holding(
+                thread(THREAD, cwd="/tmp/w", name="fix the login bug", preview="fix the login bug")
+            )
+        )
+        assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
+
+    def test_the_prompt_is_matched_the_way_codex_collapsed_and_cut_it(self) -> None:
+        """`split_whitespace().join(" ")` then 36 characters, over a prompt that had both."""
+        lane = found(
+            daemon_holding(
+                thread(
+                    THREAD,
+                    cwd="/tmp/w",
+                    name="port the log, then stop and tell me",
+                    preview="port   the log,\n\tthen stop and tell me what you found",
+                )
+            )
+        )
+        assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
+
+    def test_a_generated_title_that_merely_opens_the_prompt_is_kept(self) -> None:
+        """The rule catches codex's own cut, not everything the prompt begins with.
+
+        A generated title is told to start with an imperative verb
+        (`rust-v0.150.0:codex-rs/tui/src/app/thread_title.rs:206-214`) and a
+        prompt very often does too, so "the prompt starts with this name" would
+        throw away good titles — this is the one that would have gone.
+        """
+        lane = found(
+            daemon_holding(
+                thread(
+                    THREAD,
+                    cwd="/tmp/w",
+                    name="Fix the login bug",
+                    preview="Fix the login bug in the auth module and add a test",
+                )
+            )
+        )
+        assert str(lane.rows[0].name) == "w · Fix the login bug"
+
+    def test_a_name_the_prompt_does_not_begin_with_is_kept(self) -> None:
+        """A title generated from the conversation is not a slice of the first message."""
+        lane = found(
+            daemon_holding(
+                thread(
+                    THREAD,
+                    cwd="/tmp/w",
+                    name="Port the discovery log",
+                    preview="port the log, then stop and tell me",
+                )
+            )
+        )
+        assert str(lane.rows[0].name) == "w · Port the discovery log"
+
+    def test_a_name_longer_than_the_prompt_is_kept(self) -> None:
+        """The provisional title is a *slice*, so it can never outrun what it was cut from."""
+        lane = found(
+            daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log now", preview="port"))
+        )
+        assert str(lane.rows[0].name) == "w · port the log now"
+
+    def test_a_daemon_that_states_no_preview_keeps_the_name(self) -> None:
+        """Absent is not a claim — the same reading `threadSource` already gets (#112)."""
+        lane = found(daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log")))
+        assert str(lane.rows[0].name) == "w · port the log"
+
+    def test_an_empty_preview_keeps_the_name_too(self) -> None:
+        """`""` is how the daemon spells "no first message recorded", not "it matched"."""
+        lane = found(daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log", preview="")))
+        assert str(lane.rows[0].name) == "w · port the log"
 
 
 class TestWhenTheLaneCannotLookAtAll:

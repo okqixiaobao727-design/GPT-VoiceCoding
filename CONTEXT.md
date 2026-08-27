@@ -73,7 +73,8 @@ _Avoid_: child Session, subagent (the agent's mechanism word), crew
 What the user and the system call one Session: `<project> · <task>`, where the project is the
 Git repository the Session is working in — its own directory when it is in none — and the task
 is the agent's own name for the Session. Composed by the lane that first saw the Session and
-never changed after that, because the user says it back to address the Session.
+changed only when its official source renames it — the user says it back to address the
+Session, so there is one name at a time and nothing else may move it.
 _Avoid_: label, title
 
 **Relay**:

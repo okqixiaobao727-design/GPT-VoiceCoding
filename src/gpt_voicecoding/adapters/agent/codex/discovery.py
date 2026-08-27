@@ -142,6 +142,23 @@ SESSION_THREAD_SOURCES: Final = frozenset({"user", "subagent", "guardian_review"
 CHILD_THREAD_SOURCES: Final = SESSION_THREAD_SOURCES - {rollouts.USER_THREAD_SOURCE}
 PARENT_THREAD_ID: Final = "parentThreadId"
 
+#: What the daemon calls the thread's first user message. On the cheap read like
+#: the ones above, and read for one question only: whether the name codex gave
+#: this thread is that message read back (#113, `_thread_name`).
+PREVIEW: Final = "preview"
+
+#: How much of that first message codex 0.150.0 makes a thread's **provisional**
+#: name out of: `THREAD_TITLE_MAX_CHARS`, `rust-v0.150.0:codex-rs/tui/src/app/
+#: thread_title.rs:22`, applied by `tui/src/app/thread_routing.rs:1823-1829` as
+#: `.chars().take(_)` over the whitespace-collapsed message.
+#:
+#: **Read as codex's number rather than as a length this product chose**, which
+#: is why it is named after the constant it mirrors. If a later codex composes
+#: its provisional title differently, this rule stops matching and the daemon's
+#: name is kept — the behaviour before #113, not a worse one, and the acceptance
+#: reads the Session Name aloud where a person would notice.
+PROVISIONAL_TITLE_CHARACTERS: Final = 36
+
 #: How much of a thread id stands in for a name the daemon does not have. Eight
 #: characters of a UUID, which is what `codex` itself shows and short enough to
 #: say out loud — the fallback task of every unnamed thread (#78). It is
@@ -604,9 +621,95 @@ def _child_of(thread: Mapping[str, Any]) -> ChildClassification:
 
 
 def _thread_name(thread: Mapping[str, Any]) -> str | None:
-    """What the daemon calls this thread, when it calls it anything."""
+    """What the daemon calls this thread, when it calls it anything.
+
+    **A name that is only the user's own prompt read back is not a name** (#113).
+    codex 0.150.0 names an unnamed thread the moment its first `UserMessage`
+    completes, and that first name is the message itself: whitespace-collapsed
+    and cut to 36 characters, mid-word (`rust-v0.150.0:codex-rs/tui/src/app/
+    thread_routing.rs:1800-1854`, `tui/src/app/thread_title.rs:22`). A generated
+    title then replaces it — measured on the run of record's own thread, which
+    the daemon now calls `回复 READY` and the product froze as `Reply with the
+    single word READY. Do` (#113). *How long the first name is live is not
+    measured; it is observed on #80's run of record*, whose `stop notice` step
+    already reads the Session Name aloud. It cannot be read back from the daemon:
+    the hidden thread that generates the title is ephemeral, and an ephemeral
+    thread's `createdAt`/`updatedAt` are stamped at read time
+    (`rust-v0.150.0:codex-rs/app-server/src/request_processors/thread_processor.
+    rs:5999-6016`), so the daemon keeps no record of when the swap happened.
+
+    That unmeasured window is exactly what this rule makes not matter. #78 froze
+    the first name a target accepted, so the product kept the fragment for the
+    Session's whole life and said it back in every Stop Notice; refusing it here
+    lets the freeze land on something sayable — the id-prefix fallback below,
+    exactly as when the daemon offers nothing — until the real title arrives.
+
+    **The test is the daemon's own account of the prompt, not the shape of the
+    string.** `Thread.preview` is "usually the first user message in the thread"
+    (`rust-v0.150.0:codex-rs/app-server-protocol/src/protocol/v2/thread_data.rs:
+    211`, and identically at `@0.149.1:thread_data.rs:209`), written from that
+    same first message and never overwritten by a later one
+    (`codex-rs/thread-store/src/thread_metadata_sync.rs:316-324`). So this asks
+    codex whether the name it just gave is the prompt, and codex answers from the
+    field it already put on this document — no second request, no `includeTurns`,
+    no rollout. That is not a convenience: the provisional name appears *during*
+    the first turn, which is precisely when `TurnCache` declines to read turns at
+    all, so a rule that needed them could not see the name it exists to catch.
+
+    **Upstream draws the same line in its own house**: resuming a thread whose
+    stored title equals its preview leaves `name` unset rather than showing it
+    (`rust-v0.150.0:codex-rs/app-server/src/request_processors/thread_processor.
+    rs:5783-5788`).
+
+    **A daemon that states no preview keeps its name.** Absent is not a claim —
+    `SESSION_THREAD_SOURCES` above makes the same reading of the same silence,
+    and an older daemon that records no preview must not lose every name it has.
+    The rule only ever fires on a positive match, so where the two sides strip a
+    prompt differently — the title drops IDE context, the preview strips a
+    message prefix — it declines to fire and the name stands.
+    """
     name = thread.get("name")
-    return name.strip() if isinstance(name, str) and name.strip() else None
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if _is_the_prompt_back(name, thread.get(PREVIEW)):
+        # Debug rather than info, and for `core.sessions._named_as`'s reason: this
+        # is a decision taken again on every five-second tick for as long as the
+        # daemon holds that name, and at info a thread whose generated title never
+        # arrived would be one steady line per tick saying nothing new.
+        _log.debug("thread %s is named its own first prompt; leaving it unnamed", thread.get("id"))
+        return None
+    return name.strip()
+
+
+def _is_the_prompt_back(name: str, preview: Any) -> bool:
+    """Whether this name is *the* provisional title codex composes from the prompt.
+
+    **The title codex composes, and not merely a prefix of the prompt.** The
+    provisional name is one expression — the first message collapsed by
+    `split_whitespace().join(" ")` and cut to `PROVISIONAL_TITLE_CHARACTERS` —
+    so this recomposes that expression and compares. A looser "the prompt starts
+    with this name" would reach names codex never composed: a generated title
+    opens with an imperative verb (`tui/src/app/thread_title.rs:206-214`) and a
+    prompt very often does too, so `Fix the login bug` would be thrown away as a
+    prefix of `Fix the login bug in the auth module` — a good name lost to a rule
+    meant to catch a bad one.
+
+    Collapsed on both sides because that is the only form the two are comparable
+    in: the preview carries the message with its newlines intact. The cut is
+    collapsed again after it is made, because cutting at a character count can
+    leave the trailing space of the word it stopped after. Case is kept — the
+    name is a verbatim slice, so a case-insensitive test would only reach names
+    that are not one.
+    """
+    prompt = _collapsed(preview)
+    if not prompt:
+        return False
+    return _collapsed(name) == _collapsed(prompt[:PROVISIONAL_TITLE_CHARACTERS])
+
+
+def _collapsed(value: Any) -> str:
+    """One line of single-spaced words, or nothing at all."""
+    return " ".join(value.split()) if isinstance(value, str) else ""
 
 
 async def _named(

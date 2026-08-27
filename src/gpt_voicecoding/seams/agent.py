@@ -324,8 +324,10 @@ class SessionInspection:
     #: from the agent's own name for it and the workspace it runs in
     #: (`adapters/agent/_naming.py`). `None` is ordinary: a Codex thread that has
     #: not taken its first turn has neither a name nor an id to make one from.
-    #: The registry freezes the first one it is given (#78), so a lane composing
-    #: a different one later is composing something nobody will see.
+    #: The registry takes the first one it is given and then follows this field
+    #: (#78 as amended on #113), so a lane may only ever compose this from the
+    #: agent's *official* name for the Session: a second, different name is read
+    #: as the agent having renamed it, and reaches the user as a rename.
     name: SessionName | None = None
 
 
