@@ -9,9 +9,13 @@ a TUI, and a lane that cannot look at all.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from gpt_voicecoding.core.sessions import SessionRegistry
+import pytest
+
+from gpt_voicecoding.core import sessions as sessions_module
+from gpt_voicecoding.core.sessions import NoNameMatchError, SessionRegistry
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
@@ -327,13 +331,23 @@ class TestALaneThatCouldNotLook:
 
 
 class TestTheNameARowKeeps:
-    """#78: a Session Name is composed once per exact identity and then held.
+    """#78, amended by Simon on #113: composed once, and changed only by a rename.
 
     The rule the reference implementation enforced in its store — first write
     wins, an exact repeat is a no-op, a different one is refused
     (`legacy@1d32845:bridge/store.py:1875-1902`) — moved here, where the writes
     now come from: a lane composing a name off every reading, five seconds
-    apart, forever.
+    apart, forever. **Adapted** on #113: a different name is now taken rather
+    than refused, because the source it comes from changed character. Legacy's
+    was a one-shot self-report, so a second one was a contradiction; a lane's
+    `SessionInspection.name` is composed from the agent's *official* name for the
+    Session and nothing else (`adapters/agent/_naming.py`), so a second one is
+    the agent renaming its own Session.
+
+    What made the amendment necessary is on the Codex lane: codex 0.150.0 names
+    a thread with the first 36 characters of the user's first message and then
+    replaces that with a generated title (#113, measured; the delay is not).
+    Frozen, the product kept the fragment for good.
     """
 
     def test_the_first_name_a_lane_composes_is_taken(self) -> None:
@@ -360,8 +374,8 @@ class TestTheNameARowKeeps:
 
         assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
 
-    def test_a_second_different_name_for_one_identity_is_ignored(self) -> None:
-        """The whole point of naming: the user says the name they were told."""
+    def test_a_rename_by_the_lanes_source_is_followed(self) -> None:
+        """#113: the agent renamed its own Session, and the roster says so."""
         registry = SessionRegistry()
         registry.observe(
             AgentKind.CODEX,
@@ -373,6 +387,58 @@ class TestTheNameARowKeeps:
             seeing(codex_row(session_id="abc", pid=10, name=named("something else"))),
             now=NOW + 5,
         )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · something else"
+
+    def test_the_name_it_was_renamed_from_stops_addressing_it(self) -> None:
+        """There is one name at a time, and the old one refuses with the existing error."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("something else"))),
+            now=NOW + 5,
+        )
+
+        assert registry.match_name("something else").target.session_id == "abc"
+        with pytest.raises(NoNameMatchError):
+            registry.match_name("a task")
+
+    def test_a_rename_is_said_once_and_not_once_a_tick(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The held name becomes the new one, so the next reading has nothing to say."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        renamed = seeing(codex_row(session_id="abc", pid=10, name=named("something else")))
+        with caplog.at_level(logging.INFO, logger=sessions_module.__name__):
+            registry.observe(AgentKind.CODEX, renamed, now=NOW + 5)
+            registry.observe(AgentKind.CODEX, renamed, now=NOW + 10)
+
+        said = [record.getMessage() for record in caplog.records if "is now called" in record.msg]
+        assert len(said) == 1
+        assert said[0].endswith(
+            "is now called GPT-VoiceCoding · something else by its lane; "
+            "it was GPT-VoiceCoding · a task"
+        )
+
+    def test_a_reading_that_states_no_name_does_not_erase_the_one_it_has(self) -> None:
+        """A degraded Codex pass names none of its rows, and that is not a rename."""
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        registry.observe(AgentKind.CODEX, seeing(codex_row(session_id="abc", pid=10)), now=NOW + 5)
 
         assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
 

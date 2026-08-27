@@ -135,27 +135,49 @@ class Session:
         )
 
     def _named_as(self, row: SessionInspection, target: SessionTarget) -> SessionName | None:
-        """The Session Name this row keeps — **the first one it accepted**.
+        """The Session Name this row keeps — **the one its official source states**.
 
         A Child Process keeps none. It is listed and it is never a target, so a
         name for it would be a name the user could say and nothing could answer
         — the risk #78's own table names, held here rather than in each lane so
         it holds however #79 comes to find children.
 
-        A name is composed once per exact `SessionTarget` and never changes
-        after that (`legacy@1d32845:bridge/store.py:1875-1902`, *ported*: first
-        write wins, an exact repeat is a no-op, a different one is refused).
-        Stability is the whole point of naming a Session at all — the user says
-        the name to address it, so a name that moved between two Stop Notices
-        would be a name that reached the wrong Session.
+        A name is composed once per exact `SessionTarget` and **changes only
+        when the source it was composed from renames the Session** (#78 as
+        amended by Simon on #113, 2026-08-27). Stability is still the point — the
+        user says the name to address it — and what makes a rename safe is where
+        it can come from: `SessionInspection.name` is composed by a lane from its
+        agent's *official* name for the Session and from nothing else (Claude's
+        roster `name`, Codex's daemon `Thread.name` — `adapters/agent/_naming.py`),
+        so a change here is the agent renaming its own Session and never this
+        product changing its mind. The routes that could have made a name drift
+        on their own were dropped from the #67 port table before #78 was written:
+        no self-report (`legacy@1d32845:bridge/hook.py:215-253`), no
+        transcript-derived `ai-title` (`bridge/labels.py:73-84`).
 
-        A **target change is the one case that re-composes**, and it is not a
-        mutable name: it is a different Session under the same row. Two ways it
-        happens, both measured — a Codex row takes its first turn and gains the
-        thread id it had no name to be built from (#73), and the user types
-        `/new` in that TUI so the pid stays and the thread does not (#77). The
-        second is a new thread; naming it after the old one is the failure this
-        rule exists to prevent, not the one it would be protecting.
+        **Why the freeze could not simply stay.** codex 0.150.0 names a thread
+        the moment its first user message lands, with the first 36 characters of
+        that message, and then replaces it with a generated title (#113,
+        measured — the delay before the replacement is not, and cannot be read
+        back from the daemon). Frozen, the product kept the fragment for the
+        Session's whole life; the Codex lane now refuses that provisional name
+        (`adapters/agent/codex/discovery.py::_thread_name`) and this rule is what
+        lets the real title reach the roster when it arrives. On the Claude lane
+        the same rule is a no-op in practice: its roster names are `derived` and
+        steady, so they move only when somebody deliberately renames a Session,
+        which is the one case this is meant to follow.
+
+        Against legacy: `bridge/store.py:1875-1902` froze on first write and
+        refused a different one, **adapted** — the source is now a live official
+        name rather than a one-shot report, so a rename by that source is
+        followed instead of refused.
+
+        A **target change also re-composes**, and it is not a rename: it is a
+        different Session under the same row. Two ways it happens, both measured
+        — a Codex row takes its first turn and gains the thread id it had no name
+        to be built from (#73), and the user types `/new` in that TUI so the pid
+        stays and the thread does not (#77). The second is a new thread; naming
+        it after the old one is the failure this rule exists to prevent.
         """
         if not row.child.is_main:
             return None
@@ -163,19 +185,20 @@ class Session:
             return row.name
         if self.name is None:
             return row.name
-        if row.name is not None and row.name != self.name:
-            # Debug rather than info on purpose: a lane that composes a
-            # different name composes it again on every tick, five seconds
-            # apart, for as long as the Session runs. At info this would be one
-            # steady line per Session per tick describing a decision that never
-            # changes.
-            _log.debug(
-                "%s is now called %s by its lane; keeping the name it was accepted with, %s",
-                target,
-                row.name,
-                self.name,
-            )
-        return self.name
+        if row.name is None or row.name == self.name:
+            # A lane that has stopped stating a name states nothing about the
+            # name it already gave: `None` is "not read this tick", which is the
+            # reading a degraded Codex pass produces on every row it holds.
+            return self.name
+        # Info, and it is one line per rename rather than one per tick: the held
+        # name becomes this one, so the next pass compares equal and says nothing.
+        _log.info(
+            "%s is now called %s by its lane; it was %s",
+            target,
+            row.name,
+            self.name,
+        )
+        return row.name
 
 
 def _better_known(held: SessionTarget, seen: SessionTarget) -> SessionTarget:
