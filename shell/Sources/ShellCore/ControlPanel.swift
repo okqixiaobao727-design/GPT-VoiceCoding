@@ -35,6 +35,7 @@ public struct EngineStatus: Equatable, Sendable {
     public var sessions: Int
     public var pendingRelays: Int
     public var pendingApprovals: Int
+    public var pendingQuestions: [PendingQuestion]
 
     public var callIsUp: Bool { callID != nil }
 
@@ -45,7 +46,38 @@ public struct EngineStatus: Equatable, Sendable {
         callID = document["call_id"]?.string
         sessions = document["sessions"]?.array?.count ?? 0
         pendingRelays = document["pending_relays"]?.array?.count ?? 0
-        pendingApprovals = document["pending_approvals"]?.array?.count ?? 0
+        let approvals = document["pending_approvals"]?.array ?? []
+        pendingApprovals = approvals.count
+        pendingQuestions = approvals.compactMap(PendingQuestion.init)
+    }
+}
+
+/// One question already held by Bridge Core's Approval Pipeline.
+///
+/// This is a rendering of `status.pending_approvals`, not panel-owned state. The
+/// approval id addresses the existing request; prompt and options are the words
+/// the Agent seam carried from Claude's `AskUserQuestion` payload.
+public struct PendingQuestion: Equatable, Sendable, Identifiable {
+    public var approvalID: String
+    public var prompt: String
+    public var options: [String]
+    public var id: String { approvalID }
+
+    public init(approvalID: String, prompt: String, options: [String]) {
+        self.approvalID = approvalID
+        self.prompt = prompt
+        self.options = options
+    }
+
+    init?(_ value: JSONValue) {
+        guard value["kind"]?.string == "question",
+            let approvalID = value["approval_id"]?.string,
+            let prompt = value["prompt"]?.string
+        else { return nil }
+        self.init(
+            approvalID: approvalID,
+            prompt: prompt,
+            options: (value["options"]?.array ?? []).compactMap(\.string))
     }
 }
 
@@ -158,6 +190,25 @@ public final class ControlPanel {
         // Only what the engine sent. A failed toggle leaves the last reading
         // alone rather than guessing which way the call went.
         if let answer = outcome.answer { live = answer }
+        await refresh()
+        lastFailure = outcome.failure
+    }
+
+    /// Answer one pending question through the same typed Approval Relay every
+    /// other surface uses. `text` is carried exactly as received: an option's
+    /// label or the words typed by the user, with no local matching or trimming.
+    public func answer(_ approvalID: String, text: String) async {
+        let outcome = await ask(
+            Request(
+                action: .approve,
+                payload: [
+                    "approval_id": .string(approvalID),
+                    "verdict": .object([
+                        "kind": .string("answer"),
+                        "text": .string(text),
+                    ]),
+                ])
+        ) { $0 }
         await refresh()
         lastFailure = outcome.failure
     }

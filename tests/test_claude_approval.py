@@ -50,7 +50,13 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import CHANNEL_CONFIG_VARIA
 from gpt_voicecoding.adapters.agent.claude.privacy import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
-from gpt_voicecoding.seams.agent import ApprovalVerdict, AwaitingApproval, WaitingKind
+from gpt_voicecoding.seams.agent import (
+    ApprovalRequest,
+    ApprovalVerdict,
+    ApprovalVerdictKind,
+    AwaitingApproval,
+    WaitingKind,
+)
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
 
@@ -156,12 +162,26 @@ class TestWhatTheHookPrints:
         assert inner["hookEventName"] == HOOK_EVENT
         assert inner["decision"]["behavior"] == ALLOW_BEHAVIOR
 
+    def test_a_typed_allow_value_keeps_allow_semantics(self) -> None:
+        decision = hook_decision(ApprovalVerdict(ApprovalVerdictKind.ALLOW))
+
+        assert decision is not None
+        assert decision["hookSpecificOutput"]["decision"]["behavior"] == ALLOW_BEHAVIOR
+
     def test_deny_says_why_so_the_session_can_report_it(self) -> None:
         decision = hook_decision(ApprovalVerdict.DENY)
         assert decision is not None
         inner = decision["hookSpecificOutput"]["decision"]
         assert inner["behavior"] == DENY_BEHAVIOR
         assert inner["message"].strip()
+
+    def test_an_answer_is_denial_prose_with_the_users_words_verbatim(self) -> None:
+        assert hook_decision(ApprovalVerdict.answer("tabs")) == {
+            "hookSpecificOutput": {
+                "hookEventName": HOOK_EVENT,
+                "decision": {"behavior": DENY_BEHAVIOR, "message": "tabs"},
+            }
+        }
 
     def test_ask_prints_nothing_at_all(self) -> None:
         """The locked never-deny rule, as a wire fact.
@@ -179,7 +199,12 @@ class TestWhatTheHookPrints:
         session-scoped rule, and `updatedInput`, which would rewrite the call the
         user said yes to. Neither may ever appear.
         """
-        for verdict in ApprovalVerdict:
+        for verdict in (
+            ApprovalVerdict.ALLOW,
+            ApprovalVerdict.DENY,
+            ApprovalVerdict.ASK,
+            ApprovalVerdict.answer("tabs"),
+        ):
             decision = hook_decision(verdict)
             if decision is None:
                 continue
@@ -823,15 +848,13 @@ def group(question: str, *labels: str, multi: bool = False) -> dict[str, Any]:
     }
 
 
-class TestAQuestionIsNotAPermission:
-    """`AskUserQuestion` rides this hook, and must not be announced as an approval.
+class TestAQuestionRidesTheApprovalHook:
+    """`AskUserQuestion` is typed as a question on the shared hook route.
 
     Measured on 2.1.246 (#77): the tool raises a `PermissionRequest`, and a hook
     `deny` carrying a message is consumed by the Session *as the user's answer*.
-    So a route that announced it like any other dialog would offer a voice
-    allow/deny menu whose "deny" writes `DENIED_BY_VOICE` into the conversation as
-    an answer the user never gave. It is parked — the projection needs it, and the
-    dialog must still reach the screen — and announced by the Stop Notice instead.
+    #103 therefore parks it under `prompt_id` and enters the Approval Relay with
+    an answer verdict, never the permission route's allow/deny menu.
     """
 
     def test_a_question_payload_projects_the_whole_question(self) -> None:
@@ -842,6 +865,42 @@ class TestAQuestionIsNotAPermission:
         assert waiting.prompt == "Tabs or spaces?"
         assert [option.text for option in waiting.options] == ["Spaces", "Tabs"]
         assert waiting.approval_id == "p-1", "the dialog's own correlator, for #103"
+
+    def test_an_answer_crosses_the_real_hook_socket_under_its_prompt_id(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=43,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                )
+                receipt = await listener.answer(
+                    "p-1", ApprovalVerdict.answer("tabs"), request_id=RequestId("r-1")
+                )
+            finally:
+                await listener.aclose()
+            return receipt, await hook
+
+        receipt, decision = asyncio.run(scenario())
+
+        assert (receipt.outcome, decision) == (
+            Delivery.DELIVERED,
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": HOOK_EVENT,
+                    "decision": {"behavior": DENY_BEHAVIOR, "message": "tabs"},
+                }
+            },
+        )
 
     def test_the_session_s_own_mark_on_a_label_is_read_as_one(self) -> None:
         """`AskUserQuestion` has no recommendation field; the mark is in the label.
@@ -897,7 +956,39 @@ class TestAQuestionIsNotAPermission:
         assert waiting.kind is WaitingKind.QUESTION
         assert waiting.options == ()
 
-    def test_a_question_is_parked_and_raises_no_awaiting_approval(self, socket_root: Path) -> None:
+    def test_a_question_without_a_prompt_id_stays_with_the_on_screen_dialog(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            sink = Sink()
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=sink.emit,
+                pid=44,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs"), prompt_id=None),
+                )
+                parked = listener.newest_question_for(TARGET)
+                announced = sink.of(AwaitingApproval)
+            finally:
+                await listener.aclose()
+            return parked, announced, await hook
+
+        parked, announced, decision = asyncio.run(scenario())
+
+        assert parked is not None and (parked.approval_id, announced, decision) == (
+            None,
+            [],
+            None,
+        )
+
+    def test_a_question_is_parked_and_enters_the_approval_relay(self, socket_root: Path) -> None:
         async def scenario():
             sink = Sink()
             listener = ApprovalListener(
@@ -911,7 +1002,7 @@ class TestAQuestionIsNotAPermission:
                 hook = await hook_in_flight(
                     listener,
                     socket_root,
-                    question_dialog(group("Tabs or spaces?", "Spaces", "Tabs")),
+                    question_dialog(group("Tabs or spaces?", "Spaces (recommended)", "Tabs")),
                 )
                 parked = listener.newest_question_for(TARGET)
                 announced = sink.of(AwaitingApproval)
@@ -923,7 +1014,17 @@ class TestAQuestionIsNotAPermission:
             return parked, announced
 
         parked, announced = asyncio.run(scenario())
-        assert announced == [], "a question carries no verdict; #103 gives it its own route"
+        assert [event.request for event in announced] == [
+            ApprovalRequest(
+                approval_id="p-1",
+                target=TARGET,
+                tool_name=QUESTION_TOOL,
+                kind=WaitingKind.QUESTION,
+                prompt="Tabs or spaces?",
+                options=("Spaces", "Tabs"),
+                recommendation="Spaces",
+            )
+        ]
         assert parked is not None
         assert parked.kind is WaitingKind.QUESTION
         assert [option.text for option in parked.options] == ["Spaces", "Tabs"]

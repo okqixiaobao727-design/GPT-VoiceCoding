@@ -21,6 +21,7 @@ describe a binary that is not there.
 
 from __future__ import annotations
 
+from gpt_voicecoding.control_plane.commands import APPROVE_ANSWER_USAGE
 from gpt_voicecoding.core.instructions.blocks import (
     Block,
     InstructionError,
@@ -39,7 +40,7 @@ ACTION_GIST: dict[Action, str] = {
     Action.PROGRESS: "how far along one exact session is, read now — never a turn",
     Action.LIVE: "the Live Toggle — end the call that is up, or start one when none is",
     Action.RELAY: "carry the user's own words into one exact session",
-    Action.APPROVE: "carry the user's verdict on one pending permission request",
+    Action.APPROVE: "carry the user's verdict on one pending question or permission request",
     Action.VERIFY: "what this engine actually loaded behind each seam",
 }
 
@@ -89,6 +90,16 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                 ),
                 Block(
                     text="The actions this engine has:\n\n" + _command_card(),
+                ),
+                Block(
+                    text=(
+                        "To answer a pending question, use the approval id the engine gave you "
+                        "and this exact form:\n\n"
+                        f"    {context.cli.invocation} {APPROVE_ANSWER_USAGE}\n\n"
+                        "Copy an offered option label verbatim when the user chooses it. "
+                        "Otherwise pass the user's own words as the answer arguments; never "
+                        "match or normalise the answer against the options."
+                    ),
                 ),
                 Block(
                     covers=("delegated.identity.exact-structured",),

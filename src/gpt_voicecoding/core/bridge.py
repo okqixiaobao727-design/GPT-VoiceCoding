@@ -170,12 +170,10 @@ def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
                 parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
             if waiting_for.recommendation:
                 parts.append(f"it recommends {waiting_for.recommendation}")
-            # A question has no answering route at all on this build: the inbox
-            # carries words and never authority (#71), so a Relay cannot answer
-            # one, and the hook that holds the dialog open is deliberately not
-            # announced as an approval — a spoken "deny" there would be consumed
-            # by the Session as the user's answer (#77). #103 gives the question
-            # its own route, and takes this clause off when it does.
+            # A question with no handle has no answering route: the inbox carries
+            # words and never authority (#71), while #103's structured answer
+            # needs the `prompt_id` carried by the hook. A handled question is
+            # reoffered by the Approval Relay before this fallback is reached.
             return "; ".join(parts) + f" — {ANSWER_IT_AT_THE_TERMINAL}"
         case WaitingKind.PERMISSION:
             named = waiting_for.tool_name or "a tool"

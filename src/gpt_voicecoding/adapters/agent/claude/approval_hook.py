@@ -188,8 +188,9 @@ def _verdict_in(line: bytes) -> ApprovalVerdict:
         return ApprovalVerdict.ASK
     if not isinstance(document, dict) or document.get(TYPE_FIELD) != VERDICT_TYPE:
         return ApprovalVerdict.ASK
+    raw = document.get(VERDICT_FIELD)
     try:
-        return ApprovalVerdict(document.get(VERDICT_FIELD))
+        return ApprovalVerdict.from_document(raw)
     except ValueError:
         return ApprovalVerdict.ASK
 

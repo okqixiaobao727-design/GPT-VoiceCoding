@@ -22,8 +22,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from gpt_voicecoding.seams.agent import ApprovalVerdict, ApprovalVerdictKind
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
 from gpt_voicecoding.seams.identity import ADDRESS_SEPARATOR, address_of
+
+#: The two Approval Relay forms. Kept separate because a question instruction
+#: must never present the permission form as the exact way to answer it.
+APPROVE_PERMISSION_USAGE = "approve <approval-id> allow|deny|ask"
+APPROVE_ANSWER_USAGE = "approve <approval-id> answer <words...>"
 
 #: How each action is written on one line. Also what a refusal quotes back.
 USAGE: dict[Action, str] = {
@@ -33,7 +39,7 @@ USAGE: dict[Action, str] = {
     Action.PROGRESS: "progress <agent>:<session id>[:<pid>]",
     Action.LIVE: "live",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
-    Action.APPROVE: "approve <approval id> allow|deny|ask",
+    Action.APPROVE: f"{APPROVE_PERMISSION_USAGE} | {APPROVE_ANSWER_USAGE}",
     Action.VERIFY: "verify",
 }
 
@@ -67,8 +73,7 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
         case Action.RELAY:
             return _relay(arguments)
         case Action.APPROVE:
-            approval_id, verdict = _exactly(action, arguments, 2)
-            return {"approval_id": approval_id, "verdict": verdict}
+            return _approval(arguments)
         case Action.PROGRESS:
             (address,) = _exactly(action, arguments, 1)
             return {"target": parse_address(address)}
@@ -85,6 +90,26 @@ def _relay(arguments: list[str]) -> dict[str, object]:
         raise CommandError(f"say it as: {USAGE[Action.RELAY]}")
     address, *words = remaining
     return {"target": parse_address(address), "text": " ".join(words), "route": route}
+
+
+def _approval(arguments: list[str]) -> dict[str, object]:
+    if len(arguments) == 2:
+        approval_id, word = arguments
+        try:
+            verdict = ApprovalVerdict.from_document(word)
+        except ValueError:
+            pass
+        else:
+            return {"approval_id": approval_id, "verdict": verdict.to_document()}
+    if len(arguments) >= 3 and arguments[1] == str(ApprovalVerdictKind.ANSWER):
+        approval_id, _, *words = arguments
+        try:
+            verdict = ApprovalVerdict.answer(" ".join(words))
+        except ValueError:
+            pass
+        else:
+            return {"approval_id": approval_id, "verdict": verdict.to_document()}
+    raise CommandError(f"say it as: {USAGE[Action.APPROVE]}")
 
 
 def _exactly(action: Action, arguments: list[str], count: int) -> list[str]:

@@ -83,6 +83,7 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
+    ApprovalVerdictKind,
     AwaitingApproval,
     LaneDiscovery,
     LaneUnavailable,
@@ -606,6 +607,12 @@ class CodexAgentAdapter:
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:
         """Carry one verdict — or, for `ask`, deliberately carry nothing."""
+        if verdict.kind is ApprovalVerdictKind.ANSWER:
+            return _failed(
+                request_id,
+                "Codex has no question hook route, so it cannot carry question answers",
+            )
+
         watched, unreachable = await self._reachable(request.target)
         if watched is None:
             return _failed(request_id, unreachable)
@@ -626,7 +633,7 @@ class CodexAgentAdapter:
                 f"no permission request {request.approval_id} is waiting on this Session",
             )
 
-        if verdict is ApprovalVerdict.ASK:
+        if verdict == ApprovalVerdict.ASK:
             watched.pending.pop(request.approval_id, None)
             return DeliveryReceipt(
                 request_id=request_id,
