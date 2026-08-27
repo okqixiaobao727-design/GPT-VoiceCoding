@@ -183,6 +183,42 @@ import Testing
         // guards spends the budget exactly, so a bound of "less than the budget"
         // would be the one number that cannot tell them apart.
         #expect(elapsed < budget / 2, "took \(elapsed)s of a \(budget)s budget")
+
+        // `.said` is itself the proof that the reader **finished** before this
+        // returned, and so that the descriptor it owned is closed: the only way
+        // past the join is for `awaitEnd` to have succeeded, and every other way
+        // out is `.ranOutOfTime`. The `sleep` still holds the write end, so the
+        // reader cannot have reached EOF — it left because it was asked to.
+        //
+        // Asserted through the control flow rather than by counting `/dev/fd`:
+        // that counter is process-wide, the suites run in parallel, and a test
+        // that samples it around a 1 s call is measuring the other suites. This
+        // repository has one such assertion already and it has the noise floor in
+        // its comment to prove it.
+    }
+
+    @Test func aReaderThatNeverRanIsReportedRatherThanCalledSilence() {
+        // The last hole in "it never fails silently". If nothing schedules the
+        // reader — and the app blocks global-queue threads elsewhere, so the load
+        // this budget was sized for is exactly when that bites — then there are
+        // no bytes to parse. Calling that "the shell said nothing" drops the
+        // engine onto launchd's PATH with no panel and no way to tell.
+        let neverRuns = NeverFinishingPipe()
+
+        #expect(LoginShellPath.answer(draining: neverRuns, remaining: 0.05) == .ranOutOfTime)
+        // Asked to leave even so: a reader nobody waited for is still a reader
+        // holding a descriptor.
+        #expect(neverRuns.wasAskedToStop)
+    }
+
+    @Test func aReaderThatFinishesWithNothingIsStillJustNothing() {
+        // The other side of it. A reader that *did* run and found no answer is
+        // the ordinary "that was not a PATH" case, and must not be inflated into
+        // a timeout the user is shown — a panel that cries wolf is a panel people
+        // learn to close.
+        let ranAndSaidNothing = FinishedPipe(data: Data("chatter, no sentinels".utf8))
+
+        #expect(LoginShellPath.answer(draining: ranAndSaidNothing, remaining: 5) == .saidNothing)
     }
 
     @Test func itTakesThePathOutFromBetweenTheSentinelsAndLeavesTheNoise() throws {
@@ -255,4 +291,25 @@ import Testing
             [.posixPermissions: 0o755], ofItemAtPath: script.path)
         return script
     }
+}
+
+/// A reader that never finishes, however long it is given — the global queue
+/// with nothing spare, which is the one state a real `PipeReader` cannot be
+/// asked to be in on demand.
+private final class NeverFinishingPipe: DrainedPipe, @unchecked Sendable {
+    private let lock = NSLock()
+    private var asked = false
+
+    func awaitEnd(_ seconds: TimeInterval) -> Bool { false }
+    func stop() { lock.withLock { asked = true } }
+    var data: Data { Data() }
+    var wasAskedToStop: Bool { lock.withLock { asked } }
+}
+
+/// A reader that finished at once, holding whatever it read.
+private final class FinishedPipe: DrainedPipe, @unchecked Sendable {
+    let data: Data
+    init(data: Data) { self.data = data }
+    func awaitEnd(_ seconds: TimeInterval) -> Bool { true }
+    func stop() {}
 }

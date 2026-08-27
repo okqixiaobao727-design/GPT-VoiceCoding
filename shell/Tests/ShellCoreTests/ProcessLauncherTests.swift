@@ -171,8 +171,11 @@ import Testing
         // included, which is proof enough that it is not this test's own. The old
         // `attempts / 2` sat exactly on that ceiling and failed 1 run in 15.
         //
-        // 50 clears the measured noise twice over and still catches a leak of
-        // *one* descriptor per launch, let alone the two this is about.
+        // 50 is twice the worst residue measured and half the defect. What it
+        // does *not* claim: that it would catch a leak of one descriptor per
+        // launch. That is 50 exactly, and against a −10 sample it reads as 40 and
+        // passes — a process-wide counter cannot be made to carry that claim, and
+        // asserting it here would be the test saying more than it knows.
         #expect(leaked < attempts, "\(leaked) descriptors outlived \(attempts) failed launches")
     }
 

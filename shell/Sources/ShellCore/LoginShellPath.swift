@@ -101,7 +101,25 @@ public enum LoginShellPath {
 
     /// How finely that grace period is checked. `Process` offers no bounded
     /// `waitUntilExit`, so this is the resolution of the one written here.
+    ///
+    /// Only the grace period. The budget itself is waited on with the process's
+    /// own termination handler, because polling *that* at this resolution would
+    /// be a thousand wakeups per engine start on a stuck profile.
     static let terminationPollInterval: useconds_t = 10_000
+
+    /// How often the pipe reader looks up from the pipe to see whether it has
+    /// been asked to stop. Its own number rather than ``terminationPollInterval``
+    /// because it answers a different question — one is how patient we are with a
+    /// shell ignoring `SIGTERM`, the other is how long a reader with nothing to
+    /// read may sit before it notices the call has ended.
+    static let readerStopCheckInterval: TimeInterval = 0.01
+
+    /// How long the reader gets to finish draining once the shell has exited.
+    ///
+    /// Its own number for the same reason. The shell's last write happened
+    /// before it exited, so this is a scheduling delay and not a wait on
+    /// anybody's profile.
+    static let readerSettle: TimeInterval = 0.2
 
     /// What marks the answer off from whatever else an interactive profile
     /// decided to print. Long and unlovely on purpose: it has to be something no
@@ -329,6 +347,11 @@ public enum LoginShellPath {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
 
+        let askedAt = Date()
+        // Set before `run`, so an exit that beats us to it still signals.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+
         do { try process.run() } catch { return .saidNothing }
 
         // Closed on every path out, including the ones that give up early.
@@ -348,7 +371,21 @@ public enum LoginShellPath {
         let reading = output.fileHandleForReading
         defer { try? reading.close() }
 
-        let collected = PipeReader(descriptor: reading.fileDescriptor)
+        // The reader gets a descriptor of its **own**, and is the only thing that
+        // ever closes it.
+        //
+        // `58226cc` had the caller close the one the reader was using, on the
+        // measured ground that closing wakes a Darwin `read(2)` with 0. That
+        // measurement is true and was the wrong half of the question: it holds
+        // when the reader is *parked* in `read`, and says nothing about a reader
+        // that has just taken a chunk and not yet asked for the next one. In that
+        // window the number is freed while the reader still holds it — and the
+        // very next `Pipe()` in `ProcessLauncher.launch` is the engine's stderr,
+        // which takes the number back. The reader would then eat the engine's
+        // own account of why it could not start (ADR 0004 leaves that on stderr
+        // and nowhere else) and park on it for ever. Close-to-wake is the
+        // hazard, not the cure.
+        let collected = PipeReader(duplicating: reading.fileDescriptor)
 
         // **The deadline is on the shell, not on the pipe.** A shell that has
         // printed its answer and exited has told us everything it is going to;
@@ -356,9 +393,13 @@ public enum LoginShellPath {
         // answer, because a profile that starts `ssh-agent`, `gpg-agent` or any
         // `&`-ed job hands the write end to something that outlives the shell by
         // hours. Waiting for EOF there spent the whole budget and then threw away
-        // a PATH that had arrived in 0.4 s — and, once this began reporting,
-        // told a user with an idle machine that their login shell was slow.
-        guard process.waitUntil(deadline: .now() + timeout) else {
+        // a PATH that had arrived in 0.4 s — and, once this began reporting, told
+        // a user with an idle machine that their login shell was slow.
+        //
+        // Waited on the process's own termination handler rather than polled: at
+        // ten milliseconds a ten-second budget is a thousand wakeups per engine
+        // start, for a fact the kernel will hand us for nothing.
+        guard exited.wait(timeout: .now() + timeout) == .success else {
             // A profile that hangs must not hang the engine's supervisor with
             // it. `terminate` first, because a shell given the chance usually
             // takes it; `SIGKILL` is what makes the bound real.
@@ -366,6 +407,7 @@ public enum LoginShellPath {
             if !process.waitUntil(deadline: .now() + terminationGrace) {
                 kill(process.processIdentifier, SIGKILL)
             }
+            collected.stopAndWait(readerSettle)
             // Told apart from every other empty answer, because this is the one
             // the user is shown: their machine was busy, not their profile
             // broken, and no other ending means that.
@@ -373,55 +415,140 @@ public enum LoginShellPath {
         }
         process.waitUntilExit()
         guard process.terminationStatus == 0, process.terminationReason == .exit else {
+            collected.stopAndWait(readerSettle)
             return .saidNothing
         }
+
         // The shell's last write happened before it exited, so the bytes are in
-        // the pipe; the reader is at most a scheduling quantum behind them. It is
-        // given the same short grace a terminating shell gets, and what it has
-        // either way is what gets read.
+        // the pipe; the reader is at most a scheduling quantum behind them. It
+        // gets that quantum, and then it is asked to stop and waited for — the
+        // wait is what guarantees the descriptor it owns is closed before this
+        // returns, and what keeps a reader that never got scheduled from being
+        // reported as a shell that said nothing.
         //
-        // Always waited out rather than skipped once an answer is in hand: the
-        // reader may be holding the first two sentinels while a third is still
-        // unread in the pipe, and taking the answer then is the truncated PATH
-        // again. So the grace is paid in full whenever something other than the
-        // shell holds the write end — 0.2 s, once per engine start, against the
-        // whole budget this used to spend on the same profile. **Not** parsed as it arrives: taking the
-        // answer the moment two sentinels have been seen would, for output that
-        // ends up with three, take the gap between somebody else's sentinel and
-        // ours — the truncated PATH `delimited(in:)` exists to refuse, and which
+        // The window is always waited out rather than skipped once an answer is
+        // in hand: the reader may be holding the first two sentinels while a
+        // third is still unread in the pipe, and taking the answer then is the
+        // truncated PATH again. So a profile that backgrounds something pays
+        // `readerSettle` once per engine start, against the whole budget the same
+        // profile used to spend.
+        return answer(
+            draining: collected,
+            remaining: max(0, timeout - Date().timeIntervalSince(askedAt)))
+    }
+
+    /// What a shell that has already exited said, once its reader has let go.
+    ///
+    /// Its own function so the one case that cannot be staged with a real shell
+    /// can be: a reader that is never scheduled at all. A seam rather than a
+    /// contrivance — the caller passes the real ``PipeReader`` and a test passes
+    /// something that never finishes.
+    static func answer(draining pipe: DrainedPipe, remaining: TimeInterval) -> Answer {
+        if !pipe.awaitEnd(readerSettle) {
+            pipe.stop()
+            // Bounded by what is left of the budget: the reader leaves within one
+            // stop-check of being asked, unless nothing is scheduling it at all.
+            //
+            // That case is the reason this is a `guard` and not a shrug. With no
+            // reader there are no bytes, and calling no bytes "the shell said
+            // nothing" would put the engine on launchd's PATH **silently** — the
+            // one hole left in "it never fails silently", and likeliest at the
+            // very load the budget was sized for, because the app blocks
+            // global-queue threads elsewhere too.
+            guard pipe.awaitEnd(remaining) else { return .ranOutOfTime }
+        }
+
+        // **Not** parsed as it arrives: taking the answer the moment two
+        // sentinels have been seen would, for output that ends up with three,
+        // take the gap between somebody else's sentinel and ours — the truncated
+        // PATH `delimited(in:)` exists to refuse, and which
         // `aSentinelInTheNoiseIsNotAnAnswerEither` guards. Exactly two, over
         // everything the shell said, stays the rule.
-        collected.settle(terminationGrace)
-        guard let said = String(data: collected.data, encoding: .utf8),
+        guard let said = String(data: pipe.data, encoding: .utf8),
             let value = delimited(in: said)
         else { return .saidNothing }
         return .said(value)
     }
 }
 
-/// Draining a pipe as it fills, so what has arrived is readable before whoever
-/// holds the write end has finished with it.
+/// What the deadline logic needs of a reader, and no more.
+///
+/// Small on purpose: the only implementation that matters is ``PipeReader``, and
+/// the only reason this exists is that the failure worth proving — a reader that
+/// is never scheduled — cannot be staged with a real one.
+protocol DrainedPipe {
+    /// Wait for the reader to finish, which is to say for its descriptor to be
+    /// closed. `false` means what it holds is not the whole answer.
+    func awaitEnd(_ seconds: TimeInterval) -> Bool
+    /// Ask it to leave, once there is nothing left to read.
+    func stop()
+    var data: Data { get }
+}
+
+/// Draining a pipe as it fills, and owning the descriptor it drains.
 ///
 /// Read concurrently rather than after the wait, because a profile that printed
 /// more than the pipe's buffer would otherwise block on a pipe nobody is
 /// emptying — and the shell that blocked would then be the shell that timed out.
 ///
-/// `read(2)` rather than `FileHandle`: the caller closes the descriptor on the
-/// way out while this loop may still be parked on it, which is a case
-/// `availableData` answers by raising, and a raised `NSException` here would
-/// take the app down over somebody's `ssh-agent`. A closed descriptor is `-1`
-/// and `EBADF`, and this loop ends on it like any other error.
-private final class PipeReader: @unchecked Sendable {
+/// **It closes its own descriptor and nothing else may.** The read end is
+/// `dup`ed at construction so the caller can close the original whenever it
+/// likes without touching this one. That is not belt-and-braces; it is the whole
+/// correctness argument. Closing a descriptor a thread is *parked* in `read(2)`
+/// on does wake it, on Darwin, with 0 — measured. Closing one that a thread has
+/// merely finished a chunk on and not yet re-entered `read` with does something
+/// else entirely: it frees the **number** while that thread still holds it, and
+/// in `ProcessLauncher.launch` the very next `Pipe()` is the engine's stderr,
+/// which takes the number back. The reader would then consume the engine's own
+/// account of why it could not start — which ADR 0004 leaves on stderr and
+/// nowhere else — and park on it for ever, costing a global-queue thread with it.
+/// Two orderings, and an earlier version of this file measured only the first
+/// and concluded from it. Both are written down here so the next reader does not
+/// have to find the second one the hard way.
+///
+/// So stopping is by flag and never by close. `poll(2)` bounds how long this can
+/// sit with nothing to read, the flag is checked only when the poll finds nothing
+/// pending — so everything already written is taken before it leaves — and the
+/// caller waits for it to finish, which is what makes "the descriptor is closed"
+/// true at the moment the caller returns.
+///
+/// `read(2)` rather than `FileHandle.availableData` throughout: the latter
+/// answers an unreadable descriptor by raising, and a raised `NSException` here
+/// would take the app down over somebody's `ssh-agent`.
+private final class PipeReader: DrainedPipe, @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var collected = Data()
+    private var stopping = false
     private let lock = NSLock()
 
-    init(descriptor: Int32) {
+    init(duplicating descriptor: Int32) {
+        let owned = dup(descriptor)
+        guard owned >= 0 else {
+            finished.signal()
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
+            // The one close, by the one owner, on every way out of the loop.
+            defer {
+                close(owned)
+                finished.signal()
+            }
+            let milliseconds = Int32(LoginShellPath.readerStopCheckInterval * 1000)
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
+                var watched = pollfd(fd: owned, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&watched, 1, milliseconds)
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    return
+                }
+                if ready == 0 {
+                    // Nothing pending, so nothing is lost by leaving now.
+                    if askedToStop { return }
+                    continue
+                }
                 let got = buffer.withUnsafeMutableBytes {
-                    read(descriptor, $0.baseAddress, $0.count)
+                    read(owned, $0.baseAddress, $0.count)
                 }
                 if got > 0 {
                     lock.lock()
@@ -430,17 +557,33 @@ private final class PipeReader: @unchecked Sendable {
                     continue
                 }
                 if got < 0 && errno == EINTR { continue }
-                break  // 0 is EOF; anything else is a descriptor we cannot read
+                return  // 0 is EOF; anything else is a descriptor we cannot read
             }
-            finished.signal()
         }
     }
 
-    /// Give the reader up to `seconds` to reach EOF. Only ever called once the
-    /// shell has already gone, so this is the reader catching up and not a wait
-    /// on the shell — which is the whole distinction this class exists to make.
-    func settle(_ seconds: TimeInterval) {
-        _ = finished.wait(timeout: .now() + seconds)
+    /// Ask it to leave. Takes effect within one ``LoginShellPath/readerStopCheckInterval``,
+    /// and only once there is nothing left to read.
+    func stop() { lock.withLock { stopping = true } }
+
+    private var askedToStop: Bool { lock.withLock { stopping } }
+
+    /// Wait for the reader to finish — which is to say, for its descriptor to be
+    /// closed. `false` means it is still going, and the caller must not treat
+    /// what it has as the whole answer.
+    ///
+    /// Safe to call more than once: a timed-out wait consumes no signal, so a
+    /// short window followed by a longer one is two questions about one event.
+    @discardableResult
+    func awaitEnd(_ seconds: TimeInterval) -> Bool {
+        finished.wait(timeout: .now() + seconds) == .success
+    }
+
+    /// Leave, and wait — for the paths that are on their way out and only need
+    /// the descriptor accounted for.
+    func stopAndWait(_ seconds: TimeInterval) {
+        stop()
+        awaitEnd(seconds)
     }
 
     var data: Data {
@@ -453,6 +596,11 @@ private final class PipeReader: @unchecked Sendable {
 extension Process {
     /// `waitUntilExit` with a bound, so a child that ignores `SIGTERM` cannot
     /// hold the caller for ever.
+    ///
+    /// Polled, and only ever over ``LoginShellPath/terminationGrace`` — two
+    /// tenths of a second, which is twenty wakeups. The budget itself is waited
+    /// on with the process's own termination handler, because polling *that* at
+    /// this resolution would be a thousand wakeups per engine start.
     fileprivate func waitUntil(deadline: DispatchTime) -> Bool {
         while isRunning && DispatchTime.now() < deadline {
             usleep(LoginShellPath.terminationPollInterval)
