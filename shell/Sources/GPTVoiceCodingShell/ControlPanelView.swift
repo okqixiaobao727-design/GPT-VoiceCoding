@@ -8,6 +8,13 @@ struct ControlPanelView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            // Above the health row, because it is the one thing that explains a
+            // green engine that still finds no coding agent. The row underneath
+            // will say "running", truthfully, and be no help at all.
+            if let failure = shell.pathFailure {
+                LoginShellPathPanel(detail: failure)
+            }
+
             EngineHealthRow(health: shell.health)
 
             // A configuration that could not be read comes first. It is the
@@ -250,6 +257,29 @@ private struct SeamsPanel: View {
                     Text(seam.detail).font(.caption2).foregroundStyle(.secondary)
                 }
             }
+        }
+    }
+}
+
+/// The user's own `PATH`, which the engine is running without.
+///
+/// Its own panel rather than an `EngineHealth` case: that type is process
+/// parenthood and nothing inferred about the engine, and an engine on launchd's
+/// truncated `PATH` is running perfectly well as a process. Before #118 this
+/// went to the unified log alone, which is to say nowhere a user looks.
+private struct LoginShellPathPanel: View {
+    let detail: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("The engine is running without your PATH")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(detail)
+                .font(.callout).foregroundStyle(.red).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Retry re-reads it. A machine under heavy load is the usual cause.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

@@ -17,6 +17,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import support
 from app_bundle import console_script, inputs, lock, mach_o, signing
 from app_bundle import run as bundle_run
 from app_bundle.plan import BuildPlan
@@ -448,6 +449,29 @@ class TestTheThingsThatMustAgree:
         shell_path = Path(f"{default['prefix']}{uid}{default['suffix']}")
 
         assert shell_path == config.default_socket_path(uid)
+
+    def test_the_shell_and_the_harness_give_the_login_shell_the_same_budget(self) -> None:
+        """`LoginShellPath.timeout` and `support.PATH_TIMEOUT_SECONDS`.
+
+        The harness reproduces the shell's login-shell read because the shell is
+        out of scope for an acceptance run, and it *refuses* the run when it
+        cannot read a PATH. So a mirror that is stricter than the product refuses
+        runs the product would have served, and a mirror that is laxer accepts a
+        machine the product would have failed on. Neither is a harness telling
+        the truth about the thing being accepted.
+
+        This is not hypothetical: #79's acceptance preflight refused twice with
+        `could not read a usable PATH from the login shell` while both numbers
+        said 2.0, and it was the product that was wrong. #47's shape, three files
+        over — the guard that makes changing one require changing the other.
+        """
+        swift = (inputs.SHELL_PACKAGE / "Sources/ShellCore/LoginShellPath.swift").read_text()
+        budget = re.search(
+            r"public static let timeout: TimeInterval = (?P<seconds>[\d.]+)",
+            swift,
+        )
+        assert budget is not None, "LoginShellPath no longer states the budget as one literal"
+        assert float(budget["seconds"]) == support.PATH_TIMEOUT_SECONDS
 
     def test_the_shell_and_the_pipeline_name_the_same_interpreter_path(self) -> None:
         """`BundleLayout.engineInterpreterRelativePath` and `inputs.ENGINE_INTERPRETER`.

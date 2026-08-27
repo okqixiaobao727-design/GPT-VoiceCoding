@@ -35,18 +35,59 @@ import Foundation
 /// environment out of somebody's real profile; it is settled prior art rather
 /// than a local invention.
 ///
-/// **It fails open, always.** No shell, a shell that hangs, a non-zero exit, an
-/// answer that is not a path — every one of them leaves the inherited
-/// environment exactly as it was. This may make a spawn better; it may never
-/// make one worse.
+/// **It fails open, always — and never silently.** No shell, a shell that hangs,
+/// a non-zero exit, an answer that is not a path — every one of them leaves the
+/// inherited environment exactly as it was. This may make a spawn better; it may
+/// never make one worse.
+///
+/// Failing open is right about the *environment* and was wrong about the *user*.
+/// The `PATH` left behind is launchd's `/usr/bin:/bin:/usr/sbin:/sbin`, on which
+/// neither `claude` nor `codex` resolves, so the engine starts and every Session
+/// it launches starts without the agent it exists to drive — and until #118 the
+/// only trace was a line in the unified log. So the outcome is now a value
+/// (``Outcome``) the caller hands onwards, and the one outcome the user can act
+/// on — a login shell that never answered inside its budget — carries a
+/// ``Outcome/reason`` for the menu bar to show. Legacy failed loud here and v1.0
+/// dropped it: `legacy@1d32845:bridge/terminal.py:893-915` raised
+/// `shell_unavailable` and a timeout error rather than carrying on quietly.
+/// Ported.
 ///
 /// Nothing else is imported from the profile. A login shell can set anything,
 /// and a shell that exported a variable into a supervised daemon's environment
 /// would be a second, invisible configuration file.
 public enum LoginShellPath {
-    /// How long the login shell gets. A profile that takes longer than this has
-    /// a problem of its own, and the engine is waiting on it.
-    public static let timeout: TimeInterval = 2.0
+    /// How long the login shell gets: a measurement with a margin on it, not a
+    /// number that looked reasonable.
+    ///
+    /// The first version of this said 2.0 s on the premise that "a profile that
+    /// takes longer than this has a problem of its own". That premise was false
+    /// for the reference machine's everyday profile — nvm, `brew shellenv` and a
+    /// handful of plugin `bin` entries — and the cost of being wrong is not a
+    /// slower start but a silent one: the engine keeps launchd's `PATH` and no
+    /// coding agent is on it.
+    ///
+    /// Measured on the reference machine — 10 cores, an everyday zsh profile —
+    /// by ``readFromLoginShell`` itself, load made with real test suites rather
+    /// than busy-loops:
+    ///
+    /// | load average | this reader's wall time |
+    /// | --- | --- |
+    /// | ~2.5 (idle) | 0.38–0.44 s, 10/10 |
+    /// | ~42–52 | 0.49–1.46 s, 20/20 |
+    /// | ~89–108 | 0.65–**5.70 s** — 5/10 over the old 2.0 s budget |
+    ///
+    /// Load ~107 on ten cores is ten times oversubscribed, and 5.70 s is the
+    /// worst of every read ever measured here, so this is ≈ 1.75× it. Not more,
+    /// because the budget is bounded from *both* sides: it is also the longest a
+    /// quit can wait on a spawn already in flight, since the read runs inside the
+    /// supervisor's own actor, and the supervisor gives its child 5 s to stop.
+    /// Not less, because the cost of being under is the whole product — an
+    /// engine, and every Session it launches, on a `PATH` with no coding agent
+    /// on it.
+    ///
+    /// One bounded read and no retry loop: a profile that did not finish in ten
+    /// seconds is not going to finish in the next ten either.
+    public static let timeout: TimeInterval = 10.0
 
     /// How long a shell that ignored `SIGTERM` gets before `SIGKILL`. Short,
     /// because a shell that will take the hint takes it immediately and one that
@@ -94,9 +135,94 @@ public enum LoginShellPath {
         return String(output[bounds[0].upperBound..<bounds[1].lowerBound])
     }
 
+    /// What a login shell gave back, told apart by *why* when it gave nothing.
+    ///
+    /// `String?` collapsed four different endings into one `nil`, and they are
+    /// not one thing: a shell that printed chatter has told us something about
+    /// itself, and a shell still running when the budget ran out has told us
+    /// something about the user's afternoon. Only the second is theirs to act
+    /// on, so only the second can be reported without turning the panel into a
+    /// place people learn to ignore.
+    public enum Answer: Equatable, Sendable {
+        /// The shell printed something between the sentinels. Whether that
+        /// something is a `PATH` is ``usable(_:)``'s question, not this one's.
+        case said(String)
+        /// The budget ran out with the shell still going.
+        case ranOutOfTime
+        /// There was no shell to run, it would not start, it failed, or it
+        /// exited 0 without ever reaching the `printf`.
+        case saidNothing
+    }
+
+    /// What asking came to, and the whole of what the caller passes onwards.
+    public enum Outcome: Equatable, Sendable {
+        /// The login shell's `PATH`, and it is the one the child will run on.
+        case adopted(shell: String, path: String)
+        /// Nothing to ask. Not the user's problem and not reported to them.
+        case noLoginShellToAsk
+        /// Asked, and still going when the budget ran out. **The reported one.**
+        case ranOutOfTime(shell: String, budget: TimeInterval)
+        /// Asked, and what came back was not a `PATH`. Failing open is right
+        /// here — the answer would have made the spawn *worse* — so this is a
+        /// log line and not a panel.
+        case saidNothingUsable(shell: String)
+
+        /// What the user is told, or nothing at all when there is nothing they
+        /// can do about it.
+        ///
+        /// Names the shell, the budget it was given and what the engine is
+        /// running on instead, because "could not read your PATH" without those
+        /// three is a sentence that sends somebody to the issue tracker.
+        ///
+        /// Built by concatenation and not from a `"""` literal: this is one
+        /// paragraph of prose wrapped to fit the source, and a multi-line literal
+        /// keeps whatever indentation the formatter decides to give the
+        /// continuation lines — which reached the panel as runs of spaces in the
+        /// middle of the sentence the first time this was shown on a real screen.
+        public var reason: String? {
+            guard case .ranOutOfTime(let shell, let budget) = self else { return nil }
+            return "\(shell) did not print a PATH within \(Self.spelled(budget)), so the engine "
+                + "— and every Session it launches — is running on the short PATH macOS gives "
+                + "an app opened from Finder. A coding agent installed by Homebrew, npm or a "
+                + "version manager is not on that PATH and will not be found."
+        }
+
+        /// The one line this leaves in the unified log, for every outcome. The
+        /// log takes them all; the panel takes one.
+        var said: String {
+            switch self {
+            case .adopted(let shell, let path): return "PATH from login shell \(shell): \(path)"
+            case .noLoginShellToAsk:
+                return "no login shell to ask for a PATH; keeping the one we were given"
+            case .ranOutOfTime(let shell, let budget):
+                return "\(shell) did not answer within \(Self.spelled(budget)); "
+                    + "keeping the PATH we were given"
+            case .saidNothingUsable(let shell):
+                return "\(shell) did not give a usable PATH; keeping the one we were given"
+            }
+        }
+
+        /// Seconds, without the trailing `.0` a `TimeInterval` interpolates and
+        /// without inventing a precision the budget does not have.
+        private static func spelled(_ seconds: TimeInterval) -> String {
+            seconds == seconds.rounded()
+                ? "\(Int(seconds))s" : String(format: "%.1fs", seconds)
+        }
+    }
+
+    /// The environment to spawn with, and what asking came to. Both, because a
+    /// caller that only got the environment back had no way to say why it was
+    /// the one it already had — which is the whole of #118.
+    public struct Applied: Sendable {
+        public let environment: [String: String]
+        public let outcome: Outcome
+    }
+
     /// What runs the shell. A parameter so the failure modes can be tested
-    /// without needing a machine that has each of them.
-    public typealias Reader = @Sendable (_ shell: String, _ timeout: TimeInterval) -> String?
+    /// without needing a machine that has each of them — and so a suite that is
+    /// not about the `PATH` can decline to start a login shell per spawn at all
+    /// (`#36`).
+    public typealias Reader = @Sendable (_ shell: String, _ timeout: TimeInterval) -> Answer
 
     /// The user's login shell: what they told us, else what the password
     /// database says. Never a hard-coded `/bin/zsh` — the default shell has
@@ -114,27 +240,38 @@ public enum LoginShellPath {
 
     /// The environment to spawn the engine with: the one we have, with `PATH`
     /// replaced when — and only when — the login shell gave us a usable one.
-    public static func applied(
+    ///
+    /// Exactly one line is logged, on every path through, including the one that
+    /// worked. Said on the way past, not only on the way down: the `-lc` defect
+    /// this replaced produced a PATH that was *usable and wrong*, so no fallback
+    /// line fired and nothing was written anywhere — the only observable that
+    /// would have caught it is the one that says which PATH was taken.
+    public static func apply(
         to environment: [String: String],
         read: Reader = readFromLoginShell,
         log: (String) -> Void = { _ in }
-    ) -> [String: String] {
+    ) -> Applied {
+        func settled(_ outcome: Outcome, _ environment: [String: String]) -> Applied {
+            log(outcome.said)
+            return Applied(environment: environment, outcome: outcome)
+        }
+
         guard let shell = loginShell(environment: environment) else {
-            log("no login shell to ask for a PATH; keeping the one we were given")
-            return environment
+            return settled(.noLoginShellToAsk, environment)
         }
-        guard let answer = read(shell, timeout), let resolved = usable(answer) else {
-            log("\(shell) did not give a usable PATH; keeping the one we were given")
-            return environment
+        switch read(shell, timeout) {
+        case .ranOutOfTime:
+            return settled(.ranOutOfTime(shell: shell, budget: timeout), environment)
+        case .saidNothing:
+            return settled(.saidNothingUsable(shell: shell), environment)
+        case .said(let answer):
+            guard let resolved = usable(answer) else {
+                return settled(.saidNothingUsable(shell: shell), environment)
+            }
+            var built = environment
+            built["PATH"] = resolved
+            return settled(.adopted(shell: shell, path: resolved), built)
         }
-        // Said on the way past, not only on the way down. The `-lc` defect this
-        // replaced produced a PATH that was *usable and wrong*, so no fallback
-        // line fired and nothing was written anywhere — the only observable that
-        // would have caught it is the one that says which PATH was taken.
-        log("PATH from login shell \(shell): \(resolved)")
-        var built = environment
-        built["PATH"] = resolved
-        return built
     }
 
     /// Whether an answer is a `PATH` at all, rather than a warning a profile
@@ -177,7 +314,7 @@ public enum LoginShellPath {
     /// `/dev/null` and stderr is discarded, so a profile that prompts cannot
     /// block us and a profile that complains cannot be mistaken for the answer.
     public static let readFromLoginShell: Reader = { shell, timeout in
-        guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
+        guard FileManager.default.isExecutableFile(atPath: shell) else { return .saidNothing }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: shell)
@@ -187,7 +324,7 @@ public enum LoginShellPath {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
 
-        do { try process.run() } catch { return nil }
+        do { try process.run() } catch { return .saidNothing }
 
         // Closed on every path out, including the ones that give up early.
         // `Pipe` hands its read end to a `FileHandle` that outlives this scope —
@@ -207,12 +344,19 @@ public enum LoginShellPath {
             if !process.waitUntil(deadline: .now() + terminationGrace) {
                 kill(process.processIdentifier, SIGKILL)
             }
-            return nil
+            // Told apart from every other empty answer, because this is the one
+            // the user is shown: their machine was busy, not their profile
+            // broken, and no other ending means that.
+            return .ranOutOfTime
         }
         process.waitUntilExit()
-        guard process.terminationStatus == 0, process.terminationReason == .exit else { return nil }
-        guard let said = String(data: collected.data, encoding: .utf8) else { return nil }
-        return delimited(in: said)
+        guard process.terminationStatus == 0, process.terminationReason == .exit else {
+            return .saidNothing
+        }
+        guard let said = String(data: collected.data, encoding: .utf8),
+            let value = delimited(in: said)
+        else { return .saidNothing }
+        return .said(value)
     }
 }
 

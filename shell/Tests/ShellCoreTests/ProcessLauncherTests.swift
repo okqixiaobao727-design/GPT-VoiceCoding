@@ -72,6 +72,64 @@ import Testing
         #expect(said.lines.first?.contains(LoginShellPath.loginShell() ?? "/bin/sh") == true)
     }
 
+    @Test func everySpawnReportsWhatAskingTheLoginShellCameTo() async {
+        // The log line is for `log show`; this is for the person looking at the
+        // menu bar. Until #118 there was only the first, so an engine running on
+        // launchd's four directories — where neither `claude` nor `codex`
+        // resolves — looked exactly like a healthy one.
+        let seen = Outcomes()
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
+
+        _ = try! ProcessLauncher(
+            readPath: { _, _ in .ranOutOfTime },
+            report: { seen.add($0) }
+        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(seen.all.count == 1)
+        #expect(seen.all.first?.reason != nil)
+    }
+
+    @Test func aSpawnThatDidReadAPathReportsThatToo() async {
+        // What clears the panel. A report that only fired on failure would leave
+        // yesterday's warning up over an engine that is now running on the right
+        // PATH — and the user has no way to tell those two apart.
+        let seen = Outcomes()
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
+
+        _ = try! ProcessLauncher(
+            readPath: { _, _ in .said("/opt/homebrew/bin:/usr/bin") },
+            report: { seen.add($0) }
+        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(seen.all.first?.reason == nil)
+        if case .adopted(_, let path) = seen.all.first {
+            #expect(path == "/opt/homebrew/bin:/usr/bin")
+        } else {
+            Issue.record("the launcher reported \(String(describing: seen.all.first))")
+        }
+    }
+
+    @Test func theChildRunsOnThePathTheReaderItWasGivenGave() async {
+        // The seam is real wiring and not a test-only parameter: a launcher told
+        // where the PATH comes from has to spawn the child on *that* PATH.
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "printf '%s' \"$PATH\" 1>&2"],
+            source: .developerPath)
+
+        _ = try! ProcessLauncher(readPath: { _, _ in .said("/opt/only-here") }).launch(
+            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(collected.lines() == ["/opt/only-here"])
+    }
+
     @Test func aLaunchThatNeverSpawnsKeepsNoPipeAfterwards() {
         // A launch can fail before there is anything to wait for — the engine's
         // binary is missing or not executable, which is the case the supervisor
@@ -87,10 +145,14 @@ import Testing
         let missing = EngineCommand(
             executable: "/nonexistent/engine", arguments: [], source: .developerPath)
 
+        // Not the real PATH reader: fifty real login shells is ~22 s of somebody's
+        // profile (#36), and with a ten-second budget a stuck one would be eight
+        // minutes inside a fifteen-minute CI job. Nothing here is about the PATH.
+        let launcher = ProcessLauncher(readPath: LoginShellPath.unasked)
         let before = openDescriptors()
         for _ in 0..<attempts {
             #expect(throws: (any Error).self) {
-                try ProcessLauncher().launch(missing, stderr: { _ in }, exited: { _ in })
+                try launcher.launch(missing, stderr: { _ in }, exited: { _ in })
             }
         }
         let leaked = openDescriptors() - before
@@ -117,6 +179,15 @@ import Testing
         let code = await collected.exitCode()
         #expect(code == -SIGTERM)
     }
+}
+
+/// Gathers what the launcher said asking the login shell came to.
+private final class Outcomes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: [LoginShellPath.Outcome] = []
+
+    func add(_ outcome: LoginShellPath.Outcome) { lock.withLock { seen.append(outcome) } }
+    var all: [LoginShellPath.Outcome] { lock.withLock { seen } }
 }
 
 /// Gathers the launcher's own diagnostic lines, which is a different stream

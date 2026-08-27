@@ -7,6 +7,13 @@ import Testing
 /// real `RestartPolicy`, real children. Only the clock is a stand-in, so the
 /// backoff ladder is asserted instead of waited out.
 ///
+/// The one exception is the `PATH`: the real launcher starts a login shell on
+/// every spawn, ~0.45 s of somebody's profile, and this suite's assertions are
+/// five sequential spawns inside a fixed budget — so it was red under load on an
+/// unchanged product, which is `#36`. It reads no login shell. What it is about
+/// is the restart ladder; `LoginShellPathTests` and `ProcessLauncherTests` are
+/// where the real reader is exercised.
+///
 /// The child is a script rather than the engine because the engine needs a
 /// configured machine; what it imitates is the behaviour that matters here —
 /// exit 2 with the reason on stderr, which is what the engine really does (`the
@@ -34,7 +41,8 @@ import Testing
         let clock = TestClock()
         let log = HealthLog()
         let supervisor = EngineSupervisor(
-            launcher: ProcessLauncher(), socketPath: "/tmp/gvc-nothing-here.sock",
+            launcher: ProcessLauncher(readPath: LoginShellPath.unasked),
+            socketPath: "/tmp/gvc-nothing-here.sock",
             resolveCommand: command, clock: clock,
             socketAnswers: { _ in false }, observer: { log.record($0) })
 
@@ -62,7 +70,8 @@ import Testing
         let clock = TestClock()
         let log = HealthLog()
         let supervisor = EngineSupervisor(
-            launcher: ProcessLauncher(), socketPath: "/tmp/gvc-nothing-here.sock",
+            launcher: ProcessLauncher(readPath: LoginShellPath.unasked),
+            socketPath: "/tmp/gvc-nothing-here.sock",
             resolveCommand: command, clock: clock,
             socketAnswers: { _ in false }, observer: { log.record($0) })
 
@@ -86,7 +95,8 @@ import Testing
         let clock = TestClock()
         let log = HealthLog()
         let supervisor = EngineSupervisor(
-            launcher: ProcessLauncher(), socketPath: "/tmp/gvc-nothing-here.sock",
+            launcher: ProcessLauncher(readPath: LoginShellPath.unasked),
+            socketPath: "/tmp/gvc-nothing-here.sock",
             resolveCommand: {
                 EngineCommand(
                     executable: "/tmp/gvc-no-such-engine", arguments: [], source: .developerPath)

@@ -12,10 +12,13 @@ import Testing
     private let inherited = ["PATH": "/usr/bin:/bin", "SHELL": "/bin/zsh", "HOME": "/Users/nobody"]
 
     @Test func aUsableAnswerReplacesPathAndNothingElse() {
-        let applied = LoginShellPath.applied(
+        let read = LoginShellPath.apply(
             to: inherited,
-            read: { _, _ in "/opt/homebrew/bin:/usr/bin:/bin" })
+            read: { _, _ in .said("/opt/homebrew/bin:/usr/bin:/bin") })
+        let applied = read.environment
 
+        #expect(
+            read.outcome == .adopted(shell: "/bin/zsh", path: "/opt/homebrew/bin:/usr/bin:/bin"))
         #expect(applied["PATH"] == "/opt/homebrew/bin:/usr/bin:/bin")
         // A login shell can export anything. Importing more than PATH would make
         // somebody's profile a second, invisible configuration file.
@@ -25,9 +28,45 @@ import Testing
     }
 
     @Test func aShellThatSaysNothingChangesNothing() {
-        // Timeouts and spawn failures both arrive here as nil.
-        let applied = LoginShellPath.applied(to: inherited, read: { _, _ in nil })
-        #expect(applied == inherited)
+        let read = LoginShellPath.apply(to: inherited, read: { _, _ in .saidNothing })
+        #expect(read.environment == inherited)
+        #expect(read.outcome == .saidNothingUsable(shell: "/bin/zsh"))
+        // Failing open is *right* here: what came back would have made the spawn
+        // worse. So it is a log line, and the user is not shown a panel they can
+        // do nothing about.
+        #expect(read.outcome.reason == nil)
+    }
+
+    @Test func aShellThatRanOutOfTimeStillChangesNothingAndIsStillReported() {
+        // The two halves of #118 in one assertion. The environment is untouched,
+        // because a timeout is no reason to make a spawn worse — and the outcome
+        // carries something to say, because the PATH left behind is launchd's and
+        // no coding agent is on it.
+        let read = LoginShellPath.apply(to: inherited, read: { _, _ in .ranOutOfTime })
+
+        #expect(read.environment == inherited)
+        #expect(read.outcome == .ranOutOfTime(shell: "/bin/zsh", budget: LoginShellPath.timeout))
+        let reason = read.outcome.reason
+        #expect(reason?.contains("/bin/zsh") == true)
+        // The budget is in the sentence, spelled as seconds and not as "10.0".
+        #expect(reason?.contains("10s") == true)
+        // And it is a sentence. The first version of this was a `"""` literal,
+        // and the formatter's indentation on its continuation lines went to the
+        // panel verbatim — "so the engine —                 and every Session".
+        // A string whose only reader is a person reading prose has no other
+        // oracle than a screen, and it took one; this is the cheaper one.
+        #expect(reason?.contains("  ") == false)
+        #expect(reason?.contains("\n") == false)
+    }
+
+    @Test func theBudgetIsAboveWhatTheMachineWasMeasuredAt() {
+        // The number this replaced was 2.0, chosen because it looked reasonable,
+        // and the reference machine's own profile went over it 5 times in 10 at
+        // load ~107 (#118). This is the guard that stops it being talked back
+        // down: the worst wall time ever measured for this reader, and the budget
+        // has to be clear of it with room, not merely above it.
+        let worstMeasured: TimeInterval = 5.70
+        #expect(LoginShellPath.timeout >= worstMeasured * 1.5)
     }
 
     @Test(arguments: [
@@ -43,8 +82,9 @@ import Testing
         "relative:paths:only",  // nothing absolute in it
     ])
     func anAnswerThatIsNotAPathChangesNothing(_ answer: String) {
-        let applied = LoginShellPath.applied(to: inherited, read: { _, _ in answer })
-        #expect(applied["PATH"] == "/usr/bin:/bin")
+        let read = LoginShellPath.apply(to: inherited, read: { _, _ in .said(answer) })
+        #expect(read.environment["PATH"] == "/usr/bin:/bin")
+        #expect(read.outcome == .saidNothingUsable(shell: "/bin/zsh"))
     }
 
     @Test func withNoLoginShellToAskItKeepsWhatItHas() {
@@ -52,17 +92,31 @@ import Testing
         without["SHELL"] = ""
         // getpwuid still answers on a real machine, so this asserts the branch
         // rather than the absence: whatever happens, PATH is a PATH.
-        let applied = LoginShellPath.applied(to: without, read: { _, _ in nil })
-        #expect(applied["PATH"] == "/usr/bin:/bin")
+        let read = LoginShellPath.apply(to: without, read: { _, _ in .saidNothing })
+        #expect(read.environment["PATH"] == "/usr/bin:/bin")
     }
 
     @Test func itSaysWhyWhenItCouldNotAsk() {
         // Silent fallback is how a feature stops working without anybody
         // noticing. The line is the difference between "off" and "broken".
         var said: [String] = []
-        _ = LoginShellPath.applied(to: inherited, read: { _, _ in nil }, log: { said.append($0) })
+        _ = LoginShellPath.apply(
+            to: inherited, read: { _, _ in .saidNothing }, log: { said.append($0) })
         #expect(said.count == 1)
         #expect(said[0].contains("/bin/zsh"))
+
+        // Including the one it *could* ask, and including the one that ran out of
+        // time: one line per spawn, whatever happened, is what makes the log a
+        // record rather than an alarm.
+        var everyEnding: [String] = []
+        for answer: LoginShellPath.Answer in [
+            .said("/opt/homebrew/bin"), .ranOutOfTime, .saidNothing,
+        ] {
+            _ = LoginShellPath.apply(
+                to: inherited, read: { _, _ in answer }, log: { everyEnding.append($0) })
+        }
+        #expect(everyEnding.count == 3)
+        #expect(everyEnding.allSatisfy { $0.contains("/bin/zsh") })
     }
 
     @Test func theLoginShellIsTheUsersAndNeverAHardCodedOne() {
@@ -76,11 +130,15 @@ import Testing
 
     @Test func itReadsAPathOutOfARealShell() {
         let answer = LoginShellPath.readFromLoginShell("/bin/sh", LoginShellPath.timeout)
-        #expect(LoginShellPath.usable(answer ?? "") != nil)
+        guard case .said(let path) = answer else {
+            Issue.record("a real shell answered \(answer)")
+            return
+        }
+        #expect(LoginShellPath.usable(path) != nil)
     }
 
     @Test func aShellThatIsNotThereIsNotAnError() {
-        #expect(LoginShellPath.readFromLoginShell("/no/such/shell", 1.0) == nil)
+        #expect(LoginShellPath.readFromLoginShell("/no/such/shell", 1.0) == .saidNothing)
     }
 
     @Test func aProfileThatHangsIsBoundedAndGivesNothing() throws {
@@ -94,7 +152,10 @@ import Testing
         let answer = LoginShellPath.readFromLoginShell(hanging.path, 0.3)
         let elapsed = Date().timeIntervalSince(started)
 
-        #expect(answer == nil)
+        // `.ranOutOfTime` and not merely "nothing": this is the one ending the
+        // user is shown, and a reader that collapsed it into the others is how
+        // #118 stayed silent for the whole of the 2.0 s budget's life.
+        #expect(answer == .ranOutOfTime)
         #expect(elapsed < 3.0)
     }
 
@@ -110,8 +171,9 @@ import Testing
 
         let answer = LoginShellPath.readFromLoginShell(noisy.path, LoginShellPath.timeout)
 
-        #expect(answer == "/opt/homebrew/bin:/usr/bin")
-        #expect(LoginShellPath.usable(answer ?? "") == "/opt/homebrew/bin:/usr/bin")
+        #expect(answer == .said("/opt/homebrew/bin:/usr/bin"))
+        guard case .said(let said) = answer else { return }
+        #expect(LoginShellPath.usable(said) == "/opt/homebrew/bin:/usr/bin")
     }
 
     @Test func aSentinelInTheNoiseIsNotAnAnswerEither() throws {
@@ -125,7 +187,9 @@ import Testing
         )
         defer { try? FileManager.default.removeItem(at: colliding) }
 
-        #expect(LoginShellPath.readFromLoginShell(colliding.path, LoginShellPath.timeout) == nil)
+        #expect(
+            LoginShellPath.readFromLoginShell(colliding.path, LoginShellPath.timeout)
+                == .saidNothing)
     }
 
     @Test func noiseWithoutSentinelsIsNotAnAnswer() throws {
@@ -135,7 +199,8 @@ import Testing
         let mute = try fakeShell(#"printf 'p10k instant prompt\n/usr/bin:/bin\n'"#)
         defer { try? FileManager.default.removeItem(at: mute) }
 
-        #expect(LoginShellPath.readFromLoginShell(mute.path, LoginShellPath.timeout) == nil)
+        #expect(
+            LoginShellPath.readFromLoginShell(mute.path, LoginShellPath.timeout) == .saidNothing)
     }
 
     @Test func aShellThatFailsGivesNothingEvenIfItPrinted() throws {
@@ -144,7 +209,8 @@ import Testing
         let failing = try fakeShell(#"printf '%s/usr/bin:/bin%s' "$MARK" "$MARK"; exit 1"#)
         defer { try? FileManager.default.removeItem(at: failing) }
 
-        #expect(LoginShellPath.readFromLoginShell(failing.path, LoginShellPath.timeout) == nil)
+        #expect(
+            LoginShellPath.readFromLoginShell(failing.path, LoginShellPath.timeout) == .saidNothing)
     }
 
     /// A throwaway executable standing in for somebody's login shell: it runs
