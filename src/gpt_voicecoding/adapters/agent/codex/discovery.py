@@ -15,6 +15,16 @@ starts later (#82, measured), so "the daemon is up" and "the daemon knows about
 this Session" are different questions and the second one has to keep an answer.
 Those rows are `degraded`, not an error: they are true, they are just thinner.
 
+**A loaded thread is only a roster row while a TUI is open in its workspace**
+(#123). Zero matching processes means the TUI exited and the daemon merely kept
+the resumable main or child thread loaded, so it is not a row; two or more mean only
+that the join is ambiguous, so the thread stays live and pidless. A fresh TUI in
+that workspace can temporarily claim the old thread until its first turn writes
+its own id, when the existing identity rule corrects it. Nothing here unloads or
+stops a thread. This is **adapted** from legacy, where the wrapper waited on the
+TUI process and released its runtime after that process exited
+(`legacy@1d32845:bridge/codex.py:1922-1930,1947-1957`).
+
 **A Session that has not been spoken to has no id at all**, because `codex`
 writes the rollout carrying one at its first *turn* (#73). Such a row is
 addressed by its pid alone, and gains its id later without becoming a second row
@@ -334,14 +344,18 @@ async def discover(
 
     for thread in threads:
         child = _child_of(thread)
+        workspace_pids = _pids_in_workspace(thread, candidates)
+        if workspace_pids == ():
+            continue
         # **A Child Process never takes a workspace's TUI.** A subagent runs
         # inside the daemon and has no process of its own, so the one `codex`
         # running in that directory is its parent's — and the join is
         # first-come (`_pid_for`), so a child reaching it first would leave the
         # user's own Session addressable by its thread id alone. #112 fixed the
         # same first-come hazard for the phantom by dropping it before the
-        # join; a child keeps its row, so it is excluded from the join instead.
-        pid = _pid_for(thread, candidates, claimed) if child.is_main else None
+        # join; a child keeps its row while the parent's TUI is present, so it
+        # is excluded from claiming that process instead.
+        pid = _pid_for(workspace_pids, claimed) if child.is_main else None
         if pid is not None:
             claimed.add(pid)
         progress = (
@@ -520,9 +534,7 @@ async def read_thread(
     return thread
 
 
-def _pid_for(
-    thread: dict[str, Any], candidates: tuple[Candidate, ...], claimed: set[int]
-) -> int | None:
+def _pid_for(workspace_pids: tuple[int, ...] | None, claimed: set[int]) -> int | None:
     """The TUI running this thread, when exactly one process can be it.
 
     Joined on the workspace, because that is the only field the two sources
@@ -531,16 +543,21 @@ def _pid_for(
     so neither is claimed: a row addressed by the wrong pid is worse than one
     addressed by its thread id alone, which still reaches the daemon.
     """
+    matches = [pid for pid in workspace_pids or () if pid not in claimed]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pids_in_workspace(
+    thread: Mapping[str, Any], candidates: tuple[Candidate, ...]
+) -> tuple[int, ...] | None:
+    """Running TUIs in the stated workspace; `None` when no workspace was stated."""
     cwd = thread.get("cwd")
     if not isinstance(cwd, str) or not cwd.strip():
         return None
     wanted = os.path.realpath(cwd)
-    matches = [
-        candidate.pid
-        for candidate in candidates
-        if candidate.pid not in claimed and os.path.realpath(candidate.workspace) == wanted
-    ]
-    return matches[0] if len(matches) == 1 else None
+    return tuple(
+        candidate.pid for candidate in candidates if os.path.realpath(candidate.workspace) == wanted
+    )
 
 
 def _status_of(thread: Mapping[str, Any]) -> str | None:

@@ -25,6 +25,7 @@ from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
+    SessionLifecycle,
     SessionState,
     WaitingKind,
 )
@@ -150,9 +151,22 @@ def found(
     )
 
 
+def found_with_tuis(client: FakeDaemon, *, git: object = None) -> object:
+    """Discover daemon fixtures with one running TUI in each represented workspace."""
+    workspaces = {
+        Path(str(described["cwd"]))
+        for described in client.threads.values()
+        if isinstance(described.get("cwd"), str) and str(described["cwd"]).strip()
+    }
+    candidates = tuple(
+        running(101 + index, workspace) for index, workspace in enumerate(sorted(workspaces))
+    )
+    return found(client, *candidates, git=git)
+
+
 class TestTheDaemonIsTheAuthorityWhenItIsUp:
     def test_a_loaded_thread_becomes_a_row(self) -> None:
-        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a-thread")}))
+        lane = found_with_tuis(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a-thread")}))
         assert len(lane.rows) == 1
         row = lane.rows[0]
         assert row.target.session_id == THREAD
@@ -160,24 +174,28 @@ class TestTheDaemonIsTheAuthorityWhenItIsUp:
         assert str(row.name) == "w · a-thread"
 
     def test_rows_from_the_daemon_are_not_degraded(self) -> None:
-        assert found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})).degraded is None
+        assert found_with_tuis(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})).degraded is None
 
     def test_idle_is_idle_and_active_is_running(self) -> None:
-        idle = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})).rows[0]
-        busy = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="active")})).rows[0]
+        idle = found_with_tuis(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})).rows[0]
+        busy = found_with_tuis(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="active")})
+        ).rows[0]
         assert idle.state is SessionState.IDLE
         assert busy.state is SessionState.RUNNING
 
     def test_a_thread_whose_turn_errored_is_flagged_for_a_closer_look(self) -> None:
-        row = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="systemError")})).rows[
-            0
-        ]
+        row = found_with_tuis(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="systemError")})
+        ).rows[0]
         assert row.state is SessionState.IDLE  # still reachable, still takes the next Relay
         assert row.waiting_for.kind is WaitingKind.UNKNOWN
         assert row.waiting_for.caught_up is False
 
     def test_a_status_word_this_build_has_not_seen_fails_closed(self) -> None:
-        row = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="compacting")})).rows[0]
+        row = found_with_tuis(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", status="compacting")})
+        ).rows[0]
         assert row.state is SessionState.RUNNING
 
 
@@ -206,12 +224,21 @@ class TestJoiningAThreadToItsProcess:
         )
         by_id = next(row for row in lane.rows if row.target.session_id == THREAD)
         assert by_id.target.pid is None
+        assert by_id.lifecycle is SessionLifecycle.LIVE
         # Both processes are still listed; neither was swallowed by the thread.
         assert sorted(row.target.pid or 0 for row in lane.rows) == [0, 101, 102]
 
-    def test_a_thread_with_no_process_is_still_a_row(self) -> None:
+    def test_a_thread_with_no_process_is_not_a_session(self) -> None:
         lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
-        assert lane.rows[0].target.pid is None
+        assert lane.rows == ()
+
+    def test_a_resumed_thread_becomes_a_session_again(self) -> None:
+        daemon = FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})
+
+        assert found(daemon).rows == ()
+        assert [row.target.session_id for row in found(daemon, running(101, "/tmp/w")).rows] == [
+            THREAD
+        ]
 
 
 class TestWhenTheDaemonIsNotThere:
@@ -401,12 +428,14 @@ class TestWhatEachRowIsCalled:
     """
 
     def test_a_thread_the_daemon_named_is_called_that(self) -> None:
-        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="port the log")}))
+        lane = found_with_tuis(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="port the log")})
+        )
         assert str(lane.rows[0].name) == "w · port the log"
 
     def test_a_thread_the_daemon_did_not_name_is_called_by_its_short_id(self) -> None:
         """Eight characters of the thread id: short enough to say out loud."""
-        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
+        lane = found_with_tuis(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
         assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
 
     def test_a_row_read_off_the_process_table_is_named_the_same_way(self, tmp_path: Path) -> None:
@@ -427,7 +456,7 @@ class TestWhatEachRowIsCalled:
             del asked
             return "/src/GPT-VoiceCoding/.git\n"
 
-        lane = found(
+        lane = found_with_tuis(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="port the log")}),
             git=inside_a_repository,
         )
@@ -435,7 +464,7 @@ class TestWhatEachRowIsCalled:
 
     def test_a_thread_named_with_the_separator_is_left_unnamed(self) -> None:
         """A name with a `·` in it cannot be read back as two halves, so it is not one."""
-        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a · b")}))
+        lane = found_with_tuis(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", name="a · b")}))
         assert lane.rows[0].name is None
 
 
@@ -518,17 +547,17 @@ class TestANameThatIsOnlyThePromptReadBack:
 
     def test_the_recorded_provisional_title_is_not_a_name(self) -> None:
         """The whole ticket, on the run of record's own document."""
-        lane = found(daemon_holding(PROVISIONAL_SESSION))
+        lane = found_with_tuis(daemon_holding(PROVISIONAL_SESSION))
         assert str(lane.rows[0].name) == "workspace-codex · 01a040ee"
 
     def test_the_title_the_daemon_settled_on_is_a_name(self) -> None:
         """And the good one is kept, which is what makes this a filter and not a ban."""
-        lane = found(daemon_holding(SETTLED_SESSION))
+        lane = found_with_tuis(daemon_holding(SETTLED_SESSION))
         assert str(lane.rows[0].name) == "workspace-codex · 回复 READY"
 
     def test_a_prompt_short_enough_to_become_the_whole_name_is_still_not_a_name(self) -> None:
         """Under 36 characters nothing is truncated, and it is the same provisional title."""
-        lane = found(
+        lane = found_with_tuis(
             daemon_holding(
                 thread(THREAD, cwd="/tmp/w", name="fix the login bug", preview="fix the login bug")
             )
@@ -537,7 +566,7 @@ class TestANameThatIsOnlyThePromptReadBack:
 
     def test_the_prompt_is_matched_the_way_codex_collapsed_and_cut_it(self) -> None:
         """`split_whitespace().join(" ")` then 36 characters, over a prompt that had both."""
-        lane = found(
+        lane = found_with_tuis(
             daemon_holding(
                 thread(
                     THREAD,
@@ -557,7 +586,7 @@ class TestANameThatIsOnlyThePromptReadBack:
         prompt very often does too, so "the prompt starts with this name" would
         throw away good titles — this is the one that would have gone.
         """
-        lane = found(
+        lane = found_with_tuis(
             daemon_holding(
                 thread(
                     THREAD,
@@ -571,7 +600,7 @@ class TestANameThatIsOnlyThePromptReadBack:
 
     def test_a_name_the_prompt_does_not_begin_with_is_kept(self) -> None:
         """A title generated from the conversation is not a slice of the first message."""
-        lane = found(
+        lane = found_with_tuis(
             daemon_holding(
                 thread(
                     THREAD,
@@ -585,19 +614,21 @@ class TestANameThatIsOnlyThePromptReadBack:
 
     def test_a_name_longer_than_the_prompt_is_kept(self) -> None:
         """The provisional title is a *slice*, so it can never outrun what it was cut from."""
-        lane = found(
+        lane = found_with_tuis(
             daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log now", preview="port"))
         )
         assert str(lane.rows[0].name) == "w · port the log now"
 
     def test_a_daemon_that_states_no_preview_keeps_the_name(self) -> None:
         """Absent is not a claim — the same reading `threadSource` already gets (#112)."""
-        lane = found(daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log")))
+        lane = found_with_tuis(daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log")))
         assert str(lane.rows[0].name) == "w · port the log"
 
     def test_an_empty_preview_keeps_the_name_too(self) -> None:
         """`""` is how the daemon spells "no first message recorded", not "it matched"."""
-        lane = found(daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log", preview="")))
+        lane = found_with_tuis(
+            daemon_holding(thread(THREAD, cwd="/tmp/w", name="port the log", preview=""))
+        )
         assert str(lane.rows[0].name) == "w · port the log"
 
 
@@ -701,12 +732,12 @@ class TestThreadsTheDaemonRunsForItself:
 
     def test_the_recorded_phantom_is_dropped_and_the_recorded_session_is_kept(self) -> None:
         """The whole ticket, on the two documents the daemon really answered."""
-        lane = found(daemon_holding(RECORDED_SESSION, RECORDED_PHANTOM))
+        lane = found_with_tuis(daemon_holding(RECORDED_SESSION, RECORDED_PHANTOM))
         assert [row.target.session_id for row in lane.rows] == [RECORDED_SESSION["id"]]
 
     def test_the_phantom_never_reaches_the_naming_rule(self) -> None:
         """It was named `<project> · 01a0403a`, and that name is what made it a Session."""
-        lane = found(daemon_holding(RECORDED_SESSION, RECORDED_PHANTOM))
+        lane = found_with_tuis(daemon_holding(RECORDED_SESSION, RECORDED_PHANTOM))
         assert [str(row.name) for row in lane.rows] == [
             "gvc-110-probe.c45yj3u_ · Reply with the single word READY. Do"
         ]
@@ -744,17 +775,17 @@ class TestThreadsTheDaemonRunsForItself:
 
     def test_a_subagent_thread_is_kept_for_the_child_process_rule(self) -> None:
         """#79 classifies it; it cannot classify a row this module deleted."""
-        lane = found(daemon_holding(sourced(THREAD, "subagent")))
-        assert [row.target.session_id for row in lane.rows] == [THREAD]
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, "subagent")))
+        assert [row.target.session_id for row in lane.rows if not row.child.is_main] == [THREAD]
 
     def test_a_guardian_review_thread_is_kept_for_the_same_reason(self) -> None:
         """One delegate class split by a boolean: `codex-rs/core/src/codex_delegate.rs:111`."""
-        lane = found(daemon_holding(sourced(THREAD, "guardian_review")))
-        assert [row.target.session_id for row in lane.rows] == [THREAD]
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, "guardian_review")))
+        assert [row.target.session_id for row in lane.rows if not row.child.is_main] == [THREAD]
 
     def test_a_daemon_too_old_to_say_changes_nothing(self) -> None:
         """Absent is not "not user". A 0.130-era daemon names no source at all."""
-        lane = found(daemon_holding(sourced(THREAD, None)))
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, None)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
     def test_a_thread_the_daemon_declined_to_classify_is_kept_too(self) -> None:
@@ -766,12 +797,12 @@ class TestThreadsTheDaemonRunsForItself:
         older thread a current daemon loads. Read as a *value* rather than as an
         absence, it would empty the roster of all of them.
         """
-        lane = found(daemon_holding(dict(sourced(THREAD, None), threadSource=None)))
+        lane = found_with_tuis(daemon_holding(dict(sourced(THREAD, None), threadSource=None)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
     def test_a_source_field_of_a_shape_this_build_cannot_read_is_kept(self) -> None:
         """Fails open, like every other unreadable field here: a roster lists."""
-        lane = found(daemon_holding(dict(sourced(THREAD, None), threadSource=7)))
+        lane = found_with_tuis(daemon_holding(dict(sourced(THREAD, None), threadSource=7)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
     def test_the_keep_list_is_the_vocabulary_79_shares(self) -> None:
@@ -801,15 +832,23 @@ class TestTheChildProcessRule:
     """
 
     def test_a_subagent_thread_is_a_child(self) -> None:
-        lane = found(daemon_holding(sourced(THREAD, "subagent")))
-        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, "subagent")))
+        child = next(row for row in lane.rows if row.target.session_id == THREAD)
+        assert child.child.kind is ChildKind.CHILD
 
     def test_a_guardian_review_thread_is_a_child(self) -> None:
-        lane = found(daemon_holding(sourced(THREAD, "guardian_review")))
-        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, "guardian_review")))
+        child = next(row for row in lane.rows if row.target.session_id == THREAD)
+        assert child.child.kind is ChildKind.CHILD
+
+    def test_a_child_disappears_when_its_parents_tui_has_exited(self) -> None:
+        parent = sourced(OTHER_THREAD, "user")
+        child = dict(sourced(THREAD, "subagent"), parentThreadId=OTHER_THREAD)
+
+        assert found(daemon_holding(parent, child)).rows == ()
 
     def test_a_users_own_thread_is_main(self) -> None:
-        lane = found(daemon_holding(sourced(THREAD, "user")))
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, "user")))
         assert [row.child.kind for row in lane.rows] == [ChildKind.MAIN]
 
     def test_a_thread_that_names_no_source_is_main(self) -> None:
@@ -820,13 +859,13 @@ class TestTheChildProcessRule:
         that machine unaddressable — the failure mode this rule is the mirror
         image of.
         """
-        lane = found(daemon_holding(sourced(THREAD, None)))
+        lane = found_with_tuis(daemon_holding(sourced(THREAD, None)))
         assert [row.child.kind for row in lane.rows] == [ChildKind.MAIN]
 
     def test_a_child_is_listed_under_the_thread_that_spawned_it(self) -> None:
         """`parentThreadId` rides on the same read the classification does."""
         described = dict(sourced(THREAD, "subagent"), parentThreadId=OTHER_THREAD)
-        lane = found(daemon_holding(described))
+        lane = found_with_tuis(daemon_holding(described))
         assert lane.rows[0].child.parent == SessionTarget(
             agent=AgentKind.CODEX, session_id=OTHER_THREAD
         )
@@ -838,7 +877,9 @@ class TestTheChildProcessRule:
         for — it is `null` on the recorded phantom above — so a child that
         arrives without one is the ordinary case and not a malformed row.
         """
-        lane = found(daemon_holding(dict(sourced(THREAD, "subagent"), parentThreadId=None)))
+        lane = found_with_tuis(
+            daemon_holding(dict(sourced(THREAD, "subagent"), parentThreadId=None))
+        )
         assert lane.rows[0].child == ChildClassification(kind=ChildKind.CHILD, parent=None)
 
     def test_a_child_is_never_named(self) -> None:
@@ -849,7 +890,9 @@ class TestTheChildProcessRule:
         composing it is the honest half of the same rule: a Session Name is what
         the user says to reach a Session, and there is nothing here to reach.
         """
-        lane = found(daemon_holding(dict(sourced(THREAD, "subagent"), name="tidy the tests")))
+        lane = found_with_tuis(
+            daemon_holding(dict(sourced(THREAD, "subagent"), name="tidy the tests"))
+        )
         assert lane.rows[0].name is None
 
     def test_the_child_list_is_the_keep_list_without_the_user(self) -> None:
@@ -931,7 +974,7 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
         asyncio.run(
             discover(
                 daemon,  # type: ignore[arg-type]
-                processes=listing(),
+                processes=listing(running(101, PROBE_WORKSPACE)),
                 turns=discovery.TurnCache(),
                 projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
             )
