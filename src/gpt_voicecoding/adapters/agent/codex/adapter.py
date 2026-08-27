@@ -449,9 +449,19 @@ class CodexAgentAdapter:
         watched, so the next status notification retries it. Anything else is
         logged and costs this one thread: a discovery tick answers about the
         whole machine, and one thread refusing must not empty the roster.
+
+        **A Child Process is never adopted** (#79). Adopting is what subscribes
+        this adapter to a thread's permission prompts, and a child's prompts are
+        ones the bridge may not carry: "seen, never spoken to" includes never
+        answered. Refusing here rather than only in Bridge Core closes a real
+        window — this runs *before* the registry has observed the row, so a
+        prompt raised in between reaches `dispatch` as a target the roster has
+        never heard of, which is deliberately not read as a child. It also saves
+        the half-megabyte `thread/resume` answer per child that `TurnCache`
+        exists to avoid repeating.
         """
         target = row.target
-        if target.session_id is None or target in self._threads:
+        if target.session_id is None or target in self._threads or not row.child.is_main:
             return
         client = await self._shared_daemon()
         if client is None:

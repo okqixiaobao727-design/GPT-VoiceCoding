@@ -43,6 +43,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    ChildKind,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
@@ -97,6 +98,9 @@ class Codex(FakeAppServer):
         self.readback_copies = 1
         #: Whether `turn/start`'s approval override actually takes effect.
         self.honours_the_pin = True
+        #: What the daemon says started this thread. `None` is what a daemon too
+        #: old to record one says, and is the ordinary case (#112).
+        self.thread_source: str | None = None
 
         self.answers("initialize", {})
         self.answers(
@@ -139,7 +143,10 @@ class Codex(FakeAppServer):
         if self.readback_shows_words:
             for landed in self.delivered:
                 items.extend([{"type": "userMessage", "clientId": landed}] * self.readback_copies)
-        return {"thread": {"id": self.thread_id, "turns": [{"items": items}]}}
+        thread: dict[str, Any] = {"id": self.thread_id, "turns": [{"items": items}]}
+        if self.thread_source is not None:
+            thread["threadSource"] = self.thread_source
+        return {"thread": thread}
 
 
 @pytest.fixture
@@ -1170,6 +1177,73 @@ async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = Non
         daemon=daemon_at(server.path),
         processes=no_other_sessions,
     )
+
+
+class TestNotSubscribingToAChildProcess:
+    """#79: the lane does not watch what it will never speak to.
+
+    **This is where the Child Process rule has to bite, not only in Bridge
+    Core.** `discover` adopts every row it comes back with, and adopting is
+    `thread/resume` — the call that subscribes this adapter to a thread's
+    permission prompts. A child adopted here raises `AwaitingApproval` and
+    `SessionStopped` like anything else, and Bridge Core's guard reads a target
+    the roster has not observed yet as *unknown* rather than as a child, so a
+    prompt raised in the window between the first sighting and the registry
+    holding the row would be announced — and answering it would carry the user's
+    verdict to `approval_relay`, which consults no registry at all.
+
+    Not subscribing closes the window at its source, and the evidence is already
+    here: `SessionInspection.child` is on the row this method is handed. It also
+    saves the half-megabyte `thread/resume` answer per child that `TurnCache`
+    exists to avoid repeating.
+    """
+
+    def test_a_subagent_thread_is_listed_and_never_resumed(self, socket_path: Path) -> None:
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.thread_source = "subagent"
+                adapter = await joined(server, Sink())
+                try:
+                    lane = await adapter.discover()
+                    return lane, server.calls_to("thread/resume"), adapter.watching()
+                finally:
+                    await adapter.aclose()
+
+        lane, resumed, watching = asyncio.run(scenario())
+        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
+        assert resumed == []
+        assert watching == ()
+
+    def test_the_users_own_thread_is_resumed_as_it_always_was(self, socket_path: Path) -> None:
+        """The rule is about children. Adopting a Session is how prompts arrive at all."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.thread_source = "user"
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.discover()
+                    return server.calls_to("thread/resume"), adapter.watching()
+                finally:
+                    await adapter.aclose()
+
+        resumed, watching = asyncio.run(scenario())
+        assert len(resumed) == 1
+        assert watching == (TARGET,)
+
+    def test_a_thread_that_names_no_source_is_resumed_too(self, socket_path: Path) -> None:
+        """Absent is not a claim — the same reading `discovery._child_of` gives it."""
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, Sink())
+                try:
+                    await adapter.discover()
+                    return server.calls_to("thread/resume")
+                finally:
+                    await adapter.aclose()
+
+        assert len(asyncio.run(scenario())) == 1
 
 
 class TestReachingASessionThroughTheSharedDaemon:

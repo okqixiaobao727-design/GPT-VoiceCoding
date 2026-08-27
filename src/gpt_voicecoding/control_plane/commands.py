@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
+from gpt_voicecoding.seams.identity import ADDRESS_SEPARATOR, address_of
 
 #: How each action is written on one line. Also what a refusal quotes back.
 USAGE: dict[Action, str] = {
@@ -39,8 +40,6 @@ USAGE: dict[Action, str] = {
 #: The word that asks for the mid-turn route. Spelled out, because route follows
 #: the user's explicit intent and is never inferred from how busy a Session is.
 SUPPLEMENT_FLAG = "--supplement"
-
-ADDRESS_SEPARATOR = ":"
 
 
 class CommandError(Exception):
@@ -128,13 +127,18 @@ def parse_address(address: str) -> dict[str, object]:
 def format_address(target: dict[str, object]) -> str:
     """The address a surface reads off a roster row and hands straight back.
 
-    An unnamed Session writes its id half as nothing at all rather than as the
-    word `None`: `parse_address` reads the empty half back as "not named yet",
-    while `None` would read back as a session id spelled `None`.
+    Written by the seam that owns the format (`identity.address_of`), because
+    this module and `SessionTarget.__str__` render the same one thing and two
+    implementations of a format are a format only until one of them changes.
+    This one takes a **document** rather than a target: a surface reads rows off
+    the wire and never holds the type.
     """
     pid = target.get("pid")
-    tail = f"{ADDRESS_SEPARATOR}{pid}" if pid else ""
-    return f"{target['agent']}{ADDRESS_SEPARATOR}{target['session_id'] or ''}{tail}"
+    return address_of(
+        target["agent"],
+        str(target["session_id"]) if target.get("session_id") else None,
+        int(pid) if isinstance(pid, int) and not isinstance(pid, bool) else None,
+    )
 
 
 def render(reply: Reply) -> str:

@@ -37,6 +37,33 @@ RequestId = NewType("RequestId", str)
 #: What separates the two halves of a Session Name when it is rendered.
 NAME_SEPARATOR = " · "
 
+#: What separates the parts of an address when a target is written on one line.
+ADDRESS_SEPARATOR = ":"
+
+
+def address_of(agent: object, session_id: str | None, pid: int | None) -> str:
+    """`agent:session_id[:pid]` — the one way a Session is written on one line.
+
+    **One formatter, and it lives here** because the address is a fact about the
+    identity rather than about any surface. `control_plane/commands.py` calls
+    this on the wire *document* — it never holds a `SessionTarget`, only the
+    dict one was rendered into — and `SessionTarget.__str__` calls it on the
+    type. Two callers, one format, and no second implementation to drift.
+
+    An unnamed Session writes its id half as nothing at all rather than as the
+    word `None`, because that is what `commands.parse_address` reads back as
+    "not named yet" (#73).
+
+    **Against legacy** (ADR 0010): the `agent:session_id` shape is legacy's —
+    `legacy@1d32845:bridge/coordinator.py:432` and `bridge/daemon.py:1857,1868`
+    write it — but it was spelled out ad hoc at each call site and never
+    existed as a renderer, so there was nothing to port. **Adapted**: the same
+    shape, made one function, extended with the pid that a Claude target needs
+    and gen-1 never had (`--resume` forks two processes under one session id).
+    """
+    tail = f"{ADDRESS_SEPARATOR}{pid}" if pid else ""
+    return f"{agent}{ADDRESS_SEPARATOR}{session_id or ''}{tail}"
+
 
 def new_request_id() -> RequestId:
     """Mint the one id a sender carries across every delivery of an intent."""
@@ -134,6 +161,19 @@ class SessionTarget:
                 f"a {self.agent} target needs a session id: its official roster always "
                 "carries one, so a row without one is a defect in whoever built it"
             )
+
+    def __str__(self) -> str:
+        """`agent:session_id[:pid]` — the address a surface hands straight back.
+
+        **The one way a target is said**, so a refusal, a log line and a command
+        all spell one Session the same. Before #79 this was the dataclass repr,
+        which meant every refusal in `core/errors.py` named the Session in a
+        form nobody could type back — including the one refusing a Child Process
+        as a Relay target, which the acceptance reads. The blast radius is every
+        message and every log line that interpolates a target, and that is the
+        point rather than a side effect.
+        """
+        return address_of(self.agent, self.session_id, self.pid)
 
     @property
     def named(self) -> bool:

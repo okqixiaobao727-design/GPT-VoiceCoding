@@ -14,6 +14,7 @@ import pytest
 
 from gpt_voicecoding.core.errors import (
     AmbiguousNameError,
+    ChildSessionError,
     DuplicateSessionError,
     NoNameMatchError,
     StaleSessionError,
@@ -122,6 +123,81 @@ class TestResolving:
         registry.register(codex("abc"))
         resolved = registry.resolve(SessionTarget(agent=AgentKind.CODEX, session_id="abc", pid=777))
         assert resolved.target.pid is None
+
+
+class TestRefusingAChildProcess:
+    """Seen, not spoken to — refused here rather than remembered by a caller (#79).
+
+    Structural on purpose: a crew's reviewer answering a question meant for the
+    Session that spawned it is the user's own words landing under somebody
+    else's authority, and a rule each caller had to remember is a rule one
+    caller will forget.
+    """
+
+    def spawned(self, agent_id: str = "a891a18f447827175") -> Session:
+        return Session(
+            target=SessionTarget(agent=AgentKind.CLAUDE, session_id=agent_id, pid=9231),
+            workspace=WORKSPACE,
+            first_seen=1_000.0,
+            child=ChildClassification(
+                kind=ChildKind.CHILD,
+                parent=SessionTarget(agent=AgentKind.CLAUDE, session_id="parent", pid=9231),
+            ),
+        )
+
+    def test_a_child_is_refused_as_a_target(self) -> None:
+        registry = SessionRegistry()
+        child = self.spawned()
+        registry.register(child)
+        with pytest.raises(ChildSessionError):
+            registry.resolve(child.target)
+
+    def test_the_refusal_names_the_child_in_the_words_a_surface_typed(self) -> None:
+        """The acceptance reads this sentence and looks for the address in it.
+
+        A non-zero exit is not by itself a refusal — the surface exits non-zero
+        for an engine that never answered too — so the address is what proves
+        the rule was applied rather than the call merely failing.
+        """
+        registry = SessionRegistry()
+        child = self.spawned()
+        registry.register(child)
+        with pytest.raises(ChildSessionError) as raised:
+            registry.resolve(child.target)
+        assert "claude:a891a18f447827175:9231" in str(raised.value)
+
+    def test_it_names_the_session_that_spawned_it_too(self) -> None:
+        registry = SessionRegistry()
+        child = self.spawned()
+        registry.register(child)
+        with pytest.raises(ChildSessionError) as raised:
+            registry.resolve(child.target)
+        assert "claude:parent:9231" in str(raised.value)
+        assert raised.value.parent == child.child.parent
+
+    def test_it_is_still_listed(self) -> None:
+        """The whole difference from the reference implementation, in one line."""
+        registry = SessionRegistry()
+        registry.register(self.spawned())
+        assert len(registry.live()) == 1
+
+    def test_a_spoken_name_never_finds_one(self) -> None:
+        """It has no name to be found by, and the roster is searched anyway."""
+        registry = SessionRegistry()
+        registry.register(self.spawned())
+        with pytest.raises(NoNameMatchError):
+            registry.match_name("a891")
+
+    def test_it_can_still_be_recorded_as_ended(self) -> None:
+        """`resolve` guards addressing; `mark_ended` records what happened.
+
+        Routing this through the refusal would leave the roster claiming a dead
+        process is running, which is the one thing worse than listing it.
+        """
+        registry = SessionRegistry()
+        child = self.spawned()
+        registry.register(child)
+        assert registry.mark_ended(child.target).lifecycle is SessionLifecycle.ENDED
 
 
 class TestMatchingNames:

@@ -65,3 +65,50 @@ class TestAnAddressThatNamesNothing:
         """Its official roster always carries an id, so an unnamed row is a defect."""
         with pytest.raises(InvalidPayload):
             read_target({"target": {"agent": "claude", "session_id": None, "pid": 3538}})
+
+
+class TestATargetSaidOutLoudIsTheSameAddress:
+    """A refusal names the Session in the words a surface can hand back (#79).
+
+    Every refusal in `core/errors.py` interpolates the target, and until #79 that
+    was the dataclass repr — `SessionTarget(agent=<AgentKind.CLAUDE: 'claude'>,
+    …)`. The acceptance's `child` step reads the refusal and looks for the
+    Session it refused, and a person reading one wants the thing they typed. So
+    `str(target)` is the address, and these assert it is **the** address rather
+    than a second spelling that happens to look similar today.
+    """
+
+    def test_a_claude_target_says_itself_as_its_address(self) -> None:
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id="d3a776ae", pid=3538)
+        assert str(target) == "claude:d3a776ae:3538"
+
+    def test_a_child_process_target_says_itself_as_its_address(self) -> None:
+        """The shape #79 puts in the roster: an agent id inside its parent's process."""
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id="a891a18f447827175", pid=9231)
+        assert str(target) == "claude:a891a18f447827175:9231"
+
+    def test_a_session_with_no_id_says_the_address_the_control_plane_writes(self) -> None:
+        assert str(SessionTarget(agent=AgentKind.CODEX, pid=6548)) == "codex::6548"
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="d3a776ae", pid=3538),
+            SessionTarget(agent=AgentKind.CODEX, session_id="019917", pid=6548),
+            SessionTarget(agent=AgentKind.CODEX, session_id="019917"),
+            SessionTarget(agent=AgentKind.CODEX, pid=6548),
+        ],
+    )
+    def test_it_agrees_with_the_control_plane_on_every_shape(self, target: SessionTarget) -> None:
+        """Two writers of one format is one format only while something says so.
+
+        `format_address` writes the wire document and this writes the type, so
+        they cannot be the same function — the control plane never sees a
+        `SessionTarget`, only the dict it was rendered into. This is what keeps
+        them one format anyway.
+        """
+        assert str(target) == format_address(target_document(target))
+
+    def test_what_it_says_reads_back_as_itself(self) -> None:
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id="d3a776ae", pid=3538)
+        assert read_target({"target": parse_address(str(target))}) == target

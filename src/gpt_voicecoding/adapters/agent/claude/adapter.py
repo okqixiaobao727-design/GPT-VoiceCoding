@@ -60,8 +60,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent._project import ProjectNames
+from gpt_voicecoding.adapters.agent.claude import (
+    children,
+    inbox,
+    stop_analysis,
+    transcript_tail,
+)
 from gpt_voicecoding.adapters.agent.claude import discovery as claude_discovery
-from gpt_voicecoding.adapters.agent.claude import inbox, stop_analysis, transcript_tail
 from gpt_voicecoding.adapters.agent.claude.approval import (
     CWD_FIELD,
     MESSAGING_SOCKET_FIELD,
@@ -195,6 +200,11 @@ class ClaudeAgentAdapter:
         self._binding = asyncio.Lock()
         #: Late-receipt listeners in flight, so none outlives this adapter.
         self._listening: set[asyncio.Task[None]] = set()
+        #: What each Session has spawned, and what it has finished spawning
+        #: (#79). Stateful because a child that is over cannot start again, and
+        #: remembering that is what keeps the parent's transcript off the
+        #: cadence for a Session whose children are all done.
+        self._children = children.Children()
         #: The lane's one opener of a transcript file, shared by what a Session
         #: stopped on (#75) and how far along it is (#76).
         self._transcripts = TranscriptReader()
@@ -429,11 +439,36 @@ class ClaudeAgentAdapter:
         `inspect` because this is the verb Bridge Core actually calls — every
         five seconds, for the whole machine (`core/bridge.py:442`) — and
         `inspect` reads the same rows.
+
+        The other thing the roster cannot say is **what a Session has spawned**
+        (#79). A Task subagent is not a process and is not on the official
+        roster — measured, `children.py` — so its rows are found from the
+        parent's own transcript tree and listed straight after it. The two reads
+        are mutually exclusive and that is what keeps both off the hot path: a
+        stopped Session gets its transcript read and can have no live child,
+        while a `RUNNING` one is never opened and is the only kind that can.
         """
         lane = await claude_discovery.discover(projects=self._projects)
         if not lane.enumerated:
             return lane
-        return replace(lane, rows=tuple(self._row_with_stop(row) for row in lane.rows))
+        rows: list[SessionInspection] = []
+        for row in lane.rows:
+            rows.append(self._row_with_stop(row))
+            rows.extend(self._children_under(row))
+        return replace(lane, rows=tuple(rows))
+
+    def _children_under(self, row: SessionInspection) -> tuple[SessionInspection, ...]:
+        """Every Child Process this row is running, or none because it is not running.
+
+        The first of #79's two liveness conditions, held here because this is
+        where the parent's state is: a Session that is not mid-turn has no child
+        mid-turn, and a child whose file has no ending — the parent was
+        interrupted — stops being listed the moment its parent stops working.
+        The second condition is the child's own last record (`children.py`).
+        """
+        if row.state is not SessionState.RUNNING:
+            return ()
+        return self._children.under(row, self._transcript_path(row.target))
 
     def _row_with_stop(self, row: SessionInspection) -> SessionInspection:
         """One roster row, with everything its own transcript says about it.
