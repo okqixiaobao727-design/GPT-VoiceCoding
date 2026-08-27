@@ -333,10 +333,18 @@ public enum LoginShellPath {
 
         // Closed on every path out, including the ones that give up early.
         // `Pipe` hands its read end to a `FileHandle` that outlives this scope —
-        // the reader below runs on its own queue and, on the timeout path, is
-        // still holding it when we return. One descriptor per spawn, and this
-        // is asked on *every* spawn by design, so a crash loop is the case that
-        // runs a machine out of them (`aLaunchThatNeverSpawnsKeepsNoPipeAfterwards`).
+        // the reader below runs on its own queue and, whenever the write end is
+        // held by something other than the shell, is still parked on it when we
+        // return. One descriptor per spawn, and this is asked on *every* spawn by
+        // design, so a crash loop is the case that runs a machine out of them
+        // (`aLaunchThatNeverSpawnsKeepsNoPipeAfterwards`).
+        //
+        // It is also what ends that reader. Darwin wakes a thread blocked in
+        // `read(2)` when the descriptor it is parked on is closed, and hands it
+        // 0 — measured, not assumed — which is the `break` the loop already has
+        // for EOF. So the reader does not outlive the call even when the pipe
+        // does, and it is never left to `dup` a descriptor of its own and hold it
+        // for as long as somebody's `ssh-agent` runs.
         let reading = output.fileHandleForReading
         defer { try? reading.close() }
 
@@ -370,7 +378,14 @@ public enum LoginShellPath {
         // The shell's last write happened before it exited, so the bytes are in
         // the pipe; the reader is at most a scheduling quantum behind them. It is
         // given the same short grace a terminating shell gets, and what it has
-        // either way is what gets read. **Not** parsed as it arrives: taking the
+        // either way is what gets read.
+        //
+        // Always waited out rather than skipped once an answer is in hand: the
+        // reader may be holding the first two sentinels while a third is still
+        // unread in the pipe, and taking the answer then is the truncated PATH
+        // again. So the grace is paid in full whenever something other than the
+        // shell holds the write end — 0.2 s, once per engine start, against the
+        // whole budget this used to spend on the same profile. **Not** parsed as it arrives: taking the
         // answer the moment two sentinels have been seen would, for output that
         // ends up with three, take the gap between somebody else's sentinel and
         // ours — the truncated PATH `delimited(in:)` exists to refuse, and which
