@@ -346,7 +346,8 @@ class TestTheNameARowKeeps:
 
     What made the amendment necessary is on the Codex lane: codex 0.150.0 names
     a thread with the first 36 characters of the user's first message and then
-    replaces that with a generated title (#113, measured; the delay is not).
+    replaces that with a generated title (#113, measured; the delay is not
+    measured and is observed on #80's run of record).
     Frozen, the product kept the fragment for good.
     """
 
@@ -429,6 +430,60 @@ class TestTheNameARowKeeps:
             "is now called GPT-VoiceCoding · something else by its lane; "
             "it was GPT-VoiceCoding · a task"
         )
+
+    def test_the_project_half_moving_on_its_own_is_not_a_rename(self) -> None:
+        """Only the task half is the agent's. The project half is this side's `git`.
+
+        `_project.ProjectNames` resolves it by running `git` against the
+        workspace, so it moves for reasons that are not renames — a `git` that
+        answered once and failed the next tick, a workspace that becomes a
+        repository under a Session already running in it. CONTEXT.md says
+        nothing but the official source may move a Session Name, and this half
+        is not it.
+        """
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("a task"))),
+            now=NOW,
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(
+                codex_row(
+                    session_id="abc",
+                    pid=10,
+                    name=SessionName(project="somewhere-else", task="a task"),
+                )
+            ),
+            now=NOW + 5,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · a task"
+
+    def test_a_stale_name_the_new_one_contains_still_reaches_that_session(self) -> None:
+        """Renamed `ship` → `ship it`, the old name is a fragment of the new one.
+
+        `match_name` matches fragments and always has (its own docstring is the
+        record of why), so the old name is not refused here — it resolves, to the
+        very Session it used to name. That is the fragment rule doing its job:
+        the name it once had cannot reach anything else, because nothing else
+        answers to it.
+        """
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("ship"))),
+            now=NOW,
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, name=named("ship it"))),
+            now=NOW + 5,
+        )
+
+        assert str(registry.live()[0].name) == "GPT-VoiceCoding · ship it"
+        assert registry.match_name("GPT-VoiceCoding · ship").target.session_id == "abc"
 
     def test_a_reading_that_states_no_name_does_not_erase_the_one_it_has(self) -> None:
         """A degraded Codex pass names none of its rows, and that is not a rename."""

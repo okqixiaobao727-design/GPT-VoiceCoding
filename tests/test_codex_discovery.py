@@ -484,10 +484,11 @@ class TestANameThatIsOnlyThePromptReadBack:
     thread_routing.rs:1800-1854`, `tui/src/app/thread_title.rs:22`). A generated
     title then replaces it — see `SETTLED_SESSION` below, which is that swap
     caught after the fact on the run of record's own thread. How long the first
-    name is live is *not* measured and cannot be read back: the thread that
-    generates the title is ephemeral, and an ephemeral thread's timestamps are
-    stamped when it is read (`rust-v0.150.0:codex-rs/app-server/src/
-    request_processors/thread_processor.rs:5999-6016`).
+    name is live is *not* measured and is observed on #80's run of record; it
+    cannot be read back, because the thread that generates the title is
+    ephemeral and an ephemeral thread's timestamps are stamped when it is read
+    (`rust-v0.150.0:codex-rs/app-server/src/request_processors/
+    thread_processor.rs:5999-6016`).
 
     #78 froze the first name per target, so the product kept the truncated
     fragment for the Session's whole life — said back in every Stop Notice and
@@ -534,19 +535,39 @@ class TestANameThatIsOnlyThePromptReadBack:
         )
         assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
 
-    def test_the_prompt_is_matched_the_way_codex_collapsed_it(self) -> None:
-        """The title is `split_whitespace().join(" ")`, so the preview is read that way too."""
+    def test_the_prompt_is_matched_the_way_codex_collapsed_and_cut_it(self) -> None:
+        """`split_whitespace().join(" ")` then 36 characters, over a prompt that had both."""
         lane = found(
             daemon_holding(
                 thread(
                     THREAD,
                     cwd="/tmp/w",
-                    name="port the log, then",
-                    preview="port   the log,\n\tthen stop and tell me",
+                    name="port the log, then stop and tell me",
+                    preview="port   the log,\n\tthen stop and tell me what you found",
                 )
             )
         )
         assert str(lane.rows[0].name) == f"w · {THREAD[:8]}"
+
+    def test_a_generated_title_that_merely_opens_the_prompt_is_kept(self) -> None:
+        """The rule catches codex's own cut, not everything the prompt begins with.
+
+        A generated title is told to start with an imperative verb
+        (`rust-v0.150.0:codex-rs/tui/src/app/thread_title.rs:206-214`) and a
+        prompt very often does too, so "the prompt starts with this name" would
+        throw away good titles — this is the one that would have gone.
+        """
+        lane = found(
+            daemon_holding(
+                thread(
+                    THREAD,
+                    cwd="/tmp/w",
+                    name="Fix the login bug",
+                    preview="Fix the login bug in the auth module and add a test",
+                )
+            )
+        )
+        assert str(lane.rows[0].name) == "w · Fix the login bug"
 
     def test_a_name_the_prompt_does_not_begin_with_is_kept(self) -> None:
         """A title generated from the conversation is not a slice of the first message."""

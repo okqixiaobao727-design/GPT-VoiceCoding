@@ -147,6 +147,18 @@ PARENT_THREAD_ID: Final = "parentThreadId"
 #: this thread is that message read back (#113, `_thread_name`).
 PREVIEW: Final = "preview"
 
+#: How much of that first message codex 0.150.0 makes a thread's **provisional**
+#: name out of: `THREAD_TITLE_MAX_CHARS`, `rust-v0.150.0:codex-rs/tui/src/app/
+#: thread_title.rs:22`, applied by `tui/src/app/thread_routing.rs:1823-1829` as
+#: `.chars().take(_)` over the whitespace-collapsed message.
+#:
+#: **Read as codex's number rather than as a length this product chose**, which
+#: is why it is named after the constant it mirrors. If a later codex composes
+#: its provisional title differently, this rule stops matching and the daemon's
+#: name is kept — the behaviour before #113, not a worse one, and the acceptance
+#: reads the Session Name aloud where a person would notice.
+PROVISIONAL_TITLE_CHARACTERS: Final = 36
+
 #: How much of a thread id stands in for a name the daemon does not have. Eight
 #: characters of a UUID, which is what `codex` itself shows and short enough to
 #: say out loud — the fallback task of every unnamed thread (#78). It is
@@ -619,8 +631,10 @@ def _thread_name(thread: Mapping[str, Any]) -> str | None:
     title then replaces it — measured on the run of record's own thread, which
     the daemon now calls `回复 READY` and the product froze as `Reply with the
     single word READY. Do` (#113). *How long the first name is live is not
-    measured*: the hidden thread that generates the title is ephemeral, and an
-    ephemeral thread's `createdAt`/`updatedAt` are stamped at read time
+    measured; it is observed on #80's run of record*, whose `stop notice` step
+    already reads the Session Name aloud. It cannot be read back from the daemon:
+    the hidden thread that generates the title is ephemeral, and an ephemeral
+    thread's `createdAt`/`updatedAt` are stamped at read time
     (`rust-v0.150.0:codex-rs/app-server/src/request_processors/thread_processor.
     rs:5999-6016`), so the daemon keeps no record of when the swap happened.
 
@@ -668,16 +682,29 @@ def _thread_name(thread: Mapping[str, Any]) -> str | None:
 
 
 def _is_the_prompt_back(name: str, preview: Any) -> bool:
-    """Whether this name is the head of the thread's own first message.
+    """Whether this name is *the* provisional title codex composes from the prompt.
+
+    **The title codex composes, and not merely a prefix of the prompt.** The
+    provisional name is one expression — the first message collapsed by
+    `split_whitespace().join(" ")` and cut to `PROVISIONAL_TITLE_CHARACTERS` —
+    so this recomposes that expression and compares. A looser "the prompt starts
+    with this name" would reach names codex never composed: a generated title
+    opens with an imperative verb (`tui/src/app/thread_title.rs:206-214`) and a
+    prompt very often does too, so `Fix the login bug` would be thrown away as a
+    prefix of `Fix the login bug in the auth module` — a good name lost to a rule
+    meant to catch a bad one.
 
     Collapsed on both sides because that is the only form the two are comparable
-    in: codex composes the name by `split_whitespace().join(" ")` over a message
-    the preview carries with its newlines intact. Case is kept — the name is a
-    verbatim slice, so a case-insensitive test would only reach names that are
-    not one.
+    in: the preview carries the message with its newlines intact. The cut is
+    collapsed again after it is made, because cutting at a character count can
+    leave the trailing space of the word it stopped after. Case is kept — the
+    name is a verbatim slice, so a case-insensitive test would only reach names
+    that are not one.
     """
-    collapsed = _collapsed(preview)
-    return bool(collapsed) and collapsed.startswith(_collapsed(name))
+    prompt = _collapsed(preview)
+    if not prompt:
+        return False
+    return _collapsed(name) == _collapsed(prompt[:PROVISIONAL_TITLE_CHARACTERS])
 
 
 def _collapsed(value: Any) -> str:

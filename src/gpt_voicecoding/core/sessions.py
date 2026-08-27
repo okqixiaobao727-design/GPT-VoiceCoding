@@ -158,8 +158,9 @@ class Session:
         **Why the freeze could not simply stay.** codex 0.150.0 names a thread
         the moment its first user message lands, with the first 36 characters of
         that message, and then replaces it with a generated title (#113,
-        measured — the delay before the replacement is not, and cannot be read
-        back from the daemon). Frozen, the product kept the fragment for the
+        measured — the delay before the replacement is not measured and cannot
+        be read back from the daemon; it is observed on #80's run of record).
+        Frozen, the product kept the fragment for the
         Session's whole life; the Codex lane now refuses that provisional name
         (`adapters/agent/codex/discovery.py::_thread_name`) and this rule is what
         lets the real title reach the roster when it arrives. On the Claude lane
@@ -185,10 +186,19 @@ class Session:
             return row.name
         if self.name is None:
             return row.name
-        if row.name is None or row.name == self.name:
+        if row.name is None or row.name.task == self.name.task:
             # A lane that has stopped stating a name states nothing about the
             # name it already gave: `None` is "not read this tick", which is the
             # reading a degraded Codex pass produces on every row it holds.
+            #
+            # **The task half alone decides**, because it is the only half the
+            # agent states. The project half is resolved on this side, by running
+            # `git` against the workspace (`adapters/agent/_project.py`), and it
+            # moves for reasons that are not renames: a `git` that answered once
+            # and failed the next tick, a workspace that becomes a repository
+            # under a Session already running in it. Following those would be
+            # this product changing its mind about a Session's name, which is
+            # the one thing CONTEXT.md says may not move it.
             return self.name
         # Info, and it is one line per rename rather than one per tick: the held
         # name becomes this one, so the next pass compares equal and says nothing.
