@@ -72,6 +72,64 @@ import Testing
         #expect(said.lines.first?.contains(LoginShellPath.loginShell() ?? "/bin/sh") == true)
     }
 
+    @Test func everySpawnReportsWhatAskingTheLoginShellCameTo() async {
+        // The log line is for `log show`; this is for the person looking at the
+        // menu bar. Until #118 there was only the first, so an engine running on
+        // launchd's four directories — where neither `claude` nor `codex`
+        // resolves — looked exactly like a healthy one.
+        let seen = Outcomes()
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
+
+        _ = try! ProcessLauncher(
+            readPath: { _, _ in .ranOutOfTime },
+            report: { seen.add($0) }
+        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(seen.all.count == 1)
+        #expect(seen.all.first?.reason != nil)
+    }
+
+    @Test func aSpawnThatDidReadAPathReportsThatToo() async {
+        // What clears the panel. A report that only fired on failure would leave
+        // yesterday's warning up over an engine that is now running on the right
+        // PATH — and the user has no way to tell those two apart.
+        let seen = Outcomes()
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
+
+        _ = try! ProcessLauncher(
+            readPath: { _, _ in .said("/opt/homebrew/bin:/usr/bin") },
+            report: { seen.add($0) }
+        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(seen.all.first?.reason == nil)
+        if case .adopted(_, let path) = seen.all.first {
+            #expect(path == "/opt/homebrew/bin:/usr/bin")
+        } else {
+            Issue.record("the launcher reported \(String(describing: seen.all.first))")
+        }
+    }
+
+    @Test func theChildRunsOnThePathTheReaderItWasGivenGave() async {
+        // The seam is real wiring and not a test-only parameter: a launcher told
+        // where the PATH comes from has to spawn the child on *that* PATH.
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh", arguments: ["-c", "printf '%s' \"$PATH\" 1>&2"],
+            source: .developerPath)
+
+        _ = try! ProcessLauncher(readPath: { _, _ in .said("/opt/only-here") }).launch(
+            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(collected.lines() == ["/opt/only-here"])
+    }
+
     @Test func aLaunchThatNeverSpawnsKeepsNoPipeAfterwards() {
         // A launch can fail before there is anything to wait for — the engine's
         // binary is missing or not executable, which is the case the supervisor
@@ -87,17 +145,38 @@ import Testing
         let missing = EngineCommand(
             executable: "/nonexistent/engine", arguments: [], source: .developerPath)
 
+        // Not the real PATH reader: fifty real login shells is ~22 s of somebody's
+        // profile (#36), and with a ten-second budget a stuck one would be eight
+        // minutes inside a fifteen-minute CI job. Nothing here is about the PATH.
+        let launcher = ProcessLauncher(readPath: LoginShellPath.unasked)
         let before = openDescriptors()
         for _ in 0..<attempts {
             #expect(throws: (any Error).self) {
-                try ProcessLauncher().launch(missing, stderr: { _ in }, exited: { _ in })
+                try launcher.launch(missing, stderr: { _ in }, exited: { _ in })
             }
         }
         let leaked = openDescriptors() - before
 
-        // Two per failed launch if the pipe survives; the margin is for whatever
-        // else this process opens while these run beside other suites.
-        #expect(leaked < attempts / 2, "\(leaked) descriptors outlived \(attempts) failed launches")
+        // Two per failed launch if the pipe survives, so the defect this guards
+        // is `2 * attempts` — 100 — and the bound is half of that rather than a
+        // quarter of it.
+        //
+        // Re-derived, not loosened. `/dev/fd` is process-wide and swift-testing
+        // runs these suites in parallel, so the count includes whatever else is
+        // spawning at the same moment. That used to be invisible: with the real
+        // login-shell reader this loop took ~22 s and every other suite had long
+        // finished by the second sample. Reading no login shell (#36) took it to
+        // ~40 ms, which lands both samples inside the churn — measured over 20
+        // runs on the reference machine the residue was **−10 to +25**, negative
+        // included, which is proof enough that it is not this test's own. The old
+        // `attempts / 2` sat exactly on that ceiling and failed 1 run in 15.
+        //
+        // 50 is twice the worst residue measured and half the defect. What it
+        // does *not* claim: that it would catch a leak of one descriptor per
+        // launch. That is 50 exactly, and against a −10 sample it reads as 40 and
+        // passes — a process-wide counter cannot be made to carry that claim, and
+        // asserting it here would be the test saying more than it knows.
+        #expect(leaked < attempts, "\(leaked) descriptors outlived \(attempts) failed launches")
     }
 
     private func openDescriptors() -> Int {
@@ -117,6 +196,15 @@ import Testing
         let code = await collected.exitCode()
         #expect(code == -SIGTERM)
     }
+}
+
+/// Gathers what the launcher said asking the login shell came to.
+private final class Outcomes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen: [LoginShellPath.Outcome] = []
+
+    func add(_ outcome: LoginShellPath.Outcome) { lock.withLock { seen.append(outcome) } }
+    var all: [LoginShellPath.Outcome] { lock.withLock { seen } }
 }
 
 /// Gathers the launcher's own diagnostic lines, which is a different stream

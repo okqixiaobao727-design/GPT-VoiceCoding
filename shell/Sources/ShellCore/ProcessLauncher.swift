@@ -39,8 +39,29 @@ public struct ProcessLauncher: EngineLaunching {
         logger.notice("\(line, privacy: .public)")
     }
 
-    public init(log: @escaping @Sendable (String) -> Void = ProcessLauncher.unifiedLog) {
+    /// Where the `PATH` comes from. A seam, defaulted to the real login shell,
+    /// for one reason: the real one starts `<shell> -lic` and reads somebody's
+    /// whole profile, ~0.45 s a spawn on the reference machine, and the Swift
+    /// suites that spawn — supervision's five-restart ladder, the descriptor
+    /// test's fifty failed launches — pay it without any of them being about the
+    /// `PATH`. That is `#36`, and raising the budget to ten seconds raises the
+    /// ceiling those suites can hit from 2 s a spawn to 10 s. The suites that
+    /// *are* about the `PATH` still take the default.
+    private let readPath: LoginShellPath.Reader
+
+    /// Who is told what asking the login shell came to. The launcher chooses the
+    /// child's environment; it does not own a surface, so it hands the outcome to
+    /// whoever does and keeps no state.
+    private let report: @Sendable (LoginShellPath.Outcome) -> Void
+
+    public init(
+        log: @escaping @Sendable (String) -> Void = ProcessLauncher.unifiedLog,
+        readPath: @escaping LoginShellPath.Reader = LoginShellPath.readFromLoginShell,
+        report: @escaping @Sendable (LoginShellPath.Outcome) -> Void = { _ in }
+    ) {
         self.log = log
+        self.readPath = readPath
+        self.report = report
         // The child's stderr is a pipe this process reads and may stop reading.
         BrokenPipes.ignore()
     }
@@ -57,11 +78,21 @@ public struct ProcessLauncher: EngineLaunching {
         // The user's own PATH, read from their login shell — because launchd
         // gives a Finder-launched app `/usr/bin:/bin:/usr/sbin:/sbin`, the engine
         // inherits that, and so does every Session the engine launches. Read
-        // every spawn rather than cached: it is cheap, and a cached copy of
-        // somebody's profile is the staleness this exists to avoid. It fails
-        // open, so a spawn is never worse for having asked.
-        var environment = LoginShellPath.applied(
-            to: ProcessInfo.processInfo.environment, log: log)
+        // every spawn rather than cached: a cached copy of somebody's profile is
+        // the staleness this exists to avoid. It fails open, so a spawn is never
+        // worse for having asked — and it says so, so a spawn that fell back is
+        // never silent either.
+        // Timed, because the supervisor cannot see inside this call and would
+        // otherwise count the wait as uptime the engine never had.
+        let askedAt = Date()
+        let path = LoginShellPath.apply(
+            to: ProcessInfo.processInfo.environment, read: readPath, log: log)
+        let readCost = Date().timeIntervalSince(askedAt)
+        // Every spawn, including the ones that worked: the surface clears its
+        // own warning by being told the next spawn was fine, and a report that
+        // only fired on failure would leave a stale one up for ever.
+        report(path.outcome)
+        var environment = path.environment
 
         if command.source == .bundled {
             // Nothing may write into the bundle at runtime, and a `.pyc` beside a
@@ -98,14 +129,20 @@ public struct ProcessLauncher: EngineLaunching {
             errors.abandon()
             throw error
         }
-        return SpawnedEngine(process)
+        return SpawnedEngine(process, launchOverhead: readCost)
     }
 }
 
 final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     private let process: Process
 
-    init(_ process: Process) { self.process = process }
+    /// What reading the login shell cost, so the supervisor can discount it.
+    let launchOverhead: TimeInterval
+
+    init(_ process: Process, launchOverhead: TimeInterval = 0) {
+        self.process = process
+        self.launchOverhead = launchOverhead
+    }
 
     var processIdentifier: Int32 { process.processIdentifier }
 

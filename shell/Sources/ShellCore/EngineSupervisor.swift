@@ -3,12 +3,33 @@ import Foundation
 /// A child of this process, from the supervisor's side.
 public protocol EngineProcess: AnyObject, Sendable {
     var processIdentifier: Int32 { get }
+    /// How long the launcher spent before this child existed.
+    ///
+    /// The supervisor times a run from before it asks for the launch, because
+    /// that is the only instant it has. `ProcessLauncher` reads the user's login
+    /// shell in there — up to ``LoginShellPath/timeout`` of it — and without this
+    /// that read is counted as uptime the engine never had. Against
+    /// ``RestartPolicy/steadyStateSeconds`` of 60 that is enough to make a
+    /// permanently broken engine look like one that took hold, which resets the
+    /// failure count and restarts it for ever: the endless silent retry loop
+    /// `RestartPolicy` exists to prevent.
+    ///
+    /// Reported by the launcher rather than sampled by the supervisor so the
+    /// supervisor's own `startedAt` does not move — a child that reports nothing
+    /// is timed exactly as it was.
+    var launchOverhead: TimeInterval { get }
     /// Ask it to stop. `SIGTERM`: the engine stops in order — loops cancelled,
     /// adapters closed in reverse, socket removed — so the next start is not left
     /// claiming its own debris.
     func requestStop()
     /// Make it stop. `SIGKILL`, for a child that did not take the hint.
     func forceStop()
+}
+
+extension EngineProcess {
+    /// Nothing, for a child whose launcher did no work worth discounting. Every
+    /// existing implementation means this, and says so by not saying anything.
+    public var launchOverhead: TimeInterval { 0 }
 }
 
 /// How the engine is spawned. A protocol so the supervision rules can be tested
@@ -213,13 +234,19 @@ public actor EngineSupervisor {
                 break
             }
             child = process
+            // Read now, while the child is still here to be asked.
+            let overhead = process.launchOverhead
             health = .running(pid: process.processIdentifier)
 
             let code = await nextExit()
             child = nil
             if shuttingDown { break }
 
-            let exit = EngineExit(code: code, ranFor: clock.now - startedAt)
+            // The launcher's own work discounted, so a slow login shell is not
+            // uptime the engine never had. Floored at zero: a launcher that
+            // over-reports must not be able to invent a negative run.
+            let exit = EngineExit(
+                code: code, ranFor: max(0, clock.now - startedAt - overhead))
             let probe: SocketProbe =
                 policy.probesTheSocket(after: exit)
                 ? (socketAnswers(socketPath) ? .answered : .silent)

@@ -2,6 +2,27 @@ import Foundation
 
 @testable import ShellCore
 
+extension LoginShellPath {
+    /// A `PATH` reader that starts no login shell.
+    ///
+    /// For the suites that spawn but are not about the `PATH`. The real reader
+    /// runs `<shell> -lic` and somebody's whole profile on **every** spawn —
+    /// ~0.45 s on the reference machine — so supervision's five-restart ladder
+    /// and the descriptor test's fifty failed launches were paying for a login
+    /// shell each, and the supervision suite went red under load on a product
+    /// nobody had changed (`#36`). Raising the budget to ten seconds raised that
+    /// ceiling fivefold, which is why this arrived with it (`#118`).
+    ///
+    /// It answers with the `PATH` this process already has, which is the one
+    /// those tests' children would want anyway, so nothing is made worse for the
+    /// child by not asking. `LoginShellPathTests` and the two reporting tests in
+    /// `ProcessLauncherTests` still use the real reader — the seam exists to keep
+    /// the login shell in the suites it belongs to, not to retire it.
+    static let unasked: Reader = { _, _ in
+        .said(ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin")
+    }
+}
+
 /// A child that never was: a script of runs, each with how long it stayed up,
 /// what it said on stderr, and how it ended.
 ///

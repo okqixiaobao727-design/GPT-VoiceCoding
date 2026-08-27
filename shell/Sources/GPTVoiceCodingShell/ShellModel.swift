@@ -20,11 +20,23 @@ final class ShellModel {
     /// What the launch reconcile said, when it did not go as asked. Shown, not
     /// acted on: the panel reports installation, it does not edit it.
     private(set) var installationFailure: String?
+    /// Why the engine may be running on a `PATH` that finds no coding agent.
+    ///
+    /// It is the *last* spawn's outcome and not an accumulated grievance: set by
+    /// a spawn whose login shell ran out of time, and cleared by the next spawn
+    /// that ended any other way. It describes the child running now, so a stale
+    /// warning over a child that was never the one it complained about is a state
+    /// this cannot reach. Its own field beside the two above rather than an
+    /// `EngineHealth` case: that type is process parenthood and nothing inferred
+    /// about the engine, and an engine on the wrong `PATH` is a perfectly healthy
+    /// process.
+    private(set) var pathFailure: String?
 
     let panel: ControlPanel
     let loginItem = LoginItem()
 
     private let supervisor: EngineSupervisor
+    private let pathOutcomes: PathOutcomes
 
     init() {
         // The socket path is read from the same configuration the engine is
@@ -46,8 +58,13 @@ final class ShellModel {
 
         let configPath = resolved.configPath
         let resources = Bundle.main.resourceURL
+        // Built here, before `self` exists to capture, so what the launcher
+        // learns is left in a box this model reads afterwards rather than pushed
+        // through a callback it cannot yet form.
+        let outcomes = PathOutcomes()
+        pathOutcomes = outcomes
         let supervisor = EngineSupervisor(
-            launcher: ProcessLauncher(),
+            launcher: ProcessLauncher(report: { outcomes.record($0) }),
             socketPath: resolved.socketPath,
             resolveCommand: {
                 try EngineCommand.resolve(resources: resources, configPath: configPath)
@@ -95,7 +112,19 @@ final class ShellModel {
 
     private func healthChanged(_ health: EngineHealth) async {
         self.health = health
+        await readWhatTheLauncherLearned()
+    }
+
+    /// What the last spawn left behind: the engine's own words, and what asking
+    /// the login shell came to.
+    ///
+    /// Read rather than pushed, and read at exactly the two moments the panel is
+    /// about to be looked at — a health change, and each pass of the open
+    /// dropdown. That is already how `engineOutput` reaches this model, and one
+    /// mechanism read twice is easier to be right about than two.
+    private func readWhatTheLauncherLearned() async {
         engineOutput = await supervisor.lines()
+        pathFailure = pathOutcomes.latest?.reason
     }
 
     /// How often the open dropdown re-reads. Slow enough that it is not a
@@ -109,7 +138,7 @@ final class ShellModel {
     func readWhileOpen() async {
         while !Task.isCancelled {
             await panel.refresh()
-            engineOutput = await supervisor.lines()
+            await readWhatTheLauncherLearned()
             try? await Task.sleep(for: Self.readInterval)
         }
     }
@@ -145,4 +174,20 @@ final class ShellModel {
         case .notStarted, .shutDown: return "waveform.slash"
         }
     }
+}
+
+/// The launcher's last word on the `PATH`, carried from whatever thread spawned
+/// to this `@MainActor` model.
+///
+/// A box rather than a callback for two reasons: the launcher is built inside
+/// `ShellModel.init`, before there is a `self` to hop back to, and the model
+/// already reads the engine's stderr off the supervisor this way. Last one wins
+/// and nothing accumulates — this answers "what is the child running now on",
+/// which has exactly one answer.
+private final class PathOutcomes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: LoginShellPath.Outcome?
+
+    func record(_ outcome: LoginShellPath.Outcome) { lock.withLock { last = outcome } }
+    var latest: LoginShellPath.Outcome? { lock.withLock { last } }
 }

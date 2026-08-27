@@ -127,9 +127,15 @@ class Journal:
 #: answer from an interactive profile's chatter, and **exactly two or nothing** —
 #: a third means something other than the `printf` wrote the marker, and then no
 #: part of the output is the answer.
+#:
+#: The budget follows the shell's, and is not a second opinion about it: this
+#: harness refuses a run when it cannot read a PATH, so a mirror that gave up
+#: sooner than the product would refuse runs the product would have served —
+#: which is how #118 was found. `TestTheThingsThatMustAgree` in
+#: `tests/test_app_bundle.py` reads the Swift and fails if the two drift.
 PATH_SENTINEL = "<<<GVC-PATH>>>"
 PATH_SCRIPT = f"printf '{PATH_SENTINEL}%s{PATH_SENTINEL}' \"$PATH\""
-PATH_TIMEOUT_SECONDS = 2.0
+PATH_TIMEOUT_SECONDS = 10.0
 
 
 def login_shell_path() -> str | None:
