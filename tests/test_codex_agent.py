@@ -382,7 +382,12 @@ class TestCarryingTheUsersWords:
         async def scenario():
             adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
             return await adapter.approval_relay(
-                ApprovalRequest(approval_id="a1", target=TARGET, tool_name="a shell command"),
+                ApprovalRequest(
+                    approval_id="a1",
+                    target=TARGET,
+                    tool_name="a shell command",
+                    kind=WaitingKind.PERMISSION,
+                ),
                 ApprovalVerdict.ALLOW,
                 request_id=rid(),
             )
@@ -630,6 +635,32 @@ class TestApprovals:
 
         receipt, answered = asyncio.run(scenario())
         assert receipt.outcome is Delivery.HELD
+        assert answered is False
+
+    def test_a_question_answer_is_refused_without_raising(self, socket_path: Path) -> None:
+        """Codex has no question hook route, so an answer cannot be carried there."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    wire_id = await server.ask_all(
+                        APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
+                    )
+                    await _settled()
+                    request = sink.of(AwaitingApproval)[0].request
+                    receipt = await adapter.approval_relay(
+                        request, ApprovalVerdict.answer("tabs"), request_id=rid("v-1")
+                    )
+                    await _settled()
+                    return receipt, server.answered(wire_id)
+                finally:
+                    await adapter.aclose()
+
+        receipt, answered = asyncio.run(scenario())
+        assert receipt.outcome is Delivery.FAILED
+        assert "no question hook route" in receipt.reason
         assert answered is False
 
     def test_a_verdict_the_on_screen_dialog_already_answered_is_refused(

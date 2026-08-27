@@ -52,11 +52,12 @@ Adapters: Codex and Claude.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.events import Event
@@ -86,14 +87,80 @@ class ReplyWindow(StrEnum):
     CLOSED = "closed"
 
 
-class ApprovalVerdict(StrEnum):
-    """The user's decision on one pending permission request."""
+class ApprovalVerdictKind(StrEnum):
+    """Which shape one verdict has on the Approval Relay."""
 
     ALLOW = "allow"
     DENY = "deny"
+    ASK = "ask"
+    ANSWER = "answer"
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalVerdict:
+    """The user's typed decision on one question or permission request."""
+
+    kind: ApprovalVerdictKind
+    text: str | None = None
+
+    ALLOW: ClassVar[ApprovalVerdict]
+    DENY: ClassVar[ApprovalVerdict]
     #: Hand it back to the on-screen dialog. This is what a budget expiry
     #: answers — never deny on timeout.
-    ASK = "ask"
+    ASK: ClassVar[ApprovalVerdict]
+
+    def __post_init__(self) -> None:
+        if self.kind is ApprovalVerdictKind.ANSWER:
+            if self.text is None or not self.text.strip():
+                raise ValueError("an answer verdict must carry the user's words")
+        elif self.text is not None:
+            raise ValueError(f"a {self.kind} verdict cannot carry answer text")
+
+    @classmethod
+    def answer(cls, text: str) -> ApprovalVerdict:
+        """The user's own words answering a Session's question."""
+        return cls(ApprovalVerdictKind.ANSWER, text)
+
+    @property
+    def answer_text(self) -> str:
+        """The words on an answer verdict, or an explicit shape error."""
+        if self.kind is not ApprovalVerdictKind.ANSWER or self.text is None:
+            raise ValueError(f"a {self.kind} verdict has no answer text")
+        return self.text
+
+    @classmethod
+    def from_document(cls, document: object, *, strip_bare: bool = False) -> ApprovalVerdict:
+        """Decode the one public wire shape for each verdict kind."""
+        if isinstance(document, str):
+            word = document.strip() if strip_bare else document
+            decisions = {
+                str(ApprovalVerdictKind.ALLOW): cls.ALLOW,
+                str(ApprovalVerdictKind.DENY): cls.DENY,
+                str(ApprovalVerdictKind.ASK): cls.ASK,
+            }
+            verdict = decisions.get(word)
+            if verdict is not None:
+                return verdict
+        elif isinstance(document, Mapping):
+            if document.get("kind") == str(ApprovalVerdictKind.ANSWER):
+                text = document.get("text")
+                if isinstance(text, str):
+                    return cls.answer(text)
+        raise ValueError(f"{document!r} is not allow, deny, ask, or an answer object with text")
+
+    def to_document(self) -> str | dict[str, str]:
+        """Encode this verdict in its one public wire shape."""
+        if self.kind is ApprovalVerdictKind.ANSWER:
+            return {"kind": str(self.kind), "text": self.answer_text}
+        return str(self.kind)
+
+    def __str__(self) -> str:
+        return str(self.kind)
+
+
+ApprovalVerdict.ALLOW = ApprovalVerdict(ApprovalVerdictKind.ALLOW)
+ApprovalVerdict.DENY = ApprovalVerdict(ApprovalVerdictKind.DENY)
+ApprovalVerdict.ASK = ApprovalVerdict(ApprovalVerdictKind.ASK)
 
 
 # ----------------------------------------------------------------------
@@ -197,21 +264,25 @@ class WaitingFor:
         return self.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
 
     def as_approval_request(self, target: SessionTarget) -> ApprovalRequest | None:
-        """The pending permission as the Approval Relay addresses it, if it is one.
+        """The pending question or permission as the Approval Relay addresses it.
 
-        `None` covers both "not a permission" and "a permission nobody has
+        `None` covers both "not a question or permission" and "a wait nobody has
         handed us a handle for yet" — an Approval Relay has nothing to answer
-        into in either case, and saying so here is what keeps every consumer
-        from inventing its own half of the check.
+        into in either case. Legacy had no approval transport at all
+        (`legacy@1d32845:bridge/daemon.py:1901-2052`); this question branch is new
+        behaviour, using the same handle gate as the permission branch.
         """
-        if self.kind is not WaitingKind.PERMISSION or not self.approval_id:
+        if self.kind not in (WaitingKind.QUESTION, WaitingKind.PERMISSION) or not self.approval_id:
             return None
         return ApprovalRequest(
             approval_id=self.approval_id,
             target=target,
             tool_name=self.tool_name or "",
+            kind=self.kind,
+            prompt=self.prompt or "",
             detail=self.detail or "",
             options=tuple(option.text for option in self.options),
+            recommendation=self.recommendation,
         )
 
 
@@ -439,7 +510,7 @@ def derive_reply_window(state: SessionState, child: ChildClassification) -> Repl
 
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
-    """A Session's pending permission request, as the adapter observed it.
+    """A Session's pending question or permission, as the adapter observed it.
 
     `approval_id` is the adapter's own opaque handle for the pending dialog. It
     is deliberately not a `RequestId`: this request was raised by the Session,
@@ -449,14 +520,21 @@ class ApprovalRequest:
     approval_id: str
     target: SessionTarget
     tool_name: str
+    kind: WaitingKind
+    prompt: str = ""
     detail: str = ""
     #: The decisions the far side offers, when it offers a list — the ready-made
     #: voice menu. Empty when the route offers only allow/deny.
     options: tuple[str, ...] = ()
+    #: The Session's own recommendation, carried for the Stop Notice and never
+    #: treated as the bridge's choice.
+    recommendation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.approval_id.strip():
             raise ValueError("an approval request must carry the adapter's handle for it")
+        if self.kind not in (WaitingKind.QUESTION, WaitingKind.PERMISSION):
+            raise ValueError("the Approval Relay only carries a question or permission")
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,7 +562,7 @@ class SessionEnded(Event):
 
 @dataclass(frozen=True, slots=True)
 class AwaitingApproval(Event):
-    """A permission dialog is on screen. It blocks every other Relay until answered."""
+    """A question or permission is on screen. It blocks every other Relay until answered."""
 
     request: ApprovalRequest
 
@@ -609,7 +687,7 @@ class AgentAdapter(Protocol):
     async def approval_relay(
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:
-        """Carry the user's verdict on one pending permission request."""
+        """Carry the user's verdict on one pending question or permission request."""
         ...
 
     async def verify(self) -> VerifyResult:

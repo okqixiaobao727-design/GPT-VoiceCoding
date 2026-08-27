@@ -116,8 +116,11 @@ Payload: none. Data:
   "pending_relays": [{"request_id": "…", "target": {…}, "kind": "answer", "text": "…",
                       "route": "deliver", "queued_at": 0.0, "expires_at": 600.0,
                       "outcome": "unknown"}],
-  "pending_approvals": [{"approval_id": "…", "target": {…}, "tool_name": "Bash",
-                         "detail": "", "options": [], "opened_at": 0.0, "expires_at": 600.0}]
+  "pending_approvals": [{"approval_id": "…", "target": {…},
+                         "kind": "permission" | "question", "prompt": "Tabs or spaces?",
+                         "tool_name": "AskUserQuestion", "detail": "",
+                         "options": ["spaces", "tabs"],
+                         "opened_at": 0.0, "expires_at": 600.0}]
 }
 ```
 
@@ -254,7 +257,10 @@ a surface claiming to be the system.
 
 ### `approve`
 
-Payload: `{"approval_id": "a1", "verdict": "allow" | "deny" | "ask"}`. Data:
+Payload: `{"approval_id": "a1", "verdict": "allow" | "deny" | "ask"}` for a
+permission, or `{"approval_id": "p1", "verdict": {"kind": "answer", "text":
+"tabs"}}` for a question. Arbitrary verdict strings are never treated as answers.
+Data:
 
 ```json
 {"approval_id": "a1", "target": {…}, "verdict": "allow", "state": "delivered",
@@ -264,6 +270,10 @@ Payload: `{"approval_id": "a1", "verdict": "allow" | "deny" | "ask"}`. Data:
 A verdict for a request that already resolved is refused with `unknown_pending`:
 Bridge Core discards it safely because its closing notice has already gone out,
 and the user is owed the news that their verdict landed on nothing.
+
+Bridge Core also refuses a verdict whose shape does not match the wait: answer
+text cannot resolve a permission, and `allow` or `deny` cannot resolve a
+question. `ask` hands either kind back to its on-screen dialog.
 
 ### `verify` — ADR 0003
 
@@ -303,7 +313,8 @@ sessions
 progress <agent>:<session id>[:<pid>]
 live
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
-approve <approval id> allow|deny|ask
+approve <approval-id> allow|deny|ask
+approve <approval-id> answer <words...>
 verify
 ```
 

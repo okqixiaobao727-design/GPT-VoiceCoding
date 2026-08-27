@@ -178,6 +178,49 @@ private struct StatusSection: View {
                     + "\(status.pendingApprovals) pending approvals"
             )
             .font(.caption).foregroundStyle(.secondary)
+
+            ForEach(status.pendingQuestions) { question in
+                Divider()
+                PendingQuestionSection(question: question, panel: panel)
+            }
+        }
+    }
+}
+
+/// One question already held by Bridge Core. The panel renders the carried
+/// words and posts a typed verdict; it does not match options or hold a second
+/// copy of the pending request.
+private struct PendingQuestionSection: View {
+    let question: PendingQuestion
+    let panel: ControlPanel
+    @State private var typedAnswer = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Question").font(.caption).foregroundStyle(.secondary)
+            Text(question.prompt).font(.callout)
+
+            ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                Button(option) {
+                    Task { await panel.answer(question.approvalID, text: option) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(panel.busy)
+            }
+
+            HStack {
+                TextField("Your answer", text: $typedAnswer)
+                    .textFieldStyle(.roundedBorder)
+                Button("Send") {
+                    Task {
+                        await panel.answer(question.approvalID, text: typedAnswer)
+                        if panel.lastFailure == nil { typedAnswer = "" }
+                    }
+                }
+                .disabled(
+                    panel.busy
+                        || typedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
 }

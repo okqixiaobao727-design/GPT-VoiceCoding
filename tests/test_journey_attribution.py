@@ -33,6 +33,7 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     SessionInspection,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -81,14 +82,18 @@ class TestWhatTheHarnessThinksNamesASession:
         assert journey._naming_forms({"target": "not a mapping", "name": ""}) == ()
 
 
-class TestTheSwitchesWaitIsAResolvablePermission:
+class TestTheSwitchesWaitIsResolvable:
     """#80 must leave the journey Session usable for the following `child` step."""
 
-    def test_claude_uses_a_fresh_write_in_its_workspace(self, tmp_path: Path) -> None:
+    def test_claude_uses_the_real_question_and_ticket_answer(self, tmp_path: Path) -> None:
         instruction = journey.CLAUDE.actionable(tmp_path)
 
-        assert instruction.path_in(tmp_path) == tmp_path / journey.SWITCH_FILE
-        assert instruction.content == journey.SWITCH_WORD
+        assert instruction.path_in(tmp_path) is None
+        assert "Tabs or spaces?" in instruction.words
+        assert "spaces" in instruction.words and "tabs" in instruction.words
+        assert journey.CLAUDE.actionable_kind == "question"
+        assert journey.CLAUDE.actionable_answer == ("answer", "tabs")
+        assert journey.CLAUDE.actionable_continuation == "You answered tabs."
 
 
 class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
@@ -135,7 +140,7 @@ class TestTheProductsOwnNoticesAreAttributable:
         mine = session()
 
         announcement = announcement_for(
-            ApprovalRequest("a1", mine.target, "Write", detail="relay.txt"),
+            ApprovalRequest("a1", mine.target, "Write", WaitingKind.PERMISSION, detail="relay.txt"),
             spoken_as="workspace-claude · port the log",
         )
 

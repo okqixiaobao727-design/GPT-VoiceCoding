@@ -327,6 +327,22 @@ class TestTheActionSetIsGeneratedFromTheClosedSet:
         for action in Action:
             assert str(action) in instructions.delegated.text
 
+    def test_the_question_answer_form_appears_in_the_delegated_set(self, instructions) -> None:
+        text = instructions.delegated.text
+        assert "approve <approval-id> answer <words...>" in text
+        assert (
+            "approve <approval-id> allow|deny|ask | approve <approval-id> answer <words...>"
+            not in text
+        )
+
+    def test_a_delegated_question_copies_the_users_answer_without_interpreting_it(
+        self, instructions
+    ) -> None:
+        text = instructions.delegated.text
+
+        assert "Copy an offered option label verbatim" in text
+        assert "never match or normalise the answer against the options" in text
+
     def test_an_action_nobody_explained_stops_generation(self, monkeypatch) -> None:
         """The forcing function: a new action fails the build until someone writes its line."""
         thinned = {
