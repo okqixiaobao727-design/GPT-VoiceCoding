@@ -1130,22 +1130,14 @@ class Walk:
         before = {_address_of(row) for row in self._roster_rows()}
         turn = self._drive_turn("child", Instruction(words=self.lane.child_words))
 
-        rows = self._roster_rows()
-        children = [
-            row
-            for row in rows
-            if _address_of(row) not in before
-            and isinstance(row.get("child"), dict)
-            and row["child"].get("kind") == "child"
-        ]
-        if not children:
+        child_row, rows = self._await_child_row(before)
+        if child_row is None:
             raise StepFailed(
                 f"no child row appeared under {self.address} within "
                 f"{self.far_side.agent_turn_seconds:.0f}s (turn ended={turn.ended}); the roster "
                 f"gained {sorted({_address_of(row) for row in rows} - before) or 'nothing'}. "
                 f"#74 locks `ChildClassification` and #79 fills it."
             )
-        child_row = children[0]
         child_address = _address_of(child_row)
         parent = child_row["child"].get("parent")
         if not parent:
@@ -1224,6 +1216,48 @@ class Walk:
             )
         self.journal("ground.truth", lane=self.lane.name, **vars(self.truth))
         return self.truth
+
+    def _await_child_row(self, before: set[str]) -> tuple[dict | None, list[dict]]:
+        """The first child row to appear, and the roster read that last looked.
+
+        **A turn ending is not the child existing**, and reading the roster once
+        when `_drive_turn` returns assumed it was. Measured on the run of
+        2026-08-27 (`20260827T015022Z`): the Codex parent reported its turn ended
+        at 14:03:18, its sub-agent was not spawned until 14:03:30, and the child's
+        rollout reached disk at 14:03:25 — so the single read happened twelve
+        seconds before there was anything to see, and the step failed saying the
+        roster "gained nothing". The child was real: `thread_source: subagent`,
+        `parent_thread_id`, depth 1, the same shape as the one an earlier run did
+        see. The ordering, not the child, was what differed.
+
+        The cause is #73's: Codex answers `spawn_agent` with a blocking
+        `wait_agent`, and a parent blocked in it reads as silent, which
+        `_drive_turn` scores as a finished turn. The claude lane cannot show this
+        — a Claude parent's transcript is frozen while its child works, so its
+        turn does not end early — which is why one lane failed and the other
+        never has.
+
+        So this waits, to the deadline the failure message already claimed. It
+        arranges nothing the step judges: the three assertions are applied to
+        whatever is found, and finding nothing within the window is still a
+        failure. **First sighting wins**, because a child is transient and a
+        later poll may find it already gone.
+        """
+        deadline = time.monotonic() + self.far_side.agent_turn_seconds
+        rows: list[dict] = []
+        while True:
+            rows = self._roster_rows()
+            for row in rows:
+                child = row.get("child")
+                if (
+                    _address_of(row) not in before
+                    and isinstance(child, dict)
+                    and child.get("kind") == "child"
+                ):
+                    return row, rows
+            if time.monotonic() >= deadline:
+                return None, rows
+            time.sleep(TURN_POLL_SECONDS)
 
     def _roster_rows(self) -> list[dict]:
         data = support.control_plane_payload(
