@@ -197,6 +197,28 @@ import Testing
         // its comment to prove it.
     }
 
+    @Test func aProfileThatBackgroundsSomethingNoisyIsNotSlowEither() throws {
+        // The other half of the backgrounded job, and the one that bit. `sleep`
+        // holds the write end without using it, so the reader sits in `poll` and
+        // sees the stop the moment it is asked. A job that keeps *writing* —
+        // a progress spinner, a `tail -f`, anything in a loop — makes the poll
+        // ready every time round, so a reader that checks the stop flag only
+        // when the poll came back empty never checks it at all. The PATH is in
+        // hand, the shell exited in milliseconds, and the call still spends the
+        // whole budget and raises the panel.
+        let noisy = try fakeShell(
+            #"(while :; do printf x; done) & printf '%s' "$MARK/opt/bin:/usr/bin$MARK""#)
+        defer { try? FileManager.default.removeItem(at: noisy) }
+
+        let budget: TimeInterval = 3.0
+        let started = Date()
+        let answer = LoginShellPath.readFromLoginShell(noisy.path, budget)
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(answer == .said("/opt/bin:/usr/bin"))
+        #expect(elapsed < budget / 2, "took \(elapsed)s of a \(budget)s budget")
+    }
+
     @Test func aReaderThatNeverRanIsReportedRatherThanCalledSilence() {
         // The last hole in "it never fails silently". If nothing schedules the
         // reader — and the app blocks global-queue threads elsewhere, so the load
@@ -204,11 +226,41 @@ import Testing
         // no bytes to parse. Calling that "the shell said nothing" drops the
         // engine onto launchd's PATH with no panel and no way to tell.
         let neverRuns = NeverFinishingPipe()
+        let remaining: TimeInterval = 1.0
 
-        #expect(LoginShellPath.answer(draining: neverRuns, remaining: 0.05) == .ranOutOfTime)
+        #expect(LoginShellPath.answer(draining: neverRuns, remaining: remaining) == .notCollected)
         // Asked to leave even so: a reader nobody waited for is still a reader
         // holding a descriptor.
         #expect(neverRuns.wasAskedToStop)
+        // And both waits were **bounded**, by what was left of the budget rather
+        // than by a number of their own — the half of the join that a stub which
+        // ignored its argument would let through untested.
+        #expect(
+            neverRuns.waits == [
+                LoginShellPath.readerSettle,
+                remaining - LoginShellPath.readerSettle,
+            ])
+    }
+
+    @Test func noDescriptorToReadWithIsReportedAndNotCalledSilence() {
+        // `dup` refusing is `EMFILE`, which is the crash-loop case
+        // `aLaunchThatNeverSpawnsKeepsNoPipeAfterwards` exists for. With no
+        // descriptor there are no bytes, and no bytes read back as "the shell
+        // said nothing" is the silent launchd PATH again, through another door.
+        #expect(LoginShellPath.answer(draining: NeverStartedPipe(), remaining: 5) == .notCollected)
+    }
+
+    @Test func theAppTakesTheBlameWhenItWasTheAppsFault() {
+        // Two reported outcomes, two different sentences. Somebody sent to edit
+        // a `.zshrc` that printed its PATH correctly is somebody this panel has
+        // actively misled.
+        let ours = LoginShellPath.Outcome.answerNotCollected(shell: "/bin/zsh")
+        let theirs = LoginShellPath.Outcome.ranOutOfTime(shell: "/bin/zsh", budget: 10)
+
+        #expect(ours.reason?.contains("this app's own doing") == true)
+        #expect(ours.reason?.contains("did not print") == false)
+        #expect(theirs.reason?.contains("did not print a PATH within 10s") == true)
+        #expect(theirs.reason?.contains("this app's own doing") == false)
     }
 
     @Test func aReaderThatFinishesWithNothingIsStillJustNothing() {
@@ -299,11 +351,26 @@ import Testing
 private final class NeverFinishingPipe: DrainedPipe, @unchecked Sendable {
     private let lock = NSLock()
     private var asked = false
+    private var windows: [TimeInterval] = []
 
-    func awaitEnd(_ seconds: TimeInterval) -> Bool { false }
+    func awaitEnd(_ seconds: TimeInterval) -> Bool {
+        lock.withLock { windows.append(seconds) }
+        return false
+    }
     func stop() { lock.withLock { asked = true } }
     var data: Data { Data() }
+    var failed: Bool { false }
     var wasAskedToStop: Bool { lock.withLock { asked } }
+    /// Every window it was given, so the bound itself is under test.
+    var waits: [TimeInterval] { lock.withLock { windows } }
+}
+
+/// A reader that never got a descriptor at all.
+private final class NeverStartedPipe: DrainedPipe, @unchecked Sendable {
+    func awaitEnd(_ seconds: TimeInterval) -> Bool { true }
+    func stop() {}
+    var data: Data { Data() }
+    var failed: Bool { true }
 }
 
 /// A reader that finished at once, holding whatever it read.
@@ -312,4 +379,5 @@ private final class FinishedPipe: DrainedPipe, @unchecked Sendable {
     init(data: Data) { self.data = data }
     func awaitEnd(_ seconds: TimeInterval) -> Bool { true }
     func stop() {}
+    var failed: Bool { false }
 }

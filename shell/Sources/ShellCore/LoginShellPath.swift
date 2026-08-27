@@ -114,6 +114,24 @@ public enum LoginShellPath {
     /// read may sit before it notices the call has ended.
     static let readerStopCheckInterval: TimeInterval = 0.01
 
+    /// How much a reader that has been asked to stop will still take before it
+    /// goes.
+    ///
+    /// One pipe buffer. Everything the shell wrote before it exited is already
+    /// in the pipe, and Darwin's pipe holds 64 KiB, so this is "all of it" stated
+    /// as a number — and it has to *be* a number, because a profile that
+    /// backgrounds something which keeps writing would otherwise offer an endless
+    /// supply and the stop would never come.
+    static let drainCap = 64 * 1024
+
+    /// The most this will hold from one shell.
+    ///
+    /// A `PATH` is a few hundred bytes and the sentinels bound it. Anything past
+    /// this is a profile writing to stdout in a loop, and reading it to the end
+    /// would be an unbounded buffer in the engine's supervisor for as long as the
+    /// loop runs.
+    static let collectionCap = 1024 * 1024
+
     /// How long the reader gets to finish draining once the shell has exited.
     ///
     /// Its own number for the same reason. The shell's last write happened
@@ -172,6 +190,8 @@ public enum LoginShellPath {
         case said(String)
         /// The budget ran out with the shell still going.
         case ranOutOfTime
+        /// The shell finished, and this side never got what it wrote.
+        case notCollected
         /// There was no shell to run, it would not start, it failed, or it
         /// exited 0 without ever reaching the `printf`.
         case saidNothing
@@ -189,6 +209,13 @@ public enum LoginShellPath {
         /// here — the answer would have made the spawn *worse* — so this is a
         /// log line and not a panel.
         case saidNothingUsable(shell: String)
+        /// Asked, answered, and **we** did not get the answer: no descriptor to
+        /// read it with, or nothing scheduling the reader that would have. Told
+        /// apart from ``ranOutOfTime`` because the shell did nothing wrong, and
+        /// a panel that blames somebody's `.zshrc` for this app's thread pool
+        /// sends them to edit a file that was never the problem. Reported all the
+        /// same: the engine is on launchd's `PATH` either way.
+        case answerNotCollected(shell: String)
 
         /// What the user is told, or nothing at all when there is nothing they
         /// can do about it.
@@ -203,11 +230,22 @@ public enum LoginShellPath {
         /// continuation lines — which reached the panel as runs of spaces in the
         /// middle of the sentence the first time this was shown on a real screen.
         public var reason: String? {
-            guard case .ranOutOfTime(let shell, let budget) = self else { return nil }
-            return "\(shell) did not print a PATH within \(Self.spelled(budget)), so the engine "
-                + "— and every Session it launches — is running on the short PATH macOS gives "
-                + "an app opened from Finder. A coding agent installed by Homebrew, npm or a "
-                + "version manager is not on that PATH and will not be found."
+            let consequence =
+                "the engine — and every Session it launches — is running on the short PATH "
+                + "macOS gives an app opened from Finder. A coding agent installed by "
+                + "Homebrew, npm or a version manager is not on that PATH and will not be found."
+            switch self {
+            case .ranOutOfTime(let shell, let budget):
+                return "\(shell) did not print a PATH within \(Self.spelled(budget)), so "
+                    + consequence
+            case .answerNotCollected(let shell):
+                // Whose fault it was, said plainly, because the fix is not in
+                // their profile and pointing them at it wastes their afternoon.
+                return "\(shell) answered, but this app did not manage to read the answer, so "
+                    + consequence + " That is this app's own doing and not your profile's."
+            case .adopted, .noLoginShellToAsk, .saidNothingUsable:
+                return nil
+            }
         }
 
         /// The one line this leaves in the unified log, for every outcome. The
@@ -222,6 +260,9 @@ public enum LoginShellPath {
                     + "keeping the PATH we were given"
             case .saidNothingUsable(let shell):
                 return "\(shell) did not give a usable PATH; keeping the one we were given"
+            case .answerNotCollected(let shell):
+                return "\(shell) answered but the answer was never collected; "
+                    + "keeping the PATH we were given"
             }
         }
 
@@ -285,6 +326,8 @@ public enum LoginShellPath {
         switch read(shell, timeout) {
         case .ranOutOfTime:
             return settled(.ranOutOfTime(shell: shell, budget: timeout), environment)
+        case .notCollected:
+            return settled(.answerNotCollected(shell: shell), environment)
         case .saidNothing:
             return settled(.saidNothingUsable(shell: shell), environment)
         case .said(let answer):
@@ -354,20 +397,17 @@ public enum LoginShellPath {
 
         do { try process.run() } catch { return .saidNothing }
 
-        // Closed on every path out, including the ones that give up early.
-        // `Pipe` hands its read end to a `FileHandle` that outlives this scope —
-        // the reader below runs on its own queue and, whenever the write end is
-        // held by something other than the shell, is still parked on it when we
-        // return. One descriptor per spawn, and this is asked on *every* spawn by
-        // design, so a crash loop is the case that runs a machine out of them
+        // This closes the descriptor **this scope** owns, and only that one. The
+        // reader below is given a `dup` of its own and closes that itself; the
+        // two are separate numbers with separate owners, which is the whole of
+        // why the reader can outlive this call safely. One descriptor per spawn
+        // on each side, and this is asked on *every* spawn by design, so a crash
+        // loop is the case that runs a machine out of them
         // (`aLaunchThatNeverSpawnsKeepsNoPipeAfterwards`).
         //
-        // It is also what ends that reader. Darwin wakes a thread blocked in
-        // `read(2)` when the descriptor it is parked on is closed, and hands it
-        // 0 — measured, not assumed — which is the `break` the loop already has
-        // for EOF. So the reader does not outlive the call even when the pipe
-        // does, and it is never left to `dup` a descriptor of its own and hold it
-        // for as long as somebody's `ssh-agent` runs.
+        // Closing is **not** how the reader is stopped. An earlier version of
+        // this file made it so and was wrong; `PipeReader`'s own note has the two
+        // orderings and which of them that version measured.
         let reading = output.fileHandleForReading
         defer { try? reading.close() }
 
@@ -444,7 +484,20 @@ public enum LoginShellPath {
     /// contrivance — the caller passes the real ``PipeReader`` and a test passes
     /// something that never finishes.
     static func answer(draining pipe: DrainedPipe, remaining: TimeInterval) -> Answer {
-        if !pipe.awaitEnd(readerSettle) {
+        // No descriptor to read with — `dup` refused, which on a crash loop means
+        // the descriptors ran out. Nothing was collected and nothing will be, and
+        // calling that "the shell said nothing" is the silent launchd `PATH` this
+        // whole outcome type exists to end, through a second door.
+        guard !pipe.failed else { return .notCollected }
+
+        // The settle and the join share what is left of the budget rather than
+        // being added to it: this call promised to be over inside `timeout`.
+        // The join keeps a floor of two stop-checks even so, because a join of
+        // zero cannot observe a reader that leaves within one — a floor of
+        // twenty milliseconds, and the alternative is a bound that cannot tell
+        // "gone" from "never asked".
+        let settle = max(0, min(readerSettle, remaining))
+        if !pipe.awaitEnd(settle) {
             pipe.stop()
             // Bounded by what is left of the budget: the reader leaves within one
             // stop-check of being asked, unless nothing is scheduling it at all.
@@ -455,7 +508,8 @@ public enum LoginShellPath {
             // one hole left in "it never fails silently", and likeliest at the
             // very load the budget was sized for, because the app blocks
             // global-queue threads elsewhere too.
-            guard pipe.awaitEnd(remaining) else { return .ranOutOfTime }
+            let join = max(readerStopCheckInterval * 2, remaining - settle)
+            guard pipe.awaitEnd(join) else { return .notCollected }
         }
 
         // **Not** parsed as it arrives: taking the answer the moment two
@@ -483,6 +537,8 @@ protocol DrainedPipe {
     /// Ask it to leave, once there is nothing left to read.
     func stop()
     var data: Data { get }
+    /// Whether this never had a descriptor to read with at all.
+    var failed: Bool { get }
 }
 
 /// Draining a pipe as it fills, and owning the descriptor it drains.
@@ -519,11 +575,16 @@ private final class PipeReader: DrainedPipe, @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var collected = Data()
     private var stopping = false
+    private var couldNotStart = false
     private let lock = NSLock()
 
     init(duplicating descriptor: Int32) {
         let owned = dup(descriptor)
         guard owned >= 0 else {
+            // `EMFILE`, which is the crash-loop case. Recorded rather than
+            // shrugged off: with no descriptor there are no bytes, and no bytes
+            // must not be read back as "the shell said nothing".
+            lock.withLock { couldNotStart = true }
             finished.signal()
             return
         }
@@ -536,24 +597,28 @@ private final class PipeReader: DrainedPipe, @unchecked Sendable {
             let milliseconds = Int32(LoginShellPath.readerStopCheckInterval * 1000)
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
+                // **Checked first, every time round.** Checking it only when the
+                // poll found nothing pending is what an earlier version did, and
+                // a profile that backgrounds something which keeps *writing* then
+                // never lets this leave: the poll is always ready, the read always
+                // succeeds, and the stop is never seen. The PATH was in hand and
+                // the call still ran out its budget.
+                if askedToStop {
+                    drainPending(owned, &buffer)
+                    return
+                }
                 var watched = pollfd(fd: owned, events: Int16(POLLIN), revents: 0)
                 let ready = poll(&watched, 1, milliseconds)
                 if ready < 0 {
                     if errno == EINTR { continue }
                     return
                 }
-                if ready == 0 {
-                    // Nothing pending, so nothing is lost by leaving now.
-                    if askedToStop { return }
-                    continue
-                }
+                if ready == 0 { continue }
                 let got = buffer.withUnsafeMutableBytes {
                     read(owned, $0.baseAddress, $0.count)
                 }
                 if got > 0 {
-                    lock.lock()
-                    collected.append(contentsOf: buffer[0..<got])
-                    lock.unlock()
+                    guard keep(buffer, got) else { return }
                     continue
                 }
                 if got < 0 && errno == EINTR { continue }
@@ -562,8 +627,40 @@ private final class PipeReader: DrainedPipe, @unchecked Sendable {
         }
     }
 
+    /// Everything already pending, and then no more.
+    ///
+    /// Bounded by one pipe buffer, which is all a shell that has already exited
+    /// can have left behind — and a bound rather than "until `EAGAIN`" because a
+    /// background writer never reaches `EAGAIN` and this must end.
+    private func drainPending(_ owned: Int32, _ buffer: inout [UInt8]) {
+        var taken = 0
+        while taken < LoginShellPath.drainCap {
+            var watched = pollfd(fd: owned, events: Int16(POLLIN), revents: 0)
+            guard poll(&watched, 1, 0) > 0 else { return }
+            let got = buffer.withUnsafeMutableBytes { read(owned, $0.baseAddress, $0.count) }
+            if got > 0 {
+                taken += got
+                guard keep(buffer, got) else { return }
+                continue
+            }
+            if got < 0 && errno == EINTR { continue }
+            return
+        }
+    }
+
+    /// Hold what was read, or say that we are full. `false` ends the loop: a
+    /// profile writing to stdout for ever must not become an unbounded buffer
+    /// inside the engine's supervisor.
+    private func keep(_ buffer: [UInt8], _ count: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard collected.count < LoginShellPath.collectionCap else { return false }
+        collected.append(contentsOf: buffer[0..<count])
+        return true
+    }
+
     /// Ask it to leave. Takes effect within one ``LoginShellPath/readerStopCheckInterval``,
-    /// and only once there is nothing left to read.
+    /// whatever the profile is doing to the pipe.
     func stop() { lock.withLock { stopping = true } }
 
     private var askedToStop: Bool { lock.withLock { stopping } }
@@ -591,6 +688,8 @@ private final class PipeReader: DrainedPipe, @unchecked Sendable {
         defer { lock.unlock() }
         return collected
     }
+
+    var failed: Bool { lock.withLock { couldNotStart } }
 }
 
 extension Process {
