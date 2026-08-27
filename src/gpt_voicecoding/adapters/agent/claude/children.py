@@ -212,16 +212,33 @@ class Children:
         )
 
     def _describe(self, directory: Path, path: Path) -> dict[str, Any]:
-        """`agent-<agentId>.meta.json`, read once and remembered.
+        """`agent-<agentId>.meta.json`, read once it says anything, then remembered.
 
-        An empty document is remembered too: a metadata file that could not be
-        read is one this build will not read on the next tick either, and
-        re-reading it every five seconds for the same failure is the cost this
-        cache exists to avoid.
+        It is written at launch and never again, so a document that was read is
+        worth keeping for the life of the child.
+
+        **An empty one is not, and keeping it was a bug.** The two files are not
+        written together: the acceptance run `20260827T015022Z` created
+        `agent-a0cfe094d970fc749.jsonl` at 13:53:34 and its `.meta.json` at
+        13:53:58, 24 seconds later. The five-second cadence lands inside that
+        window routinely. Remembering the emptiness meant never learning the
+        `toolUseId`, and without it nothing the parent later writes can settle
+        the child — so a finished child returned as a live row on every tick its
+        parent was RUNNING, for the life of the engine, against this ticket's
+        "a finished child is dropped, not kept as a dead row".
+
+        Re-reading costs one 126-byte file per *unsettled* child per tick, and a
+        child that is settled is never asked about again. That is the smaller
+        cost by far: the one this cache was written to avoid was re-parsing the
+        parent's growing transcript, which `_settled` still prevents.
         """
         meta = directory / f"{path.stem}{META_SUFFIX}"
         if meta not in self._meta:
-            self._meta[meta] = _read_meta(meta)
+            document = _read_meta(meta)
+            if not document:
+                # Nothing to remember yet. Answer with it, ask again next tick.
+                return document
+            self._meta[meta] = document
         return self._meta[meta]
 
     def forget(self, agent_ids: Iterable[str]) -> None:

@@ -346,6 +346,40 @@ class TestNotAskingTwiceAboutAChildThatIsOver:
         # Had it re-read, `spawnDepth` would be gone and the parent with it.
         assert row.child.parent == parent_row().target
 
+    def test_a_child_seen_before_its_metadata_exists_is_still_settled_afterwards(
+        self, tmp_path: Path
+    ) -> None:
+        """Remembering an *absent* `meta.json` is remembering nothing, forever.
+
+        **Measured, not supposed.** The acceptance run `20260827T015022Z` created
+        `agent-a0cfe094d970fc749.jsonl` at 13:53:34 and its `.meta.json` at
+        13:53:58 — 24 seconds apart. The five-second cadence lands inside that
+        window routinely, and a tick that did read no `toolUseId`, and could
+        therefore never recognise the parent's `tool_result` for the call.
+
+        The child then outlived its own completion: condition (a) hides it while
+        the parent is idle, so it came back as a live row every time that Session
+        ran again, for the life of the engine — against this ticket's "a finished
+        child is dropped, not kept as a dead row".
+
+        A document that names nothing is not an answer worth keeping. A *read*
+        one still is, which `test_the_metadata_beside_a_child_is_read_once_and
+        _remembered` above pins.
+        """
+        transcript = transcript_for(tmp_path, [STARTED])
+        write_child(transcript, meta=None)
+        reader = children.Children()
+        assert len(found(transcript, reader)) == 1
+
+        directory = transcript.parent / transcript.stem / "subagents"
+        (directory / f"agent-{AGENT_ID}.meta.json").write_text(
+            json.dumps(RECORDED_META), encoding="utf-8"
+        )
+        transcript.write_text(
+            "".join(f"{json.dumps(record)}\n" for record in (STARTED, FINISHED)), encoding="utf-8"
+        )
+        assert found(transcript, reader) == ()
+
 
 class TestReadingTheParentBackwardFromItsEnd:
     """The bound the advisor made non-negotiable (2026-08-27).
