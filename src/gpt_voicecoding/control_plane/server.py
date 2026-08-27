@@ -70,6 +70,7 @@ from gpt_voicecoding.control_plane.ownership import (
     verify_bindable,
     verify_private_directory,
 )
+from gpt_voicecoding.private_socket import start_private_unix_server
 from gpt_voicecoding.seams.control_plane import (
     MAX_REQUEST_BYTES,
     ErrorCode,
@@ -151,13 +152,9 @@ class ControlPlaneServer:
         # The socket must never exist reachable by another account, not even
         # between bind and a later chmod, so the mode comes from umask at
         # creation time rather than from a second call afterwards.
-        previous = os.umask(0o777 & ~SOCKET_MODE)
-        try:
-            self._server = await asyncio.start_unix_server(
-                self._serve, path=str(self._path), limit=self._max_bytes
-            )
-        finally:
-            os.umask(previous)
+        self._server = await start_private_unix_server(
+            self._serve, self._path, mode=SOCKET_MODE, limit=self._max_bytes
+        )
 
     async def aclose(self) -> None:
         """Stop answering and take the socket file with it.

@@ -29,7 +29,7 @@ from gpt_voicecoding.control_plane.client import (
     EngineUnreachable,
     ask,
 )
-from gpt_voicecoding.control_plane.ownership import SocketPathTooLong
+from gpt_voicecoding.control_plane.ownership import SOCKET_MODE, SocketPathTooLong
 from gpt_voicecoding.control_plane.server import AlreadyServing, ControlPlaneServer
 from gpt_voicecoding.seams.control_plane import (
     MAX_REQUEST_BYTES,
@@ -528,3 +528,20 @@ class TestStoppingWithASurfaceStillConnected:
                 await server.aclose()
 
         assert asyncio.run(scenario()).ok
+
+
+def test_the_control_socket_is_private_from_the_moment_it_exists(
+    socket_dir: Path, mode_at_bind: dict[str, int]
+) -> None:
+    """#116: bound through `start_private_unix_server`, so never wide even briefly."""
+
+    async def scenario() -> Path:
+        server = await serving(socket_dir, StubPlane())
+        try:
+            return server._path  # noqa: SLF001 - the premise is about this exact file
+        finally:
+            await server.aclose()
+
+    path = asyncio.run(scenario())
+
+    assert oct(mode_at_bind[str(path)]) == oct(SOCKET_MODE)

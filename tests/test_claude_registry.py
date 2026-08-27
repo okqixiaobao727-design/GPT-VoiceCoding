@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -120,13 +122,27 @@ def test_another_peer_protocol_is_refused_by_number(tmp_path: Path) -> None:
     assert str(PEER_PROTOCOL) in str(refused.value)
 
 
+def a_departed_pid() -> int:
+    """A pid whose process really is gone: started here, exited here, reaped here.
+
+    Naming a number and trusting it to be dead is an assumption about the
+    machine, not about this adapter — a CI runner that happened to be running a
+    process at pid 4242 turned this test red (#116). A child this test waited on
+    is gone by construction, on any machine.
+    """
+    departed = subprocess.Popen([sys.executable, "-c", ""])  # noqa: S603 - our own interpreter
+    departed.wait()
+    return departed.pid
+
+
 def test_a_record_is_read_even_when_its_process_is_gone(tmp_path: Path) -> None:
     """Liveness is a separate question, asked separately: a stale record still parses."""
-    write(tmp_path, entry(pid=4242))
+    gone = a_departed_pid()
+    write(tmp_path, entry(pid=gone))
 
-    found = read_record(tmp_path, 4242)
+    found = read_record(tmp_path, gone)
 
-    assert found.pid == 4242
+    assert found.pid == gone
     assert not pid_is_live(found.pid)
 
 

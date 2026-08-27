@@ -66,6 +66,7 @@ from gpt_voicecoding.adapters.agent.claude.privacy import (
     verify_bindable_length,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
+from gpt_voicecoding.private_socket import start_private_unix_server
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -419,10 +420,9 @@ class ApprovalListener:
         with contextlib.suppress(OSError):
             self._path.unlink()
         try:
-            self._server = await asyncio.start_unix_server(
-                self._serve, path=str(self._path), limit=MAX_HOOK_REQUEST_BYTES
+            self._server = await start_private_unix_server(
+                self._serve, self._path, mode=PRIVATE_SOCKET_MODE, limit=MAX_HOOK_REQUEST_BYTES
             )
-            os.chmod(self._path, PRIVATE_SOCKET_MODE)
         except OSError as refused:
             self._server = None
             raise ApprovalError(

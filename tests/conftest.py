@@ -40,7 +40,10 @@ one ([#93](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/93)).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import os
+import socket
+import stat
+from collections.abc import Iterator, Sequence
 
 import pytest
 
@@ -105,6 +108,43 @@ def _no_real_claude_registry(monkeypatch: pytest.MonkeyPatch) -> None:
         real(self)
 
     monkeypatch.setattr(ReplyInbox, "_publish_key", refuse)
+
+
+@pytest.fixture
+def mode_at_bind(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, int]]:
+    """Every `AF_UNIX` socket's permission bits in the instant `bind` returned.
+
+    The property `start_private_unix_server` exists for is not "ends up 0600" —
+    binding wide and narrowing with a chmod ends up 0600 too, and that is the
+    defect, not the fix (#116). The property is "was never anything else", so the
+    reading has to happen in the one instant nothing can have followed the bind:
+    `bind` is what creates the file, and the mode it is created at is the whole
+    question.
+
+    So the seam is `bind` itself, not whatever calls it. Reading at
+    `asyncio.start_unix_server` instead would be reading after the helper had
+    already bound *and* listened, which is late enough that a helper narrowing
+    its own socket in between would go unnoticed — the test would pass and the
+    window would be open. Patching here also covers the callers that hand
+    `asyncio` a `path` and let it do the binding, with no second branch.
+
+    The umask is opened all the way for the duration, so a socket that took its
+    mode from the umask is unmistakable rather than coincidentally right.
+    """
+    recorded: dict[str, int] = {}
+    bind = socket.socket.bind
+
+    def recording(self: socket.socket, address: object) -> None:
+        bind(self, address)
+        if self.family == socket.AF_UNIX and isinstance(address, str):
+            recorded[address] = stat.S_IMODE(os.stat(address).st_mode)
+
+    monkeypatch.setattr(socket.socket, "bind", recording)
+    wide_open = os.umask(0o000)
+    try:
+        yield recorded
+    finally:
+        os.umask(wide_open)
 
 
 @pytest.fixture

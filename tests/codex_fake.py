@@ -21,7 +21,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import os
 import struct
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -29,7 +28,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gpt_voicecoding.adapters.codex_app_server.process import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.codex_app_server.wire import WEBSOCKET_GUID
+from gpt_voicecoding.private_socket import start_private_unix_server
 
 Message = dict[str, Any]
 #: What a test installs to answer one method. Returning a dict answers it;
@@ -72,11 +73,19 @@ class FakeAppServer:
     # -- lifecycle --------------------------------------------------------
 
     async def start(self) -> FakeAppServer:
-        self._server = await asyncio.start_unix_server(self._serve, path=str(self.path))
-        # Real codex creates its socket 0600, and the adapter refuses to speak to
-        # one that is more open than that. A fake that left it at whatever the
-        # umask gave would be a fake the privacy check could never pass.
-        os.chmod(self.path, 0o600)
+        """Bind the way real codex does: private from the socket's first instant.
+
+        Real codex creates its socket 0600, and the adapter refuses to speak to
+        one that is more open than that. A fake that left it at whatever the
+        umask gave would be a fake the privacy check could never pass — and a
+        fake that bound wide and narrowed it afterwards is one the check can
+        catch mid-window, which is what made this a red build on a loaded runner
+        (#116). Binding through the product's own helper is what keeps the
+        double honest about the one property the adapter inspects.
+        """
+        self._server = await start_private_unix_server(
+            self._serve, self.path, mode=PRIVATE_SOCKET_MODE
+        )
         return self
 
     async def aclose(self) -> None:

@@ -47,6 +47,7 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
 )
 from gpt_voicecoding.adapters.agent.claude.approval_hook import decide, request_for
 from gpt_voicecoding.adapters.agent.claude.bootstrap import CHANNEL_CONFIG_VARIABLE
+from gpt_voicecoding.adapters.agent.claude.privacy import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
 from gpt_voicecoding.seams.agent import ApprovalVerdict, AwaitingApproval, WaitingKind
@@ -955,3 +956,26 @@ class TestAQuestionIsNotAPermission:
         announced, question = asyncio.run(scenario())
         assert len(announced) == 1
         assert question is None, "a permission is not a question, whatever else is parked"
+
+
+def test_the_approval_socket_is_private_from_the_moment_it_exists(
+    socket_root: Path, mode_at_bind: dict[str, int]
+) -> None:
+    """#116: this carries the user's authority over a permission request."""
+
+    async def scenario() -> Path:
+        listener = ApprovalListener(
+            settings=settings_for(socket_root),
+            resolve=lambda session_id: TARGET if session_id == SESSION else None,
+            emit=Sink().emit,
+            pid=1,
+        )
+        await listener.start()
+        try:
+            return listener.path
+        finally:
+            await listener.aclose()
+
+    path = asyncio.run(scenario())
+
+    assert oct(mode_at_bind[str(path)]) == oct(PRIVATE_SOCKET_MODE)

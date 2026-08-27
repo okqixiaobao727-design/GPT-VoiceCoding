@@ -31,6 +31,7 @@ from gpt_voicecoding.adapters.agent.claude.inbox import (
     published_start,
     user_frame,
 )
+from gpt_voicecoding.adapters.agent.claude.privacy import PRIVATE_SOCKET_MODE
 
 
 @pytest.fixture
@@ -231,3 +232,22 @@ class TestTheStartTimeShape:
         printed = own_process_start()
 
         assert re.fullmatch(r"[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}", printed)
+
+
+def test_the_reply_socket_is_private_from_the_moment_it_exists(
+    sockets: Path, mode_at_bind: dict[str, int]
+) -> None:
+    """#116: this carries the user's own words into a Session — never briefly wide."""
+    registry = sockets / "sessions"
+
+    async def scenario() -> Path:
+        replies = ReplyInbox(directory=sockets, registry_directory=registry, pid=4242)
+        await replies.start()
+        try:
+            return replies.path
+        finally:
+            await replies.aclose()
+
+    path = asyncio.run(scenario())
+
+    assert oct(mode_at_bind[str(path)]) == oct(PRIVATE_SOCKET_MODE)
