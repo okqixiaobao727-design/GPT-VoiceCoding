@@ -461,10 +461,17 @@ public enum LoginShellPath {
 
         // The shell's last write happened before it exited, so the bytes are in
         // the pipe; the reader is at most a scheduling quantum behind them. It
-        // gets that quantum, and then it is asked to stop and waited for — the
-        // wait is what guarantees the descriptor it owns is closed before this
-        // returns, and what keeps a reader that never got scheduled from being
-        // reported as a shell that said nothing.
+        // gets that quantum, and then it is asked to stop and waited for — which
+        // is what keeps a reader that never got scheduled from being reported as
+        // a shell that said nothing.
+        //
+        // On this path the wait also means the descriptor is closed by the time
+        // this returns. On the give-up paths it is asked to stop and given a
+        // bounded window, and may still be going when they return. That costs a
+        // descriptor and a thread until it next runs; it costs no *correctness*,
+        // because the descriptor is the reader's own and nothing else will ever
+        // free the number under it. That is the difference the `dup` buys, and
+        // the reason the give-up paths can afford not to wait.
         //
         // The window is always waited out rather than skipped once an answer is
         // in hand: the reader may be holding the first two sentinels while a
@@ -565,8 +572,10 @@ protocol DrainedPipe {
 /// So stopping is by flag and never by close. `poll(2)` bounds how long this can
 /// sit with nothing to read, the flag is checked only when the poll finds nothing
 /// pending — so everything already written is taken before it leaves — and the
-/// caller waits for it to finish, which is what makes "the descriptor is closed"
-/// true at the moment the caller returns.
+/// caller waits for it to finish — which on the path that returns an answer makes
+/// "the descriptor is closed" true at the moment the caller returns, and on the
+/// give-up paths is a bounded courtesy rather than a guarantee. Either way no
+/// other code can free the number, which is the property that matters.
 ///
 /// `read(2)` rather than `FileHandle.availableData` throughout: the latter
 /// answers an unreadable descriptor by raising, and a raised `NSException` here
