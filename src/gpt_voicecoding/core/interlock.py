@@ -82,8 +82,8 @@ class CallInterlock:
 
         The answer is returned rather than swallowed because the interlock
         *clearing* is an outlet transition and a stale event is not one. A
-        caller that swept on every end event would attempt a retained notice
-        again on news about a call nobody was waiting on.
+        caller that requested reconciliation on every end event would inspect
+        current waits again on news about a call nobody was waiting on.
         """
         if self._call_id != call_id:
             return False

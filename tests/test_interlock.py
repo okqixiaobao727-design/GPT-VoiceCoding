@@ -168,7 +168,7 @@ class TestWhatTheCallSeamReportsUpward:
         assert guard.owns_call() is False
 
     def test_only_a_real_release_reports_the_transition(self) -> None:
-        """Callers sweep on this answer, so a stale event must not claim one."""
+        """Callers reconcile on this answer, so a stale event must not claim one."""
         guard, _ = interlock()
         asyncio.run(guard.open_call(HOUSE_RULES))
         held = guard.call_id()

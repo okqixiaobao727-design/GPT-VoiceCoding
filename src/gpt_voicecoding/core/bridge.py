@@ -44,7 +44,7 @@ from gpt_voicecoding.core.errors import (
     StaleSessionError,
     UnknownRelayError,
 )
-from gpt_voicecoding.core.escalation import EscalationPipeline, Notice
+from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOutcome
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
@@ -106,7 +106,11 @@ NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wi
 
 
 def stop_notice_for(
-    session: Session | None, target: SessionTarget, waiting_for: WaitingFor | None = None
+    session: Session | None,
+    target: SessionTarget,
+    waiting_for: WaitingFor | None = None,
+    *,
+    answerable_here: bool = False,
 ) -> str:
     """The words a stopped Session is announced with.
 
@@ -116,7 +120,9 @@ def stop_notice_for(
     Rendering happens here rather than in the adapter because the words are
     Bridge Core's policy; the adapter's job was to keep the structure.
     """
-    stopped_on = _stopped_on(waiting_for) if waiting_for is not None else ""
+    stopped_on = (
+        _stopped_on(waiting_for, answerable_here=answerable_here) if waiting_for is not None else ""
+    )
     tail = f" — {stopped_on}" if stopped_on else ""
     return f"{spoken_reference(session, target)} stopped and may need you{tail}"
 
@@ -155,7 +161,7 @@ def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
 ANSWER_IT_AT_THE_TERMINAL: Final = "answer it in the terminal; it cannot be answered from here"
 
 
-def _stopped_on(waiting_for: WaitingFor) -> str:
+def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
     """One line describing what a Session is waiting for, or nothing to add."""
     match waiting_for.kind:
         case WaitingKind.QUESTION:
@@ -176,7 +182,7 @@ def _stopped_on(waiting_for: WaitingFor) -> str:
             asked = f"{named} needs your permission" + (
                 f": {waiting_for.detail}" if waiting_for.detail else ""
             )
-            if waiting_for.approval_id:
+            if answerable_here:
                 return asked
             # No handle means no Approval Relay: the roster saw `waiting` and
             # nothing is parked on the approval socket to answer into. Saying so
@@ -257,6 +263,13 @@ class BridgeCore:
         #: every surface in the `sessions` payload, and a monotonic reading
         #: would name no moment on the far side.
         self._stamp = stamp
+        #: Waiting instances already announced in this Engine. This never
+        #: replays anything; it prevents consecutive outlet transitions from
+        #: announcing the same on-screen dialog twice (#80).
+        self._delivered_waits: set[tuple[SessionTarget, str]] = set()
+        #: An outlet transition asks the next discovery pass to reconcile its
+        #: fresh rows. The transition itself performs no lane I/O (#80).
+        self._reconcile_owed = False
 
         self.interlock = CallInterlock(call)
         self.adjudicator = SwitchAdjudicator(state.switches)
@@ -265,9 +278,7 @@ class BridgeCore:
             channel=channel,
             interlock=self.interlock,
             adjudicator=self.adjudicator,
-            relays=state.relays,
             voice_instructions=self._voice_instructions,
-            clock=clock,
         )
         self.relays = RelayPipeline(
             agents=agents,
@@ -375,13 +386,13 @@ class BridgeCore:
         """Flip a switch and report the state it held before.
 
         The flip itself is never gated. What follows it is: turning an outlet on
-        is an outlet transition, and a transition is the *only* thing that
-        re-offers a retained notice.
+        is an outlet transition, and a transition is the *only* thing that asks
+        the next discovery pass to reconcile still-actionable waits.
         """
         previous = self._state.switches.flip(name, on)
         self._state.persist()
         if on and not previous:
-            await self.escalation.sweep()
+            self._owe_reconciliation()
         return previous
 
     async def live_toggle(self) -> CallSnapshot:
@@ -406,7 +417,7 @@ class BridgeCore:
         # say — in both directions, and for both of its reasons.
         snapshot = await self.interlock.open_call(self._voice_instructions)
         if snapshot.is_up:
-            await self.escalation.sweep()
+            self._owe_reconciliation()
         return snapshot
 
     async def outlets_changed(self) -> None:
@@ -415,14 +426,41 @@ class BridgeCore:
         The named entry point for the one transition no event describes: a
         Companion Channel whose far side has come back, noticed by a liveness
         check rather than announced. Call transitions and switch flips already
-        sweep on their own events.
+        reconcile on their own events.
 
-        This is deliberately the *only* other way a retained notice is
-        re-offered. Nothing polls, and nothing retries off the back of its own
-        failure — that is what keeps uncapped retention from becoming a
-        livelock.
+        This is deliberately the *only* other reconciliation trigger. The next
+        ordinary discovery pass does the read; a failed notice attempt never
+        triggers another attempt.
         """
-        await self.escalation.sweep()
+        self._owe_reconciliation()
+
+    def _owe_reconciliation(self) -> None:
+        """Ask the next discovery pass to act, when an outlet is effective now."""
+        if self.adjudicator.outlets():
+            self._reconcile_owed = True
+
+    async def _announce_current_stops(self, fresh: set[AgentKind]) -> None:
+        """Announce actionable main rows from lanes this pass actually read."""
+        for session in self._state.sessions.live():
+            if session.target.agent not in fresh or not session.child.is_main:
+                continue
+            if session.waiting_for.needs_the_user:
+                await self._announce_waiting(
+                    session,
+                    session.target,
+                    session.waiting_for,
+                    reconcile=True,
+                )
+
+    def _forget_delivered_waits_except_current(self, session: Session) -> None:
+        current = (
+            (session.target, session.waiting_for.approval_id or session.waiting_for.kind)
+            if session.lifecycle is SessionLifecycle.LIVE and session.waiting_for.needs_the_user
+            else None
+        )
+        self._delivered_waits = {
+            key for key in self._delivered_waits if key[0] != session.target or key == current
+        }
 
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
@@ -485,9 +523,8 @@ class BridgeCore:
     async def tick(self) -> tuple[tuple[RelayOutcome, ...], tuple[ApprovalOutcome, ...]]:
         """Advance both ceilings. The composition root calls this on a timer.
 
-        Deliberately the only time-driven thing in the hub. Retained notices are
-        not swept here: retention has no cap, and a timer that re-offered them
-        would be the livelock the outlet-transition rule exists to prevent.
+        Deliberately the only time-driven thing in the hub. Stop Notices are not
+        replayed here; current state is reconciled only on outlet transitions.
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
@@ -521,7 +558,10 @@ class BridgeCore:
         that is sitting there waiting for them, so the question is asked of the
         one component that can tell a re-keying from a death.
         """
+        reconcile = self._reconcile_owed
+        self._reconcile_owed = False
         gone: list[SessionTarget] = []
+        fresh: set[AgentKind] = set()
         for kind, adapter in self._agents.items():
             try:
                 lane = await adapter.discover()
@@ -529,11 +569,21 @@ class BridgeCore:
                 _log.exception("the %s lane raised instead of reporting its trouble", kind)
                 continue
             gone.extend(self._state.sessions.observe(kind, lane, now=self._stamp()))
+            if lane.enumerated:
+                fresh.add(kind)
+            for current in self._state.sessions.live():
+                if current.target.agent is kind:
+                    self._forget_delivered_waits_except_current(current)
 
         for target in gone:
+            self._forget_delivered_waits(target)
             _log.info("Session %s is no longer running", target)
             for outcome in self.relays.session_ended(target):
                 await self._announce(outcome.target, outcome.report)
+        live_targets = {session.target for session in self._state.sessions.live()}
+        self._delivered_waits = {key for key in self._delivered_waits if key[0] in live_targets}
+        if reconcile and self.adjudicator.outlets():
+            await self._announce_current_stops(fresh)
         return tuple(gone)
 
     async def dispatch(self, event: Event) -> None:
@@ -552,21 +602,24 @@ class BridgeCore:
                     # the dialog stays the keyboard's — "never spoken to"
                     # includes never answered (advisor, 2026-08-27).
                     return
-                await self.approvals.opened(event.request, self._spoken_as(event.request.target))
+                _, outcome = await self.approvals.opened(
+                    event.request, self._spoken_as(event.request.target)
+                )
+                if outcome.delivered_by is not None:
+                    self._delivered_waits.add((event.request.target, event.request.approval_id))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
                 self._relay_receipt(event)
             case CallStarted():
                 self.interlock.note_started(event.call_id)
-                await self.escalation.sweep()
+                self._owe_reconciliation()
             case CallEnded() | CallDropped():
                 # Only a release is an outlet transition. A late event about a
-                # call the system was not holding changes nothing, and sweeping
-                # on it would attempt a retained notice again for no reason —
-                # the guard that keeps uncapped retention from livelocking.
+                # call the system was not holding changes nothing, so it cannot
+                # justify another inspection and announcement.
                 if self.interlock.note_ended(event.call_id):
-                    await self.escalation.sweep()
+                    self._owe_reconciliation()
             case InboundText():
                 await self._inbound_text(event)
             case UserSpeech():
@@ -585,23 +638,50 @@ class BridgeCore:
 
         **The log line is the run's only way to attribute a notice to this
         engine.** Until #75 the escalation path wrote nothing when it *worked* —
-        only when a notice was retained, retired or failed — so a Stop Notice
-        that reached the user left no trace at all, and the acceptance's
+        only its old retention and failure paths wrote — so a Stop Notice that
+        reached the user left no trace at all, and the acceptance's
         `stop notice` step could satisfy its attribution check only on the
         failure path. An engine silent about the one event it exists to produce
         is the gap #48 named on the inbound side, on the outbound side.
         """
         if self._spawned(event.target):
             return
-        session = self._known(event.target)
+        await self._announce_waiting(
+            self._known(event.target), event.target, event.waiting_for, reconcile=False
+        )
+
+    async def _announce_waiting(
+        self,
+        session: Session | None,
+        target: SessionTarget,
+        waiting_for: WaitingFor,
+        *,
+        reconcile: bool,
+    ) -> NoticeOutcome | None:
+        """Announce one current wait through the same producer as its live event."""
+        key = (
+            (target, waiting_for.approval_id or waiting_for.kind)
+            if waiting_for.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
+            else None
+        )
+        if key is not None and key in self._delivered_waits:
+            return None
         _log.info(
             "Session stopped: %s waiting on %s%s",
-            event.target,
-            event.waiting_for.kind,
-            f" ({event.waiting_for.tool_name})" if event.waiting_for.tool_name else "",
+            target,
+            waiting_for.kind,
+            f" ({waiting_for.tool_name})" if waiting_for.tool_name else "",
         )
-        held = event.waiting_for.as_approval_request(event.target)
+        held = waiting_for.as_approval_request(target)
         if held is not None:
+            if reconcile:
+                outcome = await self.approvals.reoffer(
+                    held.approval_id, spoken_reference(session, target)
+                )
+                if outcome is not None:
+                    if key is not None and outcome.delivered_by is not None:
+                        self._delivered_waits.add(key)
+                    return outcome
             # One dialog, two events, one announcement. A Session entering
             # `waiting` raises this Stop, and the same dialog reached
             # `AwaitingApproval` through the hook that is holding it open — so
@@ -617,19 +697,24 @@ class BridgeCore:
             _log.info(
                 "the Stop on %s is the dialog %s, which the Approval Relay announces; "
                 "not announced twice",
-                event.target,
+                target,
                 held.approval_id,
             )
-            return
-        await self.escalation.escalate(
+            if not reconcile:
+                return None
+        outcome = await self.escalation.escalate(
             Notice(
                 request_id=new_request_id(),
-                target=event.target,
-                text=stop_notice_for(session, event.target, event.waiting_for),
+                target=target,
+                text=stop_notice_for(session, target, waiting_for, answerable_here=False),
             )
         )
+        if key is not None and outcome.delivered_by is not None:
+            self._delivered_waits.add(key)
+        return outcome
 
     async def _session_ended(self, event: SessionEnded) -> None:
+        self._forget_delivered_waits(event.target)
         try:
             self._state.sessions.mark_ended(event.target)
         except BridgeCoreError:
@@ -648,12 +733,18 @@ class BridgeCore:
         """
         try:
             held = self._state.sessions.resolve(event.target)
-            self._state.sessions.set_state(event.target, _state_behind(event.window, held.state))
+            current = self._state.sessions.set_state(
+                event.target, _state_behind(event.window, held.state)
+            )
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
         if event.window is ReplyWindow.OPEN:
+            self._forget_delivered_waits_except_current(current)
             await self.relays.reply_window_opened(event.target)
+
+    def _forget_delivered_waits(self, target: SessionTarget) -> None:
+        self._delivered_waits = {key for key in self._delivered_waits if key[0] != target}
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""
@@ -722,9 +813,9 @@ class BridgeCore:
         storage is **simplified**: legacy wrote the grade to a durable ledger
         (`legacy@1d32845:bridge/store.py:1517-1614`) and this is a direct answer
         to text the user just sent, so the grade is said here and forgotten. It
-        is deliberately not retained on the escalation ledger either — a reply is
-        not a notice, and retaining it would replay an answer to a question the
-        user asked minutes ago the next time an outlet came up.
+        does not enter the Answer Relay queue either — it is a direct reply, and
+        queueing it would replay an answer to a question the user asked minutes
+        ago when its Reply Window next opened.
 
         **The words never enter the diagnostic.** The reply carries whatever the
         user's own business is; the log carries the grade and the adapter's

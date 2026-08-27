@@ -219,8 +219,10 @@ Payload: `{"name": "duty", "on": true}`. `on` must be a JSON boolean; a string i
 refused, because `"false"` is truthy and the switch it would turn on is the
 master. Data: `{"name": …, "on": …, "previous": …}`.
 
-Turning an outlet on is an outlet transition, so a retained Stop Notice may be
-re-offered as a result.
+Turning an outlet on marks current-state reconciliation as owed. The next
+ordinary discovery pass uses its fresh lane rows and announces each live main
+Session still waiting on a question or permission. It never replays a historical
+Stop Notice.
 
 ### `live` — the Live Toggle
 

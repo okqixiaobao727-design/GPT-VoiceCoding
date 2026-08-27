@@ -7,11 +7,9 @@ failed. Both are policy questions, so both are answered here and nowhere else:
 *which outlet does this notice go out on, given the call state and the
 switches*, and *what happens to it when none of them work*.
 
-The answer to the second one is no-loss: a notice that could not go out is
-**retained** — one `RelayKind.NOTICE` entry in the one ledger — and surfaces on
-the next available outlet. There is no attempt cap, because retention is the
-invariant; what stops a livelock is that attempts fire only on outlet
-transitions, never on the failure of the attempt before.
+The answer to the second one is a terminal DROPPED attempt. Bridge Core provides
+no-loss by re-inspecting current Session state when an outlet transition occurs;
+this pipeline never replays a historical notice.
 """
 
 from __future__ import annotations
@@ -30,7 +28,6 @@ from gpt_voicecoding.core.escalation import (
 )
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
-from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
@@ -63,22 +60,16 @@ class Harness:
         self.call = call or FakeCall()
         self.channel = channel or FakeCompanionChannel()
         self.interlock = CallInterlock(self.call)
-        self.relays = RelayQueue()
         self.pipeline = EscalationPipeline(
             call=self.call,
             channel=self.channel,
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),
-            relays=self.relays,
             voice_instructions=voice_instructions,
-            clock=lambda: 1_000.0,
         )
 
     def escalate(self, item: Notice, **kwargs: object) -> object:
         return asyncio.run(self.pipeline.escalate(item, **kwargs))  # type: ignore[arg-type]
-
-    def sweep(self) -> object:
-        return asyncio.run(self.pipeline.sweep())
 
 
 class TestTheRouteMatrix:
@@ -88,51 +79,37 @@ class TestTheRouteMatrix:
         assert route_matrix(call_is_up=True, may_touch_call=True, may_push=True) == (
             NoticeRoute.SPEAK_INTO_CALL,
             NoticeRoute.PUSH_TO_CHANNEL,
-            NoticeRoute.RETAIN,
         )
 
     def test_with_no_call_up_escalation_may_open_one(self) -> None:
         assert route_matrix(call_is_up=False, may_touch_call=True, may_push=True) == (
             NoticeRoute.OPEN_CALL_AND_SPEAK,
             NoticeRoute.PUSH_TO_CHANNEL,
-            NoticeRoute.RETAIN,
         )
 
     def test_voice_off_and_message_on_is_the_channel_alone(self) -> None:
         assert route_matrix(call_is_up=False, may_touch_call=False, may_push=True) == (
             NoticeRoute.PUSH_TO_CHANNEL,
-            NoticeRoute.RETAIN,
         )
 
     def test_voice_off_with_a_call_up_still_does_not_touch_the_call(self) -> None:
         """The Voice Switch is the whole call, not just opening it."""
         assert route_matrix(call_is_up=True, may_touch_call=False, may_push=True) == (
             NoticeRoute.PUSH_TO_CHANNEL,
-            NoticeRoute.RETAIN,
         )
 
     def test_message_off_and_voice_on_never_pushes_text(self) -> None:
         assert route_matrix(call_is_up=True, may_touch_call=True, may_push=False) == (
             NoticeRoute.SPEAK_INTO_CALL,
-            NoticeRoute.RETAIN,
         )
 
-    def test_with_no_outlet_at_all_the_only_route_is_retention(self) -> None:
-        assert route_matrix(call_is_up=False, may_touch_call=False, may_push=False) == (
-            NoticeRoute.RETAIN,
-        )
+    def test_with_no_outlet_at_all_there_is_no_route(self) -> None:
+        assert route_matrix(call_is_up=False, may_touch_call=False, may_push=False) == ()
 
-    def test_every_row_ends_in_retention_so_nothing_can_be_dropped(self) -> None:
-        for call_is_up in (True, False):
-            for may_touch_call in (True, False):
-                for may_push in (True, False):
-                    routes = route_matrix(
-                        call_is_up=call_is_up,
-                        may_touch_call=may_touch_call,
-                        may_push=may_push,
-                    )
-                    assert routes[-1] is NoticeRoute.RETAIN
-                    assert NoticeRoute.RETAIN not in routes[:-1]
+    def test_with_no_call_and_message_off_the_open_call_is_the_only_route(self) -> None:
+        assert route_matrix(call_is_up=False, may_touch_call=True, may_push=False) == (
+            NoticeRoute.OPEN_CALL_AND_SPEAK,
+        )
 
 
 class TestSpeakingIntoTheCallThatIsUp:
@@ -154,14 +131,6 @@ class TestSpeakingIntoTheCallThatIsUp:
         harness.escalate(notice())
 
         assert harness.channel.sent == []
-
-    def test_a_delivered_notice_leaves_no_entry_in_the_ledger(self) -> None:
-        harness = Harness()
-        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
-
-        harness.escalate(notice())
-
-        assert harness.relays.pending() == ()
 
 
 class TestOpeningACallToEscalateInto:
@@ -192,12 +161,11 @@ class TestOpeningACallToEscalateInto:
 
 
 class TestWithNoHouseRulesToOpenOn:
-    def test_escalation_opens_no_call_and_the_notice_is_not_lost(self) -> None:
+    def test_escalation_opens_no_call_and_drops_this_attempt(self) -> None:
         """The same refusal the hub meets, turned into a reason the notice carries.
 
-        It is not raised out of a sweep: a notice that could not go out is
-        retained for the next available outlet, and an engine with no
-        instructions still has a Companion Channel.
+        It is not raised out of the pipeline. Current-state reconciliation may
+        create another notice when a later outlet transition occurs.
         """
         harness = Harness(message=False, voice_instructions="")
 
@@ -205,7 +173,7 @@ class TestWithNoHouseRulesToOpenOn:
 
         assert harness.call.calls_started == 0
         assert harness.call.spoken == []
-        assert outcome.state is Lifecycle.RETAINED
+        assert outcome.state is Lifecycle.DROPPED
 
     def test_the_reason_is_the_one_the_interlock_worded(self) -> None:
         """Not this pipeline's own sentence — the same one, from the same door."""
@@ -235,7 +203,7 @@ class TestSwitchIndependence:
         outcome = harness.escalate(notice())
 
         assert harness.channel.sent == []
-        assert outcome.state is Lifecycle.RETAINED
+        assert outcome.state is Lifecycle.DROPPED
 
     def test_duty_off_neither_speaks_nor_pushes_nor_touches_the_call(self) -> None:
         harness = Harness(duty=False)
@@ -245,7 +213,7 @@ class TestSwitchIndependence:
         assert harness.call.calls_started == 0
         assert harness.call.spoken == []
         assert harness.channel.sent == []
-        assert outcome.state is Lifecycle.RETAINED
+        assert outcome.state is Lifecycle.DROPPED
 
     def test_duty_flipping_off_mid_escalation_halts_the_pipeline(self) -> None:
         """Permission is re-read between routes, not decided once at the top."""
@@ -263,23 +231,19 @@ class TestSwitchIndependence:
         outcome = harness.escalate(notice())
 
         assert channel.sent == []
-        assert outcome.state is Lifecycle.RETAINED
+        assert outcome.state is Lifecycle.DROPPED
 
 
-class TestRetentionAndRetry:
-    def test_a_notice_with_no_outlet_is_retained_in_the_one_ledger(self) -> None:
-        harness = Harness(duty=False)
-        item = notice("you are needed")
+class TestDroppedAttempts:
+    def test_a_notice_with_no_outlet_is_terminal_and_not_retryable(self) -> None:
+        outcome = Harness(duty=False).escalate(notice("you are needed"))
 
-        harness.escalate(item)
+        assert outcome.state is Lifecycle.DROPPED
+        assert outcome.state.is_terminal is True
+        assert outcome.state.is_retryable is False
+        assert outcome.attempts == ()
 
-        (waiting,) = harness.relays.pending()
-        assert waiting.request_id == item.request_id
-        assert waiting.kind is RelayKind.NOTICE
-        assert waiting.text == "you are needed"
-
-    def test_a_retained_notice_is_never_marked_delivered(self) -> None:
-        """An unreachable channel is a non-delivery, and stays one."""
+    def test_an_unreachable_channel_drops_this_attempt_with_the_adapter_reason(self) -> None:
         harness = Harness(
             voice=False,
             channel=FakeCompanionChannel(outcome=Delivery.FAILED, reason="chat unreachable"),
@@ -287,114 +251,9 @@ class TestRetentionAndRetry:
 
         outcome = harness.escalate(notice())
 
-        assert outcome.state is Lifecycle.RETAINED
-        (waiting,) = harness.relays.pending()
-        assert waiting.outcome.is_delivered is False
-
-    def test_a_retained_notice_has_no_deadline_because_no_loss_has_no_cap(self) -> None:
-        harness = Harness(duty=False)
-        harness.escalate(notice())
-
-        assert harness.relays.expired(now=1e18) == ()
-
-    def test_a_retained_notice_goes_out_once_the_interlock_clears(self) -> None:
-        """Retained → retried on the next outlet transition, not on a timer."""
-        harness = Harness(duty=False)
-        item = notice("you are needed")
-        harness.escalate(item)
-
-        harness.switches.flip(SwitchName.DUTY, True)
-        outcomes = harness.sweep()
-
-        assert harness.call.spoken == ["you are needed"]
-        assert [one.state for one in outcomes] == [Lifecycle.DELIVERED]
-        assert harness.relays.pending() == ()
-
-    def test_a_sweep_with_no_outlet_open_attempts_nothing(self) -> None:
-        harness = Harness(duty=False)
-        harness.escalate(notice())
-
-        assert harness.sweep() == ()
-        assert harness.call.calls_started == 0
-
-    def test_re_escalating_a_retained_notice_does_not_duplicate_the_entry(self) -> None:
-        harness = Harness(duty=False)
-        item = notice()
-
-        harness.escalate(item)
-        harness.escalate(item)
-
-        assert len(harness.relays.pending()) == 1
-
-    def test_a_notice_the_adapter_delivered_is_never_re_spoken_by_a_sweep(self) -> None:
-        """The reference implementation's worst bug, made structurally impossible.
-
-        There it graded an audibly spoken notice FAILED by matching another
-        surface's records and retried it, opening duplicate calls. Here a
-        DELIVERED attempt takes the entry out of the ledger, so the sweep has
-        nothing to find.
-        """
-        harness = Harness()
-        harness.escalate(notice("said once"))
-
-        harness.sweep()
-        harness.sweep()
-
-        assert harness.call.spoken == ["said once"]
-
-    def test_notices_are_swept_in_the_order_they_were_retained(self) -> None:
-        harness = Harness(duty=False)
-        harness.escalate(notice("first"))
-        harness.escalate(notice("second"))
-
-        harness.switches.flip(SwitchName.DUTY, True)
-        harness.sweep()
-
-        assert harness.call.spoken == ["first", "second"]
-
-    def test_a_sweep_leaves_a_queued_answer_relay_alone(self) -> None:
-        """This pipeline owns notices; the ledger it shares holds relays too."""
-        harness = Harness()
-        harness.relays.enqueue(
-            PendingRelay(
-                request_id=new_request_id(),
-                target=CODEX,
-                kind=RelayKind.ANSWER,
-                text="my own words",
-                queued_at=1_000.0,
-                expires_at=1_600.0,
-            )
-        )
-
-        harness.sweep()
-
-        assert harness.call.spoken == []
-        assert len(harness.relays.pending()) == 1
-
-
-class TestTheRetryBoundary:
-    def test_reporting_a_notice_failed_takes_it_out_of_the_ledger(self) -> None:
-        harness = Harness(duty=False)
-        item = notice()
-        harness.escalate(item)
-
-        outcome = harness.pipeline.report_failed(item.request_id)
-
-        assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert harness.relays.pending() == ()
-
-    def test_nothing_automatic_follows_a_reported_failure(self) -> None:
-        """Once terminal, no retry and no substitute action — the locked rule."""
-        harness = Harness(duty=False)
-        item = notice()
-        harness.escalate(item)
-        harness.pipeline.report_failed(item.request_id)
-
-        harness.switches.flip(SwitchName.DUTY, True)
-
-        assert harness.sweep() == ()
-        assert harness.call.spoken == []
-        assert harness.channel.sent == []
+        assert outcome.state is Lifecycle.DROPPED
+        assert outcome.delivered_by is None
+        assert [attempt.reason for attempt in outcome.attempts] == ["chat unreachable"]
 
 
 class TestReach:
@@ -432,10 +291,10 @@ class TestReach:
         assert harness.call.spoken == []
         assert harness.channel.sent == ["approval needed"]
 
-    def test_every_outlet_with_nothing_open_retains_like_any_notice(self) -> None:
+    def test_every_outlet_with_nothing_open_drops_this_attempt(self) -> None:
         harness = Harness(duty=False)
 
         outcome = harness.escalate(notice(), reach=Reach.EVERY_OUTLET)
 
-        assert outcome.state is Lifecycle.RETAINED
-        assert len(harness.relays.pending()) == 1
+        assert outcome.state is Lifecycle.DROPPED
+        assert outcome.attempts == ()

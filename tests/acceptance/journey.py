@@ -194,8 +194,10 @@ def writing_at(path: Path, content: str) -> Instruction:
     """
     return Instruction(
         words=(
-            f"Create a file at the absolute path {path} whose entire contents are the "
-            f"single word {content}. Do nothing else, and do not ask any questions."
+            f"Use your `apply_patch` file-edit tool to attempt to create a file at the "
+            f"absolute path {path} whose entire contents are the single word {content}. "
+            "Leave any approval request pending for the user to answer. Do nothing else, "
+            "and do not ask any questions."
         ),
         target=path,
         content=content,
@@ -230,13 +232,11 @@ OUTSIDE_THE_SANDBOX = "outside-the-sandbox"
 INBOUND = writing("inbound.txt", "CHARLIE")
 
 #: Turn 4 — `switches`. It has to end **waiting on the user**, because #80's rule
-#: is about Sessions that are still actionable when Duty comes back on.
-ASK_SOMETHING = Instruction(
-    words=(
-        "Ask me one short question about what to do next, then stop and wait for my "
-        "answer. Do not use any tools."
-    )
-)
+#: is about Sessions that are still actionable when Duty comes back on. A fresh
+#: file keeps this distinct from `approval`: repeating an already-performed write
+#: would give the agent no reason to raise another permission.
+SWITCH_FILE = "switches.txt"
+SWITCH_WORD = "DELTA"
 
 #: Turn 5 — `child`. The main Session is asked to do the one thing that produces a
 #: second agent process under it. What each lane calls that differs, so the words
@@ -321,6 +321,10 @@ class Lane:
     #: the two agents' policies refuse different actions, and an instruction that
     #: asks one of them for permission asks the other for nothing (#105).
     relayed: Callable[[Path], Instruction]
+    #: The fresh permission `switches` leaves pending while Duty is off. It has
+    #: the same lane-specific policy shape as `relayed`, but a different target
+    #: so both agents have an action left to ask about.
+    actionable: Callable[[Path], Instruction]
     #: The ground the permission was measured on, given the agent's own record of
     #: the Session. `approval` says its `named` half in the evidence line, so a
     #: green step states the ground it stood on rather than implying some
@@ -368,6 +372,7 @@ CLAUDE = Lane(
     # is what `roster` and `stable name`'s three reads want to find.
     boot=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
+    actionable=lambda workspace: writing(SWITCH_FILE, SWITCH_WORD),
     # The flag the harness passes *is* the whole policy on this lane, and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
     # nothing that can disagree. Sound by construction, and said out loud here so
@@ -442,6 +447,9 @@ CODEX = Lane(
     # directory is made by the harness, so the one refused action is the write.
     relayed=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / RELAY_FILE, RELAY_WORD
+    ),
+    actionable=lambda workspace: writing_at(
+        workspace.parent / OUTSIDE_THE_SANDBOX / SWITCH_FILE, SWITCH_WORD
     ),
     policy_at=lambda record: hand_started.codex_turn_policy(record),
     asks_about=(
@@ -609,12 +617,11 @@ class Walk:
     def drain_boot_notice(self, mark: int | None) -> None:
         """Let the boot turn's Stop Notice land before the walk marks the chat for a later one.
 
-        **Turning an outlet on is what delivers what was held.** A notice with no
-        route open is retained rather than dropped (`core/escalation.py:230-232`),
-        and `flip_switch(on=True)` sweeps the retained ones
-        (`core/bridge.py:361-372`) — so `arm_switches`, which runs between
-        `settle_boot_turn` and this, is where a held boot notice goes out. That
-        much is already before `stable name`'s mark and needs nothing from here.
+        **Turning an outlet on asks the next discovery pass to reconcile current
+        state.** A notice with no route is dropped, not held; after
+        `arm_switches`, fresh discovery raises a new notice only if the boot
+        Session is still waiting on a question or permission. That happens before
+        `stable name` takes its mark and needs nothing from that later step.
 
         What needs this is the other path. The rollout's `task_complete` and the
         engine's own observation of the Stop are not synchronised, so an engine
@@ -1054,6 +1061,20 @@ class Walk:
         observations: silence over a derived window with Duty off, and — with
         Duty back on — a notice naming this Session.
 
+        Both lanes use a real permission here. It is answerable through the
+        Approval Relay already delivered by #77, so this Session is idle again
+        before the fixed next step (`child`). A Claude `AskUserQuestion` would
+        instead be held by its PermissionRequest hook with no answer path until
+        #103, making the following step impossible; Advisor withdrew that route
+        on #80 after the conflict was measured on Claude Code 2.1.247.
+
+        The interval before release is derived from `agent_turn_seconds` +
+        `absence_window_seconds` + `DISCOVERY_SECONDS` +
+        `telegram_round_trip_seconds`; the acceptance configuration keeps that
+        sum below the Approval Relay budget. The file effect is not graded here
+        — `approval` owns that assertion; this step approves only to release the
+        Session for `child`.
+
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
         least obviously: Duty is a global switch, so a stranger's notice arriving
@@ -1067,8 +1088,28 @@ class Walk:
         if not off.ok:
             raise StepFailed(f"`switch duty off` refused: {off.text}")
 
+        actionable = self.lane.actionable(self.config.workspace)
+        target = actionable.path_in(self.config.workspace)
+        if target is None:
+            raise StepFailed("the switches permission names no filesystem effect")
+        target.parent.mkdir(parents=True, exist_ok=True)
         mark = self.person.latest_message_id()
-        turn = self._drive_turn("ask something", ASK_SOMETHING, expect_waiting=True)
+        turn = self._drive_turn("wait for permission", actionable, expect_waiting=True)
+        waiting = self._roster_field("waiting_for")
+        if not isinstance(waiting, dict) or waiting.get("kind") != "permission":
+            self.bridgectl("switch", "duty", "on")
+            raise StepFailed(
+                f"the switches turn did not stop on a permission (turn ended={turn.ended}, "
+                f"roster waiting_for={waiting!r})"
+            )
+        pending = self._own_pending_approvals()
+        if len(pending) != 1:
+            self.bridgectl("switch", "duty", "on")
+            raise StepFailed(
+                f"the switches turn left {len(pending)} pending approvals for this Session, "
+                f"not exactly one: {pending!r}"
+            )
+        approval_id = str(pending[0]["approval_id"])
         status = self.bridgectl("status")
         if not status.ok:
             raise StepFailed(f"with Duty off, `status` refused: {status.text}")
@@ -1087,21 +1128,48 @@ class Walk:
         if not back_on.ok:
             raise StepFailed(f"`switch duty on` refused: {back_on.text}")
         reconciled = self._await_own_message(
-            mark, deadline_seconds=self.far_side.telegram_round_trip_seconds
+            mark,
+            deadline_seconds=DISCOVERY_SECONDS + self.far_side.telegram_round_trip_seconds,
+            matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
         )
         if reconciled is None:
-            waiting = self._roster_field("waiting_for")
             raise StepFailed(
                 f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
                 f"(correct), but turning Duty back on reported nothing about a Session that "
-                f"stopped waiting on the user (turn ended={turn.ended}, "
-                f"roster waiting_for {waiting!r}). The bot said "
+                f"was still waiting on permission {approval_id}. The bot said "
                 f"{self._other_traffic(mark)} in that window, none of it about this Session"
+            )
+        approval_evidence = self._answer_pending_approval(mark)
+        if approval_evidence is None or approval_id not in approval_evidence:
+            raise StepFailed(
+                f"the reconciled permission {approval_id} could not be released through the "
+                f"Approval Relay: {approval_evidence!r}"
+            )
+        if not support.wait_for(
+            lambda: self._roster_field("state") == "idle",
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed(
+                f"permission {approval_id} was approved, but the Session did not return to "
+                "idle before `child`"
+            )
+        forms = _naming_forms(self._own_row())
+        announcements = [
+            message
+            for message in self.person.messages_after(mark)
+            if message.from_bot
+            and _named_in(message.text, forms)
+            and APPROVAL_ANNOUNCEMENT.search(message.text)
+        ]
+        if len(announcements) != 1:
+            raise StepFailed(
+                f"Duty on produced {len(announcements)} permission announcements for "
+                f"{approval_id}, not exactly one: {[message.text for message in announcements]!r}"
             )
         return (
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
             f"still answered ({status.text.splitlines()[0]!r}); Duty on: message "
-            f"{reconciled.id} {reconciled.text!r}"
+            f"{reconciled.id} {reconciled.text!r}; {approval_evidence}; Session returned idle"
         )
 
     # --- child ------------------------------------------------------------
@@ -1498,12 +1566,7 @@ class Walk:
         """
         deadline = time.monotonic() + self.far_side.agent_turn_seconds
         while time.monotonic() < deadline:
-            data = support.control_plane_status(self.config.socket_path, self.journal)
-            pending = [
-                waiting
-                for waiting in data.get("pending_approvals", [])
-                if _address_of(waiting) == self.address
-            ]
+            pending = self._own_pending_approvals()
             if pending:
                 announced = self._await_own_message(
                     mark,
@@ -1541,6 +1604,15 @@ class Walk:
             time.sleep(2.0)
         self.journal("approval.none", lane=self.lane.name)
         return None
+
+    def _own_pending_approvals(self) -> list[dict]:
+        """Pending authority dialogs belonging to this walk's Session, never a stranger's."""
+        data = support.control_plane_status(self.config.socket_path, self.journal)
+        return [
+            waiting
+            for waiting in data.get("pending_approvals", [])
+            if isinstance(waiting, dict) and _address_of(waiting) == self.address
+        ]
 
 
 def _address_of(row: dict) -> str:

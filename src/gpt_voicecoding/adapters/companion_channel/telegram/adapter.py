@@ -219,8 +219,9 @@ class TelegramCompanionChannel:
         message rather than as a broken one.
 
         Nothing is queued here. An unreachable network is a classified failure
-        returned at once — the engine's loop is never held — and whether an
-        undelivered notice is retried or retained is Bridge Core's to decide.
+        returned at once — the engine's loop is never held. Bridge Core decides
+        whether a later outlet transition should reconcile the current Session
+        state; this adapter never replays the notice object.
         """
         parts = split_message(text)
         if not parts:

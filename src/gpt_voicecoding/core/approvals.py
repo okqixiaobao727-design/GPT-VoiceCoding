@@ -2,7 +2,7 @@
 
 A pending permission dialog is one more attention-needing stall, so its delivery
 **rides the Stop Notice escalation pipeline** rather than getting a flow of its
-own — same route matrix, same switches, same retention. The one thing it asks
+own — same route matrix and same switches. The one thing it asks
 for that a Stop Notice does not is `Reach.EVERY_OUTLET`: the push fires
 immediately, in parallel with the voice attempt, because the user may be nowhere
 near the screen and waiting to see whether the call worked wastes the budget.
@@ -38,7 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, Reach
+from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOutcome, Reach
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.sessions import spoken_target
@@ -174,7 +174,7 @@ class ApprovalPipeline:
 
     async def opened(
         self, request: ApprovalRequest, spoken_as: str | None = None
-    ) -> PendingApproval:
+    ) -> tuple[PendingApproval, NoticeOutcome]:
         """A dialog is on screen. Start the budget and announce it everywhere.
 
         The budget starts here and ticks regardless of whether any outlet took
@@ -198,7 +198,21 @@ class ApprovalPipeline:
         )
         self._pending[request.approval_id] = waiting
 
-        await self._escalation.escalate(
+        outcome = await self._announce(waiting, spoken_as)
+        return waiting, outcome
+
+    async def reoffer(self, approval_id: str, spoken_as: str | None = None) -> NoticeOutcome | None:
+        """Announce the request already inside its budget, without opening it twice."""
+        waiting = self._pending.get(approval_id)
+        if waiting is None:
+            return None
+        return await self._announce(waiting, spoken_as)
+
+    async def _announce(
+        self, waiting: PendingApproval, spoken_as: str | None = None
+    ) -> NoticeOutcome:
+        request = waiting.request
+        return await self._escalation.escalate(
             Notice(
                 request_id=waiting.request_id,
                 target=request.target,
@@ -206,7 +220,6 @@ class ApprovalPipeline:
             ),
             reach=Reach.EVERY_OUTLET,
         )
-        return waiting
 
     async def answer(self, approval_id: str, verdict: ApprovalVerdict) -> ApprovalOutcome | None:
         """Carry the user's verdict. Returns None when nothing is waiting for it.
@@ -247,12 +260,6 @@ class ApprovalPipeline:
             )
             outcome = receipt.outcome
 
-        # Retire the announcement before closing the loop. If no outlet took it,
-        # it is still retained, and a later outlet transition would speak a
-        # prompt for a decision that has already been made — the duplicate the
-        # closing notice exists to absorb, arriving *after* the absorption.
-        self._escalation.retire(waiting.request_id)
-
         closing = closing_notice_for(verdict, outcome)
         await self._escalation.escalate(
             Notice(
@@ -265,7 +272,7 @@ class ApprovalPipeline:
 
         # RETAINED is deliberately unreachable here. A pending approval has a
         # budget and a fallback, so it is resolved or handed back — it never
-        # waits for a later attempt, which is why it is not in the ledger. An
+        # enters the Answer Relay queue. An
         # `ask` is terminal for the voice path even when the adapter carried it
         # cleanly, and that is exactly what the closing notice tells the user.
         state = (
