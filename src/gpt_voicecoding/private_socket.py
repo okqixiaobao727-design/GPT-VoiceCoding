@@ -28,12 +28,12 @@ The rewrite carried it into `control_plane/server.py` and dropped it in the two
 Claude-lane adapters (ADR 0010's shape); this module is where the three of them
 say it once instead.
 
-`mode` is a parameter rather than a constant here on purpose. Three modules
-define their own `0o600` — `control_plane/ownership.py`, `adapters/agent/claude/
-privacy.py`, `adapters/codex_app_server/process.py` — each next to the check that
-enforces it, and each call site passes its own. A default here would be a fourth
-definition of the same number, which is the thing those three are already too
-many of.
+`mode` remains a parameter rather than a default because each listener passes
+the policy its own verifier enforces. The Codex app-server is the one listener
+bound by an external child, so its mode and forbidden-bit mask live here
+together: the mask makes "no group, other or special permission bits" one rule
+for its child umask and every attach, whether the server is engine-owned or the
+shared daemon.
 
 It lives at the top level, beside `locations.py`, for that module's own reason:
 adapters may not import `control_plane` (ADR 0001, enforced in
@@ -51,7 +51,15 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-__all__ = ["start_private_unix_server"]
+__all__ = ["PRIVATE_SOCKET_MODE", "PRIVATE_SOCKET_UMASK", "start_private_unix_server"]
+
+#: The normal steady-state mode for a socket carrying a live coding session.
+PRIVATE_SOCKET_MODE = 0o600
+
+#: Every group/other and setuid/setgid/sticky permission bit. Its ordinary
+#: permission portion is the child umask, leaving directories owner-traversable
+#: at 0700; the whole mask is the verifier's single forbidden-bits rule.
+PRIVATE_SOCKET_UMASK = 0o7077
 
 #: What `asyncio` binds a socket as when nothing narrows it: every permission
 #: bit, less the umask. Named so the arithmetic below reads as the intent —
