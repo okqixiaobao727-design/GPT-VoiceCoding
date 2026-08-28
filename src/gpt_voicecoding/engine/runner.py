@@ -15,12 +15,10 @@ object it goes on to build.
 configuration that cannot be read or does not say enough is refused before the
 log is owned, so it is spoken on the terminal that started the engine — which is
 the only place it can be seen, because there is no log yet and an engine that
-dies this early never answers a status query either. Everything after adoption —
-an adapter that cannot be imported, a socket that cannot be bound, an adapter
-whose far side is not there — is written to stderr exactly as before and lands in
-the engine's own log, because stderr *is* the log from that point on. Nothing is
-lost either way; the two failures are simply readable in different places, and
-the exit code says the same thing in both.
+dies this early never answers a status query either. After adoption, stderr *is*
+the engine's log. The inherited stderr descriptor is kept only so the single
+final refusal sentence can also reach the process that started the engine; the
+traceback and every ordinary log line remain in the log the engine owns.
 
 **Every phase before the engine serves — reading the configuration, assembling,
 starting — refuses with one sentence and exit 2, on any exception. Only a failure
@@ -30,11 +28,16 @@ time: first only `ConfigError` was a refusal, then only `OSError` around the
 serve, and each time some other type — and every shipped adapter raises its own —
 fell through to the interpreter as exit 1 and a traceback.
 
-Found from the app bundle, where that is at its worst: post-adoption stderr *is*
-the log, so the menu-bar shell's stderr panel is empty and the shell restarts on
-every exit, turning a first-run misconfiguration into a silent crash loop. The
-most likely first run of all hit it — a Companion Channel whose credential
+Found from the app bundle, where that was at its worst: post-adoption stderr *is*
+the log, so the menu-bar shell's stderr panel was empty and the shell restarted
+on every exit, turning a first-run misconfiguration into a silent crash loop.
+The most likely first run of all hit it — a Companion Channel whose credential
 variable is not set refuses at *assembly*, which was the last uncovered phase.
+
+Failed loud is **ported** from
+`legacy@1d32845:bridge/terminal.py:893-915`. Mirroring the final refusal sentence
+back to the process that started this engine adapts that behaviour to ADR 0004's
+engine-owned log without making the shell read the log.
 
 Nothing is swallowed: the whole traceback goes to the diagnostics of whichever
 phase raised it, and the last line is a sentence. A `TypeError` inside somebody's
@@ -72,7 +75,8 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from gpt_voicecoding.config import ConfigError, EngineConfig, default_config_path, load
@@ -195,43 +199,77 @@ def main(
         print(f"the engine cannot start: {refusal}", file=sys.stderr)
         return EXIT_REFUSED
 
-    adopt_the_log(
-        config,
-        check_seconds=check_seconds,
-        redirect_standard_streams=redirect_standard_streams,
-    )
-
-    try:
-        engine = Engine.assemble(config)
-    except Exception as refusal:
-        # Every phase before serving refuses the same way. `EngineAssemblyError`
-        # was the only type caught here, and `built` re-raises only `TypeError`
-        # as one — so an adapter factory raising its own settings error escaped,
-        # which is the *first* thing a new install hits: the Telegram spoke
-        # raises exactly that when the variable `token_env` names is not set.
-        _log.error("the engine could not be assembled", exc_info=refusal)
-        print(f"the engine cannot start: {_start_refusal_detail(refusal, config)}", file=sys.stderr)
-        return EXIT_REFUSED
-
-    try:
-        asyncio.run(_serve(engine))
-    except StartRefused as refused:
-        # The whole traceback goes to the log, and the last line is a sentence.
-        # Both, on purpose: an adapter's own refusal reads as one line, and a
-        # `TypeError` inside somebody's `connect` is a bug whose only diagnostic
-        # is the traceback — collapsing it would throw that away.
-        _log.error("the engine could not start", exc_info=refused.cause)
-        print(
-            f"the engine cannot start: {_start_refusal_detail(refused.cause, config)}",
-            file=sys.stderr,
+    refusals = _mirrored_refusals() if redirect_standard_streams else nullcontext(_speak_refusal)
+    with refusals as speak_refusal:
+        adopt_the_log(
+            config,
+            check_seconds=check_seconds,
+            redirect_standard_streams=redirect_standard_streams,
         )
-        return EXIT_REFUSED
-    except (AlreadyServing, SocketPathTooLong, OSError) as refusal:
-        # Reached only while serving; a start that raises one of these arrives
-        # above, wrapped.
-        print(f"the engine cannot serve on {config.socket_path}: {refusal}", file=sys.stderr)
-        return EXIT_REFUSED
-    return EXIT_OK
+
+        try:
+            engine = Engine.assemble(config)
+        except Exception as refusal:
+            # Every phase before serving refuses the same way. `EngineAssemblyError`
+            # was the only type caught here, and `built` re-raises only `TypeError`
+            # as one — so an adapter factory raising its own settings error escaped,
+            # which is the *first* thing a new install hits: the Telegram spoke
+            # raises exactly that when the variable `token_env` names is not set.
+            _log.error("the engine could not be assembled", exc_info=refusal)
+            return _refuse_start(refusal, config, speak_refusal)
+
+        try:
+            asyncio.run(_serve(engine))
+        except StartRefused as refused:
+            # The whole traceback goes to the log, and the last line is a sentence.
+            # Both, on purpose: an adapter's own refusal reads as one line, and a
+            # `TypeError` inside somebody's `connect` is a bug whose only diagnostic
+            # is the traceback — collapsing it would throw that away.
+            _log.error("the engine could not start", exc_info=refused.cause)
+            return _refuse_start(refused.cause, config, speak_refusal)
+        except (AlreadyServing, SocketPathTooLong, OSError) as refusal:
+            # Reached only while serving; a start that raises one of these arrives
+            # above, wrapped.
+            print(f"the engine cannot serve on {config.socket_path}: {refusal}", file=sys.stderr)
+            return EXIT_REFUSED
+        return EXIT_OK
+
+
+def _speak_refusal(sentence: str) -> None:
+    print(sentence, file=sys.stderr)
+
+
+@contextmanager
+def _mirrored_refusals() -> Iterator[Callable[[str], None]]:
+    """Keep the starter's stderr while ADR 0004 points fd 2 at the engine log."""
+    try:
+        inherited_stderr = os.dup(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError):
+        yield _speak_refusal
+        return
+
+    def speak(sentence: str) -> None:
+        _speak_refusal(sentence)
+        pending = f"{sentence}\n".encode("utf-8", errors="replace")
+        while pending:
+            try:
+                written = os.write(inherited_stderr, pending)
+            except OSError:
+                return
+            pending = pending[written:]
+
+    try:
+        yield speak
+    finally:
+        try:
+            os.close(inherited_stderr)
+        except OSError:
+            pass
+
+
+def _refuse_start(cause: BaseException, config: EngineConfig, speak: Callable[[str], None]) -> int:
+    speak(f"the engine cannot start: {_start_refusal_detail(cause, config)}")
+    return EXIT_REFUSED
 
 
 def _start_refusal_detail(cause: BaseException, config: EngineConfig) -> str:

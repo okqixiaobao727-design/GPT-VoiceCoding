@@ -101,7 +101,7 @@ public struct ProcessLauncher: EngineLaunching {
         }
         process.environment = environment
 
-        let errors = PreAdoptionStderr(deliver: stderr)
+        let errors = InheritedStderr(deliver: stderr)
         process.standardError = errors.pipe
         errors.read()
 

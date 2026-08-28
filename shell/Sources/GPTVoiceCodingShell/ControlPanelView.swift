@@ -280,8 +280,8 @@ private struct FailurePanel: View {
 
 /// The engine's own stderr, held in memory by the shell and shown as written.
 ///
-/// An exit-2 refusal is said before the engine adopts its own log (ADR 0004), so
-/// this is the only place that reason exists.
+/// The engine keeps its inherited stderr descriptor when it adopts its own log
+/// (ADR 0004), and mirrors only the final exit-2 refusal sentence back to it.
 private struct EngineOutputPanel: View {
     let lines: [String]
 

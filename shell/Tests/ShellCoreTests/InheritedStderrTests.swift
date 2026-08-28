@@ -3,19 +3,16 @@ import Testing
 
 @testable import ShellCore
 
-/// The end of the pipe, both ways it happens. No process here on purpose: the
-/// descriptor cannot tell an engine that adopted its log from one that died, so
-/// a bare pipe is the honest way to say which of the two the code is being asked
-/// about.
-@Suite struct PreAdoptionStderrTests {
-    @Test func adoptionEndsTheWatchRatherThanSpinningOnTheEnd() async throws {
-        // ADR 0004's healthy start: the engine takes its log, its stderr stops
-        // being this pipe, and the pipe ends while the engine runs on. A
-        // descriptor at its end is permanently readable, so anything still
-        // watching reads emptiness at the speed of the machine — one core, for
-        // as long as the engine lives.
+/// The end of the inherited stderr pipe. No process here on purpose: a bare pipe
+/// is the public launcher's boundary, and it makes the ordering observable without
+/// substituting a process implementation.
+@Suite struct InheritedStderrTests {
+    @Test func theEndOfThePipeEndsTheWatchRatherThanSpinning() async throws {
+        // A descriptor at the end of a pipe is permanently readable, so anything
+        // still watching reads emptiness at the speed of the machine — one core,
+        // for as long as the engine lives.
         let said = Collected()
-        let stderr = PreAdoptionStderr(deliver: { said.add($0) })
+        let stderr = InheritedStderr(deliver: { said.add($0) })
         stderr.read()
 
         try stderr.pipe.fileHandleForWriting.write(contentsOf: Data("starting\n".utf8))
@@ -30,7 +27,7 @@ import Testing
         // Exit 2: the words are written and the writer is gone a moment later.
         // Both arrive, and they arrive before the caller is told about the exit.
         let said = Collected()
-        let stderr = PreAdoptionStderr(deliver: { said.add($0) })
+        let stderr = InheritedStderr(deliver: { said.add($0) })
         stderr.read()
 
         try stderr.pipe.fileHandleForWriting.write(
@@ -46,12 +43,11 @@ import Testing
         #expect(!stderr.isMonitoring)
     }
 
-    @Test func theExitAfterAnAdoptionAsksAnAlreadyDrainedPipeForNothing() async throws {
-        // The overlap: the pipe ended at adoption and the watch is already down,
-        // and only later does the engine exit and `finish()` run. It must find
-        // nothing, say nothing twice, and not hang on a pipe with no writer.
+    @Test func finishingAnAlreadyDrainedPipeFindsNothingTwice() async throws {
+        // The watch has already seen the end, and only later does `finish()` run.
+        // It must find nothing, say nothing twice, and not hang with no writer.
         let said = Collected()
-        let stderr = PreAdoptionStderr(deliver: { said.add($0) })
+        let stderr = InheritedStderr(deliver: { said.add($0) })
         stderr.read()
 
         try stderr.pipe.fileHandleForWriting.write(contentsOf: Data("starting\n".utf8))
