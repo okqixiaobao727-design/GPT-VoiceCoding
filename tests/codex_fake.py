@@ -28,9 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gpt_voicecoding.adapters.codex_app_server.process import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.codex_app_server.wire import WEBSOCKET_GUID
-from gpt_voicecoding.private_socket import start_private_unix_server
+from gpt_voicecoding.private_socket import PRIVATE_SOCKET_MODE, start_private_unix_server
 
 Message = dict[str, Any]
 #: What a test installs to answer one method. Returning a dict answers it;

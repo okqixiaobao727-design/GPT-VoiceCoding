@@ -23,6 +23,7 @@ import itertools
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -34,7 +35,6 @@ from codex_fake import FakeAppServer
 from gpt_voicecoding.adapters.codex_app_server import process
 from gpt_voicecoding.adapters.codex_app_server.process import (
     CLIENT_NAME,
-    PRIVATE_SOCKET_MODE,
     REALTIME_FEATURE,
     AppServerError,
     OwnedAppServer,
@@ -44,6 +44,7 @@ from gpt_voicecoding.adapters.codex_app_server.process import (
     verify_private_socket,
 )
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
+from gpt_voicecoding.private_socket import PRIVATE_SOCKET_MODE, PRIVATE_SOCKET_UMASK
 
 _names = itertools.count()
 
@@ -58,6 +59,37 @@ from codex_fake import FakeAppServer
 async def main() -> None:
     listen = [a for a in sys.argv if a.startswith("unix://")][0]
     server = FakeAppServer(Path(listen[len("unix://"):]))
+    server.answers("initialize", {{"codexHome": "/somewhere"}})
+    await server.start()
+    await asyncio.Event().wait()
+
+asyncio.run(main())
+"""
+
+#: A child that first binds an ordinary Unix socket and records its mode before
+#: anything can narrow it, then becomes the ordinary app-server stand-in. The
+#: probe is separate from the server socket so the parent's readiness poll can
+#: never race a bind-close-rebind sequence at the path it will attach to.
+MODE_RECORDING_STAND_IN = """\
+import asyncio, os, socket, stat, sys
+sys.path.insert(0, {tests!r})
+from pathlib import Path
+from codex_fake import FakeAppServer
+
+async def main() -> None:
+    listen = [a for a in sys.argv if a.startswith("unix://")][0]
+    socket_path = Path(listen[len("unix://"):])
+    probe_path = socket_path.parent / "mode-at-bind.sock"
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.bind(str(probe_path))
+        mode = stat.S_IMODE(os.stat(probe_path).st_mode)
+        Path({mode_report!r}).write_text(f"{{mode:04o}}")
+    finally:
+        probe.close()
+        probe_path.unlink(missing_ok=True)
+
+    server = FakeAppServer(socket_path)
     server.answers("initialize", {{"codexHome": "/somewhere"}})
     await server.start()
     await asyncio.Event().wait()
@@ -98,6 +130,17 @@ def stand_in(tmp_path: Path, *, body: str | None = None) -> str:
         where.write_text(f"#!/bin/sh\n{script}\n")
     where.chmod(where.stat().st_mode | stat.S_IXUSR)
     return str(where)
+
+
+def mode_recording_stand_in(tmp_path: Path, mode_report: Path) -> str:
+    """A real child that reports the mode its inherited umask creates."""
+    runner = tmp_path / "mode_recording_stand_in.py"
+    runner.write_text(
+        MODE_RECORDING_STAND_IN.format(
+            tests=str(Path(__file__).parent), mode_report=str(mode_report)
+        )
+    )
+    return stand_in(tmp_path, body=f'exec {sys.executable} "{runner}" "$@"')
 
 
 @pytest.fixture
@@ -192,6 +235,55 @@ class TestAttachingToSomebodyElsesServer:
 
 
 class TestOwningOne:
+    def test_the_child_exposes_no_socket_permissions_to_other_accounts(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        """The spawned app-server must never expose a pre-chmod permission window."""
+        mode_report = tmp_path / "mode-at-bind.txt"
+
+        async def scenario() -> str:
+            owned = OwnedAppServer(
+                settings=quick(executable=mode_recording_stand_in(tmp_path, mode_report)),
+                socket_path=socket_path,
+            )
+            try:
+                await owned.start()
+                return mode_report.read_text()
+            finally:
+                await owned.aclose()
+
+        mode_at_bind = int(asyncio.run(scenario()), 8)
+        assert mode_at_bind & PRIVATE_SOCKET_UMASK == 0
+
+    def test_the_spawn_passes_the_private_umask_to_popen(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        socket_path: Path,
+    ) -> None:
+        """The child receives the mask before exec, rather than chmodding after bind."""
+        spawned_with: list[dict[str, object]] = []
+        popen = subprocess.Popen
+
+        def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            spawned_with.append(kwargs)
+            return popen(*args, **kwargs)  # type: ignore[arg-type, return-value]
+
+        monkeypatch.setattr(subprocess, "Popen", recording_popen)
+
+        async def scenario() -> None:
+            owned = OwnedAppServer(
+                settings=quick(executable=stand_in(tmp_path)), socket_path=socket_path
+            )
+            try:
+                await owned.start()
+            finally:
+                await owned.aclose()
+
+        asyncio.run(scenario())
+
+        assert spawned_with[0]["umask"] == PRIVATE_SOCKET_UMASK & 0o777
+
     def test_a_started_server_is_spawned_connected_and_experimental(
         self, tmp_path: Path, socket_path: Path
     ) -> None:
@@ -545,6 +637,15 @@ class TestRefusingAPathSubstitution:
             async with FakeAppServer(socket_path):
                 verify_private_directory(socket_path.parent)
                 verify_private_socket(socket_path)
+
+        asyncio.run(scenario())
+
+    def test_a_socket_with_a_special_mode_bit_is_refused(self, socket_path: Path) -> None:
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path):
+                socket_path.chmod(PRIVATE_SOCKET_MODE | stat.S_ISUID)
+                with pytest.raises(AppServerError, match="reachable by other accounts"):
+                    verify_private_socket(socket_path)
 
         asyncio.run(scenario())
 

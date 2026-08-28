@@ -84,6 +84,7 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
     ClosedHandler,
     Message,
 )
+from gpt_voicecoding.private_socket import PRIVATE_SOCKET_UMASK
 
 #: What this client calls itself when it initialises. The far side records it,
 #: so it says which software is holding the connection.
@@ -137,9 +138,6 @@ class AppServerError(Exception):
 #: A directory only its owner may enter. Anything under it is unreachable to
 #: every other account on the machine, whatever the mode on the thing itself.
 PRIVATE_DIRECTORY_MODE = 0o700
-
-#: What a socket carrying a live coding session must not be more open than.
-PRIVATE_SOCKET_MODE = 0o600
 
 
 def _own_stat(path: Path, what: str) -> os.stat_result:
@@ -203,17 +201,19 @@ def prepare_private_directory(directory: Path) -> None:
 
 
 def verify_private_socket(path: Path) -> None:
-    """Refuse to speak to a socket this user does not own, or others can reach.
+    """Refuse a socket this user does not own or that has forbidden permission bits.
 
-    The directory is checked first and is the stronger half: codex creates its
-    own socket 0600, but only a private directory makes that mode mean anything
-    in a shared runtime root.
+    The normal steady-state mode is 0600, while the child umask makes an
+    engine-owned socket observable as 0700 before codex narrows it. Both that
+    socket and a shared daemon's attach obey the same rule: 0700 is accepted,
+    but group, other and special permission bits are not. The directory check
+    remains the stronger half because only it prevents path substitution.
     """
     verify_private_directory(path.parent)
     found = _own_stat(path, "socket")
     if not stat.S_ISSOCK(found.st_mode):
         raise AppServerError(f"{path} is not a socket")
-    if stat.S_IMODE(found.st_mode) & ~PRIVATE_SOCKET_MODE:
+    if stat.S_IMODE(found.st_mode) & PRIVATE_SOCKET_UMASK:
         raise AppServerError(
             f"{path} is reachable by other accounts (mode "
             f"{stat.S_IMODE(found.st_mode):04o}); refusing to use it"
@@ -467,6 +467,12 @@ class OwnedAppServer:
             stdout=output,
             stderr=subprocess.STDOUT,
             env=dict(os.environ),
+            # Codex chmods its socket only after binding it. Give the child the
+            # mask that withholds every group/other bit at creation, while
+            # leaving owner execute available for directories it creates.
+            # **New, not ported.** Legacy's spawn takes no umask and has no
+            # privacy guard (`legacy@1d32845:bridge/codex.py:290-300`).
+            umask=PRIVATE_SOCKET_UMASK & 0o777,
             # Its own session, so `aclose` can signal the whole tree rather than
             # only the process this engine can see. See the module docstring:
             # what `PATH` resolves to here is usually a shim, and the process
