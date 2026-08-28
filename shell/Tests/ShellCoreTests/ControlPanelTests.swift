@@ -48,6 +48,145 @@ private let allSwitchesOff = """
         #expect(!status.callIsUp)
     }
 
+    @Test func aChildProcessFollowsItsParentAndAnUnknownChildIsLast() async {
+        let status = """
+            {"ok": true, "action": "status", "protocol": 3, "data": {
+              "switches": {"duty": true, "voice": true, "message": true},
+              "sessions": [
+                {
+                  "target": {"agent": "codex", "session_id": "ended-1", "pid": null},
+                  "name": "GPT-VoiceCoding · Already ended",
+                  "lifecycle": "ended",
+                  "state": "idle",
+                  "child": {"kind": "main", "parent": null}
+                },
+                {
+                  "target": {"agent": "codex", "session_id": "child-2", "pid": null},
+                  "name": null,
+                  "lifecycle": "live",
+                  "state": "idle",
+                  "child": {
+                    "kind": "child",
+                    "parent": {"agent": "codex", "session_id": "parent-1", "pid": null}
+                  }
+                },
+                {
+                  "target": {"agent": "codex", "session_id": "child-1", "pid": null},
+                  "name": null,
+                  "lifecycle": "live",
+                  "state": "running",
+                  "child": {
+                    "kind": "child",
+                    "parent": {"agent": "codex", "session_id": "parent-1", "pid": null}
+                  }
+                },
+                {
+                  "target": {"agent": "claude", "session_id": "orphan-1", "pid": 303},
+                  "name": null,
+                  "lifecycle": "live",
+                  "state": "idle",
+                  "child": {"kind": "child", "parent": null}
+                },
+                {
+                  "target": {"agent": "codex", "session_id": "parent-1", "pid": null},
+                  "name": "GPT-VoiceCoding · Control Panel roster",
+                  "lifecycle": "live",
+                  "state": "waiting",
+                  "child": {"kind": "main", "parent": null}
+                }
+              ],
+              "call_id": null, "pending_relays": [], "pending_approvals": []}}
+            """
+        let panel = ControlPanel(client: ScriptedControlPlane([.status: .success(status)]))
+
+        await panel.refresh()
+
+        guard case .read(let reading) = panel.reading else {
+            Issue.record("expected a reading")
+            return
+        }
+        #expect(reading.sessions == 4)
+        #expect(
+            reading.sessionRows.map(\.target.sessionID)
+                == ["parent-1", "child-2", "child-1", "orphan-1"])
+        #expect(reading.sessionRows.map(\.state) == ["waiting", "idle", "running", "idle"])
+        #expect(reading.sessionRows.map(\.isChild) == [false, true, true, true])
+        #expect(reading.sessionRows[0].title == "GPT-VoiceCoding · Control Panel roster")
+        #expect(reading.sessionRows[1].title == "Child Process")
+        #expect(reading.sessionRows[1].parent?.sessionID == "parent-1")
+        #expect(reading.sessionRows[3].parent == nil)
+    }
+
+    @Test func aWaitingRowCarriesWhatItWaitsForAndWhenItLastMoved() async {
+        let status = """
+            {"ok": true, "action": "status", "protocol": 3, "data": {
+              "switches": {"duty": true, "voice": true, "message": true},
+              "sessions": [
+                {
+                  "target": {"agent": "claude", "session_id": "session-1", "pid": 404},
+                  "name": "GPT-VoiceCoding · Pick a test seam",
+                  "lifecycle": "live",
+                  "state": "waiting",
+                  "last_activity": "1970-01-01T00:02:03+00:00",
+                  "waiting_for": {"kind": "question"},
+                  "child": {"kind": "main", "parent": null}
+                },
+                {
+                  "target": {"agent": "claude", "session_id": "session-2", "pid": 405},
+                  "name": "GPT-VoiceCoding · Approve a tool",
+                  "lifecycle": "live",
+                  "state": "waiting",
+                  "last_activity": "1970-01-01T00:02:03.500000+00:00",
+                  "waiting_for": {"kind": "permission"},
+                  "child": {"kind": "main", "parent": null}
+                }
+              ],
+              "call_id": null, "pending_relays": [], "pending_approvals": []}}
+            """
+        let panel = ControlPanel(client: ScriptedControlPlane([.status: .success(status)]))
+
+        await panel.refresh()
+
+        guard case .read(let reading) = panel.reading else {
+            Issue.record("expected a reading")
+            return
+        }
+        #expect(reading.sessionRows[0].waitingKind == "question")
+        #expect(reading.sessionRows[0].waitingMessage == "Waiting for question")
+        #expect(reading.sessionRows[0].lastActivity == Date(timeIntervalSince1970: 123))
+        #expect(reading.sessionRows[1].waitingKind == "permission")
+        #expect(reading.sessionRows[1].waitingMessage == "Waiting for permission")
+        #expect(reading.sessionRows[1].lastActivity == Date(timeIntervalSince1970: 123.5))
+    }
+
+    @Test func anEmptyRosterSaysSoInWords() async {
+        let panel = ControlPanel(client: ScriptedControlPlane([.status: .success(allSwitchesOff)]))
+
+        await panel.refresh()
+
+        guard case .read(let reading) = panel.reading else {
+            Issue.record("expected a reading")
+            return
+        }
+        #expect(reading.emptyRosterMessage == "No live Sessions")
+    }
+
+    @Test func theRosterScrollsWithinItsSingleHeightBound() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // ShellCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // shell
+            .appendingPathComponent("Sources/GPTVoiceCodingShell/ControlPanelView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let rosterSource =
+            source.components(separatedBy: "private struct SessionRoster: View").last?
+            .components(separatedBy: "private struct SessionRosterRow: View").first ?? ""
+
+        #expect(source.contains("private let rosterMaxHeight: CGFloat = 220"))
+        #expect(rosterSource.contains("ScrollView"))
+        #expect(rosterSource.contains(".frame(maxHeight: rosterMaxHeight)"))
+    }
+
     @Test func theControlPlaneIsNeverGated() async {
         // Every action answers with Duty, Voice and Message all off. The dropdown
         // shows status and flips switches from exactly that machine — ADR 0002.

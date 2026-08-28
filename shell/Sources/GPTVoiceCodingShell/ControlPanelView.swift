@@ -1,6 +1,10 @@
 import ShellCore
 import SwiftUI
 
+/// About five idle rows at the default font; waiting rows are taller, so height
+/// rather than row count is the one bound that keeps the roster honest.
+private let rosterMaxHeight: CGFloat = 220
+
 /// The v0 Control Panel: this dropdown, beside `bridgectl`. Runtime state and
 /// switch flips only — it is not an editor for installation settings.
 struct ControlPanelView: View {
@@ -173,12 +177,70 @@ private struct StatusSection: View {
                 .disabled(panel.busy)
             }
 
+            SessionRoster(status: status)
+
             Text(
                 "\(status.sessions) sessions · \(status.pendingRelays) pending relays · "
                     + "\(status.pendingApprovals) pending approvals"
             )
             .font(.caption).foregroundStyle(.secondary)
         }
+    }
+}
+
+/// The view-only roster: state read from Bridge Core, and no route back into it.
+private struct SessionRoster: View {
+    let status: EngineStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Sessions").font(.caption).foregroundStyle(.secondary)
+            if let empty = status.emptyRosterMessage {
+                Text(empty).font(.callout)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(status.sessionRows) { row in
+                            SessionRosterRow(row: row)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: rosterMaxHeight)
+            }
+        }
+    }
+}
+
+private struct SessionRosterRow: View {
+    let row: SessionRow
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            if row.isChild {
+                Image(systemName: "arrow.turn.down.right")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.title).font(.callout).lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(row.state)
+                    Text("·")
+                    if let lastActivity = row.lastActivity {
+                        Text("active")
+                        Text(lastActivity, style: .relative)
+                    } else {
+                        Text("no activity yet")
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                if let waiting = row.waitingMessage {
+                    Text(waiting)
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+        }
+        .padding(.leading, row.isChild ? 12 : 0)
     }
 }
 

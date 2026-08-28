@@ -25,27 +25,120 @@ public enum StatusReading: Equatable, Sendable {
     case failed(ActionFailure)
 }
 
-/// The `status` reply, as far as this dropdown renders it. Every value is read
-/// from Bridge Core; none is inferred here.
+/// The `status` reply, as far as this dropdown renders it. Every fact is read
+/// from Bridge Core. The only projection is display order: a Child Process is
+/// placed under the parent address the wire carries, never classified here.
 public struct EngineStatus: Equatable, Sendable {
     public var switches: [SwitchReading]
     /// `null` when the system owns no call. The presence of the id is what the
     /// reply says; "up" is not a conclusion this surface draws from elsewhere.
     public var callID: String?
-    public var sessions: Int
+    /// Live rows shown by the roster. Ended rows remain engine history, not
+    /// Sessions a person can see running now.
+    public var sessionRows: [SessionRow]
     public var pendingRelays: Int
     public var pendingApprovals: Int
 
     public var callIsUp: Bool { callID != nil }
+    public var sessions: Int { sessionRows.count }
+    public var emptyRosterMessage: String? {
+        sessionRows.isEmpty ? "No live Sessions" : nil
+    }
 
     public init(document: [String: JSONValue]) {
         switches = SwitchReading.canonicalOrder.compactMap { name in
             document["switches"]?[name]?.bool.map { SwitchReading(name: name, on: $0) }
         }
         callID = document["call_id"]?.string
-        sessions = document["sessions"]?.array?.count ?? 0
+        let rows = (document["sessions"]?.array ?? []).map(SessionRow.init).filter {
+            $0.lifecycle == "live"
+        }
+        sessionRows = Self.parentsBeforeChildren(rows)
         pendingRelays = document["pending_relays"]?.array?.count ?? 0
         pendingApprovals = document["pending_approvals"]?.array?.count ?? 0
+    }
+
+    /// A stable hierarchy projection over the wire's order.
+    ///
+    /// Main Sessions keep their relative order; every known child follows its
+    /// parent and its siblings keep theirs. A Child Process whose parent is not
+    /// present remains visible at the end. Nothing is ordered by state.
+    private static func parentsBeforeChildren(_ rows: [SessionRow]) -> [SessionRow] {
+        let mainRows = rows.filter { !$0.isChild }
+        let mainTargets = Set(mainRows.map(\.target))
+        let nested = mainRows.flatMap { parent in
+            [parent] + rows.filter { $0.isChild && $0.parent == parent.target }
+        }
+        return nested
+            + rows.filter {
+                $0.isChild && $0.parent.map(mainTargets.contains) != true
+            }
+    }
+}
+
+/// The wire address that identifies one Session and links a Child Process to its parent.
+public struct SessionAddress: CustomStringConvertible, Equatable, Hashable, Sendable {
+    public var agent: String
+    public var sessionID: String?
+    public var pid: Int?
+
+    public var description: String {
+        let process = pid.map { ":\($0)" } ?? ""
+        return "\(agent):\(sessionID ?? "")\(process)"
+    }
+
+    init(_ value: JSONValue) {
+        agent = value["agent"]?.string ?? ""
+        sessionID = value["session_id"]?.string
+        pid = value["pid"]?.number.map(Int.init)
+    }
+}
+
+/// One Session roster row, carrying only facts Bridge Core already reported.
+public struct SessionRow: Equatable, Identifiable, Sendable {
+    public var target: SessionAddress
+    public var name: String?
+    public var lifecycle: String
+    public var state: String
+    public var lastActivity: Date?
+    public var waitingKind: String?
+    public var isChild: Bool
+    public var parent: SessionAddress?
+
+    public var id: SessionAddress { target }
+    public var title: String {
+        if isChild { return "Child Process" }
+        return name ?? target.description
+    }
+    public var waitingMessage: String? {
+        guard state == "waiting", let waitingKind else { return nil }
+        switch waitingKind {
+        case "question", "permission": return "Waiting for \(waitingKind)"
+        default: return nil
+        }
+    }
+
+    init(_ value: JSONValue) {
+        target = SessionAddress(value["target"] ?? .null)
+        name = value["name"]?.string
+        lifecycle = value["lifecycle"]?.string ?? ""
+        state = value["state"]?.string ?? ""
+        lastActivity = Self.readDate(value["last_activity"]?.string)
+        waitingKind = value["waiting_for"]?["kind"]?.string
+        isChild = value["child"]?["kind"]?.string == "child"
+        if let parentValue = value["child"]?["parent"], !parentValue.isNull {
+            parent = SessionAddress(parentValue)
+        } else {
+            parent = nil
+        }
+    }
+
+    private static func readDate(_ text: String?) -> Date? {
+        guard let text else { return nil }
+        if let date = try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(text) {
+            return date
+        }
+        return try? Date.ISO8601FormatStyle().parse(text)
     }
 }
 
