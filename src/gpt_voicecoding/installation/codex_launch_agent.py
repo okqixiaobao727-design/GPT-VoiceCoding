@@ -97,6 +97,11 @@ VERSION_ARGUMENTS: Final = ("app-server", "daemon", "version")
 CLI_VERSION_FIELD: Final = "cliVersion"
 APP_SERVER_VERSION_FIELD: Final = "appServerVersion"
 
+#: #129 measured launchd's soft default at 256 and its hard limit as unlimited;
+#: the shared daemon held 271 descriptors after two days.  This is an install
+#: invariant rather than a user setting, and both plist limits use this value.
+OPEN_FILE_LIMIT: Final = 65_536
+
 #: launchd's own path. Not resolved through `PATH`, because this is one of the
 #: few binaries whose location is part of the operating system's contract.
 LAUNCHCTL: Final = Path("/bin/launchctl")
@@ -239,6 +244,8 @@ def job(binary: Path, codex_home: Path, log_path: Path) -> dict[str, Any]:
         "ProgramArguments": [str(binary), *DAEMON_ARGUMENTS],
         "RunAtLoad": True,
         "EnvironmentVariables": {CODEX_HOME_VARIABLE: str(codex_home)},
+        "SoftResourceLimits": {"NumberOfFiles": OPEN_FILE_LIMIT},
+        "HardResourceLimits": {"NumberOfFiles": OPEN_FILE_LIMIT},
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),
     }
