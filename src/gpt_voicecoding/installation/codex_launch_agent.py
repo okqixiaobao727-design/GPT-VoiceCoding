@@ -238,21 +238,12 @@ class Launchd:
             login_asid=int(found_asid.group(1)) if found_asid else None,
         )
 
-    def holding(self) -> str | None:
-        """The loaded program, retained for callers that need only that guard."""
-        held = self.held_job()
-        return None if held is None else held.program
-
-    def loaded(self) -> bool:
-        """Whether launchd holds this job at all, whatever it is running."""
-        return self.holding() is not None
-
     def bootstrap(self, path: Path) -> tuple[HeldJob | None, str]:
         """Load the job now and return the identity read back from launchd.
 
         The exit status is not the answer: bootstrapping a job that is already
         loaded fails, and that is the state this is trying to reach. So it is
-        attempted and then `loaded` decides.
+        attempted and then the identity read-back decides.
         """
         _, said = self.ask([str(LAUNCHCTL), "bootstrap", self.domain, str(path)])
         held = self.held_job()
