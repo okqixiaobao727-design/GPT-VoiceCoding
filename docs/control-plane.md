@@ -335,7 +335,7 @@ state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json" 
 
 [adapters]
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
-companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
+companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"
 
 [adapters.agents]
 claude = "gpt_voicecoding.adapters.agent.claude:build"
