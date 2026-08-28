@@ -379,7 +379,11 @@ def _prefixes(section: dict[str, Any], where: str) -> tuple[str, ...]:
 def _policy(section: dict[str, Any], where: str) -> CorePolicy:
     """The locked durations, dialled. The pipelines own what they mean."""
     numbers: dict[str, float] = {}
-    for key in ("relay_ceiling_seconds", "approval_budget_seconds"):
+    for key in (
+        "relay_ceiling_seconds",
+        "approval_budget_seconds",
+        "silence_end_seconds",
+    ):
         value = section.get(key)
         if value is None:
             continue

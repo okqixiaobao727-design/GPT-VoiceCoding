@@ -340,7 +340,7 @@ class Engine:
                 _log.exception("dispatching %s raised", type(event).__name__)
 
     async def _ticking(self, seconds: float) -> None:
-        """One of two time-driven things here: the Relay ceiling and the approval budget."""
+        """Advance Core's Relay, approval, and Live Call silence ceilings."""
         while True:
             await asyncio.sleep(seconds)
             try:

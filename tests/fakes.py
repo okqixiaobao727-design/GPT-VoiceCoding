@@ -231,6 +231,7 @@ class FakeCall:
         #: How many calls this adapter actually brought up. A policy test asserts
         #: on it to prove the one-call invariant stopped a second one.
         self.calls_started = 0
+        self.calls_ended = 0
 
     async def ensure_call(self, instructions: str) -> CallSnapshot:
         if self._snapshot.is_up:
@@ -244,6 +245,7 @@ class FakeCall:
         return self._snapshot
 
     async def end_call(self) -> CallSnapshot:
+        self.calls_ended += 1
         self._snapshot = CallSnapshot(state=CallState.DOWN)
         return self._snapshot
 

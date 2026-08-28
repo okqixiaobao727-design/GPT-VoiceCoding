@@ -45,9 +45,11 @@ class Hub:
         control: object = None,
         delegate: object = None,
         instructions: bool = True,
+        call: FakeCall | None = None,
         channel_outcome: Delivery = Delivery.DELIVERED,
         channel_reason: str = "fake channel",
         approval_budget_seconds: float = TEN_MINUTES,
+        silence_end_seconds: float = 60.0,
     ) -> None:
         self.now = 1_000.0
         switches = Switchboard()
@@ -70,7 +72,7 @@ class Hub:
                 )
             )
 
-        self.call = FakeCall()
+        self.call = call or FakeCall()
         self.channel = FakeCompanionChannel(outcome=channel_outcome, reason=channel_reason)
         self.agent = FakeAgent(routes=frozenset(RelayRoute))
         self.state = BridgeState(switches=switches, sessions=registry, relays=RelayQueue())
@@ -79,7 +81,10 @@ class Hub:
             call=self.call,
             channel=self.channel,
             agents={AgentKind.CODEX: self.agent, AgentKind.CLAUDE: self.agent},
-            policy=CorePolicy(approval_budget_seconds=approval_budget_seconds),
+            policy=CorePolicy(
+                approval_budget_seconds=approval_budget_seconds,
+                silence_end_seconds=silence_end_seconds,
+            ),
             grammar=TextGrammar(control_commands=COMMANDS),
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]

@@ -73,7 +73,6 @@ class Harness:
         self.channel = FakeCompanionChannel()
         self.agent = FakeAgent(outcome=outcome, reason="the fake carried nothing")
         self.escalation = EscalationPipeline(
-            call=self.call,
             channel=self.channel,
             interlock=CallInterlock(self.call),
             adjudicator=SwitchAdjudicator(self.switches),

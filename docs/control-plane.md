@@ -343,6 +343,7 @@ workspace = "~/code"                # where the bridge's own threads run; defaul
 [policy]                            # optional; these are the locked defaults
 relay_ceiling_seconds   = 600
 approval_budget_seconds = 600
+silence_end_seconds     = 60
 
 [log]                               # required: three numbers with no default
 max_bytes                     = 8388608

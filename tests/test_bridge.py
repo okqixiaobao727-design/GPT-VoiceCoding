@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from fakes import FakeCall
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
@@ -51,6 +52,12 @@ from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
+
+
+class EndRefusingCall(FakeCall):
+    async def end_call(self):
+        self.calls_ended += 1
+        raise RuntimeError("the call transport refused to end")
 
 
 class TestTheStopNoticePipelineEndToEnd:
@@ -241,6 +248,108 @@ class TestTheApprovalPipelineEndToEnd:
 
         assert late is None
         assert [call.verdict for call in hub.agent.calls] == [ApprovalVerdict.ASK]
+
+
+class TestTheLiveCallSilenceCeiling:
+    def test_tick_ends_an_owned_call_once_when_the_silence_threshold_arrives(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.tick()
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+        assert hub.core.interlock.owns_call() is False
+        assert hub.call.spoken == []
+        assert hub.channel.sent == []
+        assert "ended the Live Call after 60 seconds without call activity" in [
+            record.getMessage() for record in caplog.records
+        ]
+
+    def test_user_speech_restarts_the_owned_calls_silence_window(self) -> None:
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 50.0
+        hub.emit(UserSpeech(text="still here"))
+        hub.now += 59.9
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.now += 0.1
+        hub.tick()
+        assert hub.call.calls_ended == 1
+
+    def test_a_notice_spoken_into_the_call_restarts_its_silence_window(self) -> None:
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 50.0
+        hub.emit(SessionStopped(target=CODEX))
+        hub.now += 59.9
+        hub.tick()
+
+        assert hub.call.spoken
+        assert hub.call.calls_ended == 0
+
+    def test_the_silence_ceiling_is_not_gated_by_any_switch(self) -> None:
+        hub = Hub(
+            duty=False,
+            voice=False,
+            message=False,
+            silence_end_seconds=60.0,
+        )
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_a_call_that_ended_by_itself_is_not_ended_again(self) -> None:
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+        hub.emit(CallDropped(call_id=started.call_id, detail="the far side left"))
+
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 0
+
+    def test_an_end_failure_is_logged_and_not_retried_for_that_call(self, caplog) -> None:
+        caplog.set_level("ERROR", logger="gpt_voicecoding.core.bridge")
+        call = EndRefusingCall()
+        hub = Hub(call=call, silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.tick()
+        hub.emit(UserSpeech(text="the failed call is still here"))
+        hub.now += 60.0
+        hub.tick()
+        hub.emit(CallStarted(call_id="call-2"))
+        hub.now += 60.0
+        hub.tick()
+
+        assert call.calls_ended == 2
+        assert [record.getMessage() for record in caplog.records] == [
+            "could not end the silent Live Call; not trying again until the call changes",
+            "could not end the silent Live Call; not trying again until the call changes",
+        ]
 
 
 class TestAChildProcessIsNeverAnnounced:

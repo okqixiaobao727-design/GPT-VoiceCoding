@@ -22,11 +22,30 @@ from fakes import HOUSE_RULES, FakeCall
 from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.seams.call import CallState
+from gpt_voicecoding.seams.identity import new_request_id
 
 
 def interlock(call: FakeCall | None = None) -> tuple[CallInterlock, FakeCall]:
     fake = call or FakeCall()
     return CallInterlock(fake), fake
+
+
+async def open_and_report_started(guard: CallInterlock) -> None:
+    snapshot = await guard.open_call(HOUSE_RULES)
+    assert snapshot.call_id is not None
+    guard.note_started(snapshot.call_id)
+
+
+class YieldingSpeakCall(FakeCall):
+    def __init__(self) -> None:
+        super().__init__()
+        self.speak_entered = asyncio.Event()
+        self.release_speak = asyncio.Event()
+
+    async def speak(self, text, *, request_id):
+        self.speak_entered.set()
+        await self.release_speak.wait()
+        return await super().speak(text, request_id=request_id)
 
 
 class TestOwnership:
@@ -62,6 +81,83 @@ class TestOwnership:
 
         assert snapshot.state is not CallState.UP
         assert guard.owns_call() is False
+
+
+class TestTheSilenceCeiling:
+    def test_speech_that_wins_the_race_refreshes_activity_before_silence_is_rechecked(
+        self,
+    ) -> None:
+        async def race() -> tuple[bool, int]:
+            now = 100.0
+            call = YieldingSpeakCall()
+            guard = CallInterlock(call, clock=lambda: now)
+            await open_and_report_started(guard)
+            now = 160.0
+
+            speaking = asyncio.create_task(
+                guard.speak("that session stopped", request_id=new_request_id())
+            )
+            await call.speak_entered.wait()
+            ending = asyncio.create_task(guard.end_silent_call(60.0))
+            call.release_speak.set()
+
+            await speaking
+            return await ending, call.calls_ended
+
+        ended, attempts = asyncio.run(race())
+
+        assert ended is False
+        assert attempts == 0
+
+    def test_an_owned_call_is_due_once_when_its_configured_silence_elapses(self) -> None:
+        now = 100.0
+        call = FakeCall()
+        guard = CallInterlock(call, clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+
+        now = 159.9
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        now = 160.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        assert call.calls_ended == 1
+
+    def test_activity_restarts_the_owned_calls_silence_window(self) -> None:
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+
+        now = 150.0
+        guard.note_activity()
+        now = 209.9
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        now = 210.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+    def test_a_call_change_starts_a_fresh_window_and_a_fresh_end_attempt(self) -> None:
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        guard.note_started("call-1")
+        now = 160.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+        guard.note_started("call-2")
+        now = 219.9
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        now = 220.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+    def test_system_speech_restarts_the_owned_calls_silence_window(self) -> None:
+        now = 100.0
+        call = FakeCall()
+        guard = CallInterlock(call, clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+
+        now = 150.0
+        asyncio.run(guard.speak("that session stopped", request_id=new_request_id()))
+        now = 209.9
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        assert call.spoken == ["that session stopped"]
 
 
 class TestTheOtherRefusal:
