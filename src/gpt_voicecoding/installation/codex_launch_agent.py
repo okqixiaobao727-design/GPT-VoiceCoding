@@ -387,6 +387,27 @@ def _unknown_render_note(path: Path) -> str:
     return f"{path} — loaded job is of unknown render; applies at the next login"
 
 
+def _unknown_identity_note(path: Path, reason: str) -> str:
+    return f"{path} — the job is loaded, and launchd {reason}; loaded render is unknown"
+
+
+def _program_in(standing: JobFile | None) -> str | None:
+    if standing is None:
+        return None
+    arguments = standing.document.get("ProgramArguments")
+    if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+        return None
+    return arguments[0]
+
+
+def _program_mismatch_note(path: Path, actual: str, expected: str) -> str:
+    return (
+        f"{path} is current, and the job launchd holds runs {actual}, not {expected}. "
+        "It is not reloaded, because that would stop the daemon live Sessions are on; "
+        "the file applies at the next login."
+    )
+
+
 def inspect(
     launch_agents_directory: Path,
     codex_home: Path,
@@ -425,29 +446,37 @@ def inspect(
         )
     if running is None:
         return Outcome(NAME, State.STALE, note=f"{path} is current, and {held}")
-    if running.program and running.program != str(binary):
+    if not running.program:
+        return Outcome(
+            NAME,
+            State.STALE,
+            note=_unknown_identity_note(path, "did not say what it runs"),
+        )
+    if running.program != str(binary):
         # The file is right and what launchd is holding is the render before it.
         # Nothing reloads it, so this is the honest state until the next login.
         return Outcome(
             NAME,
             State.STALE,
-            note=(
-                f"{path} is current, and the job launchd holds still runs {running.program}. "
-                "It is not reloaded, because that would stop the daemon live Sessions "
-                "are on; the file applies at the next login."
-            ),
+            note=_program_mismatch_note(path, running.program, str(binary)),
+        )
+    if running.login_asid is None:
+        return Outcome(
+            NAME,
+            State.STALE,
+            note=_unknown_identity_note(path, "did not say which login loaded it"),
         )
     loaded = read_bootstrapped_render(record_path)
     if loaded is None or loaded.render_sha256 is None:
         return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
-    if loaded.render_sha256 != standing.sha256:
-        return Outcome(NAME, State.STALE, note=_previous_render_note(path))
-    if not running.program:
+    if loaded.login_asid is None:
         return Outcome(
             NAME,
-            State.CURRENT,
-            note=f"{path} — the job is loaded, and launchd did not say what it runs",
+            State.STALE,
+            note=_unknown_identity_note(path, "did not record which login loaded it"),
         )
+    if loaded.render_sha256 != standing.sha256:
+        return Outcome(NAME, State.STALE, note=_previous_render_note(path))
     return Outcome(NAME, State.CURRENT, note=f"{path} — {held}")
 
 
@@ -472,6 +501,13 @@ def install(
     wanted_sha256 = hashlib.sha256(wanted_text.encode("utf-8")).hexdigest()
     held = launchd.held_job()  # asked before the write, so the note below is true of it
     loaded = read_bootstrapped_render(record_path)
+    disk_program = _program_in(standing if isinstance(standing, JobFile) else None)
+    foreign_program = (
+        held is not None
+        and bool(held.program)
+        and disk_program is not None
+        and held.program != disk_program
+    )
 
     if held is not None:
         # A missing record proves nothing about the job already in launchd. Keep
@@ -483,9 +519,20 @@ def install(
             failure = write_bootstrapped_render(record_path, loaded)
             if failure:
                 return Outcome(NAME, State.STALE, ok=False, note=failure)
+        elif loaded.login_asid is None:
+            loaded = BootstrappedRender(render_sha256=None, login_asid=held.login_asid)
+            failure = write_bootstrapped_render(record_path, loaded)
+            if failure:
+                return Outcome(NAME, State.STALE, ok=False, note=failure)
         elif held.login_asid is not None and held.login_asid != loaded.login_asid:
             loaded = BootstrappedRender(
-                render_sha256=standing.sha256 if isinstance(standing, JobFile) else None,
+                render_sha256=(
+                    standing.sha256
+                    if isinstance(standing, JobFile)
+                    and bool(held.program)
+                    and held.program == disk_program
+                    else None
+                ),
                 login_asid=held.login_asid,
             )
             failure = write_bootstrapped_render(record_path, loaded)
@@ -507,6 +554,28 @@ def install(
         rewritten = True
 
     if held is not None:
+        expected_program = str(managed_binary(codex_home)) if rewritten else disk_program
+        if foreign_program:
+            return Outcome(
+                NAME,
+                State.STALE,
+                changed=rewritten,
+                note=_program_mismatch_note(path, held.program, expected_program or "unknown"),
+            )
+        if not held.program:
+            return Outcome(
+                NAME,
+                State.STALE,
+                changed=rewritten,
+                note=_unknown_identity_note(path, "did not say what it runs"),
+            )
+        if held.login_asid is None:
+            return Outcome(
+                NAME,
+                State.STALE,
+                changed=rewritten,
+                note=_unknown_identity_note(path, "did not say which login loaded it"),
+            )
         if rewritten:
             if loaded is not None and loaded.render_sha256 == wanted_sha256:
                 return Outcome(
@@ -540,6 +609,12 @@ def install(
             )
         if loaded is None or loaded.render_sha256 is None:
             return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
+        if loaded.login_asid is None:
+            return Outcome(
+                NAME,
+                State.STALE,
+                note=_unknown_identity_note(path, "did not record which login loaded it"),
+            )
         if loaded.render_sha256 != standing.sha256:
             return Outcome(NAME, State.STALE, note=_previous_render_note(path))
         return Outcome(NAME, State.CURRENT, note=f"{path} — the job is loaded")
@@ -547,13 +622,43 @@ def install(
     bootstrapped, refusal = launchd.bootstrap(path)
     if refusal:
         return Outcome(NAME, State.STALE, changed=rewritten, ok=False, note=refusal)
+    bootstrapped_program = bootstrapped.program if bootstrapped is not None else ""
+    bootstrapped_asid = bootstrapped.login_asid if bootstrapped is not None else None
+    trusted_identity = (
+        bootstrapped_program == str(managed_binary(codex_home)) and bootstrapped_asid is not None
+    )
     loaded = BootstrappedRender(
-        render_sha256=wanted_sha256 if rewritten or standing is None else standing.sha256,
-        login_asid=bootstrapped.login_asid if bootstrapped is not None else None,
+        render_sha256=(wanted_sha256 if rewritten or standing is None else standing.sha256)
+        if trusted_identity
+        else None,
+        login_asid=bootstrapped_asid,
     )
     failure = write_bootstrapped_render(record_path, loaded)
     if failure:
         return Outcome(NAME, State.STALE, changed=True, ok=False, note=failure)
+    if bootstrapped is None or not bootstrapped.program:
+        return Outcome(
+            NAME,
+            State.STALE,
+            changed=True,
+            note=_unknown_identity_note(path, "did not say what it runs"),
+        )
+    if bootstrapped.program != str(managed_binary(codex_home)):
+        return Outcome(
+            NAME,
+            State.STALE,
+            changed=True,
+            note=_program_mismatch_note(
+                path, bootstrapped.program, str(managed_binary(codex_home))
+            ),
+        )
+    if bootstrapped.login_asid is None:
+        return Outcome(
+            NAME,
+            State.STALE,
+            changed=True,
+            note=_unknown_identity_note(path, "did not say which login loaded it"),
+        )
     return Outcome(NAME, State.CURRENT, changed=True, note=f"{path} — the job is loaded")
 
 

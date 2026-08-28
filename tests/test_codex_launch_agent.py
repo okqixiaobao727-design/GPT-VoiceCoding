@@ -32,7 +32,12 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.installation import State, read_bootstrapped_render
+from gpt_voicecoding.installation import (
+    BootstrappedRender,
+    State,
+    read_bootstrapped_render,
+    write_bootstrapped_render,
+)
 from gpt_voicecoding.installation import codex_launch_agent as agent
 from launchd_fake import DOMAIN, FakeLaunchd, codex_home
 
@@ -694,7 +699,7 @@ def test_a_new_login_with_no_plist_records_an_unknown_loaded_render(
     assert "unknown render" in standing.note
 
 
-def test_a_launchd_that_does_not_say_what_it_runs_is_not_guessed_at(
+def test_a_launchd_that_does_not_say_what_it_loaded_fails_closed(
     tmp_path: Path, launchd: FakeLaunchd
 ) -> None:
     """A `print` whose shape this does not recognise is reported as unknown.
@@ -711,8 +716,68 @@ def test_a_launchd_that_does_not_say_what_it_runs_is_not_guessed_at(
     silent = agent.Launchd(domain=DOMAIN, run=lambda _: (0, "a shape this does not recognise"))
     standing = agent.inspect(directory, home, log, record_in(tmp_path), silent)
 
-    assert standing.state is State.CURRENT
+    assert standing.state is State.STALE
     assert "did not say what it runs" in standing.note
+
+
+def test_a_loaded_render_record_without_an_asid_fails_closed(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    loaded = read_bootstrapped_render(record)
+    assert loaded is not None
+    write_bootstrapped_render(
+        record, BootstrappedRender(render_sha256=loaded.render_sha256, login_asid=None)
+    )
+
+    standing = agent.inspect(directory, home, log, record, launchd.launchd)
+
+    assert standing.state is State.STALE
+    assert "which login" in standing.note
+
+
+def test_reconcile_keeps_a_foreign_loaded_program_stale(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    launchd.program = "/foreign/codex"
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert "/foreign/codex" in reconciled.note
+
+
+def test_bootstrap_without_a_login_asid_records_an_unknown_render(tmp_path: Path) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    binary = str(agent.managed_binary(home))
+    print_count = 0
+
+    def answer(arguments: Sequence[str]) -> tuple[int, str]:
+        nonlocal print_count
+        if arguments[1] == "bootstrap":
+            return (0, "")
+        print_count += 1
+        if print_count == 1:
+            return (113, "Could not find service")
+        return (0, f"program = {binary}")
+
+    launchd = agent.Launchd(domain=DOMAIN, run=answer)
+
+    outcome = agent.install(directory, home, log, record, launchd)
+    loaded = read_bootstrapped_render(record)
+
+    assert outcome.state is State.STALE
+    assert loaded is not None and loaded.render_sha256 is None
+    assert loaded.login_asid is None
 
 
 #: One real `launchctl print` answer, captured on 2026-08-26 from the job this
