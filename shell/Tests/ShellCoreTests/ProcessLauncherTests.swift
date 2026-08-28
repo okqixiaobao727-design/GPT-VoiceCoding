@@ -1,4 +1,5 @@
 import Foundation
+import ShellTestSupport
 import Testing
 
 @testable import ShellCore
@@ -128,6 +129,61 @@ import Testing
         _ = await collected.exitCode()
 
         #expect(collected.lines() == ["/opt/only-here"])
+    }
+
+    @Test func theCredentialFileOverridesTheInheritedValueInTheRealChild() async throws {
+        let fixture = try TelegramCredentialFixture(tokenVariable: "GVC_LAUNCH_TEST_TOKEN")
+        try fixture.writeEnvironment("GVC_LAUNCH_TEST_TOKEN=file-wins\n")
+
+        let collected = Collector()
+        let command = EngineCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf '%s' \"$GVC_LAUNCH_TEST_TOKEN\" 1>&2"],
+            source: .developerPath)
+        _ = try ProcessLauncher(
+            readPath: LoginShellPath.unasked,
+            environment: ["GVC_LAUNCH_TEST_TOKEN": "inherited-loses"],
+            credentials: fixture.credentials
+        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        _ = await collected.exitCode()
+
+        #expect(collected.lines() == ["file-wins"])
+    }
+
+    @Test func aChannelFreeConfigurationIgnoresAnUnusableCredentialFile() async throws {
+        for (contents, mode): (String, mode_t) in [
+            ("BROKEN", 0o600), ("OLD_TOKEN=leftover\n", 0o644),
+        ] {
+            let directory = URL(
+                fileURLWithPath: "/tmp/gvc-launch-null-channel-\(UUID().uuidString.prefix(8))")
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let config = directory.appendingPathComponent("config.toml")
+            try Data(
+                """
+                [adapters]
+                companion_channel = "gpt_voicecoding.adapters.companion_channel:null_channel"
+                """.utf8
+            ).write(to: config)
+            let file = directory.appendingPathComponent("environment")
+            try Data(contents.utf8).write(to: file)
+            #expect(chmod(file.path, mode) == 0)
+
+            let collected = Collector()
+            let command = EngineCommand(
+                executable: "/bin/sh", arguments: ["-c", "printf started 1>&2"],
+                source: .developerPath)
+            let credentials = TelegramCredentials(
+                configPath: config.path, environmentPath: file.path)
+
+            _ = try ProcessLauncher(
+                readPath: LoginShellPath.unasked, credentials: credentials
+            ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+            _ = await collected.exitCode()
+
+            #expect(collected.lines() == ["started"])
+        }
     }
 
     @Test func aLaunchThatNeverSpawnsKeepsNoPipeAfterwards() {

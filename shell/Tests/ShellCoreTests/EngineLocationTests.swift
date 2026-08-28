@@ -32,6 +32,19 @@ import Testing
         }
     }
 
+    @Test func theTelegramTokenVariableIsReadFromItsDocumentedTable() throws {
+        let config = """
+            [adapters.settings.companion_channel]
+            token_env = "A_TELEGRAM_TOKEN"
+            chat_id = "123"
+            """
+
+        let variable = try MinimalTOML.string(
+            forKey: "token_env", inTable: "adapters.settings.companion_channel", of: config)
+
+        #expect(variable == "A_TELEGRAM_TOKEN")
+    }
+
     @Test func anAbsentKeyFallsBackToTheDocumentedDefault() throws {
         try withConfig("[engine]\nstate_path = \"/tmp/state.json\"\n") { path in
             let located = try EngineLocation.resolve(configPath: path)

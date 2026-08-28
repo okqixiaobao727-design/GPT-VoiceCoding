@@ -48,7 +48,7 @@ Status queries and switch flips, accepted from every surface and never gated by 
 _Avoid_: admin commands, management interface
 
 **Control Panel**:
-The at-computer surface for seeing the system's current state — the Session roster included — and flipping switches. Runtime state only, not installation settings.
+The at-computer surface for seeing the system's current state — the Session roster included — and flipping switches, plus the shell-owned Companion Channel credential. Runtime state and that one write-only credential, not installation settings.
 _Avoid_: settings app, preferences window, config tool
 
 **Installation**:

@@ -49,19 +49,29 @@ public struct ProcessLauncher: EngineLaunching {
     /// *are* about the `PATH` still take the default.
     private let readPath: LoginShellPath.Reader
 
+    /// The shell-owned environment file, when this launcher is the app's engine
+    /// launcher. Nil preserves the general launcher used by headless and focused
+    /// process tests; the menu-bar assembly always supplies the shipping credential.
+    private let credentials: TelegramCredentials?
+
     /// Who is told what asking the login shell came to. The launcher chooses the
     /// child's environment; it does not own a surface, so it hands the outcome to
     /// whoever does and keeps no state.
     private let report: @Sendable (LoginShellPath.Outcome) -> Void
+    private let environment: [String: String]
 
     public init(
         log: @escaping @Sendable (String) -> Void = ProcessLauncher.unifiedLog,
         readPath: @escaping LoginShellPath.Reader = LoginShellPath.readFromLoginShell,
-        report: @escaping @Sendable (LoginShellPath.Outcome) -> Void = { _ in }
+        report: @escaping @Sendable (LoginShellPath.Outcome) -> Void = { _ in },
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        credentials: TelegramCredentials? = nil
     ) {
         self.log = log
         self.readPath = readPath
         self.report = report
+        self.environment = environment
+        self.credentials = credentials
         // The child's stderr is a pipe this process reads and may stop reading.
         BrokenPipes.ignore()
     }
@@ -85,14 +95,26 @@ public struct ProcessLauncher: EngineLaunching {
         // Timed, because the supervisor cannot see inside this call and would
         // otherwise count the wait as uptime the engine never had.
         let askedAt = Date()
+        let credentialEnvironment: [String: String]
+        if let credentials {
+            let reading = credentials.load()
+            guard reading.state.allowsEngineStart else {
+                throw TelegramCredentialPreflightFailure(reading.state)
+            }
+            credentialEnvironment = reading.environment
+        } else {
+            credentialEnvironment = [:]
+        }
+
         let path = LoginShellPath.apply(
-            to: ProcessInfo.processInfo.environment, read: readPath, log: log)
-        let readCost = Date().timeIntervalSince(askedAt)
+            to: environment, read: readPath, log: log)
+        let launchOverhead = Date().timeIntervalSince(askedAt)
         // Every spawn, including the ones that worked: the surface clears its
         // own warning by being told the next spawn was fine, and a report that
         // only fired on failure would leave a stale one up for ever.
         report(path.outcome)
         var environment = path.environment
+        environment.merge(credentialEnvironment) { _, fromFile in fromFile }
 
         if command.source == .bundled {
             // Nothing may write into the bundle at runtime, and a `.pyc` beside a
@@ -129,14 +151,14 @@ public struct ProcessLauncher: EngineLaunching {
             errors.abandon()
             throw error
         }
-        return SpawnedEngine(process, launchOverhead: readCost)
+        return SpawnedEngine(process, launchOverhead: launchOverhead)
     }
 }
 
 final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     private let process: Process
 
-    /// What reading the login shell cost, so the supervisor can discount it.
+    /// What pre-spawn environment assembly cost, so the supervisor can discount it.
     let launchOverhead: TimeInterval
 
     init(_ process: Process, launchOverhead: TimeInterval = 0) {
