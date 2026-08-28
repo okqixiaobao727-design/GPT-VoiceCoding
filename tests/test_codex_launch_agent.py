@@ -92,6 +92,23 @@ def test_the_job_starts_at_login_and_is_never_kept_alive(
     assert "KeepAlive" not in job
 
 
+def test_the_job_raises_both_open_file_limits_to_the_ruled_value(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """#129: launchd's soft default of 256 failed after two days at 271 fds.
+
+    The daemon leaks descriptors in the managed Codex binary, outside this
+    repository.  A high launch limit keeps Sessions usable while that defect is
+    reported upstream; both limits deliberately carry the same ruled value.
+    """
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    job = written(directory)
+
+    assert job["SoftResourceLimits"] == {"NumberOfFiles": 65_536}
+    assert job["HardResourceLimits"] == {"NumberOfFiles": 65_536}
+
+
 def test_the_job_carries_the_codex_home_it_was_resolved_from(
     tmp_path: Path, launchd: FakeLaunchd
 ) -> None:
