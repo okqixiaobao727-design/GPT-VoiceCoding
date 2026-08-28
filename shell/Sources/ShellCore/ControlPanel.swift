@@ -35,12 +35,12 @@ public struct EngineStatus: Equatable, Sendable {
     public var callID: String?
     /// Live rows shown by the roster. Ended rows remain engine history, not
     /// Sessions a person can see running now.
-    public var sessions: Int
     public var sessionRows: [SessionRow]
     public var pendingRelays: Int
     public var pendingApprovals: Int
 
     public var callIsUp: Bool { callID != nil }
+    public var sessions: Int { sessionRows.count }
     public var emptyRosterMessage: String? {
         sessionRows.isEmpty ? "No live Sessions" : nil
     }
@@ -54,7 +54,6 @@ public struct EngineStatus: Equatable, Sendable {
             $0.lifecycle == "live"
         }
         sessionRows = Self.parentsBeforeChildren(rows)
-        sessions = sessionRows.count
         pendingRelays = document["pending_relays"]?.array?.count ?? 0
         pendingApprovals = document["pending_approvals"]?.array?.count ?? 0
     }
