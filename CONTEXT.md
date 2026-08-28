@@ -28,7 +28,7 @@ The one decision-maker: it owns every policy and holds the system's single sourc
 _Avoid_: Bridge Control Center, supervisor, orchestrator, engine (the process, not the role)
 
 **Duty Switch**:
-The master on/off switch: off means the system does not speak, does not push, and does not touch the Live Call; events are still recorded. Every other switch is effective only while it is on.
+The master on/off switch: off means the system does not speak, does not push, and does not touch the Live Call; events are still recorded. The silence ceiling on a call the system holds still applies — it is the call's own limit, not an act toward the user. Every other switch is effective only while it is on.
 _Avoid_: duty mode, pause mode, do-not-disturb
 
 **Voice Switch**:

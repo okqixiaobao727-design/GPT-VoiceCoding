@@ -1,9 +1,10 @@
 """Where Bridge Core's policy gets the time from.
 
-Two of the locked numbers are durations — the Relay queue's ten-minute ceiling
-and the Approval Relay's budget — so every pipeline that owns one takes a clock
-by injection rather than calling the module-level `time` functions. A test that
-has to sleep ten minutes is a test nobody runs.
+Three of the locked numbers are durations — the Relay queue's ten-minute
+ceiling, the Approval Relay's budget, and the Live Call's silence ceiling — so
+every component that owns one takes a clock by injection rather than calling
+the module-level `time` functions. A test that has to sleep ten minutes is a
+test nobody runs.
 
 The default is `time.monotonic`, not `time.time`, because these are *elapsed*
 questions: "has this waited past its ceiling" must not be answerable differently

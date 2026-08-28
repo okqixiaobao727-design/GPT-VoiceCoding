@@ -74,6 +74,7 @@ executable = "/opt/homebrew/bin/codex"
 # Optional; these are the locked defaults.
 # relay_ceiling_seconds   = 600
 # approval_budget_seconds = 600
+# silence_end_seconds     = 60
 
 [log]
 # REQUIRED, all three. The engine owns its log and rotates it by rename

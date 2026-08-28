@@ -61,7 +61,6 @@ class Harness:
         self.channel = channel or FakeCompanionChannel()
         self.interlock = CallInterlock(self.call)
         self.pipeline = EscalationPipeline(
-            call=self.call,
             channel=self.channel,
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),

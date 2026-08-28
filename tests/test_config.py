@@ -70,15 +70,26 @@ class TestACompleteConfiguration:
 
         assert config.policy.relay_ceiling_seconds == 600.0
         assert config.policy.approval_budget_seconds == 600.0
+        # legacy@1d32845:config.plist:74-78 — one 60-second heartbeat.
+        assert config.policy.silence_end_seconds == 60.0
 
     def test_a_duration_may_be_dialled(self, tmp_path: Path) -> None:
-        config = load(written(tmp_path, COMPLETE + "\n[policy]\napproval_budget_seconds = 90\n"))
+        config = load(
+            written(
+                tmp_path,
+                COMPLETE + "\n[policy]\napproval_budget_seconds = 90\nsilence_end_seconds = 12.5\n",
+            )
+        )
 
         assert config.policy.approval_budget_seconds == 90.0
+        assert config.policy.silence_end_seconds == 12.5
 
     def test_a_duration_that_would_expire_everything_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError):
             load(written(tmp_path, COMPLETE + "\n[policy]\nrelay_ceiling_seconds = 0\n"))
+
+        with pytest.raises(ConfigError):
+            load(written(tmp_path, COMPLETE + "\n[policy]\nsilence_end_seconds = 0\n"))
 
 
 class TestWhereThingsLive:

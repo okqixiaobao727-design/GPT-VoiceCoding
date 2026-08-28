@@ -277,10 +277,9 @@ class BridgeCore:
         #: fresh rows. The transition itself performs no lane I/O (#80).
         self._reconcile_owed = False
 
-        self.interlock = CallInterlock(call)
+        self.interlock = CallInterlock(call, clock=clock)
         self.adjudicator = SwitchAdjudicator(state.switches)
         self.escalation = EscalationPipeline(
-            call=call,
             channel=channel,
             interlock=self.interlock,
             adjudicator=self.adjudicator,
@@ -551,7 +550,7 @@ class BridgeCore:
         return len(waiting)
 
     async def tick(self) -> tuple[tuple[RelayOutcome, ...], tuple[ApprovalOutcome, ...]]:
-        """Advance both ceilings. The composition root calls this on a timer.
+        """Advance the time-driven ceilings. The composition root calls this on a timer.
 
         Deliberately the only time-driven thing in the hub. Stop Notices are not
         replayed here; current state is reconciled only on outlet transitions.
@@ -574,7 +573,22 @@ class BridgeCore:
                         ),
                     )
                 )
-        return expired, await self.approvals.sweep_expired()
+        approvals = await self.approvals.sweep_expired()
+        try:
+            ended_silent_call = await self.interlock.end_silent_call(
+                self._policy.silence_end_seconds
+            )
+        except Exception:  # noqa: BLE001 - the interlock spends one attempt per call
+            _log.exception(
+                "could not end the silent Live Call; not trying again until the call changes"
+            )
+        else:
+            if ended_silent_call:
+                _log.info(
+                    "ended the Live Call after %g seconds without call activity",
+                    self._policy.silence_end_seconds,
+                )
+        return expired, approvals
 
     async def discover(self) -> tuple[SessionTarget, ...]:
         """Ask every lane what Sessions exist, and make the roster agree.
@@ -668,6 +682,7 @@ class BridgeCore:
             case InboundText():
                 await self._inbound_text(event)
             case UserSpeech():
+                self.interlock.note_activity()
                 # Recorded, never parsed. Spoken intent reaches Bridge Core as
                 # structured control-plane calls the voice thread makes (#5),
                 # over the transport the Call adapter raises (#6) — the router's
