@@ -31,12 +31,21 @@ final class ShellModel {
     /// about the engine, and an engine on the wrong `PATH` is a perfectly healthy
     /// process.
     private(set) var pathFailure: String?
+    /// The shell's pre-spawn answer about its write-only Telegram credential.
+    /// Kept apart from `EngineHealth`, which is process parenthood only.
+    private(set) var credentialState: TelegramCredentials.State
+    private(set) var credentialSaveFailure: String?
 
     let panel: ControlPanel
     let loginItem = LoginItem()
 
     private let supervisor: EngineSupervisor
     private let pathOutcomes: PathOutcomes
+    private let credentials: TelegramCredentials
+    /// Installation reconcile and initial preflight, in their required order.
+    /// A token saved immediately after app launch waits for this rather than
+    /// starting the engine ahead of installation.
+    private var preparation: Task<Void, Never>?
 
     init() {
         // The socket path is read from the same configuration the engine is
@@ -54,6 +63,10 @@ final class ShellModel {
         }
         location = resolved
         locationFailure = failure
+        let credentials = TelegramCredentials(configPath: resolved.configPath)
+        self.credentials = credentials
+        credentialState = Self.preflight(credentials: credentials)
+        credentialSaveFailure = nil
         panel = ControlPanel(client: UnixSocketControlPlane(path: resolved.socketPath))
 
         let configPath = resolved.configPath
@@ -64,14 +77,15 @@ final class ShellModel {
         let outcomes = PathOutcomes()
         pathOutcomes = outcomes
         let supervisor = EngineSupervisor(
-            launcher: ProcessLauncher(report: { outcomes.record($0) }),
+            launcher: ProcessLauncher(
+                report: { outcomes.record($0) }, credentials: credentials),
             socketPath: resolved.socketPath,
             resolveCommand: {
                 try EngineCommand.resolve(resources: resources, configPath: configPath)
             })
         self.supervisor = supervisor
 
-        Task { await self.begin() }
+        preparation = Task { await self.begin() }
     }
 
     private func begin() async {
@@ -79,7 +93,13 @@ final class ShellModel {
         await supervisor.observe { [weak self] health in
             Task { @MainActor in await self?.healthChanged(health) }
         }
+        guard credentialState.allowsEngineStart else { return }
         await supervisor.start()
+    }
+
+    /// The credential gate used at assembly and tested without starting the app.
+    static func preflight(credentials: TelegramCredentials) -> TelegramCredentials.State {
+        credentials.load().state
     }
 
     /// First launch is the install (ADR 0012), and every launch after it is a
@@ -125,6 +145,7 @@ final class ShellModel {
     private func readWhatTheLauncherLearned() async {
         engineOutput = await supervisor.lines()
         pathFailure = pathOutcomes.latest?.reason
+        credentialState = Self.preflight(credentials: credentials)
     }
 
     /// How often the open dropdown re-reads. Slow enough that it is not a
@@ -145,6 +166,31 @@ final class ShellModel {
 
     func retryEngine() async {
         await supervisor.retry()
+    }
+
+    func clearCredentialSaveFailure() {
+        credentialSaveFailure = nil
+    }
+
+    /// Replace the write-only token, then replace the child that inherited the
+    /// old environment. Stopping completes before retry starts, so two engines
+    /// never overlap on the one Telegram `getUpdates` consumer.
+    func saveTelegramToken(_ token: String) async -> Bool {
+        await preparation?.value
+        do {
+            let reading = try credentials.save(token: token)
+            credentialState = reading.state
+            credentialSaveFailure = nil
+        } catch let failure as TelegramCredentialSaveFailure {
+            credentialSaveFailure = failure.detail
+            return false
+        } catch {
+            credentialSaveFailure = "Telegram credentials could not be saved: \(error)"
+            return false
+        }
+        await supervisor.shutDown()
+        await supervisor.retry()
+        return true
     }
 
     /// Whether the child has already been asked to stop, so the terminate hook

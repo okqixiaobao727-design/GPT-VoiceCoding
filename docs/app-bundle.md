@@ -147,16 +147,27 @@ refuses **before it adopts its log**, so the sentence goes to stderr, the shell'
 Retry panel **shows it**, and no `engine.log` is created at all. This is the
 pleasant case.
 
-*Then, a missing credential* — put the model back, and start it with the variable
-named by `token_env` unset. The engine refuses **after adoption**, so its stderr
-*is* the log (ADR 0004): the terminal says nothing, the Retry panel is **empty**,
-and the reason — with a full traceback above it — is in `engine.log` beside the
-configuration.
+*Then, a missing credential* — put the model back and leave
+`~/Library/Application Support/GPT-VoiceCoding/engine/environment` absent. The
+shell stops **before spawn**: the Control Panel says `Telegram bot token: not
+set` and offers `Set…`, rather than spending five starts and presenting an empty
+Retry panel. Enter the token in the write-only field and save it; the shell
+creates the file privately and starts the engine with the variable named by
+`[adapters.settings.companion_channel] token_env`.
 
-That empty panel is a known v0 rough edge. This step exists so you meet it once
-on purpose, and it uses the missing-credential case deliberately: it is the most
-likely thing to be wrong on anybody's real first run, so you are rehearsing the
-failure you would actually have met.
+The file is hand-editable strict UTF-8 `KEY=VALUE`: blank lines and `#` comment
+lines are allowed, the value is everything after the first `=`, and there is no
+shell or dotenv expansion. Variable names are environment identifiers and may
+appear only once. It must have no group or other permission bits (`chmod 600`
+is the documented mode); make it 0644 once and confirm the panel refuses to load
+it and says why, then restore 0600. Neither the token nor the file contents are
+displayed back or written to a log. Saving through the panel writes a new 0600
+file, atomically replaces the old one, and restarts the engine in order.
+
+This adapts the first generation's proven file-to-environment preflight
+(`legacy@1d32845:bridge-serve:103-139`). That launcher sourced shell syntax and
+had no menu-bar editor; this shell deliberately accepts only the strict format
+above and adds the write-only Control Panel path.
 
 **1. The microphone.** `python3 scripts/microphone_grant_proof.py --reset`, and
 follow it. The prompt must name the app.

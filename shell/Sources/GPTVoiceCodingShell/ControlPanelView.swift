@@ -5,8 +5,9 @@ import SwiftUI
 /// rather than row count is the one bound that keeps the roster honest.
 private let rosterMaxHeight: CGFloat = 220
 
-/// The v0 Control Panel: this dropdown, beside `bridgectl`. Runtime state and
-/// switch flips only — it is not an editor for installation settings.
+/// The v0 Control Panel: this dropdown, beside `bridgectl`. Runtime state, switch
+/// flips and the shell-owned Companion Channel credential — it is not an editor
+/// for installation settings.
 struct ControlPanelView: View {
     @Bindable var shell: ShellModel
 
@@ -18,6 +19,8 @@ struct ControlPanelView: View {
             if let failure = shell.pathFailure {
                 LoginShellPathPanel(detail: failure)
             }
+
+            TelegramCredentialRow(shell: shell)
 
             EngineHealthRow(health: shell.health)
 
@@ -81,6 +84,73 @@ struct ControlPanelView: View {
         // is cancelled when the dropdown closes, which is the whole of the
         // polling policy.
         .task { await shell.readWhileOpen() }
+    }
+}
+
+private struct TelegramCredentialRow: View {
+    @Bindable var shell: ShellModel
+    @State private var editing = false
+    @State private var saving = false
+    @State private var token = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Telegram bot token: \(status)")
+                Spacer()
+                Button("Set…") {
+                    shell.clearCredentialSaveFailure()
+                    editing = true
+                }
+                .disabled(saving)
+            }
+
+            if editing {
+                SecureField("Telegram bot token", text: $token)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(saving)
+                HStack {
+                    Button("Save") {
+                        Task {
+                            saving = true
+                            let saved = await shell.saveTelegramToken(token)
+                            saving = false
+                            if saved {
+                                token = ""
+                                editing = false
+                            }
+                        }
+                    }
+                    .disabled(saving)
+                    Button("Cancel") {
+                        token = ""
+                        shell.clearCredentialSaveFailure()
+                        editing = false
+                    }
+                    .disabled(saving)
+                }
+            }
+
+            if let failure {
+                Text(failure)
+                    .font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var status: String {
+        switch shell.credentialState {
+        case .ready: return "set"
+        case .notConfigured: return "not configured"
+        case .missing: return "not set"
+        case .unsafe: return "unsafe"
+        case .unreadable: return "unreadable"
+        }
+    }
+
+    private var failure: String? {
+        shell.credentialSaveFailure ?? shell.credentialState.failureDetail
     }
 }
 

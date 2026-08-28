@@ -22,5 +22,11 @@ let package = Package(
         .testTarget(
             name: "ShellCoreTests",
             dependencies: ["ShellCore", .product(name: "Testing", package: "swift-testing")]),
+        .testTarget(
+            name: "GPTVoiceCodingShellTests",
+            dependencies: [
+                "GPTVoiceCodingShell", "ShellCore",
+                .product(name: "Testing", package: "swift-testing"),
+            ]),
     ]
 )
