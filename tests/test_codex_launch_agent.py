@@ -754,6 +754,23 @@ def test_reconcile_keeps_a_foreign_loaded_program_stale(
     assert "/foreign/codex" in reconciled.note
 
 
+def test_reconcile_keeps_a_foreign_loaded_program_stale_when_plist_is_missing(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """The wanted program is still authoritative when reconcile recreates the plist."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    agent.plist_path(directory).unlink()
+    launchd.program = "/foreign/codex"
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert "/foreign/codex" in reconciled.note
+
+
 def test_bootstrap_without_a_login_asid_records_an_unknown_render(tmp_path: Path) -> None:
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)

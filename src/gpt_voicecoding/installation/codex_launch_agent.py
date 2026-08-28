@@ -408,6 +408,16 @@ def _program_mismatch_note(path: Path, actual: str, expected: str) -> str:
     )
 
 
+def _loaded_identity_problem(path: Path, held: HeldJob | None, expected_program: str) -> str:
+    if held is None or not held.program:
+        return _unknown_identity_note(path, "did not say what it runs")
+    if held.program != expected_program:
+        return _program_mismatch_note(path, held.program, expected_program)
+    if held.login_asid is None:
+        return _unknown_identity_note(path, "did not say which login loaded it")
+    return ""
+
+
 def inspect(
     launch_agents_directory: Path,
     codex_home: Path,
@@ -446,26 +456,9 @@ def inspect(
         )
     if running is None:
         return Outcome(NAME, State.STALE, note=f"{path} is current, and {held}")
-    if not running.program:
-        return Outcome(
-            NAME,
-            State.STALE,
-            note=_unknown_identity_note(path, "did not say what it runs"),
-        )
-    if running.program != str(binary):
-        # The file is right and what launchd is holding is the render before it.
-        # Nothing reloads it, so this is the honest state until the next login.
-        return Outcome(
-            NAME,
-            State.STALE,
-            note=_program_mismatch_note(path, running.program, str(binary)),
-        )
-    if running.login_asid is None:
-        return Outcome(
-            NAME,
-            State.STALE,
-            note=_unknown_identity_note(path, "did not say which login loaded it"),
-        )
+    identity_problem = _loaded_identity_problem(path, running, str(binary))
+    if identity_problem:
+        return Outcome(NAME, State.STALE, note=identity_problem)
     loaded = read_bootstrapped_render(record_path)
     if loaded is None or loaded.render_sha256 is None:
         return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
@@ -502,12 +495,6 @@ def install(
     held = launchd.held_job()  # asked before the write, so the note below is true of it
     loaded = read_bootstrapped_render(record_path)
     disk_program = _program_in(standing if isinstance(standing, JobFile) else None)
-    foreign_program = (
-        held is not None
-        and bool(held.program)
-        and disk_program is not None
-        and held.program != disk_program
-    )
 
     if held is not None:
         # A missing record proves nothing about the job already in launchd. Keep
@@ -554,28 +541,9 @@ def install(
         rewritten = True
 
     if held is not None:
-        expected_program = str(managed_binary(codex_home)) if rewritten else disk_program
-        if foreign_program:
-            return Outcome(
-                NAME,
-                State.STALE,
-                changed=rewritten,
-                note=_program_mismatch_note(path, held.program, expected_program or "unknown"),
-            )
-        if not held.program:
-            return Outcome(
-                NAME,
-                State.STALE,
-                changed=rewritten,
-                note=_unknown_identity_note(path, "did not say what it runs"),
-            )
-        if held.login_asid is None:
-            return Outcome(
-                NAME,
-                State.STALE,
-                changed=rewritten,
-                note=_unknown_identity_note(path, "did not say which login loaded it"),
-            )
+        identity_problem = _loaded_identity_problem(path, held, str(managed_binary(codex_home)))
+        if identity_problem:
+            return Outcome(NAME, State.STALE, changed=rewritten, note=identity_problem)
         if rewritten:
             if loaded is not None and loaded.render_sha256 == wanted_sha256:
                 return Outcome(
@@ -622,43 +590,19 @@ def install(
     bootstrapped, refusal = launchd.bootstrap(path)
     if refusal:
         return Outcome(NAME, State.STALE, changed=rewritten, ok=False, note=refusal)
-    bootstrapped_program = bootstrapped.program if bootstrapped is not None else ""
+    identity_problem = _loaded_identity_problem(path, bootstrapped, str(managed_binary(codex_home)))
     bootstrapped_asid = bootstrapped.login_asid if bootstrapped is not None else None
-    trusted_identity = (
-        bootstrapped_program == str(managed_binary(codex_home)) and bootstrapped_asid is not None
-    )
     loaded = BootstrappedRender(
         render_sha256=(wanted_sha256 if rewritten or standing is None else standing.sha256)
-        if trusted_identity
+        if not identity_problem
         else None,
         login_asid=bootstrapped_asid,
     )
     failure = write_bootstrapped_render(record_path, loaded)
     if failure:
         return Outcome(NAME, State.STALE, changed=True, ok=False, note=failure)
-    if bootstrapped is None or not bootstrapped.program:
-        return Outcome(
-            NAME,
-            State.STALE,
-            changed=True,
-            note=_unknown_identity_note(path, "did not say what it runs"),
-        )
-    if bootstrapped.program != str(managed_binary(codex_home)):
-        return Outcome(
-            NAME,
-            State.STALE,
-            changed=True,
-            note=_program_mismatch_note(
-                path, bootstrapped.program, str(managed_binary(codex_home))
-            ),
-        )
-    if bootstrapped.login_asid is None:
-        return Outcome(
-            NAME,
-            State.STALE,
-            changed=True,
-            note=_unknown_identity_note(path, "did not say which login loaded it"),
-        )
+    if identity_problem:
+        return Outcome(NAME, State.STALE, changed=True, note=identity_problem)
     return Outcome(NAME, State.CURRENT, changed=True, note=f"{path} — the job is loaded")
 
 
