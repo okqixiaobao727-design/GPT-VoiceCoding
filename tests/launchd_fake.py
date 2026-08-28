@@ -48,10 +48,21 @@ class FakeLaunchd:
         #: `None` is "launchd holds nothing". A test sets it to stand a job up or
         #: to kill one; `bootstrap` sets it the way launchd would.
         self.program: str | None = None
+        #: A GUI login's audit session identifier. A kickstart leaves it alone;
+        #: a new login changes it, which is #132's reload evidence.
+        self.login_asid = 100_016
 
     @property
     def held(self) -> bool:
         return self.program is not None
+
+    def begin_login(self, path: Path) -> None:
+        """Start a new fake GUI login and load the plist then on disk."""
+        self.login_asid += 1
+        if not path.exists():
+            self.program = None
+            return
+        self.program = plistlib.loads(path.read_bytes())["ProgramArguments"][0]
 
     def __call__(self, arguments: Sequence[str]) -> tuple[int, str]:
         self.commands.append(list(arguments))
@@ -60,7 +71,11 @@ class FakeLaunchd:
             if self.program is None:
                 return (113, "Could not find service")
             # The shape real launchd answers in, kept to the two lines this reads.
-            return (0, f"{arguments[2]} = {{\n\tstate = running\n\tprogram = {self.program}\n}}")
+            return (
+                0,
+                f"{arguments[2]} = {{\n\tstate = running\n"
+                f"\tprogram = {self.program}\n\tasid = {self.login_asid}\n}}",
+            )
         if verb == "bootstrap":
             if self.refuses:
                 return (5, "Input/output error")

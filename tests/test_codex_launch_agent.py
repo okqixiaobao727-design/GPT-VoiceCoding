@@ -32,7 +32,12 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.installation import State
+from gpt_voicecoding.installation import (
+    BootstrappedRender,
+    State,
+    read_bootstrapped_render,
+    write_bootstrapped_render,
+)
 from gpt_voicecoding.installation import codex_launch_agent as agent
 from launchd_fake import DOMAIN, FakeLaunchd, codex_home
 
@@ -45,6 +50,10 @@ def launch_agents(root: Path) -> Path:
 
 def log_in(root: Path) -> Path:
     return root / "Application Support" / "GPT-VoiceCoding" / "codex-daemon.log"
+
+
+def record_in(root: Path) -> Path:
+    return root / "Application Support" / "GPT-VoiceCoding" / "installation.json"
 
 
 def written(directory: Path) -> dict:
@@ -63,7 +72,7 @@ def test_the_job_runs_the_managed_binary_and_nothing_else(
     which on this product's own author's machine was a gen-1 wrapper function.
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
 
     assert written(directory)["ProgramArguments"] == [
         str(agent.managed_binary(home)),
@@ -85,7 +94,7 @@ def test_the_job_starts_at_login_and_is_never_kept_alive(
     supervised daemon; this one is dropped on the way across.
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
     job = written(directory)
 
     assert job["RunAtLoad"] is True
@@ -102,7 +111,7 @@ def test_the_job_raises_both_open_file_limits_to_the_ruled_value(
     reported upstream; both limits deliberately carry the same ruled value.
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
     job = written(directory)
 
     assert job["SoftResourceLimits"] == {"NumberOfFiles": 65_536}
@@ -118,7 +127,7 @@ def test_the_job_carries_the_codex_home_it_was_resolved_from(
     one home and TUIs on another, and an empty roster nothing explains.
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
 
     assert written(directory)["EnvironmentVariables"]["CODEX_HOME"] == str(home)
 
@@ -127,7 +136,7 @@ def test_the_job_names_no_version(tmp_path: Path, launchd: FakeLaunchd) -> None:
     """`current` is a symlink Codex's own updater moves. Resolving it here would
     pin this product to whichever Codex was installed on the day it was."""
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
 
     assert "current" in str(agent.managed_binary(home))
     assert "0.149" not in agent.plist_path(directory).read_text(encoding="utf-8")
@@ -138,7 +147,7 @@ def test_the_job_logs_where_the_engine_does_not(tmp_path: Path, launchd: FakeLau
     reopen anything — so this descriptor must never be on the engine's log."""
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     job = written(directory)
 
     assert job["StandardOutPath"] == job["StandardErrorPath"] == str(log)
@@ -169,7 +178,9 @@ def test_the_label_is_not_the_gen_one_job(tmp_path: Path, launchd: FakeLaunchd) 
     (directory / "com.gpt-voicecoding.bridge.plist").write_bytes(
         plistlib.dumps({"Label": "com.gpt-voicecoding.bridge", "KeepAlive": True})
     )
-    agent.install(directory, codex_home(tmp_path), log_in(tmp_path), launchd.launchd)
+    agent.install(
+        directory, codex_home(tmp_path), log_in(tmp_path), record_in(tmp_path), launchd.launchd
+    )
 
     assert agent.LABEL != "com.gpt-voicecoding.bridge"
     assert plistlib.loads((directory / "com.gpt-voicecoding.bridge.plist").read_bytes()) == {
@@ -193,7 +204,9 @@ def test_install_loads_the_job_now_rather_than_at_the_next_login(
     directory = launch_agents(tmp_path)
     plist = agent.plist_path(directory)
 
-    outcome = agent.install(directory, codex_home(tmp_path), log_in(tmp_path), launchd.launchd)
+    outcome = agent.install(
+        directory, codex_home(tmp_path), log_in(tmp_path), record_in(tmp_path), launchd.launchd
+    )
 
     assert (outcome.ok, outcome.state, outcome.changed) == (True, State.CURRENT, True)
     assert ["print", "bootstrap", "print"] == launchd.verbs
@@ -207,10 +220,10 @@ def test_an_already_loaded_job_is_not_bootstrapped_again(
     it was reaching for is the state that is already there."""
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     launchd.commands.clear()
 
-    again = agent.install(directory, home, log, launchd.launchd)
+    again = agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
 
     assert (again.state, again.changed, again.ok) == (State.CURRENT, False, True)
     assert "bootstrap" not in launchd.verbs
@@ -222,11 +235,11 @@ def test_a_job_that_died_is_loaded_again_by_the_next_reconcile(
     """Which is repair at an event, not a supervisor on a timer (#83's scope)."""
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     launchd.program = None  # the job died
     launchd.commands.clear()
 
-    repaired = agent.install(directory, home, log, launchd.launchd)
+    repaired = agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
 
     assert (repaired.ok, repaired.state, repaired.changed) == (True, State.CURRENT, True)
     assert "bootstrap" in launchd.verbs
@@ -237,7 +250,11 @@ def test_launchd_refusing_to_load_the_job_is_reported_in_its_own_words(
 ) -> None:
     launchd.refuses = True
     outcome = agent.install(
-        launch_agents(tmp_path), codex_home(tmp_path), log_in(tmp_path), launchd.launchd
+        launch_agents(tmp_path),
+        codex_home(tmp_path),
+        log_in(tmp_path),
+        record_in(tmp_path),
+        launchd.launchd,
     )
 
     assert outcome.ok is False
@@ -256,11 +273,11 @@ def test_a_changed_render_is_written_and_the_running_job_is_left_alone(
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     moved = codex_home(tmp_path / "elsewhere")
     launchd.commands.clear()
 
-    rewritten = agent.install(directory, moved, log, launchd.launchd)
+    rewritten = agent.install(directory, moved, log, record_in(tmp_path), launchd.launchd)
 
     assert (rewritten.ok, rewritten.changed) == (True, True)
     assert "next login" in rewritten.note
@@ -272,7 +289,7 @@ def test_uninstall_never_asks_launchd_for_anything(tmp_path: Path, launchd: Fake
     """No `bootout`, ever. It would stop the daemon live Sessions are attached
     to, which is what #83 forbids in the words "without stopping user Sessions"."""
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
-    agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
     launchd.commands.clear()
 
     removed = agent.uninstall(directory)
@@ -288,11 +305,31 @@ def test_uninstall_never_asks_launchd_for_anything(tmp_path: Path, launchd: Fake
 def test_uninstall_takes_the_file_back_out(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
 
-    assert agent.install(directory, home, log_in(tmp_path), launchd.launchd).changed is True
+    assert (
+        agent.install(
+            directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd
+        ).changed
+        is True
+    )
     assert agent.plist_path(directory).exists()
 
     agent.uninstall(directory)
     assert list(directory.iterdir()) == []
+
+
+def test_reinstalling_the_same_loaded_render_is_current(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """Recreating a removed plist is not a render change when its SHA is loaded."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    agent.uninstall(directory)
+
+    restored = agent.install(directory, home, log, record, launchd.launchd)
+
+    assert (restored.state, restored.changed, restored.ok) == (State.CURRENT, True, True)
 
 
 def test_uninstall_with_nothing_there_is_not_a_failure(tmp_path: Path) -> None:
@@ -303,10 +340,13 @@ def test_uninstall_with_nothing_there_is_not_a_failure(tmp_path: Path) -> None:
 def test_a_moved_codex_home_is_stale(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
 
     moved = codex_home(tmp_path / "elsewhere")
-    assert agent.inspect(directory, moved, log, launchd.launchd).state is State.STALE
+    assert (
+        agent.inspect(directory, moved, log, record_in(tmp_path), launchd.launchd).state
+        is State.STALE
+    )
 
 
 def test_a_current_plist_with_no_job_loaded_is_stale(tmp_path: Path, launchd: FakeLaunchd) -> None:
@@ -316,17 +356,19 @@ def test_a_current_plist_with_no_job_loaded_is_stale(tmp_path: Path, launchd: Fa
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     launchd.program = None  # the job died
 
-    standing = agent.inspect(directory, home, log, launchd.launchd)
+    standing = agent.inspect(directory, home, log, record_in(tmp_path), launchd.launchd)
     assert standing.state is State.STALE
     assert "is current" in standing.note and "not loaded" in standing.note
 
 
 def test_inspect_writes_nothing(tmp_path: Path, launchd: FakeLaunchd) -> None:
     directory = launch_agents(tmp_path)
-    standing = agent.inspect(directory, codex_home(tmp_path), log_in(tmp_path), launchd.launchd)
+    standing = agent.inspect(
+        directory, codex_home(tmp_path), log_in(tmp_path), record_in(tmp_path), launchd.launchd
+    )
 
     assert (standing.ok, standing.state) == (True, State.ABSENT)
     assert list(directory.iterdir()) == []
@@ -345,7 +387,7 @@ def test_no_managed_binary_is_not_a_failure(tmp_path: Path, launchd: FakeLaunchd
     without launchd ever having had to fail first.
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path, managed=False)
-    outcome = agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    outcome = agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
 
     assert (outcome.ok, outcome.state, outcome.changed) == (True, State.ABSENT, False)
     assert not agent.plist_path(directory).exists()
@@ -366,7 +408,7 @@ def test_a_file_at_our_path_that_is_not_ours_is_refused_untouched(
     theirs = plistlib.dumps({"Label": "com.somebody.else", "ProgramArguments": ["/bin/true"]})
     agent.plist_path(directory).write_bytes(theirs)
 
-    refused = agent.install(directory, home, log_in(tmp_path), launchd.launchd)
+    refused = agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd)
     assert refused.ok is False
     assert "com.somebody.else" in refused.note
     assert agent.plist_path(directory).read_bytes() == theirs
@@ -381,7 +423,10 @@ def test_a_plist_that_will_not_parse_is_refused_untouched(
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     agent.plist_path(directory).write_text("<plist> and then nothing", encoding="utf-8")
 
-    assert agent.install(directory, home, log_in(tmp_path), launchd.launchd).ok is False
+    assert (
+        agent.install(directory, home, log_in(tmp_path), record_in(tmp_path), launchd.launchd).ok
+        is False
+    )
     assert agent.plist_path(directory).read_text(encoding="utf-8") == "<plist> and then nothing"
     assert agent.uninstall(directory).ok is False
 
@@ -392,7 +437,9 @@ def test_a_launch_agents_directory_that_is_not_there_is_created(
     """Unlike Claude's config directory, this one is macOS's and is ours to make:
     a user who has never installed a login item simply has no such directory."""
     directory = tmp_path / "Library" / "LaunchAgents"
-    outcome = agent.install(directory, codex_home(tmp_path), log_in(tmp_path), launchd.launchd)
+    outcome = agent.install(
+        directory, codex_home(tmp_path), log_in(tmp_path), record_in(tmp_path), launchd.launchd
+    )
 
     assert (outcome.ok, outcome.state, outcome.changed) == (True, State.CURRENT, True)
     assert agent.plist_path(directory).exists()
@@ -405,7 +452,9 @@ def test_a_launch_agents_directory_that_cannot_be_written_is_reported(
     directory = launch_agents(tmp_path)
     directory.chmod(0o500)
     try:
-        outcome = agent.install(directory, codex_home(tmp_path), log_in(tmp_path), launchd.launchd)
+        outcome = agent.install(
+            directory, codex_home(tmp_path), log_in(tmp_path), record_in(tmp_path), launchd.launchd
+        )
     finally:
         directory.chmod(0o700)
 
@@ -499,11 +548,11 @@ def test_a_loaded_job_still_running_the_previous_render_is_stale(
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     moved = codex_home(tmp_path / "elsewhere")
-    agent.install(directory, moved, log, launchd.launchd)
+    agent.install(directory, moved, log, record_in(tmp_path), launchd.launchd)
 
-    standing = agent.inspect(directory, moved, log, launchd.launchd)
+    standing = agent.inspect(directory, moved, log, record_in(tmp_path), launchd.launchd)
 
     assert standing.state is State.STALE
     assert str(agent.managed_binary(home)) in standing.note, "it does not say what is running"
@@ -511,7 +560,146 @@ def test_a_loaded_job_still_running_the_previous_render_is_stale(
     assert launchd.program == str(agent.managed_binary(home)), "the job was reloaded"
 
 
-def test_a_launchd_that_does_not_say_what_it_runs_is_not_guessed_at(
+def test_a_loaded_job_with_the_same_program_and_previous_render_is_stale(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """#132: the program path cannot identify the whole loaded render.
+
+    #129 changed only the resource limits, so launchd kept the same program while
+    holding the old definition.  A status run must not call that loaded job current.
+    """
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    previous_log = log_in(tmp_path / "previous")
+    current_log = log_in(tmp_path)
+    agent.install(directory, home, previous_log, record_in(tmp_path), launchd.launchd)
+    agent.install(directory, home, current_log, record_in(tmp_path), launchd.launchd)
+
+    standing = agent.inspect(directory, home, current_log, record_in(tmp_path), launchd.launchd)
+
+    assert standing.state is State.STALE
+    assert "loaded job is a previous render; applies at the next login" in standing.note
+    assert launchd.program == str(agent.managed_binary(home)), "the job was reloaded"
+
+
+def test_a_second_reconcile_in_the_same_login_keeps_the_previous_render_stale(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """A byte-identical reconcile is not evidence that launchd reloaded the file."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    record = record_in(tmp_path)
+    previous_log = log_in(tmp_path / "previous")
+    current_log = log_in(tmp_path)
+    agent.install(directory, home, previous_log, record, launchd.launchd)
+    agent.install(directory, home, current_log, record, launchd.launchd)
+    recorded_stale = record.read_bytes()
+    launchd.commands.clear()
+
+    again = agent.install(directory, home, current_log, record, launchd.launchd)
+
+    assert again.state is State.STALE
+    assert "previous render" in again.note
+    assert record.read_bytes() == recorded_stale
+    assert "bootstrap" not in launchd.verbs
+
+
+def test_a_new_login_makes_the_render_it_loaded_current(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """ASID change is the fake equivalent of logout/login in #132's acceptance."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    record = record_in(tmp_path)
+    previous_log = log_in(tmp_path / "previous")
+    current_log = log_in(tmp_path)
+    agent.install(directory, home, previous_log, record, launchd.launchd)
+    agent.install(directory, home, current_log, record, launchd.launchd)
+    launchd.begin_login(agent.plist_path(directory))
+
+    reconciled = agent.install(directory, home, current_log, record, launchd.launchd)
+    standing = agent.inspect(directory, home, current_log, record, launchd.launchd)
+
+    assert reconciled.state is State.CURRENT
+    assert standing.state is State.CURRENT
+
+
+def test_a_new_login_records_the_disk_render_before_reconcile_changes_it(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """The login loaded the old disk bytes, not the new build's later render."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    record = record_in(tmp_path)
+    previous_log = log_in(tmp_path / "previous")
+    current_log = log_in(tmp_path)
+    agent.install(directory, home, previous_log, record, launchd.launchd)
+    launchd.begin_login(agent.plist_path(directory))
+
+    reconciled = agent.install(directory, home, current_log, record, launchd.launchd)
+    standing = agent.inspect(directory, home, current_log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert standing.state is State.STALE
+    assert "previous render" in standing.note
+
+
+def test_a_missing_loaded_render_record_fails_closed_without_status_writing(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """An upgraded install cannot guess which same-program render launchd holds."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    record.unlink()
+
+    standing = agent.inspect(directory, home, log, record, launchd.launchd)
+
+    assert standing.state is State.STALE
+    assert "unknown render" in standing.note
+    assert not record.exists(), "status wrote the missing installation record"
+
+
+def test_install_records_an_unknown_render_when_the_loaded_record_is_missing(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    record.unlink()
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+    loaded = read_bootstrapped_render(record)
+
+    assert reconciled.state is State.STALE
+    assert "unknown render" in reconciled.note
+    assert loaded is not None
+    assert loaded.render_sha256 is None
+    assert loaded.login_asid == launchd.login_asid
+
+
+def test_a_new_login_with_no_plist_records_an_unknown_loaded_render(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """A loaded job plus an absent file never supplies bytes the login loaded."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    agent.plist_path(directory).unlink()
+    launchd.login_asid += 1
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+    loaded = read_bootstrapped_render(record)
+    standing = agent.inspect(directory, home, log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert "unknown render" in reconciled.note
+    assert loaded is not None and loaded.render_sha256 is None
+    assert loaded.login_asid == launchd.login_asid
+    assert standing.state is State.STALE
+    assert "unknown render" in standing.note
+
+
+def test_a_launchd_that_does_not_say_what_it_loaded_fails_closed(
     tmp_path: Path, launchd: FakeLaunchd
 ) -> None:
     """A `print` whose shape this does not recognise is reported as unknown.
@@ -522,14 +710,91 @@ def test_a_launchd_that_does_not_say_what_it_runs_is_not_guessed_at(
     """
     directory, home = launch_agents(tmp_path), codex_home(tmp_path)
     log = log_in(tmp_path)
-    agent.install(directory, home, log, launchd.launchd)
+    agent.install(directory, home, log, record_in(tmp_path), launchd.launchd)
     launchd.commands.clear()
 
     silent = agent.Launchd(domain=DOMAIN, run=lambda _: (0, "a shape this does not recognise"))
-    standing = agent.inspect(directory, home, log, silent)
+    standing = agent.inspect(directory, home, log, record_in(tmp_path), silent)
 
-    assert standing.state is State.CURRENT
+    assert standing.state is State.STALE
     assert "did not say what it runs" in standing.note
+
+
+def test_a_loaded_render_record_without_an_asid_fails_closed(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    loaded = read_bootstrapped_render(record)
+    assert loaded is not None
+    write_bootstrapped_render(
+        record, BootstrappedRender(render_sha256=loaded.render_sha256, login_asid=None)
+    )
+
+    standing = agent.inspect(directory, home, log, record, launchd.launchd)
+
+    assert standing.state is State.STALE
+    assert "which login" in standing.note
+
+
+def test_reconcile_keeps_a_foreign_loaded_program_stale(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    launchd.program = "/foreign/codex"
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert "/foreign/codex" in reconciled.note
+
+
+def test_reconcile_keeps_a_foreign_loaded_program_stale_when_plist_is_missing(
+    tmp_path: Path, launchd: FakeLaunchd
+) -> None:
+    """The wanted program is still authoritative when reconcile recreates the plist."""
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    agent.install(directory, home, log, record, launchd.launchd)
+    agent.plist_path(directory).unlink()
+    launchd.program = "/foreign/codex"
+
+    reconciled = agent.install(directory, home, log, record, launchd.launchd)
+
+    assert reconciled.state is State.STALE
+    assert "/foreign/codex" in reconciled.note
+
+
+def test_bootstrap_without_a_login_asid_records_an_unknown_render(tmp_path: Path) -> None:
+    directory, home = launch_agents(tmp_path), codex_home(tmp_path)
+    log = log_in(tmp_path)
+    record = record_in(tmp_path)
+    binary = str(agent.managed_binary(home))
+    print_count = 0
+
+    def answer(arguments: Sequence[str]) -> tuple[int, str]:
+        nonlocal print_count
+        if arguments[1] == "bootstrap":
+            return (0, "")
+        print_count += 1
+        if print_count == 1:
+            return (113, "Could not find service")
+        return (0, f"program = {binary}")
+
+    launchd = agent.Launchd(domain=DOMAIN, run=answer)
+
+    outcome = agent.install(directory, home, log, record, launchd)
+    loaded = read_bootstrapped_render(record)
+
+    assert outcome.state is State.STALE
+    assert loaded is not None and loaded.render_sha256 is None
+    assert loaded.login_asid is None
 
 
 #: One real `launchctl print` answer, captured on 2026-08-26 from the job this
@@ -548,9 +813,13 @@ REAL_PRINT = """gui/501/com.gpt-voicecoding.codex-daemon = {
 \t\tapp-server
 \t\tdaemon
 \t\tstart
+
+\tasid = 100016
 """
 
 
 def test_the_program_is_read_out_of_a_real_launchctl_answer() -> None:
-    holding = agent.Launchd(domain=DOMAIN, run=lambda _: (0, REAL_PRINT)).holding()
-    assert holding == "/Users/simon/.codex/packages/standalone/current/codex"
+    held = agent.Launchd(domain=DOMAIN, run=lambda _: (0, REAL_PRINT)).held_job()
+    assert held is not None
+    assert held.program == "/Users/simon/.codex/packages/standalone/current/codex"
+    assert held.login_asid == 100_016

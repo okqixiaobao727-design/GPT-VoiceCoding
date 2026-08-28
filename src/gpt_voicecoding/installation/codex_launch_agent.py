@@ -30,6 +30,17 @@ this is not one: `KeepAlive` is absent from the job, and the only thing that eve
 re-bootstraps a job that died is the next app launch (ADR 0012), which is an
 event and not a timer.
 
+**The loaded render is this product's own read-back — #132.** `launchctl print`
+exposes the program but not the whole loaded definition, so the same program can
+hide an older resource limit or log path. When this item bootstraps a job it
+records the exact plist SHA and launchd's GUI-login ASID in `installation.json`.
+Status compares that SHA with the file on disk and keeps the program comparison
+as the foreign-origin guard. A changed ASID proves a new login loaded the bytes
+that were on disk before this reconcile; a second reconcile in the same ASID
+proves no reload at all. Missing evidence is an unknown render, never `current`.
+Legacy has no equivalent: `legacy@1d32845:install.sh:174-195` loaded its job and
+never recorded or read back the loaded render, so this behavior is **not ported**.
+
 **Nothing in the rendered job is hard-coded.** The user, their home, `CODEX_HOME`
 and the Codex version all come from the environment this runs in — the binary is
 reached through the `current` symlink Codex's own updater moves, so the job
@@ -49,6 +60,7 @@ launched, wrapped, per-Session app-server, and its launch marker is not adapted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -60,7 +72,15 @@ from pathlib import Path
 from typing import Any, Final
 from xml.parsers.expat import ExpatError
 
-from gpt_voicecoding.installation import Outcome, State, remove_file, replace_text
+from gpt_voicecoding.installation import (
+    BootstrappedRender,
+    Outcome,
+    State,
+    read_bootstrapped_render,
+    remove_file,
+    replace_text,
+    write_bootstrapped_render,
+)
 
 #: How this item is named in a report.
 NAME: Final = "codex-launch-agent"
@@ -160,6 +180,14 @@ def _run(arguments: Sequence[str]) -> tuple[int, str]:
 
 
 @dataclass(frozen=True, slots=True)
+class HeldJob:
+    """The identity launchd exposes for one loaded job definition."""
+
+    program: str
+    login_asid: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class Launchd:
     """The user's own launchd domain, and the two questions this item asks it.
 
@@ -185,42 +213,43 @@ class Launchd:
     def ask(self, arguments: Sequence[str]) -> tuple[int, str]:
         return (self.run or _run)(arguments)
 
-    def holding(self) -> str | None:
-        """The program launchd currently runs for this job, if it holds it at all.
+    def held_job(self) -> HeldJob | None:
+        """The identity launchd currently holds for this job, if any.
 
         Three answers, and the third is the one that matters. `None` is *not
-        loaded*. A path is the program in the job launchd is actually holding,
+        loaded*. A non-empty ``program`` is the program in the job launchd holds,
         which is **not** necessarily the one in the file on disk: nothing here
         ever reloads a job, so after a render changes, the file and the loaded
         job disagree until the next login. Asking launchd rather than reading our
         own file back is the only way a status run can say that out loud.
 
-        The empty string is *loaded, and launchd did not say what it runs* — a
-        `print` whose shape this does not recognise. It is reported as unknown
-        rather than guessed at, because the alternative is a status run that
-        claims a job is current on the strength of a line it could not find.
+        An empty ``program`` is *loaded, and launchd did not say what it runs*.
+        ``login_asid`` is the GUI login's audit session identifier. macOS changes
+        it at login, not at a kickstart inside the same login, which lets install
+        distinguish a genuine reload opportunity from a second reconcile (#132).
         """
         status, said = self.ask([str(LAUNCHCTL), "print", f"{self.domain}/{LABEL}"])
         if status != 0:
             return None
-        found = re.search(r"^\s*program\s*=\s*(.+?)\s*$", said, re.MULTILINE)
-        return found.group(1) if found else ""
+        found_program = re.search(r"^\s*program\s*=\s*(.+?)\s*$", said, re.MULTILINE)
+        found_asid = re.search(r"^\s*asid\s*=\s*(\d+)\s*$", said, re.MULTILINE)
+        return HeldJob(
+            program=found_program.group(1) if found_program else "",
+            login_asid=int(found_asid.group(1)) if found_asid else None,
+        )
 
-    def loaded(self) -> bool:
-        """Whether launchd holds this job at all, whatever it is running."""
-        return self.holding() is not None
-
-    def bootstrap(self, path: Path) -> str:
-        """Load the job now. Returns a sentence when launchd still does not hold it.
+    def bootstrap(self, path: Path) -> tuple[HeldJob | None, str]:
+        """Load the job now and return the identity read back from launchd.
 
         The exit status is not the answer: bootstrapping a job that is already
         loaded fails, and that is the state this is trying to reach. So it is
-        attempted and then `loaded` decides.
+        attempted and then the identity read-back decides.
         """
         _, said = self.ask([str(LAUNCHCTL), "bootstrap", self.domain, str(path)])
-        if self.loaded():
-            return ""
-        return f"launchd did not load {LABEL}: {said or 'it said nothing'}"
+        held = self.held_job()
+        if held is not None:
+            return (held, "")
+        return (None, f"launchd did not load {LABEL}: {said or 'it said nothing'}")
 
 
 def default_launchd() -> Launchd:
@@ -256,10 +285,19 @@ def render(document: Mapping[str, Any]) -> str:
     return plistlib.dumps(dict(document), sort_keys=True).decode("utf-8")
 
 
-def _read(path: Path) -> dict[str, Any] | None | str:
+@dataclass(frozen=True, slots=True)
+class JobFile:
+    """One read of the plist, including the exact bytes launchd could load."""
+
+    document: dict[str, Any]
+    sha256: str
+
+
+def _read(path: Path) -> JobFile | None | str:
     """The job that is there, `None` when there is none, or why neither."""
     try:
-        document: Any = plistlib.loads(path.read_bytes())
+        contents = path.read_bytes()
+        document: Any = plistlib.loads(contents)
     except FileNotFoundError:
         return None
     except OSError as refusal:
@@ -278,7 +316,7 @@ def _read(path: Path) -> dict[str, Any] | None | str:
             f"{path}: carries the job {document.get('Label')!r}, which this product "
             f"never wrote. Nothing was changed."
         )
-    return document
+    return JobFile(document=document, sha256=hashlib.sha256(contents).hexdigest())
 
 
 def daemon_versions(
@@ -332,19 +370,58 @@ def _no_managed_binary(codex_home: Path) -> Outcome:
     )
 
 
+def _previous_render_note(path: Path) -> str:
+    return f"{path} — loaded job is a previous render; applies at the next login"
+
+
+def _unknown_render_note(path: Path) -> str:
+    return f"{path} — loaded job is of unknown render; applies at the next login"
+
+
+def _unknown_identity_note(path: Path, reason: str) -> str:
+    return f"{path} — the job is loaded, and launchd {reason}; loaded render is unknown"
+
+
+def _program_in(standing: JobFile | None) -> str | None:
+    if standing is None:
+        return None
+    arguments = standing.document.get("ProgramArguments")
+    if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+        return None
+    return arguments[0]
+
+
+def _program_mismatch_note(path: Path, actual: str, expected: str) -> str:
+    return (
+        f"{path} is current, and the job launchd holds runs {actual}, not {expected}. "
+        "It is not reloaded, because that would stop the daemon live Sessions are on; "
+        "the file applies at the next login."
+    )
+
+
+def _loaded_identity_problem(path: Path, held: HeldJob | None, expected_program: str) -> str:
+    if held is None or not held.program:
+        return _unknown_identity_note(path, "did not say what it runs")
+    if held.program != expected_program:
+        return _program_mismatch_note(path, held.program, expected_program)
+    if held.login_asid is None:
+        return _unknown_identity_note(path, "did not say which login loaded it")
+    return ""
+
+
 def inspect(
     launch_agents_directory: Path,
     codex_home: Path,
     log_path: Path,
+    record_path: Path,
     launchd: Launchd,
 ) -> Outcome:
     """What is on this machine, without changing any of it.
 
-    Two facts, and both are reported: whether the plist is the one this build
-    renders, and whether launchd currently holds the job. `state` stays about the
-    artifact — that is what the boundary's other item means by it — and the job is
-    in the note, because a plist that is current with no job loaded is a machine
-    that will be right at the next login and is not right now.
+    Three facts, and all are reported: whether the plist is the one this build
+    renders, whether launchd currently holds the job, and whether the recorded
+    loaded-render SHA matches the file. A plist that is current with no job, or
+    whose loaded SHA differs, is a machine that is not current now.
     """
     if not managed_binary(codex_home).exists():
         return _no_managed_binary(codex_home)
@@ -357,35 +434,33 @@ def inspect(
     # Asked once. Asked twice, the two answers can differ — launchd is a live
     # thing — and the report would then carry a `state` decided by one reading
     # and a sentence describing the other.
-    running = launchd.holding()
+    running = launchd.held_job()
     binary = managed_binary(codex_home)
     held = "the job is not loaded" if running is None else "the job is loaded"
     if standing is None:
+        if running is not None:
+            return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
         return Outcome(NAME, State.ABSENT, note=f"no login job at {path} — {held}")
-    if standing != job(binary, codex_home, log_path):
+    if standing.document != job(binary, codex_home, log_path):
         return Outcome(
             NAME, State.STALE, note=f"{path} is a job this build would write differently"
         )
     if running is None:
         return Outcome(NAME, State.STALE, note=f"{path} is current, and {held}")
-    if running and running != str(binary):
-        # The file is right and what launchd is holding is the render before it.
-        # Nothing reloads it, so this is the honest state until the next login.
+    identity_problem = _loaded_identity_problem(path, running, str(binary))
+    if identity_problem:
+        return Outcome(NAME, State.STALE, note=identity_problem)
+    loaded = read_bootstrapped_render(record_path)
+    if loaded is None or loaded.render_sha256 is None:
+        return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
+    if loaded.login_asid is None:
         return Outcome(
             NAME,
             State.STALE,
-            note=(
-                f"{path} is current, and the job launchd holds still runs {running}. "
-                "It is not reloaded, because that would stop the daemon live Sessions "
-                "are on; the file applies at the next login."
-            ),
+            note=_unknown_identity_note(path, "did not record which login loaded it"),
         )
-    if not running:
-        return Outcome(
-            NAME,
-            State.CURRENT,
-            note=f"{path} — the job is loaded, and launchd did not say what it runs",
-        )
+    if loaded.render_sha256 != standing.sha256:
+        return Outcome(NAME, State.STALE, note=_previous_render_note(path))
     return Outcome(NAME, State.CURRENT, note=f"{path} — {held}")
 
 
@@ -393,6 +468,7 @@ def install(
     launch_agents_directory: Path,
     codex_home: Path,
     log_path: Path,
+    record_path: Path,
     launchd: Launchd,
 ) -> Outcome:
     """Put the job where launchd finds it, and have launchd hold it now. Idempotent."""
@@ -405,9 +481,44 @@ def install(
         return Outcome(NAME, State.ABSENT, ok=False, note=standing)
 
     wanted = job(managed_binary(codex_home), codex_home, log_path)
-    was_loaded = launchd.loaded()  # asked before the write, so the note below is true of it
+    wanted_text = render(wanted)
+    wanted_sha256 = hashlib.sha256(wanted_text.encode("utf-8")).hexdigest()
+    held = launchd.held_job()  # asked before the write, so the note below is true of it
+    loaded = read_bootstrapped_render(record_path)
+    disk_program = _program_in(standing if isinstance(standing, JobFile) else None)
+
+    if held is not None:
+        # A missing record proves nothing about the job already in launchd. Keep
+        # that uncertainty for this login. If the ASID changed, launchd loaded
+        # whatever bytes were on disk *before this reconcile writes*, so those
+        # bytes become the authority for the new login (#132 advisor ruling).
+        if loaded is None:
+            loaded = BootstrappedRender(render_sha256=None, login_asid=held.login_asid)
+            failure = write_bootstrapped_render(record_path, loaded)
+            if failure:
+                return Outcome(NAME, State.STALE, ok=False, note=failure)
+        elif loaded.login_asid is None:
+            loaded = BootstrappedRender(render_sha256=None, login_asid=held.login_asid)
+            failure = write_bootstrapped_render(record_path, loaded)
+            if failure:
+                return Outcome(NAME, State.STALE, ok=False, note=failure)
+        elif held.login_asid is not None and held.login_asid != loaded.login_asid:
+            loaded = BootstrappedRender(
+                render_sha256=(
+                    standing.sha256
+                    if isinstance(standing, JobFile)
+                    and bool(held.program)
+                    and held.program == disk_program
+                    else None
+                ),
+                login_asid=held.login_asid,
+            )
+            failure = write_bootstrapped_render(record_path, loaded)
+            if failure:
+                return Outcome(NAME, State.STALE, ok=False, note=failure)
+
     rewritten = False
-    if standing != wanted:
+    if standing is None or standing.document != wanted:
         # launchd will not spawn a job whose output path names a directory that
         # is not there, and it reports that as the job failing to start — a
         # failure whose reason would land in the file it could not open.
@@ -415,19 +526,39 @@ def install(
             log_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as refusal:
             return Outcome(NAME, State.ABSENT, ok=False, note=f"{log_path.parent}: {refusal}")
-        failure = replace_text(path, render(wanted))
+        failure = replace_text(path, wanted_text)
         if failure:
             return Outcome(NAME, State.ABSENT, ok=False, note=failure)
         rewritten = True
 
-    if was_loaded:
+    if held is not None:
+        identity_problem = _loaded_identity_problem(path, held, str(managed_binary(codex_home)))
+        if identity_problem:
+            return Outcome(NAME, State.STALE, changed=rewritten, note=identity_problem)
         if rewritten:
+            if loaded is not None and loaded.render_sha256 == wanted_sha256:
+                return Outcome(
+                    NAME,
+                    State.CURRENT,
+                    changed=True,
+                    note=f"{path} written — the same render is already loaded",
+                )
+            if loaded is None or loaded.render_sha256 is None:
+                return Outcome(
+                    NAME,
+                    State.STALE,
+                    changed=True,
+                    note=(
+                        f"{path} written — loaded job is of unknown render; "
+                        "applies at the next login"
+                    ),
+                )
             # Reloading it means `bootout`, and `bootout` stops the daemon the
             # user's own TUIs are attached to. The job the user has is the one
             # that was already right for them; the new render is for next login.
             return Outcome(
                 NAME,
-                State.CURRENT,
+                State.STALE,
                 changed=True,
                 note=(
                     f"{path} written — the loaded job is the previous render and was not "
@@ -435,11 +566,34 @@ def install(
                     "It applies at the next login."
                 ),
             )
+        if loaded is None or loaded.render_sha256 is None:
+            return Outcome(NAME, State.STALE, note=_unknown_render_note(path))
+        if loaded.login_asid is None:
+            return Outcome(
+                NAME,
+                State.STALE,
+                note=_unknown_identity_note(path, "did not record which login loaded it"),
+            )
+        if loaded.render_sha256 != standing.sha256:
+            return Outcome(NAME, State.STALE, note=_previous_render_note(path))
         return Outcome(NAME, State.CURRENT, note=f"{path} — the job is loaded")
 
-    refusal = launchd.bootstrap(path)
+    bootstrapped, refusal = launchd.bootstrap(path)
     if refusal:
         return Outcome(NAME, State.STALE, changed=rewritten, ok=False, note=refusal)
+    identity_problem = _loaded_identity_problem(path, bootstrapped, str(managed_binary(codex_home)))
+    bootstrapped_asid = bootstrapped.login_asid if bootstrapped is not None else None
+    loaded = BootstrappedRender(
+        render_sha256=(wanted_sha256 if rewritten or standing is None else standing.sha256)
+        if not identity_problem
+        else None,
+        login_asid=bootstrapped_asid,
+    )
+    failure = write_bootstrapped_render(record_path, loaded)
+    if failure:
+        return Outcome(NAME, State.STALE, changed=True, ok=False, note=failure)
+    if identity_problem:
+        return Outcome(NAME, State.STALE, changed=True, note=identity_problem)
     return Outcome(NAME, State.CURRENT, changed=True, note=f"{path} — the job is loaded")
 
 

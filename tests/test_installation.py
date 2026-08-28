@@ -23,10 +23,18 @@ from pathlib import Path
 import pytest
 
 from gpt_voicecoding.core.policy import CorePolicy
-from gpt_voicecoding.installation import Outcome, State, read_intent, replace_text, write_intent
+from gpt_voicecoding.installation import (
+    Outcome,
+    State,
+    read_bootstrapped_render,
+    read_intent,
+    replace_text,
+    write_intent,
+)
 from gpt_voicecoding.installation import claude_hooks as hooks
 from gpt_voicecoding.installation import codex_launch_agent as codex
 from gpt_voicecoding.installation.__main__ import EXIT_FAILED, EXIT_OK, main
+from gpt_voicecoding.locations import codex_daemon_log_path, installation_path
 from launchd_fake import FakeLaunchd, codex_home
 
 INTERPRETER = Path("/Applications/GPT-VoiceCoding.app/Contents/Resources/engine/bin/python3")
@@ -375,6 +383,9 @@ def test_a_clean_install_lands_both_items(tmp_path: Path, launchd: FakeLaunchd) 
     assert hooks.APPROVAL_MODULE in settings(directory)
     assert codex.plist_path(tmp_path / "Library" / "LaunchAgents").exists()
     assert launchd.held is True
+    loaded = read_bootstrapped_render(base / "installation.json")
+    assert loaded is not None and loaded.render_sha256 is not None
+    assert loaded.login_asid == launchd.login_asid
 
 
 def test_an_uninstall_takes_both_items_back(tmp_path: Path, launchd: FakeLaunchd) -> None:
@@ -384,11 +395,13 @@ def test_an_uninstall_takes_both_items_back(tmp_path: Path, launchd: FakeLaunchd
     before = settings(directory)
 
     _run("install", environ, base, launchd, tmp_path)
+    loaded = read_bootstrapped_render(base / "installation.json")
     assert _run("uninstall", environ, base, launchd, tmp_path) == EXIT_OK
 
     assert settings(directory) == before
     assert not codex.plist_path(tmp_path / "Library" / "LaunchAgents").exists()
     assert launchd.held is True, "the uninstall stopped a daemon the user's Sessions are on"
+    assert read_bootstrapped_render(base / "installation.json") == loaded
 
 
 def test_a_reconcile_that_agrees_writes_nothing_and_asks_launchd_for_nothing(
@@ -400,12 +413,14 @@ def test_a_reconcile_that_agrees_writes_nothing_and_asks_launchd_for_nothing(
     _run("install", environ, base, launchd, tmp_path)
     settled = settings(directory)
     plist = codex.plist_path(tmp_path / "Library" / "LaunchAgents").read_bytes()
+    record = (base / "installation.json").read_bytes()
     launchd.commands.clear()
 
     assert _run("reconcile", environ, base, launchd, tmp_path) == EXIT_OK
 
     assert settings(directory) == settled
     assert codex.plist_path(tmp_path / "Library" / "LaunchAgents").read_bytes() == plist
+    assert (base / "installation.json").read_bytes() == record
     assert "bootstrap" not in launchd.verbs
 
 
@@ -459,3 +474,42 @@ def test_status_reports_both_items_and_the_daemon(
     assert hooks.NAME in printed
     assert printed.count(codex.NAME) >= 2, "the item's line, and the daemon's own"
     assert "no managed Codex binary" in printed
+
+
+def test_status_tracks_a_same_program_render_across_the_next_login(
+    tmp_path: Path, launchd: FakeLaunchd, monkeypatch, capsys
+) -> None:
+    """#132 through the user's `bridge-install` seam, not the item internals."""
+    directory = config_directory(tmp_path, FOREIGN)
+    home = codex_home(tmp_path)
+    base = tmp_path / "support"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    old_log = codex_daemon_log_path(base).with_name("previous-codex-daemon.log")
+    record = installation_path(base)
+    codex.install(launch_agents, home, old_log, record, launchd.launchd)
+    monkeypatch.setattr(codex, "daemon_versions", lambda _: "daemon evidence")
+
+    assert _run("install", {"CLAUDE_CONFIG_DIR": str(directory)}, base, launchd, tmp_path) == (
+        EXIT_OK
+    )
+    capsys.readouterr()
+    assert _run("status", {"CLAUDE_CONFIG_DIR": str(directory)}, base, launchd, tmp_path) == (
+        EXIT_OK
+    )
+    before_login = capsys.readouterr().out
+
+    assert f"{codex.NAME}: stale" in before_login
+    assert "loaded job is a previous render; applies at the next login" in before_login
+
+    launchd.begin_login(codex.plist_path(launch_agents))
+    assert _run("reconcile", {"CLAUDE_CONFIG_DIR": str(directory)}, base, launchd, tmp_path) == (
+        EXIT_OK
+    )
+    capsys.readouterr()
+    assert _run("status", {"CLAUDE_CONFIG_DIR": str(directory)}, base, launchd, tmp_path) == (
+        EXIT_OK
+    )
+    after_login = capsys.readouterr().out
+
+    assert f"{codex.NAME}: current" in after_login
+    assert "previous render" not in after_login

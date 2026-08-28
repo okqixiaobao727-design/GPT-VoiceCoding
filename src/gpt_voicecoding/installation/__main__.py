@@ -46,7 +46,7 @@ from gpt_voicecoding.installation import (
     read_intent,
     write_intent,
 )
-from gpt_voicecoding.locations import codex_daemon_log_path
+from gpt_voicecoding.locations import codex_daemon_log_path, installation_path
 
 #: Everything went as asked.
 EXIT_OK = 0
@@ -76,6 +76,7 @@ class Placement:
     launch_agents_directory: Path
     codex_home: Path
     codex_log_path: Path
+    installation_record_path: Path
     launchd: codex_launch_agent.Launchd
 
 
@@ -92,6 +93,7 @@ def _resolve(
         launch_agents_directory=codex_launch_agent.default_launch_agents_directory(home),
         codex_home=codex_launch_agent.default_codex_home(environ, home),
         codex_log_path=codex_daemon_log_path(base_dir),
+        installation_record_path=installation_path(base_dir),
         launchd=launchd or codex_launch_agent.default_launchd(),
     )
 
@@ -100,7 +102,11 @@ def _inspect_all(where: Placement) -> list[Outcome]:
     return [
         claude_hooks.inspect(where.claude_config_directory, where.interpreter),
         codex_launch_agent.inspect(
-            where.launch_agents_directory, where.codex_home, where.codex_log_path, where.launchd
+            where.launch_agents_directory,
+            where.codex_home,
+            where.codex_log_path,
+            where.installation_record_path,
+            where.launchd,
         ),
     ]
 
@@ -109,7 +115,11 @@ def _install_all(where: Placement) -> list[Outcome]:
     return [
         claude_hooks.install(where.claude_config_directory, where.interpreter),
         codex_launch_agent.install(
-            where.launch_agents_directory, where.codex_home, where.codex_log_path, where.launchd
+            where.launch_agents_directory,
+            where.codex_home,
+            where.codex_log_path,
+            where.installation_record_path,
+            where.launchd,
         ),
     ]
 
