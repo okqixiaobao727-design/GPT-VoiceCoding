@@ -39,8 +39,8 @@ ADDRESS_FILE_NAME: Final = "address.json"
 #: this descriptor is held by launchd, which cannot be told to reopen anything.
 CODEX_DAEMON_LOG_NAME: Final = "codex-daemon.log"
 
-#: Whether the user wants the installation. Beside the engine's directory rather
-#: than inside it, because it outlives any one engine and is not the engine's.
+#: Installation bookkeeping: user intent and the loaded Codex job render. Beside
+#: the engine because both outlive any one engine and are not engine state.
 INSTALLATION_FILE_NAME: Final = "installation.json"
 
 
@@ -64,5 +64,5 @@ def codex_daemon_log_path(base_dir: Path | None = None) -> Path:
 
 
 def installation_path(base_dir: Path | None = None) -> Path:
-    """Where the user's answer to "do you want this installed" is kept."""
+    """Where product-owned installation intent and read-back evidence are kept."""
     return product_directory(base_dir) / INSTALLATION_FILE_NAME

@@ -14,6 +14,10 @@ to share and no protocol to declare. ``__main__`` names the items explicitly, th
 way the composition root names adapters, and this module holds the one result
 type they all answer with and the one write they all go through.
 
+`installation.json` carries two pieces of product-owned bookkeeping: whether the
+user wants installation, and #132's evidence of which Codex LaunchAgent render
+launchd loaded. Each writer preserves the other field; neither is user config.
+
 **Every write is atomic, read back, and reported.** The atomicity is what keeps a
 half-written ``settings.json`` off the disk. It cannot prevent a *lost update* —
 another writer's change between our read and our write is simply gone — and ADR
@@ -29,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
@@ -38,12 +43,15 @@ from typing import Any, Final
 from gpt_voicecoding.locations import installation_path
 
 __all__ = [
+    "BootstrappedRender",
     "Intent",
     "Outcome",
     "State",
+    "read_bootstrapped_render",
     "read_intent",
     "remove_file",
     "replace_text",
+    "write_bootstrapped_render",
     "write_intent",
 ]
 
@@ -143,9 +151,26 @@ def remove_file(path: Path) -> str:
     return ""
 
 
-#: The one field of the intent file. A missing file is a third answer and is not
-#: written down: nobody has installed on this machine yet.
+#: The user intent and Codex loaded-render evidence share ``installation.json``.
+#: Both are this product's bookkeeping, not files the user owns; each writer
+#: preserves the other field when it updates its own answer.
 WANTED_FIELD: Final = "wanted"
+CODEX_LAUNCH_AGENT_FIELD: Final = "codex_launch_agent"
+RENDER_SHA256_FIELD: Final = "render_sha256"
+LOGIN_ASID_FIELD: Final = "login_asid"
+
+
+def _read_record(path: Path) -> dict[str, Any]:
+    """The installation record, or an empty document when none is usable."""
+    try:
+        document: Any = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def _write_record(path: Path, document: dict[str, Any]) -> str:
+    return replace_text(path, json.dumps(document, indent=2) + "\n")
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,19 +196,59 @@ class Intent:
         return self.wanted is not False
 
 
+@dataclass(frozen=True, slots=True)
+class BootstrappedRender:
+    """The Codex job definition known to be loaded in one GUI login.
+
+    ``render_sha256`` is ``None`` when a loaded job exists but this product has
+    no evidence of which render it holds. ``login_asid`` is launchd's audit
+    session identifier: macOS creates a new one for each GUI login, so a change
+    proves that launchd had another opportunity to load the plist from disk.
+    """
+
+    render_sha256: str | None
+    login_asid: int | None
+
+
 def read_intent(base_dir: Path | None = None) -> Intent:
     """The recorded intent. Anything unreadable reads as never recorded."""
-    try:
-        document: Any = json.loads(installation_path(base_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return Intent(wanted=None)
-    if not isinstance(document, dict) or not isinstance(document.get(WANTED_FIELD), bool):
+    document = _read_record(installation_path(base_dir))
+    if not isinstance(document.get(WANTED_FIELD), bool):
         return Intent(wanted=None)
     return Intent(wanted=document[WANTED_FIELD])
 
 
 def write_intent(wanted: bool, base_dir: Path | None = None) -> str:
     """Record the user's answer. Returns a sentence when it could not be written."""
-    return replace_text(
-        installation_path(base_dir), json.dumps({WANTED_FIELD: wanted}, indent=2) + "\n"
-    )
+    path = installation_path(base_dir)
+    document = _read_record(path)
+    document[WANTED_FIELD] = wanted
+    return _write_record(path, document)
+
+
+def read_bootstrapped_render(path: Path) -> BootstrappedRender | None:
+    """The loaded Codex render evidence, or ``None`` when it is absent/invalid."""
+    candidate = _read_record(path).get(CODEX_LAUNCH_AGENT_FIELD)
+    if not isinstance(candidate, dict):
+        return None
+    render_sha256 = candidate.get(RENDER_SHA256_FIELD)
+    login_asid = candidate.get(LOGIN_ASID_FIELD)
+    if render_sha256 is not None and (
+        not isinstance(render_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", render_sha256) is None
+    ):
+        return None
+    if login_asid is not None and (
+        not isinstance(login_asid, int) or isinstance(login_asid, bool) or login_asid < 0
+    ):
+        return None
+    return BootstrappedRender(render_sha256=render_sha256, login_asid=login_asid)
+
+
+def write_bootstrapped_render(path: Path, loaded: BootstrappedRender) -> str:
+    """Record which Codex render launchd holds while preserving user intent."""
+    document = _read_record(path)
+    document[CODEX_LAUNCH_AGENT_FIELD] = {
+        RENDER_SHA256_FIELD: loaded.render_sha256,
+        LOGIN_ASID_FIELD: loaded.login_asid,
+    }
+    return _write_record(path, document)
