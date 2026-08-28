@@ -181,7 +181,7 @@ public actor EngineSupervisor {
         let deadline = Task { [clock] in
             await clock.sleep(Self.stopGraceSeconds)
             guard !Task.isCancelled else { return }
-            await self.forceIfStillAlive(stopping)
+            self.forceIfStillAlive(stopping)
         }
         await supervision?.value
         deadline.cancel()
