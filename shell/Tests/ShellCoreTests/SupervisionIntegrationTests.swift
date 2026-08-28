@@ -54,8 +54,8 @@ import Testing
 
         #expect(stopped == .stopped(.repeatedFailures(attempts: 5)))
         #expect(clock.sleeps() == [1, 2, 4, 8])
-        // Verbatim, and the only copy: the engine says this before it adopts its
-        // own log, so nothing else holds it.
+        // Verbatim: after log adoption the engine mirrors only this final refusal
+        // sentence onto the inherited stderr pipe.
         let held = await supervisor.lines()
         #expect(held == ["the engine cannot start: no engine configuration at /tmp/nope.toml"])
         await supervisor.shutDown()

@@ -8,8 +8,9 @@ one point every process it will ever spawn descends from.
 
 The ordering is what the tests pin, because the ordering is what decides where a
 failure can be read. A configuration that cannot be read is refused *before* the
-log exists, so it goes to the terminal that started the engine. Everything after
-adoption goes to stderr, which by then *is* the log.
+log exists, so it goes to the terminal that started the engine. After adoption,
+stderr *is* the log; only the final refusal sentence is also mirrored to the
+inherited stderr descriptor.
 
 The end-to-end case runs a real engine as a real subprocess, because that is the
 only place adoption can be observed honestly: in-process, pointing this runner's
@@ -289,6 +290,46 @@ class TestWhichSideOfAdoptionARefusalLandsOn:
 
 class TestARealEngineOwningARealLog:
     """The whole of ADR 0004's Done-when, in one process that is actually served."""
+
+    def test_a_post_adoption_refusal_is_also_spoken_on_inherited_stderr(
+        self, home: Path, configured: Path
+    ) -> None:
+        token_variable = "GVC_TEST_UNSET_TELEGRAM_TOKEN"
+        original = configured.read_text()
+        rewritten = original.replace(
+            'companion_channel = "fakes:FakeCompanionChannel"',
+            "companion_channel = "
+            '"gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"',
+        )
+        assert rewritten != original, "the fixture no longer names the fake Companion Channel"
+        configured.write_text(
+            rewritten
+            + "\n[adapters.settings.companion_channel]\n"
+            + f'token_env = "{token_variable}"\n'
+            + 'chat_id = "-100137"\n',
+            encoding="utf-8",
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(TESTS_DIR)
+        environment.pop(token_variable, None)
+
+        engine = subprocess.run(
+            [sys.executable, "-m", "gpt_voicecoding.engine", "--config", str(configured)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+        inherited_lines = engine.stderr.splitlines()
+        assert engine.returncode == EXIT_REFUSED
+        assert engine.stdout == ""
+        assert inherited_lines
+        refusal = inherited_lines[-1]
+        assert refusal.startswith("the engine cannot start: ")
+        assert f"${token_variable}" in refusal
+        assert refusal in (home / "engine.log").read_text()
 
     def test_it_logs_through_the_file_it_owns_and_says_nothing_on_the_terminal(
         self, home: Path, configured: Path

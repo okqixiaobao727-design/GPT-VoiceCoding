@@ -96,7 +96,7 @@ public struct RestartPolicy: Sendable {
 /// The engine's exit codes, as `engine/runner.py` defines them.
 public enum EngineExitCode {
     public static let ok: Int32 = 0
-    /// It could not start, and said why on stderr — before it adopts its own log
-    /// (ADR 0004), so stderr is the only place that reason exists.
+    /// It could not start, and mirrored the final reason to inherited stderr while
+    /// keeping its full diagnostics in the log it owns (ADR 0004).
     public static let couldNotStart: Int32 = 2
 }

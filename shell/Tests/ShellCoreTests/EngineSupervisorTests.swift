@@ -159,9 +159,9 @@ import Testing
     }
 
     @Test func theCrashLoopPanelHoldsTheLastRunsWordsVerbatim() async throws {
-        // Exit 2's reason exists only on stderr — it is said before the engine
-        // adopts its own log (ADR 0004) — so this ring is the only copy, and the
-        // one that matters is the run that finally exhausted the budget.
+        // The engine mirrors exit 2's final reason onto inherited stderr while
+        // keeping its log (ADR 0004). The panel needs the run that finally
+        // exhausted the budget rather than a complaint from an earlier attempt.
         let clock = TestClock()
         let log = HealthLog()
         let (supervisor, _) = supervisor(

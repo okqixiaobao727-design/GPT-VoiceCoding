@@ -324,6 +324,10 @@ positional agent/workspace/label form is not accepted beside this one.
 
 One TOML file, read once, by the composition root and nothing else.
 
+`[adapters.settings.session_launcher]` and `[launch]` are no longer read. A
+configuration carrying `[adapters.settings.session_launcher]` is refused rather
+than silently ignored.
+
 ```toml
 [engine]
 socket_path = "/tmp/gpt-voicecoding-501/control.sock"   # optional
@@ -331,7 +335,7 @@ state_path  = "~/Library/Application Support/GPT-VoiceCoding/engine/state.json" 
 
 [adapters]
 call              = "gpt_voicecoding.adapters.call.realtime:realtime_call"
-companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
+companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"
 
 [adapters.agents]
 claude = "gpt_voicecoding.adapters.agent.claude:build"
@@ -438,5 +442,7 @@ The engine stays in the foreground and never daemonises: the menu-bar shell
 spawns it as a direct child and expects it to remain one (ADR 0005). `SIGINT` and
 `SIGTERM` both stop it in order — loops cancelled, socket removed, so the next
 start is not left claiming its own debris. It exits **2** when it could not start,
-naming what was missing on stderr; that output happens before the engine adopts
-its own log (ADR 0004), which is why it goes to the terminal that started it.
+naming what was missing on stderr. A configuration refusal before log takeover
+goes there in full. After takeover, only the final
+`the engine cannot start: …` sentence is mirrored to the inherited stderr; the
+full diagnostic stays in `engine.log`, which the engine owns (ADR 0004).

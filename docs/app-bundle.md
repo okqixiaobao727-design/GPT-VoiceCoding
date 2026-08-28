@@ -237,12 +237,6 @@ re-run: it is a property of macOS, not of this bundle.
 
 Deliberate, and written down so they are not rediscovered as bugs.
 
-**A refusal after log adoption is invisible in the shell.** The engine exits 2
-and says why, but by then its stderr *is* its log (ADR 0004), so the menu-bar
-shell's Retry panel — which shows only the engine's *pre-adoption* words — is
-empty. The answer is `engine.log`, beside the configuration. Step 0 of the
-acceptance exists so this is met once on purpose.
-
 **Nothing ends an engine it did not start.** Kill the shell abnormally and the
 engine is orphaned, and there is no supported way to stop it but `kill` on the
 process. Note this is about the *engine*, not the Sessions it launched: under the

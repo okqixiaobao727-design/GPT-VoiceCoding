@@ -3,9 +3,9 @@ import Testing
 
 @testable import ShellCore
 
-/// The engine names what was missing on stderr and exits 2, and that happens
-/// *before* it adopts its own log (ADR 0004) — so stderr is the only place that
-/// reason exists, and the shell is the only thing holding it.
+/// The engine names what was missing on inherited stderr and exits 2. After it
+/// adopts its own log (ADR 0004), only that final refusal sentence is mirrored
+/// here; the shell holds it in memory and writes no second log.
 @Suite struct StderrRingTests {
     @Test func itKeepsTheLinesVerbatim() {
         var ring = StderrRing()
