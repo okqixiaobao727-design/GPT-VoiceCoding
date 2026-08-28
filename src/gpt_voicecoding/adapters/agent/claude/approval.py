@@ -1,4 +1,4 @@
-"""The Approval Relay: a hook process holds the dialog open, and we answer into it.
+"""The Claude hook listener: one wire, selected behind two Agent-seam routes.
 
 **The route is a `PermissionRequest` hook, and the hook is the wire.** Claude Code
 runs it for a displayed permission and for `AskUserQuestion`, hands it the tool
@@ -18,17 +18,18 @@ denial wearing the wrong word. Handing a request back is therefore implemented b
 printing nothing at all — the same shape the Codex spoke's approvals module
 arrived at independently, for the same reason.
 
-At the seam, a permission uses `allow`, `deny`, or `ask`, while a question uses
-`answer(text)`. At the wire, the answer is a denial whose message is that text,
-because Claude consumes it as the question's tool result; `ask` is the one
-verdict said by saying nothing.
+At the seam, permissions use the Approval Relay's `allow`, `deny`, or `ask`.
+Questions use the Answer Relay's ordinary words; the Claude adapter selects this
+hook instead of the inbox while the exact prompt remains parked. At the wire,
+that answer is a denial whose framed message Claude consumes as the question's
+tool result. `ask` is the one verdict said by saying nothing.
 
-**Nothing here has a clock.** The hook waits for this listener and this listener
-waits for Bridge Core, whose `approval_budget_seconds` is the one budget in the
-system; expiry arrives as an ordinary `ASK`, carried down the connection like any
-other verdict. Claude Code's own default hook budget happens to be 600 s, the
-same number `CorePolicy` defaults to — a coincidence worth knowing and not a
-constant to mirror, because two copies of one number are two numbers.
+**The listener timestamps; Bridge Core owns the duration.** A parked question
+records the listener's injected monotonic clock. Bridge Core passes its configured
+`approval_budget_seconds` into `sweep_question_budget`, so this module imports no
+policy and mirrors no default. Expiry pops first and writes `ASK`. Claude Code's
+own default hook budget happens to be 600 s, the same number `CorePolicy` defaults
+to — a coincidence worth knowing and not a constant to copy.
 
 **The grant ceiling is a policy this file keeps, not a limit the route imposes.**
 `permission_suggestions` arrives on the hook payload and an `allow` decision may
@@ -52,6 +53,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -71,8 +73,9 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
-    ApprovalVerdictKind,
     AwaitingApproval,
+    ReplyWindow,
+    ReplyWindowChanged,
     WaitingFor,
     WaitingKind,
 )
@@ -101,9 +104,8 @@ PROVEN_AGAINST_VERSION: Final = "2.1.238"
 #: What a denied tool call is told. The user said no; the Session hears why.
 DENIED_BY_VOICE: Final = "denied by the user, by voice, through GPT-VoiceCoding"
 
-#: The dialog's own correlator, undocumented and carried on every payload —
-#: the same field #71 recorded. It is what `WaitingFor.approval_id` holds for a
-#: question, and what #103 addresses an answer with.
+#: Claude's dialog correlator when the wire supplies one. `WaitingFor` reports
+#: this value exactly; the listener mints a separate private key when it is absent.
 PROMPT_ID_FIELD: Final = "prompt_id"
 
 
@@ -115,7 +117,7 @@ PROMPT_ID_FIELD: Final = "prompt_id"
 # would be indistinguishable from a hook that answered `ask`. Nothing on the wire
 # would say so, which is exactly why this route's proof of delivery is the
 # `approval_ack` frame over our own socket (`ACK_TYPE`) and never the hook's exit.
-def hook_decision(verdict: ApprovalVerdict) -> dict[str, Any] | None:
+def hook_decision(verdict: ApprovalVerdict, *, message: str | None = None) -> dict[str, Any] | None:
     """What the hook prints for one verdict, or `None` when it prints nothing.
 
     Neither `updatedInput` nor `updatedPermissions` ever appears. The first would
@@ -123,17 +125,13 @@ def hook_decision(verdict: ApprovalVerdict) -> dict[str, Any] | None:
     something else; the second is a session-scoped rule, and the locked ceiling
     for a spoken grant is one call.
     """
-    if verdict.kind is ApprovalVerdictKind.ASK:
+    if verdict is ApprovalVerdict.ASK:
         return None
-    if verdict.kind is ApprovalVerdictKind.ANSWER:
-        decision: dict[str, Any] = {
-            "behavior": DENY_BEHAVIOR,
-            "message": verdict.answer_text,
-        }
-    elif verdict.kind is ApprovalVerdictKind.ALLOW:
-        decision = {"behavior": ALLOW_BEHAVIOR}
-    else:
-        decision = {"behavior": DENY_BEHAVIOR, "message": DENIED_BY_VOICE}
+    decision: dict[str, Any] = (
+        {"behavior": ALLOW_BEHAVIOR}
+        if verdict is ApprovalVerdict.ALLOW
+        else {"behavior": DENY_BEHAVIOR, "message": message or DENIED_BY_VOICE}
+    )
     return {"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "decision": decision}}
 
 
@@ -183,7 +181,13 @@ CWD_FIELD: Final = "cwd"
 TOOL_NAME_FIELD: Final = "tool_name"
 TOOL_INPUT_FIELD: Final = "tool_input"
 VERDICT_FIELD: Final = "verdict"
+MESSAGE_FIELD: Final = "message"
 REASON_FIELD: Final = "reason"
+
+#: Claude consumes a denied `AskUserQuestion` call's message as the tool result.
+#: Frame remote words so the Session can distinguish their source from a local
+#: keyboard answer while preserving the user's words inside the frame.
+QUESTION_ANSWER_PREFIX: Final = "The user answered from GPT-VoiceCoding: "
 
 #: The registration's own fields. `transcript_path` is the one that earns this
 #: hook its place (#71): Claude Code's own registry does not carry it, and it
@@ -251,7 +255,6 @@ def request_from(
         approval_id=approval_id,
         target=target,
         tool_name=tool_name if isinstance(tool_name, str) and tool_name.strip() else "a tool",
-        kind=WaitingKind.PERMISSION,
         detail=stop_analysis.summarise(payload.get(TOOL_INPUT_FIELD)),
     )
 
@@ -260,18 +263,19 @@ def question_from(payload: Mapping[str, Any]) -> WaitingFor | None:
     """One `AskUserQuestion` dialog as a `WaitingFor`, or `None` for anything else.
 
     **`AskUserQuestion` rides the permission hook**, measured on 2.1.246 (#77):
-    the payload carries the whole structured question in `tool_input.questions`,
-    with a `prompt_id` beside it. That is a fact about the wire, not about
-    permissions, and it is the only route a question has — the transcript only
-    says a question was asked once the tool call has flushed, and by then the
-    person at the keyboard has usually answered it.
+    the payload carries the whole structured question in `tool_input.questions`.
+    Claude Code 2.1.248 carries no usable `prompt_id` on this request, while an
+    ordinary permission does. This projector reports that distinction exactly;
+    the listener separately mints a private key for its held writer. The
+    transcript only says a question was asked once the tool call has flushed,
+    and by then the person at the keyboard has usually answered it.
 
     **The shape is parsed by #75's parser and nothing else.** The hook's
     `tool_input` and the transcript's `tool_use.input` are the same object, so a
     second projector here would be two readings of one payload that could
     disagree about what an option is — the thing `stop_analysis.question_in`
-    exists to prevent. What this adds is the one field the transcript cannot
-    carry: the dialog's handle.
+    exists to prevent. What this adds is Claude's `prompt_id` when present,
+    without substituting the listener's private correlator when it is absent.
 
     **`Option.recommended` is read, and it is a fact rather than an inference.**
     `AskUserQuestion` has no recommendation *field* — the tool's own instructions
@@ -309,20 +313,36 @@ class ApprovalError(Exception):
 class _Waiting:
     """One hook process, parked mid-dialog, and the connection it is holding open."""
 
-    __slots__ = ("acknowledged", "answered", "gone", "question", "request", "writer")
+    __slots__ = (
+        "acknowledged",
+        "answered",
+        "gone",
+        "parked_at",
+        "permission",
+        "question",
+        "target",
+        "writer",
+    )
 
     def __init__(
         self,
-        request: ApprovalRequest,
+        target: SessionTarget,
         writer: asyncio.StreamWriter,
+        *,
+        permission: ApprovalRequest | None = None,
         question: WaitingFor | None = None,
+        parked_at: float,
     ) -> None:
-        self.request = request
+        if (permission is None) == (question is None):
+            raise ValueError("a parked hook is exactly one permission or question")
+        self.target = target
         self.writer = writer
+        self.permission = permission
         #: What this dialog asked, when it is an `AskUserQuestion` rather than a
         #: permission. Parsed once, here, when the payload arrives: two parses of
         #: one message are two answers that can disagree.
         self.question = question
+        self.parked_at = parked_at
         #: Set once a verdict has been written to this hook. It is what tells the
         #: connection's own task that the end it is about to see is an ordinary
         #: goodbye rather than a human winning the race.
@@ -352,6 +372,7 @@ class ApprovalListener:
         emit: Callable[[AgentEvent], None],
         pid: int | None = None,
         register: Callable[[dict[str, Any]], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         #: What to do with a `SessionStart` line. `None` drops it, which is what
@@ -361,6 +382,7 @@ class ApprovalListener:
         #: holds a registration for — or `None`, which is the authority check.
         self._resolve = resolve
         self._emit = emit
+        self._clock = clock
         self._path = approval_socket_path(settings.socket_directory, pid or os.getpid())
         self._server: asyncio.Server | None = None
         self._waiting: dict[str, _Waiting] = {}
@@ -368,6 +390,10 @@ class ApprovalListener:
         #: at the keyboard won the race. Kept so a verdict arriving a moment
         #: later can be told which race it lost instead of "no such request".
         self._answered_elsewhere: set[str] = set()
+        #: A released question remains a closed route until discovery observes
+        #: the Session move on. This prevents a late Answer Relay falling
+        #: through to the ordinary inbox as a new turn.
+        self._released_questions: dict[SessionTarget, str] = {}
 
     @property
     def path(self) -> Path:
@@ -378,8 +404,12 @@ class ApprovalListener:
         return self._server is not None
 
     def pending(self) -> tuple[ApprovalRequest, ...]:
-        """Every dialog currently parked on this socket, in arrival order."""
-        return tuple(waiting.request for waiting in self._waiting.values())
+        """Every permission currently parked on this socket, in arrival order."""
+        return tuple(
+            waiting.permission
+            for waiting in self._waiting.values()
+            if waiting.permission is not None
+        )
 
     def newest_for(self, target: SessionTarget) -> ApprovalRequest | None:
         """The dialog one exact Session is held up on, or `None` for none.
@@ -394,8 +424,8 @@ class ApprovalListener:
         about what this listener is holding.
         """
         for waiting in reversed(self._waiting.values()):
-            if waiting.request.target == target:
-                return waiting.request
+            if waiting.target == target:
+                return waiting.permission
         return None
 
     def newest_question_for(self, target: SessionTarget) -> WaitingFor | None:
@@ -407,10 +437,35 @@ class ApprovalListener:
 
         The newest, and keyed by the exact target, for `newest_for`'s reasons.
         """
-        for waiting in reversed(self._waiting.values()):
-            if waiting.request.target == target:
-                return waiting.question
+        held = self.held_question_for(target)
+        return held[1] if held is not None else None
+
+    def held_question_for(self, target: SessionTarget) -> tuple[str, WaitingFor] | None:
+        """The listener-private key and question for one target's newest held writer.
+
+        The key is Claude's `prompt_id` when the wire supplied one, otherwise an
+        opaque UUID minted by this listener. The generated value never replaces
+        `WaitingFor.approval_id`, whose value remains exactly what Claude sent.
+        """
+        for question_id, waiting in reversed(self._waiting.items()):
+            if waiting.target != target:
+                continue
+            if waiting.question is None:
+                return None
+            return question_id, waiting.question
         return None
+
+    def question_answerable(self, target: SessionTarget) -> bool:
+        """Whether this listener still holds the exact question route."""
+        return self.held_question_for(target) is not None
+
+    def released_question_reason(self, target: SessionTarget) -> str | None:
+        """Why the latest question route closed, while its waiting row remains."""
+        return self._released_questions.get(target)
+
+    def clear_released_question(self, target: SessionTarget) -> None:
+        """Forget a closed route after discovery proves the Session moved on."""
+        self._released_questions.pop(target, None)
 
     async def start(self) -> None:
         """Bind the socket, in a directory only this user can enter."""
@@ -447,15 +502,18 @@ class ApprovalListener:
         this is trying not to block on.
         """
         server, self._server = self._server, None
-        for waiting in list(self._waiting.values()):
+        for approval_id, waiting in list(self._waiting.items()):
+            self._waiting.pop(approval_id, None)
             with contextlib.suppress(OSError, ConnectionError):
                 await self._write_verdict(waiting, ApprovalVerdict.ASK)
+            self._question_released(waiting)
         if server is not None:
             server.close()
             with contextlib.suppress(Exception):
                 await server.wait_closed()
         self._waiting.clear()
         self._answered_elsewhere.clear()
+        self._released_questions.clear()
         with contextlib.suppress(OSError):
             self._path.unlink()
         with contextlib.suppress(OSError):
@@ -483,6 +541,50 @@ class ApprovalListener:
         Popping first is what makes this exactly once, and what makes a second
         verdict for the same dialog a refusal rather than a second write.
         """
+        return await self._answer(
+            approval_id,
+            verdict,
+            request_id=request_id,
+            message=None,
+            question_only=False,
+        )
+
+    async def answer_question(
+        self, question_id: str, words: str, *, request_id: RequestId
+    ) -> DeliveryReceipt:
+        """Carry the user's words into the exact question hook still parked."""
+        waiting = self._waiting.get(question_id)
+        if waiting is None or waiting.question is None:
+            if question_id in self._answered_elsewhere:
+                return _failed(request_id, "that question was answered elsewhere")
+            return _failed(request_id, f"no question {question_id} is answerable on this Session")
+        collapsed = " ".join(words.split())
+        canonical = next(
+            (
+                option.text
+                for option in waiting.question.options
+                if " ".join(option.text.split()).casefold() == collapsed.casefold()
+            ),
+            words,
+        )
+        return await self._answer(
+            question_id,
+            ApprovalVerdict.DENY,
+            request_id=request_id,
+            message=QUESTION_ANSWER_PREFIX + canonical,
+            question_only=True,
+        )
+
+    async def _answer(
+        self,
+        approval_id: str,
+        verdict: ApprovalVerdict,
+        *,
+        request_id: RequestId,
+        message: str | None,
+        question_only: bool,
+    ) -> DeliveryReceipt:
+        """Pop one parked hook first, then carry one framed wire decision."""
         waiting = self._waiting.pop(approval_id, None)
         if waiting is None:
             if approval_id in self._answered_elsewhere:
@@ -491,6 +593,13 @@ class ApprovalListener:
                 request_id,
                 f"no permission request {approval_id} is waiting on this Session",
             )
+        if question_only and waiting.question is None:
+            self._waiting[approval_id] = waiting
+            return _failed(request_id, f"{approval_id} is a permission, not a question")
+        if not question_only and waiting.question is not None:
+            self._waiting[approval_id] = waiting
+            return _failed(request_id, f"{approval_id} is a question, not a permission")
+        self._question_released(waiting)
 
         held = DeliveryReceipt(
             request_id=request_id,
@@ -498,17 +607,17 @@ class ApprovalListener:
             reason="handed back to the on-screen dialog, which still holds it",
         )
         try:
-            await self._write_verdict(waiting, verdict)
+            await self._write_verdict(waiting, verdict, message=message)
         except (OSError, ConnectionError) as broken:
             self._answered_elsewhere.add(approval_id)
-            if verdict.kind is ApprovalVerdictKind.ASK:
+            if verdict is ApprovalVerdict.ASK:
                 # Nothing was owed to the hook here: `ask` asks it to do nothing,
                 # and a hook that has already gone has already done it.
                 return held
             return _failed(request_id, f"the hook holding that dialog went away: {broken}")
 
         acknowledged = await self._hook_acknowledged(waiting)
-        if verdict.kind is ApprovalVerdictKind.ASK:
+        if verdict is ApprovalVerdict.ASK:
             return held
         if not acknowledged:
             return _unknown(
@@ -518,13 +627,48 @@ class ApprovalListener:
             )
         return DeliveryReceipt(request_id=request_id, outcome=Delivery.DELIVERED)
 
-    async def _write_verdict(self, waiting: _Waiting, verdict: ApprovalVerdict) -> None:
+    async def _write_verdict(
+        self, waiting: _Waiting, verdict: ApprovalVerdict, *, message: str | None = None
+    ) -> None:
         """Put one verdict on one hook's connection. Raises if it did not go."""
-        await self._reply(
-            waiting.writer,
-            {TYPE_FIELD: VERDICT_TYPE, VERDICT_FIELD: verdict.to_document()},
-        )
+        frame: dict[str, Any] = {TYPE_FIELD: VERDICT_TYPE, VERDICT_FIELD: str(verdict)}
+        if message is not None:
+            frame[MESSAGE_FIELD] = message
+        await self._reply(waiting.writer, frame)
         waiting.answered.set()
+
+    async def sweep_question_budget(
+        self, budget_seconds: float
+    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
+        """Pop and release every held question past Core's configured budget."""
+        now = self._clock()
+        expired = [
+            (approval_id, waiting)
+            for approval_id, waiting in self._waiting.items()
+            if waiting.question is not None and waiting.parked_at + budget_seconds <= now
+        ]
+        released: list[tuple[SessionTarget, WaitingFor]] = []
+        for approval_id, waiting in expired:
+            self._waiting.pop(approval_id, None)
+            question = waiting.question
+            assert question is not None
+            with contextlib.suppress(OSError, ConnectionError):
+                await self._write_verdict(waiting, ApprovalVerdict.ASK)
+            self._question_released(waiting)
+            released.append((waiting.target, question))
+        return tuple(released)
+
+    def _question_released(
+        self,
+        waiting: _Waiting,
+        *,
+        reason: str = "that question is no longer answerable from here; answer it in the terminal",
+    ) -> None:
+        if waiting.question is None:
+            return
+        target = waiting.target
+        self._released_questions[target] = reason
+        self._emit(ReplyWindowChanged(target=target, window=ReplyWindow.CLOSED))
 
     async def _hook_acknowledged(self, waiting: _Waiting) -> bool:
         """Wait, bounded, for the hook's own receipt. Nothing else is a proof.
@@ -576,37 +720,43 @@ class ApprovalListener:
             question = question_from(payload)
             if question is not None:
                 approval_id = question.approval_id or str(uuid.uuid4())
-                request = ApprovalRequest(
-                    approval_id=approval_id,
-                    target=target,
-                    tool_name=stop_analysis.QUESTION_TOOL,
-                    kind=WaitingKind.QUESTION,
-                    prompt=question.prompt or "",
-                    options=tuple(option.text for option in question.options),
-                    recommendation=question.recommendation,
-                )
+                request = None
             else:
                 approval_id = str(uuid.uuid4())
                 request = request_from(payload, target=target, approval_id=approval_id)
-            waiting = _Waiting(request, writer, question)
+            waiting = _Waiting(
+                target,
+                writer,
+                permission=request,
+                question=question,
+                parked_at=self._clock(),
+            )
             self._waiting[approval_id] = waiting
+            if question is not None:
+                self._released_questions.pop(target, None)
 
             # Raised only once the request is parked, so a verdict answered the
-            # same tick has somewhere to land. A question enters the same
-            # Approval Relay only under its own prompt id (#103); without that
-            # correlator it remains observable but cannot honestly be addressed.
-            if question is None or question.approval_id is not None:
+            # same tick has somewhere to land. A question never enters the
+            # Approval Relay. This held writer privately addresses the next
+            # Answer Relay, using Claude's prompt id or this listener's opaque
+            # fallback key.
+            if question is None:
+                assert request is not None
                 self._emit(AwaitingApproval(request=request))
+            if question is not None:
+                self._emit(ReplyWindowChanged(target=target, window=ReplyWindow.OPEN))
             if question is not None and question.approval_id is not None:
                 _log.info(
-                    "a question is parked for %s (prompt_id=%s); entered the Approval Relay",
+                    "a question is parked for %s (prompt_id=%s); Reply Window opened",
                     target,
                     question.approval_id,
                 )
             elif question is not None:
                 _log.info(
-                    "a question is parked for %s without a prompt_id; left to the on-screen dialog",
+                    "a question is parked for %s without a prompt_id; "
+                    "engine-private correlator=%s; Reply Window opened",
                     target,
+                    approval_id,
                 )
 
             # From here this task does exactly one thing: watch for the hook's
@@ -625,6 +775,10 @@ class ApprovalListener:
             waiting.gone.set()
             if not waiting.answered.is_set():
                 self._answered_elsewhere.add(approval_id)
+                self._question_released(
+                    waiting,
+                    reason="that question was answered elsewhere at the on-screen dialog",
+                )
                 _log.info("approval %s left with its dialog before a verdict arrived", approval_id)
         except (OSError, ConnectionError, ValueError) as broken:
             _log.info("an approval hook connection failed: %s", broken)

@@ -69,6 +69,7 @@ from typing import Any
 from gpt_voicecoding.adapters.agent.claude.approval import (
     ACK_TYPE,
     MAX_HOOK_REQUEST_BYTES,
+    MESSAGE_FIELD,
     PROMPT_ID_FIELD,
     REQUEST_TYPE,
     SESSION_ID_FIELD,
@@ -98,10 +99,10 @@ def request_for(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     than the engine needs — a whole file's contents on a `Write`, a permission
     suggestion that is a *rule* — so it is transcribed rather than passed on. The
     cost of that choice is exactly this: a field left out of this dictionary is
-    absent on the engine's side and nothing errors. `prompt_id` is the dialog's
-    own correlator, undocumented, and the handle a question is projected with
-    (#77) and answered by (#103); it is carried here because a `WaitingFor` with
-    no handle reads as "the roster saw it and nobody can address it".
+    absent on the engine's side and nothing errors. `prompt_id` is Claude's
+    undocumented correlator when it supplies one. Claude Code 2.1.248 supplies
+    no usable value for `AskUserQuestion`, so the listener may mint a private
+    correlator; this copy still preserves exactly what the wire sent.
     """
     session_id = payload.get(SESSION_ID_FIELD)
     if not isinstance(session_id, str) or not session_id.strip():
@@ -115,7 +116,9 @@ def request_for(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def ask_engine(request: dict[str, Any], *, path: Path, dial_timeout: float) -> ApprovalVerdict:
+def ask_engine(
+    request: dict[str, Any], *, path: Path, dial_timeout: float
+) -> tuple[ApprovalVerdict, str | None]:
     """One dialog out, one verdict back. Every failure answers `ASK`.
 
     A refusal, a closed socket, a reply about something else and a reply that is
@@ -126,7 +129,7 @@ def ask_engine(request: dict[str, Any], *, path: Path, dial_timeout: float) -> A
     try:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     except OSError:
-        return ApprovalVerdict.ASK
+        return ApprovalVerdict.ASK, None
     with connection:
         try:
             connection.settimeout(dial_timeout)
@@ -141,7 +144,7 @@ def ask_engine(request: dict[str, Any], *, path: Path, dial_timeout: float) -> A
             verdict = _verdict_in(line)
             _acknowledge(connection, line)
         except (OSError, ValueError):
-            return ApprovalVerdict.ASK
+            return ApprovalVerdict.ASK, None
     return verdict
 
 
@@ -178,21 +181,22 @@ def _one_line(connection: socket.socket) -> bytes:
     return b"".join(chunks)
 
 
-def _verdict_in(line: bytes) -> ApprovalVerdict:
+def _verdict_in(line: bytes) -> tuple[ApprovalVerdict, str | None]:
     """The engine's answer, or `ASK` for anything that is not exactly one."""
     if not line.strip():
-        return ApprovalVerdict.ASK
+        return ApprovalVerdict.ASK, None
     try:
         document: Any = json.loads(line.split(b"\n", 1)[0])
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return ApprovalVerdict.ASK
+        return ApprovalVerdict.ASK, None
     if not isinstance(document, dict) or document.get(TYPE_FIELD) != VERDICT_TYPE:
-        return ApprovalVerdict.ASK
-    raw = document.get(VERDICT_FIELD)
+        return ApprovalVerdict.ASK, None
     try:
-        return ApprovalVerdict.from_document(raw)
+        verdict = ApprovalVerdict(document.get(VERDICT_FIELD))
     except ValueError:
-        return ApprovalVerdict.ASK
+        return ApprovalVerdict.ASK, None
+    message = document.get(MESSAGE_FIELD)
+    return verdict, message if isinstance(message, str) else None
 
 
 def decide(payload: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str, Any] | None:
@@ -207,8 +211,8 @@ def decide(payload: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str, 
     request = request_for(payload)
     if request is None:
         return None
-    verdict = ask_engine(request, path=path, dial_timeout=dial_timeout_in(environ))
-    return hook_decision(verdict)
+    verdict, message = ask_engine(request, path=path, dial_timeout=dial_timeout_in(environ))
+    return hook_decision(verdict, message=message)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -66,6 +66,7 @@ a turn whose Stop lands where a later step is looking for a different one.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -238,22 +239,26 @@ INBOUND = writing("inbound.txt", "CHARLIE")
 SWITCH_FILE = "switches.txt"
 SWITCH_WORD = "DELTA"
 
-#: #103's real Claude question. The answer and continuation are the ticket's
-#: measured values, not text copied out of this implementation.
-CLAUDE_QUESTION = "Tabs or spaces?"
-CLAUDE_OPTIONS = ("spaces", "tabs")
-CLAUDE_ANSWER = "tabs"
-CLAUDE_ANSWERED = "You answered tabs."
+#: #128's real Claude question. The two deterministic labels make the chosen
+#: value readable in the notice, the hook result, and the filesystem effect.
+QUESTION_FILE = "question.txt"
+CLAUDE_QUESTION = "Which marker should be written?"
+CLAUDE_OPTIONS = ("ALPHA", "DELTA")
+CLAUDE_ANSWER = "DELTA"
+CLAUDE_ANSWER_FRAME = f"The user answered from GPT-VoiceCoding: {CLAUDE_ANSWER}"
 
 
 def asking_the_claude_question(_: Path) -> Instruction:
-    """Raise the exact `AskUserQuestion` route #103 adds, with no file side effect."""
+    """Ask one deterministic question, then persist the selected label."""
     return Instruction(
         words=(
-            "Use AskUserQuestion to ask `Tabs or spaces?` with exactly two option labels, "
-            "`spaces` and `tabs`. After the question is answered, reply with exactly "
-            "`You answered tabs.` and do nothing else."
-        )
+            f"Use AskUserQuestion to ask `{CLAUDE_QUESTION}` with exactly two option labels, "
+            f"`{CLAUDE_OPTIONS[0]}` and `{CLAUDE_OPTIONS[1]}`. After it is answered, create "
+            f"a file named {QUESTION_FILE} in the current directory whose entire contents "
+            "are the selected option label. Do nothing else."
+        ),
+        target=Path(QUESTION_FILE),
+        content=CLAUDE_ANSWER,
     )
 
 
@@ -341,16 +346,12 @@ class Lane:
     #: asks one of them for permission asks the other for nothing (#105).
     relayed: Callable[[Path], Instruction]
     #: The fresh authority dialog `switches` leaves pending while Duty is off:
-    #: a Claude question or a Codex permission.
+    #: a permission on both lanes.
     actionable: Callable[[Path], Instruction]
-    #: What that action waits on, and the exact `approve` arguments that release
-    #: it. Lane data rather than `if agent == ...`: the wait and its answer are
-    #: wire facts that differ between the two adapters.
-    actionable_kind: str
-    actionable_answer: tuple[str, ...]
-    #: A real question must prove the Session continued on the hook's words.
-    #: Permissions already prove continuation through their filesystem effect.
-    actionable_continuation: str | None
+    #: #128's extra acceptance route. Claude carries it; Codex explicitly
+    #: records the unsupported route without grading it.
+    question: Callable[[Path], Instruction] | None
+    question_answer: str | None
     #: The ground the permission was measured on, given the agent's own record of
     #: the Session. `approval` says its `named` half in the evidence line, so a
     #: green step states the ground it stood on rather than implying some
@@ -398,10 +399,9 @@ CLAUDE = Lane(
     # is what `roster` and `stable name`'s three reads want to find.
     boot=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
-    actionable=asking_the_claude_question,
-    actionable_kind="question",
-    actionable_answer=("answer", CLAUDE_ANSWER),
-    actionable_continuation=CLAUDE_ANSWERED,
+    actionable=lambda workspace: writing(SWITCH_FILE, SWITCH_WORD),
+    question=asking_the_claude_question,
+    question_answer=CLAUDE_ANSWER,
     # The flag the harness passes *is* the whole policy on this lane, and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
     # nothing that can disagree. Sound by construction, and said out loud here so
@@ -480,9 +480,8 @@ CODEX = Lane(
     actionable=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / SWITCH_FILE, SWITCH_WORD
     ),
-    actionable_kind="permission",
-    actionable_answer=("allow",),
-    actionable_continuation=None,
+    question=None,
+    question_answer=None,
     policy_at=lambda record: hand_started.codex_turn_policy(record),
     asks_about=(
         "a write to a path outside the Session's writable roots raises "
@@ -1093,16 +1092,16 @@ class Walk:
         observations: silence over a derived window with Duty off, and — with
         Duty back on — a notice naming this Session.
 
-        Claude uses a real `AskUserQuestion` here, answered through #103's typed
-        verdict; Codex still uses the real permission its adapter supports. In
-        both lanes the Session is idle again before the fixed next step (`child`).
+        Both lanes use a real permission here. It is answerable through the
+        Approval Relay, so the Session is idle again before #128's Claude-only
+        question proof and the fixed next step (`child`).
 
         The interval before release is derived from `agent_turn_seconds` +
         `absence_window_seconds` + `DISCOVERY_SECONDS` +
         `telegram_round_trip_seconds`; the acceptance configuration keeps that
-        sum below the Approval Relay budget. Codex's file effect is not graded
-        here — `approval` owns that assertion. Claude instead grades the
-        ticket's measured continuation after `answer tabs`.
+        sum below the Approval Relay budget. The file effect is not graded here
+        — `approval` owns that assertion; this part approves only to release the
+        Session for the question proof and `child`.
 
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
@@ -1119,24 +1118,17 @@ class Walk:
 
         actionable = self.lane.actionable(self.config.workspace)
         target = actionable.path_in(self.config.workspace)
-        if target is not None:
-            target.parent.mkdir(parents=True, exist_ok=True)
+        if target is None:
+            raise StepFailed("the switches permission names no filesystem effect")
+        target.parent.mkdir(parents=True, exist_ok=True)
         mark = self.person.latest_message_id()
-        turn = self._drive_turn(
-            f"wait for {self.lane.actionable_kind}", actionable, expect_waiting=True
-        )
-
-        def reached_actionable_wait() -> bool:
-            seen = self._roster_field("waiting_for")
-            return isinstance(seen, dict) and seen.get("kind") == self.lane.actionable_kind
-
-        support.wait_for(reached_actionable_wait, deadline_seconds=DISCOVERY_SECONDS)
+        turn = self._drive_turn("wait for permission", actionable, expect_waiting=True)
         waiting = self._roster_field("waiting_for")
-        if not isinstance(waiting, dict) or waiting.get("kind") != self.lane.actionable_kind:
+        if not isinstance(waiting, dict) or waiting.get("kind") != "permission":
             self.bridgectl("switch", "duty", "on")
             raise StepFailed(
-                f"the switches turn did not stop on a {self.lane.actionable_kind} "
-                f"(turn ended={turn.ended}, roster waiting_for={waiting!r})"
+                f"the switches turn did not stop on a permission (turn ended={turn.ended}, "
+                f"roster waiting_for={waiting!r})"
             )
         pending = self._own_pending_approvals()
         if len(pending) != 1:
@@ -1145,18 +1137,6 @@ class Walk:
                 f"the switches turn left {len(pending)} pending approvals for this Session, "
                 f"not exactly one: {pending!r}"
             )
-        if self.lane.actionable_kind == "question":
-            projected = {
-                "prompt": pending[0].get("prompt"),
-                "options": tuple(pending[0].get("options", [])),
-            }
-            expected = {"prompt": CLAUDE_QUESTION, "options": CLAUDE_OPTIONS}
-            if projected != expected:
-                self.bridgectl("switch", "duty", "on")
-                raise StepFailed(
-                    f"the real question did not cross status verbatim: "
-                    f"expected {expected!r}, got {projected!r}"
-                )
         approval_id = str(pending[0]["approval_id"])
         status = self.bridgectl("status")
         if not status.ok:
@@ -1175,37 +1155,22 @@ class Walk:
         back_on = self.bridgectl("switch", "duty", "on")
         if not back_on.ok:
             raise StepFailed(f"`switch duty on` refused: {back_on.text}")
-        announcement_matches = (
-            (
-                lambda seen: (
-                    CLAUDE_QUESTION in seen.text
-                    and all(option in seen.text for option in CLAUDE_OPTIONS)
-                )
-            )
-            if self.lane.actionable_kind == "question"
-            else (lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)))
-        )
         reconciled = self._await_own_message(
             mark,
             deadline_seconds=DISCOVERY_SECONDS + self.far_side.telegram_round_trip_seconds,
-            matching=announcement_matches,
+            matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
         )
         if reconciled is None:
             raise StepFailed(
                 f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
                 f"(correct), but turning Duty back on reported nothing about a Session that "
-                f"was still waiting on {self.lane.actionable_kind} {approval_id}. The bot said "
+                f"was still waiting on permission {approval_id}. The bot said "
                 f"{self._other_traffic(mark)} in that window, none of it about this Session"
             )
-        approval_evidence = self._answer_pending_approval(
-            mark,
-            verdict=self.lane.actionable_answer,
-            announcement_matches=announcement_matches,
-        )
+        approval_evidence = self._answer_pending_approval(mark)
         if approval_evidence is None or approval_id not in approval_evidence:
             raise StepFailed(
-                f"the reconciled {self.lane.actionable_kind} {approval_id} could not be "
-                "released through the "
+                f"the reconciled permission {approval_id} could not be released through the "
                 f"Approval Relay: {approval_evidence!r}"
             )
         if not support.wait_for(
@@ -1213,40 +1178,186 @@ class Walk:
             deadline_seconds=self.far_side.agent_turn_seconds,
         ):
             raise StepFailed(
-                f"{self.lane.actionable_kind} {approval_id} was answered, but the Session "
-                "did not return to "
-                "idle before `child`"
-            )
-        if self.lane.actionable_continuation and not support.wait_for(
-            lambda: self._record_contains(self.lane.actionable_continuation or ""),
-            deadline_seconds=self.far_side.agent_turn_seconds,
-        ):
-            raise StepFailed(
-                f"the hook accepted {self.lane.actionable_answer!r}, but the Session's own "
-                f"record never contained {self.lane.actionable_continuation!r}"
+                f"permission {approval_id} was approved, but the Session did not return to "
+                "idle before the question proof"
             )
         forms = _naming_forms(self._own_row())
         announcements = [
             message
             for message in self.person.messages_after(mark)
-            if message.from_bot and _named_in(message.text, forms) and announcement_matches(message)
+            if message.from_bot
+            and _named_in(message.text, forms)
+            and APPROVAL_ANNOUNCEMENT.search(message.text)
         ]
         if len(announcements) != 1:
             raise StepFailed(
-                f"Duty on produced {len(announcements)} {self.lane.actionable_kind} "
-                "announcements for "
+                f"Duty on produced {len(announcements)} permission announcements for "
                 f"{approval_id}, not exactly one: {[message.text for message in announcements]!r}"
             )
+        question_evidence = self._accept_question()
         return (
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
             f"still answered ({status.text.splitlines()[0]!r}); Duty on: message "
-            f"{reconciled.id} {reconciled.text!r}; {approval_evidence}; Session returned idle"
-            + (
-                f" and said {self.lane.actionable_continuation!r}"
-                if self.lane.actionable_continuation
-                else ""
-            )
+            f"{reconciled.id} {reconciled.text!r}; {approval_evidence}; Session returned idle; "
+            f"{question_evidence}"
         )
+
+    def _accept_question(self) -> str:
+        """Exercise #128's Claude route; Codex is recorded, not graded.
+
+        Claude Code 2.1.248 was measured on this machine on 2026-08-28: its
+        `AskUserQuestion` dialog stays visible and interactive while the
+        `PermissionRequest` hook is held, but that request carries no usable
+        `prompt_id` while an ordinary permission request does. The listener
+        therefore uses an engine-private correlator without projecting it as the
+        question's `approval_id`. The product is deliberately not version pinned.
+        This proof reads the chat, public control plane, transcript, and filesystem;
+        it never scrapes that terminal dialog.
+        """
+        if self.lane.question is None:
+            evidence = "Codex projects no question dialog; recorded, not graded (#128)"
+            self.journey.observe("question", evidence)
+            return evidence
+        if self.address is None or self.lane.question_answer is None:
+            raise LaneBlocked("the Claude question route has no Session address or answer")
+
+        question = self.lane.question(self.config.workspace)
+        target = question.path_in(self.config.workspace)
+        if target is None:
+            raise StepFailed("the question continuation names no filesystem effect")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mark = self.person.latest_message_id()
+        turn = self._drive_turn("question", question, expect_waiting=True)
+
+        waiting = self._roster_field("waiting_for")
+        options = (
+            tuple(
+                option.get("text")
+                for option in waiting.get("options", [])
+                if isinstance(option, dict)
+            )
+            if isinstance(waiting, dict)
+            else ()
+        )
+        if (
+            not isinstance(waiting, dict)
+            or waiting.get("kind") != "question"
+            or waiting.get("prompt") != CLAUDE_QUESTION
+            or options != CLAUDE_OPTIONS
+            or self._roster_field("reply_window") != "open"
+        ):
+            raise StepFailed(
+                "the Claude turn did not expose the answerable question exactly: "
+                f"turn ended={turn.ended}, waiting_for={waiting!r}, options={options!r}, "
+                f"reply_window={self._roster_field('reply_window')!r}"
+            )
+        if self._own_pending_approvals():
+            raise StepFailed("the question leaked into `pending_approvals`")
+
+        def is_question_notice(seen) -> bool:
+            return (
+                CLAUDE_QUESTION in seen.text
+                and all(option in seen.text for option in CLAUDE_OPTIONS)
+                and "reply with your answer" in seen.text
+            )
+
+        announced = self._await_own_message(
+            mark,
+            deadline_seconds=self.far_side.telegram_round_trip_seconds,
+            matching=is_question_notice,
+        )
+        if announced is None:
+            raise StepFailed(
+                "the question reached the roster but no answerable notice naming this Session "
+                f"reached chat; other traffic: {self._other_traffic(mark)}"
+            )
+        forms = _naming_forms(self._own_row())
+        if not any(announced.text.startswith(form) for form in forms):
+            raise StepFailed(
+                f"the question notice did not name the Session first: {announced.text!r}"
+            )
+        if "answer it in the terminal" in announced.text:
+            raise StepFailed(
+                f"the answerable question told the user to use the terminal: {announced.text!r}"
+            )
+
+        answer = self.bridgectl(
+            "relay",
+            self.address,
+            self.lane.question_answer,
+            timeout=support.RELAY_DEADLINE_SECONDS,
+        )
+        if not answer.ok or "delivered" not in answer.text.lower():
+            raise StepFailed(
+                f"`bridgectl relay {self.address} {self.lane.question_answer}` did not return "
+                f"DELIVERED: {answer.text!r}"
+            )
+
+        tool_result_proof: str | None = None
+
+        def tool_result_arrived() -> bool:
+            nonlocal tool_result_proof
+            tool_result_proof = self._question_tool_result_proof(self.lane.question_answer or "")
+            return tool_result_proof is not None
+
+        if not support.wait_for(
+            tool_result_arrived,
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed(
+                f"the transcript never recorded an error tool_result containing "
+                f"{CLAUDE_ANSWER_FRAME!r}"
+            )
+
+        write_permission = self._answer_pending_approval(mark)
+        if write_permission is None:
+            raise StepFailed("the continued Claude turn raised no permission for its file effect")
+        if not support.wait_for(
+            lambda: question.performed_in(self.config.workspace),
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed(
+                f"the answered question continued, but {target} contains "
+                f"{question.effect_in(self.config.workspace)!r}, not {question.content!r}"
+            )
+
+        transcript_proof: str | None = None
+
+        def transcript_continued() -> bool:
+            nonlocal transcript_proof
+            transcript_proof = self._question_transcript_proof(self.lane.question_answer or "")
+            return transcript_proof is not None
+
+        if not support.wait_for(
+            transcript_continued,
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed(
+                f"the transcript recorded {tool_result_proof}, but no later assistant record"
+            )
+        if not support.wait_for(
+            lambda: self._roster_field("state") == "idle",
+            deadline_seconds=self.far_side.agent_turn_seconds,
+        ):
+            raise StepFailed("the question turn did not return to idle after writing its answer")
+
+        notices = [
+            message
+            for message in self.person.messages_after(mark)
+            if message.from_bot and _named_in(message.text, forms) and is_question_notice(message)
+        ]
+        if len(notices) != 1:
+            raise StepFailed(
+                f"the question produced {len(notices)} answerable notices, not exactly one: "
+                f"{[message.text for message in notices]!r}"
+            )
+        evidence = (
+            f"question notice {announced.id}: {announced.text!r}; relay {answer.text!r}; "
+            f"{tool_result_proof}; {transcript_proof}; {write_permission}; "
+            f"{target} contains {question.content}"
+        )
+        self.journey.observe("question", evidence)
+        return evidence
 
     # --- child ------------------------------------------------------------
 
@@ -1572,12 +1683,56 @@ class Walk:
         record = self._record_now()
         return record.stat().st_size if record and record.exists() else 0
 
-    def _record_contains(self, text: str) -> bool:
-        """Whether the Session's own record contains the expected continuation."""
+    def _question_result(self, answer: str) -> tuple[list[dict], int, str] | None:
+        """Find the framed error tool result in Claude's JSONL."""
         record = self._record_now()
         if record is None or not record.exists():
-            return False
-        return text in record.read_text(encoding="utf-8", errors="replace")
+            return None
+        rows: list[dict] = []
+        for line in record.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        framed = f"The user answered from GPT-VoiceCoding: {answer}"
+        for index, row in enumerate(rows):
+            message = row.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            blocks = content if isinstance(content, list) else ()
+            answered = any(
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("is_error") is True
+                and block.get("content") == framed
+                for block in blocks
+            )
+            if answered:
+                return rows, index, framed
+        return None
+
+    def _question_tool_result_proof(self, answer: str) -> str | None:
+        """Describe the transcript row that proves the hook carried the answer."""
+        found = self._question_result(answer)
+        if found is None:
+            return None
+        _, index, framed = found
+        return f"transcript row {index + 1} has is_error=True and {framed!r}"
+
+    def _question_transcript_proof(self, answer: str) -> str | None:
+        """Find an assistant record after the hook answer in Claude's JSONL."""
+        found = self._question_result(answer)
+        if found is None:
+            return None
+        rows, index, framed = found
+        for later_index, later in enumerate(rows[index + 1 :], start=index + 1):
+            if later.get("type") == "assistant":
+                return (
+                    f"transcript row {index + 1} has is_error=True and {framed!r}; "
+                    f"assistant row {later_index + 1} follows"
+                )
+        return None
 
     def _drive_turn(
         self, what: str, instruction: Instruction, *, expect_waiting: bool = False

@@ -36,7 +36,14 @@ from gpt_voicecoding.core.relays import (
     RelayPipeline,
 )
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
-from gpt_voicecoding.seams.agent import RelayRoute, ReplyWindow, SessionState
+from gpt_voicecoding.seams.agent import (
+    RelayRoute,
+    ReplyWindow,
+    SessionInspection,
+    SessionState,
+    WaitingFor,
+    WaitingKind,
+)
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -141,6 +148,28 @@ class TestQueueingAgainstAClosedWindow:
 
         (waiting,) = harness.relays.pending()
         assert waiting.expires_at == waiting.queued_at + TEN_MINUTES
+
+    def test_a_closed_question_route_refuses_instead_of_queueing_for_the_inbox(self) -> None:
+        harness = Harness(targets=(CLAUDE,))
+        harness.sessions.observed_one(
+            SessionInspection(
+                target=CLAUDE,
+                workspace=Path("/tmp/workspace"),
+                state=SessionState.WAITING,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="Which base?",
+                ),
+            ),
+            now=harness.now,
+        )
+
+        outcome = asyncio.run(harness.pipeline.relay(CLAUDE, "main"))
+
+        assert outcome.state is Lifecycle.REPORTED_FAILED
+        assert outcome.report
+        assert harness.agent.calls == []
+        assert harness.relays.pending() == ()
 
     def test_the_ceiling_is_configurable_rather_than_baked_in(self) -> None:
         harness = Harness()

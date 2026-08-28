@@ -38,18 +38,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.errors import ApprovalVerdictMismatch
 from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOutcome, Reach
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.sessions import spoken_target
-from gpt_voicecoding.seams.agent import (
-    AgentAdapter,
-    ApprovalRequest,
-    ApprovalVerdict,
-    ApprovalVerdictKind,
-    WaitingKind,
-)
+from gpt_voicecoding.seams.agent import AgentAdapter, ApprovalRequest, ApprovalVerdict
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, new_request_id
 
@@ -79,12 +72,6 @@ def announcement_for(request: ApprovalRequest, spoken_as: str) -> str:
     gen-1 named the Session on its permission notice and the rewrite dropped it,
     which is the class of loss ADR 0010 exists for.
     """
-    if request.kind is WaitingKind.QUESTION:
-        options = f" Options: {', '.join(request.options)}" if request.options else ""
-        recommendation = (
-            f" It recommends {request.recommendation}" if request.recommendation else ""
-        )
-        return f"{spoken_as} is waiting for your answer: {request.prompt}{options}{recommendation}"
     detail = f" — {request.detail}" if request.detail.strip() else ""
     return f"{spoken_as} is waiting for your permission to use {request.tool_name}{detail}"
 
@@ -98,13 +85,12 @@ def announcement_for(request: ApprovalRequest, spoken_as: str) -> str:
 #: request, and the budget can then run out up to ten minutes later on something
 #: nobody is looking at any more. Surfaces render these notices verbatim, so the
 #: sentence has to be true in every path that can fire it.
-CLOSING_NOTICES: dict[ApprovalVerdictKind, str] = {
-    ApprovalVerdictKind.ALLOW: "approved by voice",
-    ApprovalVerdictKind.DENY: "denied by voice",
-    ApprovalVerdictKind.ASK: (
+CLOSING_NOTICES: dict[ApprovalVerdict, str] = {
+    ApprovalVerdict.ALLOW: "approved by voice",
+    ApprovalVerdict.DENY: "denied by voice",
+    ApprovalVerdict.ASK: (
         "the voice window closed — if the dialog is still on screen, answer it there"
     ),
-    ApprovalVerdictKind.ANSWER: "your answer reached the session",
 }
 
 #: What closes the loop when it did not (P14, #61 R5). Same keys, so the choice
@@ -121,29 +107,24 @@ CLOSING_NOTICES: dict[ApprovalVerdictKind, str] = {
 #: Each sentence points back at the on-screen dialog, because on every grade
 #: that lands here the dialog is still the thing that can actually resolve it —
 #: `HELD` says so outright, and `FAILED`/`UNKNOWN` leave it untouched.
-UNCONFIRMED_NOTICES: dict[ApprovalVerdictKind, str] = {
-    ApprovalVerdictKind.ALLOW: (
+UNCONFIRMED_NOTICES: dict[ApprovalVerdict, str] = {
+    ApprovalVerdict.ALLOW: (
         "your approval was not confirmed to have reached the session — if the dialog is "
         "still on screen, answer it there"
     ),
-    ApprovalVerdictKind.DENY: (
+    ApprovalVerdict.DENY: (
         "your denial was not confirmed to have reached the session — if the dialog is "
         "still on screen, answer it there"
     ),
     #: `ask` carried no verdict, so there is nothing a receipt could fail to
     #: confirm: its own wording already claims nothing and stands on every grade.
-    ApprovalVerdictKind.ASK: CLOSING_NOTICES[ApprovalVerdictKind.ASK],
-    ApprovalVerdictKind.ANSWER: (
-        "your answer was not confirmed to have reached the session — if the dialog is "
-        "still on screen, answer it there"
-    ),
+    ApprovalVerdict.ASK: CLOSING_NOTICES[ApprovalVerdict.ASK],
 }
 
 
 def closing_notice_for(verdict: ApprovalVerdict, outcome: Delivery) -> str:
     """What the user is told, claiming exactly what the receipt proves and no more."""
-    notices = CLOSING_NOTICES if outcome.is_delivered else UNCONFIRMED_NOTICES
-    return notices[verdict.kind]
+    return CLOSING_NOTICES[verdict] if outcome.is_delivered else UNCONFIRMED_NOTICES[verdict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,30 +228,13 @@ class ApprovalPipeline:
         is **discarded safely**: it carries nothing and emits nothing, because
         the closing notice for that request has already gone out.
         """
-        waiting = self._pending.get(approval_id)
+        waiting = self._pending.pop(approval_id, None)
         if waiting is None:
             _log.info(
                 "verdict %s for %s arrived after it resolved; discarded", verdict, approval_id
             )
             return None
-        self._require_matching_verdict(waiting.request, verdict)
-        del self._pending[approval_id]
         return await self._resolve(waiting, verdict)
-
-    @staticmethod
-    def _require_matching_verdict(request: ApprovalRequest, verdict: ApprovalVerdict) -> None:
-        if verdict == ApprovalVerdict.ASK:
-            return
-        matches = (
-            request.kind is WaitingKind.QUESTION and verdict.kind is ApprovalVerdictKind.ANSWER
-        ) or (
-            request.kind is WaitingKind.PERMISSION
-            and verdict.kind in (ApprovalVerdictKind.ALLOW, ApprovalVerdictKind.DENY)
-        )
-        if not matches:
-            raise ApprovalVerdictMismatch(
-                waiting_kind=str(request.kind), verdict_kind=str(verdict.kind)
-            )
 
     async def sweep_expired(self) -> tuple[ApprovalOutcome, ...]:
         """Every request past its budget falls back to the on-screen dialog.
@@ -313,7 +277,7 @@ class ApprovalPipeline:
         # cleanly, and that is exactly what the closing notice tells the user.
         state = (
             Lifecycle.DELIVERED
-            if verdict != ApprovalVerdict.ASK and outcome.is_delivered
+            if verdict is not ApprovalVerdict.ASK and outcome.is_delivered
             else Lifecycle.REPORTED_FAILED
         )
         return ApprovalOutcome(

@@ -34,6 +34,7 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     Progress,
     RelayRoute,
+    ReplyWindow,
     WaitingFor,
 )
 from gpt_voicecoding.seams.call import CallSnapshot
@@ -119,11 +120,11 @@ def read_route(payload: Mapping[str, Any], key: str = "route") -> RelayRoute:
 
 
 def read_verdict(payload: Mapping[str, Any], key: str = "verdict") -> ApprovalVerdict:
-    raw = payload.get(key)
     try:
-        return ApprovalVerdict.from_document(raw, strip_bare=True)
-    except ValueError as unusable:
-        raise InvalidPayload(str(unusable)) from None
+        return ApprovalVerdict(read_text(payload, key))
+    except ValueError:
+        known = ", ".join(str(verdict) for verdict in ApprovalVerdict)
+        raise InvalidPayload(f"{payload.get(key)!r} is not a verdict: {known}") from None
 
 
 # ----------------------------------------------------------------------
@@ -135,7 +136,9 @@ def target_document(target: SessionTarget) -> dict[str, Any]:
     return {"agent": str(target.agent), "session_id": target.session_id, "pid": target.pid}
 
 
-def session_document(session: Session) -> dict[str, Any]:
+def session_document(
+    session: Session, *, reply_window: ReplyWindow | None = None
+) -> dict[str, Any]:
     """One Session as a surface renders it: spoken by name, addressed by target.
 
     Every field of the roster row travels, because a surface that had to ask a
@@ -162,7 +165,7 @@ def session_document(session: Session) -> dict[str, Any]:
         "child": child_document(session.child),
         # Derived on the row and rendered here, so no surface re-derives it and
         # no two surfaces can disagree about the same Session.
-        "reply_window": str(session.reply_window),
+        "reply_window": str(reply_window or session.reply_window),
     }
 
 
@@ -222,8 +225,6 @@ def pending_approval_document(pending: PendingApproval) -> dict[str, Any]:
     return {
         "approval_id": pending.request.approval_id,
         "target": target_document(pending.request.target),
-        "kind": str(pending.request.kind),
-        "prompt": pending.request.prompt,
         "tool_name": pending.request.tool_name,
         "detail": pending.request.detail,
         "options": list(pending.request.options),
@@ -235,7 +236,13 @@ def pending_approval_document(pending: PendingApproval) -> dict[str, Any]:
 def status_document(status: Status) -> dict[str, Any]:
     return {
         "switches": status.switches.as_mapping(),
-        "sessions": [session_document(session) for session in status.sessions],
+        "sessions": [
+            session_document(
+                session,
+                reply_window=status.reply_windows.get(session.target, session.reply_window),
+            )
+            for session in status.sessions
+        ],
         "lanes": {str(agent): reason for agent, reason in status.lanes.items()},
         "degraded_lanes": {str(agent): reason for agent, reason in status.degraded_lanes.items()},
         "call_id": status.call_id,
@@ -265,7 +272,7 @@ def approval_document(outcome: ApprovalOutcome) -> dict[str, Any]:
     return {
         "approval_id": outcome.request.approval_id,
         "target": target_document(outcome.request.target),
-        "verdict": outcome.verdict.to_document(),
+        "verdict": str(outcome.verdict),
         "state": str(outcome.state),
         "outcome": str(outcome.outcome),
         "closing_notice": outcome.closing_notice,

@@ -19,6 +19,7 @@ mirror a thing that breaks loudly rather than an acceptance step that goes quiet
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import journey
@@ -33,7 +34,6 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     SessionInspection,
-    WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -85,15 +85,53 @@ class TestWhatTheHarnessThinksNamesASession:
 class TestTheSwitchesWaitIsResolvable:
     """#80 must leave the journey Session usable for the following `child` step."""
 
-    def test_claude_uses_the_real_question_and_ticket_answer(self, tmp_path: Path) -> None:
-        instruction = journey.CLAUDE.actionable(tmp_path)
+    def test_claude_keeps_the_switch_permission_and_adds_the_question(self, tmp_path: Path) -> None:
+        permission = journey.CLAUDE.actionable(tmp_path)
+        assert permission.path_in(tmp_path) == tmp_path / journey.SWITCH_FILE
 
-        assert instruction.path_in(tmp_path) is None
-        assert "Tabs or spaces?" in instruction.words
-        assert "spaces" in instruction.words and "tabs" in instruction.words
-        assert journey.CLAUDE.actionable_kind == "question"
-        assert journey.CLAUDE.actionable_answer == ("answer", "tabs")
-        assert journey.CLAUDE.actionable_continuation == "You answered tabs."
+        assert journey.CLAUDE.question is not None
+        question = journey.CLAUDE.question(tmp_path)
+        assert question.path_in(tmp_path) == tmp_path / journey.QUESTION_FILE
+        assert journey.CLAUDE_QUESTION in question.words
+        assert all(option in question.words for option in journey.CLAUDE_OPTIONS)
+        assert journey.CLAUDE.question_answer == journey.CLAUDE_ANSWER
+        assert journey.CODEX.question is None
+
+    def test_the_question_result_is_proved_before_continuation_flushes(
+        self, tmp_path: Path
+    ) -> None:
+        record = tmp_path / "session.jsonl"
+        result = {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": journey.CLAUDE_ANSWER_FRAME,
+                        "is_error": True,
+                    }
+                ]
+            },
+        }
+        record.write_text(json.dumps(result) + "\n", encoding="utf-8")
+        walk = object.__new__(journey.Walk)
+        walk._record_now = lambda: record
+
+        assert walk._question_tool_result_proof(journey.CLAUDE_ANSWER) is not None
+        assert walk._question_transcript_proof(journey.CLAUDE_ANSWER) is None
+
+        result["message"]["content"][0]["content"] = journey.CLAUDE_ANSWER_FRAME + " extra"
+        record.write_text(json.dumps(result) + "\n", encoding="utf-8")
+        assert walk._question_tool_result_proof(journey.CLAUDE_ANSWER) is None
+
+        result["message"]["content"][0]["content"] = journey.CLAUDE_ANSWER_FRAME
+        assistant = {"type": "assistant", "message": {"content": []}}
+        record.write_text(
+            json.dumps(result) + "\n" + json.dumps(assistant) + "\n",
+            encoding="utf-8",
+        )
+
+        assert walk._question_transcript_proof(journey.CLAUDE_ANSWER) is not None
 
 
 class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
@@ -140,7 +178,7 @@ class TestTheProductsOwnNoticesAreAttributable:
         mine = session()
 
         announcement = announcement_for(
-            ApprovalRequest("a1", mine.target, "Write", WaitingKind.PERMISSION, detail="relay.txt"),
+            ApprovalRequest("a1", mine.target, "Write", detail="relay.txt"),
             spoken_as="workspace-claude · port the log",
         )
 

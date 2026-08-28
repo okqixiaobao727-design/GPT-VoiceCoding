@@ -5,11 +5,12 @@
 calls it with the event sink and this seam's settings table. Nothing else
 imports an adapter (ADR 0001).
 
-This package is the shared Claude adapter for the Answer Relay over the Session's
-own **inbox socket** and the Approval Relay over the `PermissionRequest` hook —
-two routes, two proofs, one settings table, and one set of socket privacy rules.
-The inbox carries the user's words; only the hook can carry their authority, and
-#71 proved that boundary is upstream's own and enforced (`inbox.py`).
+This package is the shared Claude adapter for the Answer Relay and Approval
+Relay. Ordinary Answer Relay words use the Session's own **inbox socket**; an
+answer for a question whose `PermissionRequest` hook is still held uses that
+hook, as does the Approval Relay's permission verdict. Route selection is private
+to this adapter. The inbox carries words but not authority, and #71 proved that
+boundary is upstream's own and enforced (`inbox.py`).
 
 The approval socket is bound at `connect` in a directory of this engine's own,
 because its address has to exist before any Session's hook dials it.

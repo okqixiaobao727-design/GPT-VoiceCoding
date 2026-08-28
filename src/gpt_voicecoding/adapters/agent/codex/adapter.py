@@ -83,7 +83,6 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
-    ApprovalVerdictKind,
     AwaitingApproval,
     LaneDiscovery,
     LaneUnavailable,
@@ -325,6 +324,16 @@ class CodexAgentAdapter:
         if watched is None:
             return ReplyWindow.CLOSED
         return watched.reply_window
+
+    def question_answerable(self, target: SessionTarget) -> bool:
+        """Codex exposes no held question-answer route."""
+        return False
+
+    async def sweep_question_budget(
+        self, budget_seconds: float
+    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
+        """Codex holds no question hook, so there is nothing to release."""
+        return ()
 
     async def forget_session(self, target: SessionTarget) -> None:
         """Stop watching one Session. The Session itself is left running.
@@ -607,12 +616,6 @@ class CodexAgentAdapter:
         self, request: ApprovalRequest, verdict: ApprovalVerdict, *, request_id: RequestId
     ) -> DeliveryReceipt:
         """Carry one verdict — or, for `ask`, deliberately carry nothing."""
-        if verdict.kind is ApprovalVerdictKind.ANSWER:
-            return _failed(
-                request_id,
-                "Codex has no question hook route, so it cannot carry question answers",
-            )
-
         watched, unreachable = await self._reachable(request.target)
         if watched is None:
             return _failed(request_id, unreachable)

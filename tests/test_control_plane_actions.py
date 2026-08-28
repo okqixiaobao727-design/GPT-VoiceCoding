@@ -32,7 +32,6 @@ from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.core.verification import SeamLoad
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
-    ApprovalVerdict,
     AwaitingApproval,
     ChildClassification,
     ChildKind,
@@ -45,6 +44,8 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindowChanged,
     SessionInspection,
     SessionState,
+    SessionStopped,
+    WaitingFor,
     WaitingKind,
 )
 from gpt_voicecoding.seams.control_plane import Action, ErrorCode, Reply, Request
@@ -127,12 +128,7 @@ class TestWithEverySwitchOff:
         )
         asyncio.run(
             surface.core.approvals.opened(
-                ApprovalRequest(
-                    approval_id="a1",
-                    target=CODEX,
-                    tool_name="Bash",
-                    kind=WaitingKind.PERMISSION,
-                )
+                ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
             )
         )
 
@@ -239,6 +235,32 @@ class TestRefusalsKeepTheirIdentity:
         assert reply.error is not None
         assert reply.error.code is ErrorCode.UNKNOWN_PENDING
 
+    def test_a_question_prompt_id_is_not_an_approval_that_can_be_approved(self) -> None:
+        surface = Surface()
+        surface.register(CLAUDE)
+        asyncio.run(
+            surface.core.dispatch(
+                SessionStopped(
+                    target=CLAUDE,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                        approval_id="question-prompt",
+                    ),
+                )
+            )
+        )
+
+        reply = surface.ask(
+            Action.APPROVE,
+            approval_id="question-prompt",
+            verdict="allow",
+        )
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.UNKNOWN_PENDING
+        assert surface.agent.calls == []
+
     def test_a_verdict_that_is_not_one(self) -> None:
         reply = Surface().ask(Action.APPROVE, approval_id="a1", verdict="maybe")
 
@@ -283,12 +305,7 @@ class TestRelayingAndApproving:
         asyncio.run(
             surface.core.dispatch(
                 AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="a1",
-                        target=CODEX,
-                        tool_name="Bash",
-                        kind=WaitingKind.PERMISSION,
-                    )
+                    request=ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
                 )
             )
         )
@@ -298,163 +315,6 @@ class TestRelayingAndApproving:
         assert data["verdict"] == "allow"
         assert data["closing_notice"]
         assert [call.verdict for call in surface.agent.calls if call.verb == "approval_relay"]
-
-    def test_the_existing_bare_permission_verdict_keeps_its_text_reader(self) -> None:
-        surface = Surface()
-        surface.register()
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="a1",
-                        target=CODEX,
-                        tool_name="Bash",
-                        kind=WaitingKind.PERMISSION,
-                    )
-                )
-            )
-        )
-
-        data = surface.ask(Action.APPROVE, approval_id="a1", verdict=" allow ").data
-
-        assert data["verdict"] == "allow"
-
-    def test_a_typed_question_answer_crosses_the_control_plane_and_agent_seam(self) -> None:
-        surface = Surface()
-        surface.register(CLAUDE)
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="p-1",
-                        target=CLAUDE,
-                        tool_name="AskUserQuestion",
-                        kind=WaitingKind.QUESTION,
-                        prompt="Tabs or spaces?",
-                        options=("spaces", "tabs"),
-                    )
-                )
-            )
-        )
-
-        reply = surface.ask(
-            Action.APPROVE,
-            approval_id="p-1",
-            verdict={"kind": "answer", "text": "tabs"},
-        )
-
-        carried = [call.verdict for call in surface.agent.calls if call.verb == "approval_relay"]
-        assert (reply.data["verdict"], carried) == (
-            {"kind": "answer", "text": "tabs"},
-            [ApprovalVerdict.answer("tabs")],
-        )
-
-    def test_status_projects_the_pending_question_for_control_panel_surfaces(self) -> None:
-        surface = Surface()
-        surface.register(CLAUDE)
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="p-1",
-                        target=CLAUDE,
-                        tool_name="AskUserQuestion",
-                        kind=WaitingKind.QUESTION,
-                        prompt="Tabs or spaces?",
-                        options=("spaces", "tabs"),
-                    )
-                )
-            )
-        )
-
-        (pending,) = surface.ask(Action.STATUS).data["pending_approvals"]
-
-        assert {key: pending[key] for key in ("kind", "prompt", "options")} == {
-            "kind": "question",
-            "prompt": "Tabs or spaces?",
-            "options": ["spaces", "tabs"],
-        }
-
-    def test_question_answer_text_is_not_trimmed_or_matched_to_an_option(self) -> None:
-        surface = Surface()
-        surface.register(CLAUDE)
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="p-1",
-                        target=CLAUDE,
-                        tool_name="AskUserQuestion",
-                        kind=WaitingKind.QUESTION,
-                        prompt="Tabs or spaces?",
-                        options=("spaces", "tabs"),
-                    )
-                )
-            )
-        )
-
-        surface.ask(
-            Action.APPROVE,
-            approval_id="p-1",
-            verdict={"kind": "answer", "text": " tabs "},
-        )
-
-        (carried,) = [call.verdict for call in surface.agent.calls if call.verb == "approval_relay"]
-        assert carried == ApprovalVerdict.answer(" tabs ")
-
-    def test_answer_text_is_refused_for_a_permission_wait(self) -> None:
-        surface = Surface()
-        surface.register(CLAUDE)
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="a1",
-                        target=CLAUDE,
-                        tool_name="Bash",
-                        kind=WaitingKind.PERMISSION,
-                    )
-                )
-            )
-        )
-
-        reply = surface.ask(
-            Action.APPROVE,
-            approval_id="a1",
-            verdict={"kind": "answer", "text": "tabs"},
-        )
-
-        carried = [call for call in surface.agent.calls if call.verb == "approval_relay"]
-        assert (reply.ok, carried) == (False, [])
-
-    @pytest.mark.parametrize("verdict", ["allow", "deny"])
-    def test_permission_verdicts_are_refused_for_a_question_wait(self, verdict: str) -> None:
-        surface = Surface()
-        surface.register(CLAUDE)
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(
-                        approval_id="p-1",
-                        target=CLAUDE,
-                        tool_name="AskUserQuestion",
-                        kind=WaitingKind.QUESTION,
-                        prompt="Tabs or spaces?",
-                        options=("spaces", "tabs"),
-                    )
-                )
-            )
-        )
-
-        reply = surface.ask(Action.APPROVE, approval_id="p-1", verdict=verdict)
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "question" in reply.error.message and verdict in reply.error.message
-        assert [pending.request.approval_id for pending in surface.core.approvals.pending()] == [
-            "p-1"
-        ]
-        assert [call for call in surface.agent.calls if call.verb == "approval_relay"] == []
 
 
 class TestVerify:
@@ -521,6 +381,30 @@ class TestProgress:
             "read_at": READ_AT.isoformat(),
         }
         assert session["last_activity"] == READ_AT.isoformat()
+
+    def test_progress_renders_the_live_reply_window_for_an_answerable_question(self) -> None:
+        surface = Surface()
+        surface.register()
+        surface.agent.answerable_questions.add(CODEX)
+        surface.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                    progress=Progress(read_at=READ_AT),
+                ),
+            )
+        )
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.ok
+        assert reply.data["session"]["reply_window"] == "open"
 
     def test_it_asks_the_lane_rather_than_answering_from_the_roster(self) -> None:
         """A cached answer would make the verb no fresher than the tick beside it."""

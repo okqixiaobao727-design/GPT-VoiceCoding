@@ -1,4 +1,8 @@
-"""A Session's own inbox socket, and the only two things that prove a Relay arrived.
+"""A Session's inbox, and the only two things proving a Relay arrived on this route.
+
+This is the ordinary Claude Answer Relay route. ADR 0015 makes route selection
+the adapter's private business: an answer to a question whose hook is still held
+uses that hook, while every other Answer Relay uses this inbox.
 
 **This replaces the channel server, and the receipt is why.** ADR 0006 built a
 process of our own inside every Session so that the Session could call a tool

@@ -51,10 +51,10 @@ from gpt_voicecoding.adapters.agent.claude.privacy import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
 from gpt_voicecoding.seams.agent import (
-    ApprovalRequest,
     ApprovalVerdict,
-    ApprovalVerdictKind,
     AwaitingApproval,
+    ReplyWindow,
+    ReplyWindowChanged,
     WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery
@@ -148,7 +148,9 @@ async def hook_in_flight(
     task = asyncio.create_task(
         asyncio.to_thread(decide, payload or dialog(), environment(listener.path, root))
     )
-    await _until(lambda: bool(listener.pending()))
+    await _until(
+        lambda: bool(listener.pending()) or listener.newest_question_for(TARGET) is not None
+    )
     return task
 
 
@@ -162,12 +164,6 @@ class TestWhatTheHookPrints:
         assert inner["hookEventName"] == HOOK_EVENT
         assert inner["decision"]["behavior"] == ALLOW_BEHAVIOR
 
-    def test_a_typed_allow_value_keeps_allow_semantics(self) -> None:
-        decision = hook_decision(ApprovalVerdict(ApprovalVerdictKind.ALLOW))
-
-        assert decision is not None
-        assert decision["hookSpecificOutput"]["decision"]["behavior"] == ALLOW_BEHAVIOR
-
     def test_deny_says_why_so_the_session_can_report_it(self) -> None:
         decision = hook_decision(ApprovalVerdict.DENY)
         assert decision is not None
@@ -175,11 +171,17 @@ class TestWhatTheHookPrints:
         assert inner["behavior"] == DENY_BEHAVIOR
         assert inner["message"].strip()
 
-    def test_an_answer_is_denial_prose_with_the_users_words_verbatim(self) -> None:
-        assert hook_decision(ApprovalVerdict.answer("tabs")) == {
+    def test_a_question_answer_is_denial_prose_with_the_framed_words(self) -> None:
+        assert hook_decision(
+            ApprovalVerdict.DENY,
+            message="The user answered from GPT-VoiceCoding: tabs",
+        ) == {
             "hookSpecificOutput": {
                 "hookEventName": HOOK_EVENT,
-                "decision": {"behavior": DENY_BEHAVIOR, "message": "tabs"},
+                "decision": {
+                    "behavior": DENY_BEHAVIOR,
+                    "message": "The user answered from GPT-VoiceCoding: tabs",
+                },
             }
         }
 
@@ -203,7 +205,6 @@ class TestWhatTheHookPrints:
             ApprovalVerdict.ALLOW,
             ApprovalVerdict.DENY,
             ApprovalVerdict.ASK,
-            ApprovalVerdict.answer("tabs"),
         ):
             decision = hook_decision(verdict)
             if decision is None:
@@ -848,13 +849,14 @@ def group(question: str, *labels: str, multi: bool = False) -> dict[str, Any]:
     }
 
 
-class TestAQuestionRidesTheApprovalHook:
+class TestAQuestionRidesTheHeldHook:
     """`AskUserQuestion` is typed as a question on the shared hook route.
 
     Measured on 2.1.246 (#77): the tool raises a `PermissionRequest`, and a hook
     `deny` carrying a message is consumed by the Session *as the user's answer*.
-    #103 therefore parks it under `prompt_id` and enters the Approval Relay with
-    an answer verdict, never the permission route's allow/deny menu.
+    #128 therefore parks it under Claude's `prompt_id` when present, or a
+    listener-private key otherwise, so the next Answer Relay can use the held
+    hook as its private transport and never the permission route.
     """
 
     def test_a_question_payload_projects_the_whole_question(self) -> None:
@@ -864,7 +866,7 @@ class TestAQuestionRidesTheApprovalHook:
         assert waiting.kind is WaitingKind.QUESTION
         assert waiting.prompt == "Tabs or spaces?"
         assert [option.text for option in waiting.options] == ["Spaces", "Tabs"]
-        assert waiting.approval_id == "p-1", "the dialog's own correlator, for #103"
+        assert waiting.approval_id == "p-1", "the dialog's own correlator, for #128"
 
     def test_an_answer_crosses_the_real_hook_socket_under_its_prompt_id(
         self, socket_root: Path
@@ -877,15 +879,14 @@ class TestAQuestionRidesTheApprovalHook:
                 pid=43,
             )
             await listener.start()
+            hook: asyncio.Task[dict[str, Any] | None] | None = None
             try:
                 hook = await hook_in_flight(
                     listener,
                     socket_root,
                     question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
                 )
-                receipt = await listener.answer(
-                    "p-1", ApprovalVerdict.answer("tabs"), request_id=RequestId("r-1")
-                )
+                receipt = await listener.answer_question("p-1", "TABS", request_id=RequestId("r-1"))
             finally:
                 await listener.aclose()
             return receipt, await hook
@@ -897,9 +898,115 @@ class TestAQuestionRidesTheApprovalHook:
             {
                 "hookSpecificOutput": {
                     "hookEventName": HOOK_EVENT,
-                    "decision": {"behavior": DENY_BEHAVIOR, "message": "tabs"},
+                    "decision": {
+                        "behavior": DENY_BEHAVIOR,
+                        "message": "The user answered from GPT-VoiceCoding: tabs",
+                    },
                 }
             },
+        )
+
+    def test_an_unacknowledged_question_answer_is_unknown(self, socket_root: Path) -> None:
+        async def scenario():
+            sink = Sink()
+            listener = ApprovalListener(
+                settings=ClaudeSettings(
+                    socket_directory=socket_root,
+                    request_timeout_seconds=0.3,
+                ),
+                resolve=lambda _: TARGET,
+                emit=sink.emit,
+                pid=48,
+            )
+            await listener.start()
+            try:
+                _, writer = await asyncio.open_unix_connection(str(listener.path))
+                request = request_for(question_dialog(group("Tabs or spaces?", "spaces", "tabs")))
+                writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+                await writer.drain()
+                await _until(lambda: listener.question_answerable(TARGET))
+                receipt = await listener.answer_question(
+                    "p-1", "tabs", request_id=RequestId("r-unknown")
+                )
+                writer.close()
+                return receipt, sink.of(ReplyWindowChanged)
+            finally:
+                await listener.aclose()
+
+        receipt, windows = asyncio.run(scenario())
+
+        assert receipt.outcome is Delivery.UNKNOWN
+        assert receipt.reason.strip()
+        assert [event.window for event in windows] == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+
+    def test_a_terminal_answer_closes_the_window_and_is_reported_as_elsewhere(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            sink = Sink()
+            adapter = ClaudeAgentAdapter(
+                sink=sink,
+                settings=settings_for(socket_root),
+            )
+            adapter.register_session(TARGET, socket_root / "unused-inbox.sock")
+            await adapter.connect()
+            try:
+                listener = adapter._approvals  # noqa: SLF001 - drive the real hook socket
+                _, writer = await asyncio.open_unix_connection(str(listener.path))
+                request = request_for(question_dialog(group("Tabs or spaces?", "spaces", "tabs")))
+                writer.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+                await writer.drain()
+                await _until(lambda: listener.question_answerable(TARGET))
+
+                writer.close()
+                with contextlib.suppress(OSError, ConnectionError):
+                    await writer.wait_closed()
+                await _until(lambda: not listener.question_answerable(TARGET))
+
+                receipt = await adapter.answer_relay(
+                    TARGET,
+                    "tabs",
+                    request_id=RequestId("r-elsewhere"),
+                )
+                return receipt, sink.of(ReplyWindowChanged)
+            finally:
+                await adapter.aclose()
+
+        receipt, windows = asyncio.run(scenario())
+
+        assert receipt.outcome is Delivery.FAILED
+        assert "answered elsewhere" in receipt.reason
+        assert [event.window for event in windows] == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+
+    def test_free_text_that_is_not_an_option_keeps_the_users_words_verbatim(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=46,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                )
+                await listener.answer_question(
+                    "p-1", "  use a hybrid  ", request_id=RequestId("r-free")
+                )
+                return await hook
+            finally:
+                await listener.aclose()
+
+        decision = asyncio.run(scenario())
+
+        assert decision is not None
+        assert decision["hookSpecificOutput"]["decision"]["message"] == (
+            "The user answered from GPT-VoiceCoding:   use a hybrid  "
         )
 
     def test_the_session_s_own_mark_on_a_label_is_read_as_one(self) -> None:
@@ -956,39 +1063,55 @@ class TestAQuestionRidesTheApprovalHook:
         assert waiting.kind is WaitingKind.QUESTION
         assert waiting.options == ()
 
-    def test_a_question_without_a_prompt_id_stays_with_the_on_screen_dialog(
-        self, socket_root: Path
+    @pytest.mark.parametrize("prompt_id", [None, ""], ids=["missing", "empty"])
+    def test_a_question_without_a_prompt_id_uses_an_engine_private_correlator(
+        self, socket_root: Path, prompt_id: str | None
     ) -> None:
         async def scenario():
             sink = Sink()
-            listener = ApprovalListener(
+            adapter = ClaudeAgentAdapter(
+                sink=sink,
                 settings=settings_for(socket_root),
-                resolve=lambda _: TARGET,
-                emit=sink.emit,
-                pid=44,
             )
-            await listener.start()
+            adapter.register_session(TARGET, socket_root / "unused-inbox.sock")
+            await adapter.connect()
             try:
+                listener = adapter._approvals  # noqa: SLF001 - drive the real public seam
+                payload = question_dialog(group("Tabs or spaces?", "spaces", "tabs"))
+                if prompt_id is None:
+                    payload.pop("prompt_id")
+                else:
+                    payload["prompt_id"] = prompt_id
                 hook = await hook_in_flight(
                     listener,
                     socket_root,
-                    question_dialog(group("Tabs or spaces?", "spaces", "tabs"), prompt_id=None),
+                    payload,
                 )
-                parked = listener.newest_question_for(TARGET)
-                announced = sink.of(AwaitingApproval)
+                projected = listener.newest_question_for(TARGET)
+                answerable = listener.question_answerable(TARGET)
+                receipt = await adapter.answer_relay(
+                    TARGET,
+                    "tabs",
+                    request_id=RequestId("r-private"),
+                )
             finally:
-                await listener.aclose()
-            return parked, announced, await hook
+                await adapter.aclose()
+            return projected, answerable, receipt, sink.of(ReplyWindowChanged), await hook
 
-        parked, announced, decision = asyncio.run(scenario())
+        projected, answerable, receipt, windows, decision = asyncio.run(scenario())
 
-        assert parked is not None and (parked.approval_id, announced, decision) == (
-            None,
-            [],
-            None,
+        assert projected is not None and projected.approval_id is None
+        assert answerable is True
+        assert receipt.outcome is Delivery.DELIVERED
+        assert decision is not None
+        assert decision["hookSpecificOutput"]["decision"]["message"] == (
+            "The user answered from GPT-VoiceCoding: tabs"
         )
+        assert [event.window for event in windows] == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
 
-    def test_a_question_is_parked_and_enters_the_approval_relay(self, socket_root: Path) -> None:
+    def test_a_question_is_parked_without_entering_the_approval_relay(
+        self, socket_root: Path
+    ) -> None:
         async def scenario():
             sink = Sink()
             listener = ApprovalListener(
@@ -1006,25 +1129,17 @@ class TestAQuestionRidesTheApprovalHook:
                 )
                 parked = listener.newest_question_for(TARGET)
                 announced = sink.of(AwaitingApproval)
+                windows = sink.of(ReplyWindowChanged)
             finally:
                 # Releases the parked dialog to its human, which is what lets
                 # the hook thread finish: nothing here ever answers a question.
                 await listener.aclose()
             assert await hook is None, "no verdict was carried, so nothing was printed"
-            return parked, announced
+            return parked, announced, windows
 
-        parked, announced = asyncio.run(scenario())
-        assert [event.request for event in announced] == [
-            ApprovalRequest(
-                approval_id="p-1",
-                target=TARGET,
-                tool_name=QUESTION_TOOL,
-                kind=WaitingKind.QUESTION,
-                prompt="Tabs or spaces?",
-                options=("Spaces", "Tabs"),
-                recommendation="Spaces",
-            )
-        ]
+        parked, announced, windows = asyncio.run(scenario())
+        assert announced == []
+        assert windows[0] == ReplyWindowChanged(target=TARGET, window=ReplyWindow.OPEN)
         assert parked is not None
         assert parked.kind is WaitingKind.QUESTION
         assert [option.text for option in parked.options] == ["Spaces", "Tabs"]
@@ -1032,6 +1147,109 @@ class TestAQuestionRidesTheApprovalHook:
         # rather than a forward: a field the hook does not name is absent on this
         # side and nothing errors. The projector's own test cannot see that.
         assert parked.approval_id == "p-1", "the dialog's correlator crossed the wire"
+
+    def test_a_question_past_the_budget_is_released_once_and_closes_the_window(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            now = 10.0
+            sink = Sink()
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=sink.emit,
+                pid=45,
+                clock=lambda: now,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                )
+                now = 16.0
+                released = await listener.sweep_question_budget(5.0)
+                again = await listener.sweep_question_budget(5.0)
+                printed = await hook
+                return released, again, printed, sink.of(ReplyWindowChanged)
+            finally:
+                await listener.aclose()
+
+        released, again, printed, windows = asyncio.run(scenario())
+
+        assert [(target, waiting.approval_id) for target, waiting in released] == [(TARGET, "p-1")]
+        assert again == ()
+        assert printed is None, "release writes ask, which prints no hook decision"
+        assert [event.window for event in windows] == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+
+    def test_an_in_budget_question_remains_parked(self, socket_root: Path) -> None:
+        async def scenario():
+            now = 10.0
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=47,
+                clock=lambda: now,
+            )
+            await listener.start()
+            try:
+                hook = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                )
+                now = 14.0
+                released = await listener.sweep_question_budget(5.0)
+                answerable = listener.question_answerable(TARGET)
+            finally:
+                await listener.aclose()
+            assert hook is not None
+            return released, answerable, await hook
+
+        released, answerable, printed = asyncio.run(scenario())
+
+        assert released == ()
+        assert answerable is True
+        assert printed is None
+
+    def test_a_released_question_refuses_a_late_answer_without_inbox_fallback(
+        self, socket_root: Path
+    ) -> None:
+        async def scenario():
+            adapter = ClaudeAgentAdapter(
+                sink=Sink(),
+                settings=settings_for(socket_root),
+            )
+            adapter.register_session(TARGET, socket_root / "unused-inbox.sock")
+            await adapter.connect()
+            try:
+                hook = await hook_in_flight(
+                    adapter._approvals,  # noqa: SLF001 - driving the real public adapter seam
+                    socket_root,
+                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                )
+                before = adapter.question_answerable(TARGET)
+                released = await adapter.sweep_question_budget(0.0)
+                after = adapter.question_answerable(TARGET)
+                late = await adapter.answer_relay(
+                    TARGET,
+                    "tabs",
+                    request_id=RequestId("r-late"),
+                )
+                return before, released, after, late, await hook
+            finally:
+                await adapter.aclose()
+
+        before, released, after, late, printed = asyncio.run(scenario())
+
+        assert before is True
+        assert len(released) == 1
+        assert after is False
+        assert late.outcome is Delivery.FAILED
+        assert "no longer answerable" in late.reason
+        assert printed is None
 
     def test_a_permission_still_raises_awaiting_approval(self, socket_root: Path) -> None:
         """The control: nothing about the ordinary dialog changed."""
@@ -1057,6 +1275,70 @@ class TestAQuestionRidesTheApprovalHook:
         announced, question = asyncio.run(scenario())
         assert len(announced) == 1
         assert question is None, "a permission is not a question, whatever else is parked"
+
+    def test_a_newer_permission_hides_an_older_question_route(self, socket_root: Path) -> None:
+        async def scenario():
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=49,
+            )
+            await listener.start()
+            try:
+                question = await hook_in_flight(
+                    listener,
+                    socket_root,
+                    question_dialog(group("Which base?", "main", "develop")),
+                )
+                permission = asyncio.create_task(
+                    asyncio.to_thread(decide, dialog(), environment(listener.path, socket_root))
+                )
+                await _until(lambda: len(listener.pending()) == 1)
+                projected = listener.newest_question_for(TARGET)
+                answerable = listener.question_answerable(TARGET)
+            finally:
+                await listener.aclose()
+            return projected, answerable, await question, await permission
+
+        projected, answerable, question_result, permission_result = asyncio.run(scenario())
+
+        assert projected is None
+        assert answerable is False
+        assert question_result is None
+        assert permission_result is None
+
+    def test_a_newer_question_hides_an_older_permission(self, socket_root: Path) -> None:
+        async def scenario():
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda _: TARGET,
+                emit=Sink().emit,
+                pid=50,
+            )
+            await listener.start()
+            try:
+                permission = await hook_in_flight(listener, socket_root)
+                question = asyncio.create_task(
+                    asyncio.to_thread(
+                        decide,
+                        question_dialog(group("Which base?", "main", "develop")),
+                        environment(listener.path, socket_root),
+                    )
+                )
+                await _until(lambda: listener.newest_question_for(TARGET) is not None)
+                projected = listener.newest_for(TARGET)
+                answerable = listener.question_answerable(TARGET)
+            finally:
+                await listener.aclose()
+            return projected, answerable, await permission, await question
+
+        projected, answerable, permission_result, question_result = asyncio.run(scenario())
+
+        assert projected is None
+        assert answerable is True
+        assert permission_result is None
+        assert question_result is None
 
 
 def test_the_approval_socket_is_private_from_the_moment_it_exists(

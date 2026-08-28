@@ -202,6 +202,13 @@ def rid(text: str = "r-1") -> RequestId:
     return RequestId(text)
 
 
+def test_codex_exposes_no_question_hook_or_question_budget() -> None:
+    adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+
+    assert adapter.question_answerable(TARGET) is False
+    assert asyncio.run(adapter.sweep_question_budget(600.0)) == ()
+
+
 class TestRegisteringSessions:
     def test_a_registered_session_channel_is_recorded(self, socket_path: Path, caplog) -> None:
         caplog.set_level("INFO", logger="gpt_voicecoding.adapters.agent.codex.adapter")
@@ -386,7 +393,6 @@ class TestCarryingTheUsersWords:
                     approval_id="a1",
                     target=TARGET,
                     tool_name="a shell command",
-                    kind=WaitingKind.PERMISSION,
                 ),
                 ApprovalVerdict.ALLOW,
                 request_id=rid(),
@@ -635,32 +641,6 @@ class TestApprovals:
 
         receipt, answered = asyncio.run(scenario())
         assert receipt.outcome is Delivery.HELD
-        assert answered is False
-
-    def test_a_question_answer_is_refused_without_raising(self, socket_path: Path) -> None:
-        """Codex has no question hook route, so an answer cannot be carried there."""
-        sink = Sink()
-
-        async def scenario():
-            async with Codex(socket_path).script() as server:
-                adapter = await watching(server, sink)
-                try:
-                    wire_id = await server.ask_all(
-                        APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
-                    )
-                    await _settled()
-                    request = sink.of(AwaitingApproval)[0].request
-                    receipt = await adapter.approval_relay(
-                        request, ApprovalVerdict.answer("tabs"), request_id=rid("v-1")
-                    )
-                    await _settled()
-                    return receipt, server.answered(wire_id)
-                finally:
-                    await adapter.aclose()
-
-        receipt, answered = asyncio.run(scenario())
-        assert receipt.outcome is Delivery.FAILED
-        assert "no question hook route" in receipt.reason
         assert answered is False
 
     def test_a_verdict_the_on_screen_dialog_already_answered_is_refused(

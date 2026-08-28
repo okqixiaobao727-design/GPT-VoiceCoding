@@ -55,7 +55,8 @@ class _Parked:
     """One dialog held open, as `ApprovalListener._waiting` holds it."""
 
     def __init__(self, request: ApprovalRequest, question: WaitingFor | None = None) -> None:
-        self.request = request
+        self.target = request.target
+        self.permission = request if question is None else None
         self.question = question
 
 
@@ -117,7 +118,6 @@ def dialog(tool_name: str = "Bash", detail: str = "push the branch") -> Approval
         approval_id="a-1",
         target=TARGET,
         tool_name=tool_name,
-        kind=WaitingKind.PERMISSION,
         detail=detail,
     )
 
@@ -147,11 +147,12 @@ class TestAParkedQuestionWinsOutright:
 
     `AskUserQuestion` raises the same `PermissionRequest` hook a `Write` does
     (measured on 2.1.246), so a question is parked on this engine's approval
-    socket with the whole prompt, its options and a `prompt_id` — while the
-    transcript says nothing about it until the tool call has flushed, by which
-    time the person at the keyboard has usually answered it. The hook's question
-    is the thing itself; the transcript's is a reconstruction of it. So the hook
-    wins whether the two name the same prompt or different ones.
+    socket with the whole prompt and its options — while the transcript says
+    nothing about it until the tool call has flushed, by which time the person at
+    the keyboard has usually answered it. Claude 2.1.248 supplies no usable
+    `prompt_id` for this request, so the listener may use a private correlator.
+    The hook's question is the thing itself; the transcript's is a reconstruction
+    of it. So the hook wins whether the two name the same prompt or different ones.
     """
 
     @staticmethod
@@ -205,8 +206,8 @@ class TestAParkedQuestionWinsOutright:
 
         assert waiting.prompt == "Tabs or spaces?"
 
-    def test_the_question_projects_into_103s_approval_relay(self, tmp_path: Path) -> None:
-        """The hook handle, prompt and option labels are the answerable request."""
+    def test_the_question_never_projects_into_the_permission_relay(self, tmp_path: Path) -> None:
+        """Question words ride Answer Relay; Approval Relay remains permissions only."""
         adapter = adapter_holding(
             transcript(tmp_path, [*turn()]),
             parked=(dialog(tool_name="AskUserQuestion", detail=""),),
@@ -215,12 +216,7 @@ class TestAParkedQuestionWinsOutright:
 
         waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
 
-        request = waiting.as_approval_request(TARGET)
-        assert request is not None
-        assert request.approval_id == "7333021c-1ab7-451d-9eee-91617bc4838d"
-        assert request.kind is WaitingKind.QUESTION
-        assert request.prompt == "Tabs or spaces?"
-        assert request.options == ("Spaces", "Tabs")
+        assert waiting.as_approval_request(TARGET) is None
 
     def test_a_parked_permission_is_ranked_as_it_always_was(self, tmp_path: Path) -> None:
         """The control: `asking` is what distinguishes the two, not the tool name."""

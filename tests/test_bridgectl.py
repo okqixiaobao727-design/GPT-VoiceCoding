@@ -24,7 +24,7 @@ from fakes import FakeCall
 from gpt_voicecoding.cli import main
 from gpt_voicecoding.config import load
 from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, EngineUnreachable
-from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
+from gpt_voicecoding.control_plane.commands import render
 from gpt_voicecoding.engine.composition import Engine
 from gpt_voicecoding.seams.call import CallSnapshot
 from gpt_voicecoding.seams.control_plane import Action, Reply
@@ -33,21 +33,6 @@ from gpt_voicecoding.seams.control_plane import Action, Reply
 #: the engine's own shutdown does not wait on it. It stands in for the real
 #: thing #28 was found on: an action that outruns the client's patience.
 SLOWER_THAN_ANY_DEADLINE_SECONDS = 3.0
-
-
-def test_an_answer_command_builds_the_typed_verdict_document() -> None:
-    request = build_request("approve", ["p-1", "answer", "tabs", "with", "spaces"])
-
-    assert dict(request.payload) == {
-        "approval_id": "p-1",
-        "verdict": {"kind": "answer", "text": "tabs with spaces"},
-    }
-
-
-@pytest.mark.parametrize("arguments", [["p-1", "maybe"], ["p-1", "answer"]])
-def test_an_unknown_or_empty_answer_kind_is_a_parse_error(arguments: list[str]) -> None:
-    with pytest.raises(CommandError, match="say it as"):
-        build_request("approve", arguments)
 
 
 class SlowCall(FakeCall):

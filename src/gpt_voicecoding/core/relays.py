@@ -68,7 +68,14 @@ from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry
-from gpt_voicecoding.seams.agent import AgentAdapter, RelayRoute, ReplyWindow
+from gpt_voicecoding.seams.agent import (
+    AgentAdapter,
+    RelayRoute,
+    ReplyWindow,
+    SessionState,
+    WaitingKind,
+    derive_reply_window,
+)
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget, new_request_id
 
@@ -194,7 +201,34 @@ class RelayPipeline:
         chosen = self._honest_route(adapter, route)
         rid = request_id or new_request_id()
 
-        may_go_now = chosen is RelayRoute.SUPPLEMENT or session.reply_window is ReplyWindow.OPEN
+        try:
+            question_answerable = adapter.question_answerable(target)
+        except Exception:  # noqa: BLE001 - a level query fails closed, never the Relay call
+            _log.exception("the %s lane could not report its question route", target.agent)
+            question_answerable = False
+        window = derive_reply_window(
+            session.state,
+            session.waiting_for,
+            session.child,
+            question_answerable=question_answerable,
+        )
+        if (
+            chosen is RelayRoute.DELIVER
+            and session.state is SessionState.WAITING
+            and session.waiting_for.kind is WaitingKind.QUESTION
+            and not question_answerable
+        ):
+            return RelayOutcome(
+                request_id=rid,
+                target=target,
+                state=Lifecycle.REPORTED_FAILED,
+                route=chosen,
+                report=(
+                    "that question is no longer answerable from here; answer it in the terminal"
+                ),
+                outcome=Delivery.FAILED,
+            )
+        may_go_now = chosen is RelayRoute.SUPPLEMENT or window is ReplyWindow.OPEN
         if may_go_now:
             receipt = await adapter.answer_relay(target, text, request_id=rid, route=chosen)
             if receipt.is_delivered:

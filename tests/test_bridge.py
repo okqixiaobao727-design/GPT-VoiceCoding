@@ -21,8 +21,10 @@ import pytest
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
+    stop_notice_for,
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
+from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.router import Classification
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.switches import SwitchName
@@ -33,6 +35,7 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     LaneDiscovery,
+    Option,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -51,6 +54,35 @@ from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
 
 
 class TestTheStopNoticePipelineEndToEnd:
+    def test_an_answerable_question_tells_the_user_to_reply_here(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            WaitingFor(
+                kind=WaitingKind.QUESTION,
+                prompt="Which base?",
+                options=(Option("main"), Option("feature")),
+            ),
+            answerable_here=True,
+        )
+
+        assert "reply with your answer" in notice
+        assert "answer it in the terminal" not in notice
+
+    def test_several_questions_tell_the_user_to_answer_all_in_one_reply(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            WaitingFor(
+                kind=WaitingKind.QUESTION,
+                prompt="Tabs or spaces?\nWhich base?",
+                options=(Option("tabs"), Option("spaces"), Option("main")),
+            ),
+            answerable_here=True,
+        )
+
+        assert "answer all of them in one reply" in notice
+
     def test_a_stop_notice_never_relays_words_back_into_a_session(self) -> None:
         """The system tells the user about a stop; it does not address an agent."""
         hub = Hub()
@@ -137,21 +169,62 @@ class TestTheStopNoticePipelineEndToEnd:
 
 
 class TestTheApprovalPipelineEndToEnd:
+    def test_tick_sweeps_question_holds_with_the_configured_budget_and_closes_once(
+        self,
+    ) -> None:
+        hub = Hub(voice=False, approval_budget_seconds=17.0)
+        question = WaitingFor(
+            kind=WaitingKind.QUESTION,
+            prompt="Which base?",
+            approval_id="p-1",
+        )
+        hub.agent.question_releases.append((CODEX, question))
+
+        hub.tick()
+        first = tuple(hub.channel.sent)
+        hub.tick()
+
+        assert hub.agent.question_budgets == [17.0, 17.0, 17.0, 17.0]
+        assert len(first) == 1
+        assert hub.channel.sent == list(first)
+        assert "answer it in the terminal" in first[0]
+
+    def test_an_answer_after_budget_release_is_refused_at_the_public_relay(self) -> None:
+        hub = Hub(voice=False, approval_budget_seconds=17.0)
+        question = WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?")
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=question,
+                ),
+            )
+        )
+        hub.agent.answerable_questions.add(CODEX)
+        asyncio.run(hub.core.discover())
+        hub.agent.question_releases.append((CODEX, question))
+
+        hub.tick()
+        outcome = asyncio.run(hub.core.relay(CODEX, "main"))
+
+        assert outcome.state is Lifecycle.REPORTED_FAILED
+        assert outcome.report
+        assert hub.agent.calls == []
+        assert hub.state.relays.pending() == ()
+
     def test_an_awaiting_approval_event_announces_on_every_outlet(self) -> None:
         hub = Hub()
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
 
         assert hub.call.spoken
         assert hub.channel.sent
 
     def test_an_unanswered_approval_expires_to_ask_and_never_to_deny(self) -> None:
         hub = Hub()
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
 
         hub.now += TEN_MINUTES
         hub.tick()
@@ -160,9 +233,7 @@ class TestTheApprovalPipelineEndToEnd:
 
     def test_a_verdict_after_expiry_is_discarded_safely(self) -> None:
         hub = Hub()
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
         hub.now += TEN_MINUTES
         hub.tick()
 
@@ -259,9 +330,7 @@ class TestAChildProcessIsNeverAnnounced:
         hub = Hub()
         child = self.spawned(hub)
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", child, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", child, "Bash")))
 
         assert hub.channel.sent == []
         assert hub.core.approvals.pending() == ()
@@ -270,15 +339,79 @@ class TestAChildProcessIsNeverAnnounced:
         hub = Hub()
         self.spawned(hub)
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
 
         assert hub.channel.sent
         assert len(hub.core.approvals.pending()) == 1
 
 
 class TestTheRelayPipelineEndToEnd:
+    def test_an_answerable_question_opens_the_reply_window_without_changing_waiting_state(
+        self,
+    ) -> None:
+        hub = Hub(voice=False)
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                        approval_id="p-1",
+                    ),
+                ),
+            )
+        )
+        hub.agent.answerable_questions.add(CODEX)
+        asyncio.run(hub.core.discover())
+
+        outcome = asyncio.run(hub.core.relay(CODEX, "main"))
+
+        assert outcome.outcome is Delivery.DELIVERED
+        assert [call.text for call in hub.agent.calls] == ["main"]
+        assert hub.core.status().reply_windows[CODEX] is ReplyWindow.OPEN
+        assert hub.state.sessions.resolve(CODEX).state is SessionState.WAITING
+
+    def test_the_question_open_event_delivers_queued_words_without_changing_waiting_state(
+        self,
+    ) -> None:
+        hub = Hub(voice=False)
+        hub.emit(InboundText(text="main"))
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.QUESTION,
+                        prompt="Which base?",
+                    ),
+                ),
+            )
+        )
+        asyncio.run(hub.core.discover())
+        hub.agent.answerable_questions.add(CODEX)
+
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        assert [call.text for call in hub.agent.calls] == ["main"]
+        assert hub.state.sessions.resolve(CODEX).state is SessionState.WAITING
+
+    def test_a_question_open_event_does_not_invent_idle_before_discovery_catches_up(
+        self,
+    ) -> None:
+        hub = Hub(voice=False)
+        hub.emit(InboundText(text="main"))
+        hub.agent.answerable_questions.add(CODEX)
+
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        assert [call.text for call in hub.agent.calls] == ["main"]
+        assert hub.state.sessions.resolve(CODEX).state is SessionState.RUNNING
+
     def test_words_for_a_busy_session_wait_and_are_confirmed_once(self) -> None:
         hub = Hub()
 
@@ -762,7 +895,6 @@ class TestSwitchAdjudicationEndToEnd:
                     approval_id="a1",
                     target=CODEX,
                     tool_name="Bash",
-                    kind=WaitingKind.PERMISSION,
                     detail="push the branch",
                 )
             )
@@ -817,43 +949,6 @@ class TestSwitchAdjudicationEndToEnd:
         assert len(hub.channel.sent) == 2
         assert hub.channel.sent[1] == hub.channel.sent[0]
 
-    def test_duty_turning_on_reoffers_the_same_pending_question(self) -> None:
-        hub = Hub(duty=False, voice=False)
-        request = ApprovalRequest(
-            approval_id="p-1",
-            target=CODEX,
-            tool_name="AskUserQuestion",
-            kind=WaitingKind.QUESTION,
-            prompt="Which base?",
-            options=("main", "develop"),
-        )
-        hub.emit(AwaitingApproval(request=request))
-        (opened,) = hub.core.approvals.pending()
-        hub.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=Path("/tmp/workspace"),
-                    state=SessionState.WAITING,
-                    waiting_for=WaitingFor(
-                        kind=WaitingKind.QUESTION,
-                        prompt="Which base?",
-                        options=tuple(),
-                        approval_id="p-1",
-                    ),
-                ),
-            )
-        )
-
-        hub.flip(SwitchName.DUTY, True)
-        asyncio.run(hub.core.discover())
-
-        assert hub.channel.sent == [
-            "GPT-VoiceCoding · port the log is waiting for your answer: Which base? "
-            "Options: main, develop"
-        ]
-        assert hub.core.approvals.pending() == (opened,)
-
     def test_an_expired_permission_is_reconciled_as_answerable_only_in_the_terminal(
         self,
     ) -> None:
@@ -864,7 +959,6 @@ class TestSwitchAdjudicationEndToEnd:
                     approval_id="a1",
                     target=CODEX,
                     tool_name="Bash",
-                    kind=WaitingKind.PERMISSION,
                     detail="push the branch",
                 )
             )
@@ -1113,11 +1207,7 @@ class TestSwitchAdjudicationEndToEnd:
 
         async def watch() -> list[str]:
             escalating = asyncio.ensure_future(
-                hub.core.dispatch(
-                    AwaitingApproval(
-                        request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION)
-                    )
-                )
+                hub.core.dispatch(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
             )
             # Let the fan-out start both attempts before the call is unblocked.
             for _ in range(4):
@@ -1330,7 +1420,6 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
                 approval_id="a1",
                 target=CODEX,
                 tool_name="Bash",
-                kind=WaitingKind.PERMISSION,
                 detail="push the branch",
             )
         )
@@ -1347,29 +1436,6 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
             "GPT-VoiceCoding \u00b7 port the log is waiting for your permission to use Bash "
             "\u2014 push the branch"
         ]
-
-    def test_a_question_the_approval_pipeline_holds_announces_once(self) -> None:
-        hub = Hub(voice=False)
-        request = ApprovalRequest(
-            approval_id="p-1",
-            target=CODEX,
-            tool_name="AskUserQuestion",
-            kind=WaitingKind.QUESTION,
-            prompt="Which base?",
-            options=("main", "develop"),
-        )
-        waiting = WaitingFor(
-            kind=WaitingKind.QUESTION,
-            prompt="Which base?",
-            approval_id="p-1",
-        )
-
-        hub.emit(
-            AwaitingApproval(request=request),
-            SessionStopped(target=CODEX, waiting_for=waiting),
-        )
-
-        assert len(hub.channel.sent) == 1 and "Which base?" in hub.channel.sent[0]
 
     def test_the_suppressed_stop_is_written_down_rather_than_dropped_silently(self, caplog) -> None:
         caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
@@ -1398,7 +1464,7 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
         assert "terminal" in notice
 
     def test_a_question_sends_the_user_to_the_terminal_too(self) -> None:
-        """Without #103's hook handle there is no route that can answer one.
+        """Without #128's held-hook route there is no way to answer one here.
 
         The same reasoning as the permission with no handle: a notice that reads
         out a question and its options, and does not say where it is answered,
@@ -1459,9 +1525,7 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
     def test_the_announcement_names_the_session_the_way_the_user_does(self) -> None:
         hub = Hub(voice=False)
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
 
         (announcement,) = hub.channel.sent
         assert announcement.startswith("GPT-VoiceCoding · port the log is waiting")
@@ -1470,9 +1534,7 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
         """One answer to "what is this called", or the user hears two Sessions."""
         hub = Hub(voice=False)
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", WaitingKind.PERMISSION))
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
         hub.emit(SessionStopped(target=CODEX))
 
         announcement, stop_notice = hub.channel.sent
@@ -1483,11 +1545,7 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
         """The floor `spoken_name` itself falls back to — never "a session"."""
         hub = Hub(voice=False)
 
-        hub.emit(
-            AwaitingApproval(
-                request=ApprovalRequest("a1", self.STRANGER, "Bash", WaitingKind.PERMISSION)
-            )
-        )
+        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", self.STRANGER, "Bash")))
 
         (announcement,) = hub.channel.sent
         assert announcement.startswith("codex not-in-the-roster is waiting")
@@ -1496,11 +1554,7 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
         hub = Hub(voice=False)
 
         hub.emit(
-            AwaitingApproval(
-                request=ApprovalRequest(
-                    "a1", CODEX, "Bash", WaitingKind.PERMISSION, detail="push the branch"
-                )
-            )
+            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", detail="push the branch"))
         )
 
         (announcement,) = hub.channel.sent

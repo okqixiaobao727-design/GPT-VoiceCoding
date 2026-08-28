@@ -73,7 +73,7 @@ class Action(StrEnum):
     LIVE = "live"
     #: An Answer Relay — the user's own words, for one exact Session.
     RELAY = "relay"
-    #: The user's verdict on one pending question or permission request.
+    #: The user's verdict on one pending permission request.
     APPROVE = "approve"
     #: What the engine actually loaded behind each seam — ADR 0003.
     VERIFY = "verify"

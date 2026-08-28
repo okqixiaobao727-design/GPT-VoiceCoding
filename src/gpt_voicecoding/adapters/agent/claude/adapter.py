@@ -1,8 +1,9 @@
-"""The Agent seam, over a Session's own inbox socket. Mechanism only; no queueing.
+"""The Claude Agent seam, selecting its private wire. Mechanism only; no queueing.
 
-**What proves delivery, and it is narrow.** The Answer Relay writes into the
-inbox socket Claude Code binds for every Session, and a write that is accepted
-proves nothing at all: the line was taken by a socket, not read by a Session.
+**What proves delivery on the ordinary route, and it is narrow.** An Answer
+Relay ordinarily writes into the inbox socket Claude Code binds for every
+Session, and a write that is accepted proves nothing at all: the line was taken
+by a socket, not read by a Session.
 #71 measured the two things that do prove it — the `held → delivered`
 `peer_message_status` receipt, and the target's own transcript entry whose
 `origin.from` is our reply address and whose `origin.msg_id` is the id we minted.
@@ -20,12 +21,12 @@ terminal keeps a listener for a second and longer budget, and upstream's own
 settlement is raised upward whichever way it went. A grade that *was* terminal
 is never revisited.
 
-**Two verbs over two different wires.** This package is the shared Claude
-adapter. The Answer Relay rides the Session's inbox socket, described above. The
-Approval Relay rides the **`PermissionRequest` hook**, delegated to
-`approval.py`, and it is the route where *we* are the server: a hook process
-dials in holding a displayed dialog open, and the verdict travels back down the
-connection it is waiting on.
+**Two public verbs over two wires, selected here.** An ordinary Answer Relay
+rides the Session's inbox socket. While a Session is parked on its own question,
+the same verb selects the held **`PermissionRequest` hook** delegated to
+`approval.py`. The Approval Relay uses that hook for permission verdicts too; it
+is the route where *we* are the server, with the hook process holding the dialog
+open while the response travels back down its connection.
 
 **Words on one wire, authority on the other, and that is structural.** A peer
 message is announced to the receiving Session as not typed by its user, and
@@ -396,6 +397,7 @@ class ClaudeAgentAdapter:
         than by everything that has ever registered (#98).
         """
         self._inboxes.pop(target, None)
+        self._approvals.clear_released_question(target)
         self._windows.forget(target)
         report = self._reported.pop(target, None)
         if report is not None:
@@ -420,6 +422,16 @@ class ClaudeAgentAdapter:
         if target not in self._inboxes:
             return ReplyWindow.CLOSED
         return self._windows.level(target)
+
+    def question_answerable(self, target: SessionTarget) -> bool:
+        """Whether the exact question hook for this Session is still parked."""
+        return self._approvals.question_answerable(target)
+
+    async def sweep_question_budget(
+        self, budget_seconds: float
+    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
+        """Release Claude questions past Core's configured budget."""
+        return await self._approvals.sweep_question_budget(budget_seconds)
 
     # -- the seam ---------------------------------------------------------
 
@@ -553,14 +565,13 @@ class ClaudeAgentAdapter:
         0. **A question parked on the approval socket wins over everything**
            (#77). `AskUserQuestion` raises the same `PermissionRequest` hook a
            `Write` does (measured on 2.1.246), so the dialog arrives here with
-           the whole prompt, its options and the `prompt_id` a verdict would be
-           addressed with — while the transcript says nothing about the call
+           the whole prompt and its options — while the transcript says nothing about the call
            until it has flushed, and by then the person at the keyboard has
            usually answered it. The hook's question is the thing itself and the
            record's is a reconstruction of it, so the hook wins whether the two
-           name the same prompt or different ones. With a `prompt_id`, #103
-           addresses it through the Approval Relay; without that correlator it
-           remains observable and the on-screen dialog is still the only route.
+           name the same prompt or different ones. #128 addresses the held writer
+           through the Answer Relay, with Claude's `prompt_id` when supplied or
+           a listener-private correlator otherwise.
         1. **A readable question wins outright.** The reference implementation's
            precedence — a decision only the user can supply outranks a permission
            call beside it (`legacy@1d32845:bridge/transcript.py:1691-1692`) — and
@@ -593,7 +604,10 @@ class ClaudeAgentAdapter:
             found = base
         dialog = self._approvals.newest_for(target)
         if dialog is None or found.kind is WaitingKind.QUESTION:
+            if found.kind is not WaitingKind.QUESTION:
+                self._approvals.clear_released_question(target)
             return found
+        self._approvals.clear_released_question(target)
         if found.kind is WaitingKind.PERMISSION:
             tool_name, detail = _announced_as(found, dialog)
             return replace(
@@ -667,6 +681,16 @@ class ClaudeAgentAdapter:
             # Bridge Core decides what to do instead — queueing is its policy,
             # never this adapter's.
             return _failed(request_id, SUPPLEMENT_UNAVAILABLE)
+        held_question = self._approvals.held_question_for(target)
+        if held_question is not None:
+            question_id, _ = held_question
+            return await self._approvals.answer_question(question_id, text, request_id=request_id)
+        released_reason = self._approvals.released_question_reason(target)
+        if released_reason is not None:
+            return _failed(
+                request_id,
+                released_reason,
+            )
         return await self._deliver(target, text, request_id=request_id)
 
     async def approval_relay(

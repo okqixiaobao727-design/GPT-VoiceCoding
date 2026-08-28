@@ -47,6 +47,7 @@ class Hub:
         instructions: bool = True,
         channel_outcome: Delivery = Delivery.DELIVERED,
         channel_reason: str = "fake channel",
+        approval_budget_seconds: float = TEN_MINUTES,
     ) -> None:
         self.now = 1_000.0
         switches = Switchboard()
@@ -78,7 +79,7 @@ class Hub:
             call=self.call,
             channel=self.channel,
             agents={AgentKind.CODEX: self.agent, AgentKind.CLAUDE: self.agent},
-            policy=CorePolicy(),
+            policy=CorePolicy(approval_budget_seconds=approval_budget_seconds),
             grammar=TextGrammar(control_commands=COMMANDS),
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]

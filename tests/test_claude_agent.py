@@ -47,7 +47,6 @@ from gpt_voicecoding.seams.agent import (
     RelayRoute,
     ReplyWindow,
     SessionState,
-    WaitingKind,
 )
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionName, SessionTarget
@@ -660,7 +659,6 @@ class TestTheRoutesThisBuildReallyHas:
                             approval_id="a-1",
                             target=TARGET,
                             tool_name="Bash",
-                            kind=WaitingKind.PERMISSION,
                         ),
                         ApprovalVerdict.ALLOW,
                         request_id=rid("r-2"),

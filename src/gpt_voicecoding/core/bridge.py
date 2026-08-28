@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
@@ -79,6 +79,7 @@ from gpt_voicecoding.seams.agent import (
     SessionStopped,
     WaitingFor,
     WaitingKind,
+    derive_reply_window,
 )
 from gpt_voicecoding.seams.call import (
     CallAdapter,
@@ -150,9 +151,9 @@ def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
     and anything else becomes `RUNNING`. Guessing the other way would erase a
     permission dialog from the roster while it is still on the user's screen.
     """
-    if window is ReplyWindow.OPEN:
-        return SessionState.IDLE
-    return held if held is SessionState.WAITING else SessionState.RUNNING
+    if held is SessionState.WAITING:
+        return held
+    return SessionState.IDLE if window is ReplyWindow.OPEN else SessionState.RUNNING
 
 
 #: What a notice says about something this engine can announce and cannot answer.
@@ -170,11 +171,15 @@ def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
                 parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
             if waiting_for.recommendation:
                 parts.append(f"it recommends {waiting_for.recommendation}")
-            # A question with no handle has no answering route: the inbox carries
-            # words and never authority (#71), while #103's structured answer
-            # needs the `prompt_id` carried by the hook. A handled question is
-            # reoffered by the Approval Relay before this fallback is reached.
-            return "; ".join(parts) + f" — {ANSWER_IT_AT_THE_TERMINAL}"
+            if answerable_here:
+                action = (
+                    "answer all of them in one reply"
+                    if "\n" in waiting_for.prompt
+                    else "reply with your answer"
+                )
+            else:
+                action = ANSWER_IT_AT_THE_TERMINAL
+            return "; ".join(parts) + f" — {action}"
         case WaitingKind.PERMISSION:
             named = waiting_for.tool_name or "a tool"
             asked = f"{named} needs your permission" + (
@@ -216,6 +221,9 @@ class Status:
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
     pending_approvals: tuple[PendingApproval, ...]
+    #: Reply Window levels include the lane's live question-route fact, which is
+    #: deliberately not copied onto the roster row.
+    reply_windows: Mapping[SessionTarget, ReplyWindow] = field(default_factory=dict)
 
 
 class BridgeCore:
@@ -323,6 +331,30 @@ class BridgeCore:
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
             pending_approvals=self.approvals.pending(),
+            reply_windows={
+                session.target: self._reply_window(session)
+                for session in self._state.sessions.all()
+            },
+        )
+
+    def _question_answerable(self, target: SessionTarget) -> bool:
+        adapter = self._agents.get(target.agent)
+        if adapter is None:
+            return False
+        try:
+            return adapter.question_answerable(target)
+        except Exception:  # noqa: BLE001 - a query can only close, never drop, a Session
+            _log.exception("the %s lane could not report its question route", target.agent)
+            return False
+
+    def _reply_window(self, session: Session) -> ReplyWindow:
+        if session.lifecycle is not SessionLifecycle.LIVE:
+            return ReplyWindow.CLOSED
+        return derive_reply_window(
+            session.state,
+            session.waiting_for,
+            session.child,
+            question_answerable=self._question_answerable(session.target),
         )
 
     async def progress(self, target: SessionTarget) -> Session:
@@ -527,6 +559,21 @@ class BridgeCore:
         expired = self.relays.sweep_expired()
         for outcome in expired:
             await self._announce(outcome.target, outcome.report)
+        for adapter in self._agents.values():
+            released = await adapter.sweep_question_budget(self._policy.approval_budget_seconds)
+            for target, waiting_for in released:
+                await self.escalation.escalate(
+                    Notice(
+                        request_id=new_request_id(),
+                        target=target,
+                        text=stop_notice_for(
+                            self._known(target),
+                            target,
+                            waiting_for,
+                            answerable_here=False,
+                        ),
+                    )
+                )
         return expired, await self.approvals.sweep_expired()
 
     async def discover(self) -> tuple[SessionTarget, ...]:
@@ -704,7 +751,15 @@ class BridgeCore:
             Notice(
                 request_id=new_request_id(),
                 target=target,
-                text=stop_notice_for(session, target, waiting_for, answerable_here=False),
+                text=stop_notice_for(
+                    session,
+                    target,
+                    waiting_for,
+                    answerable_here=(
+                        waiting_for.kind is WaitingKind.QUESTION
+                        and self._question_answerable(target)
+                    ),
+                ),
             )
         )
         if key is not None and outcome.delivered_by is not None:
@@ -728,11 +783,22 @@ class BridgeCore:
         event is a coarser reading of the same fact and it lands on the field
         the fine-grained one lands on. The next discovery overwrites both, which
         is what makes this a shortcut rather than a second source of truth.
+
+        A held question is the exception to the state shortcut. Its listener can
+        open the route before the roster has reported `WAITING`; the event proves
+        the route, not `IDLE`, so only discovery may change the Session state.
         """
         try:
             held = self._state.sessions.resolve(event.target)
-            current = self._state.sessions.set_state(
-                event.target, _state_behind(event.window, held.state)
+            question_route_open = event.window is ReplyWindow.OPEN and self._question_answerable(
+                event.target
+            )
+            current = (
+                held
+                if question_route_open
+                else self._state.sessions.set_state(
+                    event.target, _state_behind(event.window, held.state)
+                )
             )
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)

@@ -103,7 +103,7 @@ class Session:
         """
         if self.lifecycle is not SessionLifecycle.LIVE:
             return ReplyWindow.CLOSED
-        return derive_reply_window(self.state, self.child)
+        return derive_reply_window(self.state, self.waiting_for, self.child)
 
     @property
     def is_live(self) -> bool:

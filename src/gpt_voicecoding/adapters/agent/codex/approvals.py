@@ -30,7 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from gpt_voicecoding.adapters.agent import _summary
-from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict, WaitingKind
+from gpt_voicecoding.seams.agent import ApprovalRequest, ApprovalVerdict
 from gpt_voicecoding.seams.identity import SessionTarget
 
 #: The permission prompts this adapter consumes, and the tool name each is
@@ -155,7 +155,6 @@ def request_from(method: str, params: dict[str, Any], *, target: SessionTarget) 
         approval_id=approval_id_of(method, params),
         target=target,
         tool_name=tool_name_for(method, params),
-        kind=WaitingKind.PERMISSION,
         detail=summary_of(method, params),
         options=voice_menu(params.get("availableDecisions")),
     )
@@ -173,8 +172,7 @@ def carries_a_decision(method: str) -> bool:
 
 
 def answer_for(verdict: ApprovalVerdict) -> dict[str, Any] | None:
-    """What to send back, or `None` when Codex has no wire answer for it."""
-    decision = DECISIONS.get(verdict)
-    if decision is None:
+    """What to send back, or `None` when the verdict is answered by silence."""
+    if verdict is ApprovalVerdict.ASK:
         return None
-    return {"decision": decision}
+    return {"decision": DECISIONS[verdict]}

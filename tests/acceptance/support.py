@@ -676,11 +676,13 @@ ENGINE_RELAY_PROOF_SECONDS = DEFAULT_ACK_TIMEOUT_SECONDS
 def control_plane_status(socket_path: Path, journal: Journal) -> dict[str, Any]:
     """Read `status`'s **payload**, not `bridgectl`'s rendering of it.
 
-    This exists for the automated journey's `approval_id`. The Swift Control
-    Panel now renders pending questions and can answer them (#103), but the
-    harness cannot drive that window and `bridgectl status` deliberately prints
-    only a count. Reading the payload lets the run exercise the same public
-    Control Plane action without inventing a private adapter route.
+    This exists for exactly one value: `approval_id`. It is in the control-plane
+    reply (`control_plane/payloads.py:180`) and it reaches **no human surface** —
+    `bridgectl status` prints only a count of pending approvals
+    (`control_plane/commands.py:209`), the escalated announcement does not carry
+    it (`core/approvals.py:43`), the Swift shell never mentions it, and
+    `engine.log` records it only for a verdict that arrives too late. So
+    `bridgectl approve <id>` cannot be driven by anyone.
 
     Legacy has **no** counterpart behaviour to cite: its permission handling
     pushed "Claude needs your permission to use X" as a *notice*
@@ -688,14 +690,16 @@ def control_plane_status(socket_path: Path, journal: Journal) -> dict[str, Any]:
     keyboard. There was never an id-addressed `approve` route, which is why
     nobody found this.
 
-    Every call is journaled as `side-channel`, so the receipt says exactly how
-    the automated run obtained the id rather than implying a human typed it.
+    That is a finding, and the lane records it as one. This side channel is how
+    the run gets *past* it, so a single expensive run reports every red rather
+    than the first. Every call is journaled as `side-channel`, so no verdict can
+    rest on it without the journal saying so.
     """
     return control_plane_payload(
         Action.STATUS,
         socket_path=socket_path,
         journal=journal,
-        why="the automated journey cannot drive the Control Panel",
+        why="approval_id reaches no surface",
     )
 
 

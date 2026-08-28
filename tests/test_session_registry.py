@@ -27,6 +27,9 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     SessionLifecycle,
     SessionState,
+    WaitingFor,
+    WaitingKind,
+    derive_reply_window,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -271,6 +274,28 @@ class TestMatchingNames:
 
 
 class TestReplyWindow:
+    def test_a_held_question_is_open_only_while_the_lane_can_answer_it(self) -> None:
+        question = WaitingFor(kind=WaitingKind.QUESTION, prompt="Which layout?")
+
+        assert (
+            derive_reply_window(
+                SessionState.WAITING,
+                question,
+                ChildClassification(),
+                question_answerable=True,
+            )
+            is ReplyWindow.OPEN
+        )
+        assert (
+            derive_reply_window(
+                SessionState.WAITING,
+                question,
+                ChildClassification(),
+                question_answerable=False,
+            )
+            is ReplyWindow.CLOSED
+        )
+
     def test_a_session_starts_with_its_reply_window_closed(self) -> None:
         registry = SessionRegistry()
         session = codex("abc")

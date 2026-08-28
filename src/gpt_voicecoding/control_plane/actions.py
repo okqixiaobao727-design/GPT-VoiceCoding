@@ -125,9 +125,15 @@ class ControlPlane:
         reader of the same facts. What this action adds is *when* — the row comes
         back read at the moment it was asked for, rather than at the last tick.
         """
+        session = await self._core.progress(payloads.read_target(payload))
+        reply_window = self._core.status().reply_windows.get(
+            session.target,
+            session.reply_window,
+        )
         return {
             "session": payloads.session_document(
-                await self._core.progress(payloads.read_target(payload))
+                session,
+                reply_window=reply_window,
             )
         }
 

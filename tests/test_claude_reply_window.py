@@ -324,13 +324,13 @@ class TestReportingAStopTheMomentADialogGoesUp:
     """A Session entering `waiting` has stopped on the user, and says so (#77).
 
     Found by #75's worker and fenced into this ticket. `STATUSES_MEANING_TURN_
-    ACTIVE` counts `waiting` as part of the turn, which is right for the Reply
-    Window — a dialog takes no Relay — and wrong for the Stop Notice: a Session
-    that raised a question or a permission is stopped on the *user*, which is
-    the whole thing a Stop Notice exists to say. Before this, the only Stop it
-    raised came after the user had answered, by which time the transcript
-    carries the `tool_result` and `analyse` correctly says NONE — so the notice
-    that finally fired said nothing about what it had stopped on.
+    ACTIVE` counts `waiting` as part of the turn, which is right for a permission
+    dialog's Reply Window and wrong for the Stop Notice: a Session that raised a
+    question or a permission is stopped on the *user*, which is the whole thing
+    a Stop Notice exists to say. #128 later opened the window only for a question
+    whose exact hook is still held; that adapter fact does not change this roster
+    transition. Before this, the only Stop arrived after the user had answered,
+    when the transcript carried `tool_result` and `analyse` correctly said NONE.
 
     The permission half already reached the user by the hook route
     (`approval.py` → `AwaitingApproval`). **The question half had no

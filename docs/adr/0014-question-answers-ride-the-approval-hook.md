@@ -1,6 +1,6 @@
 # 14. A question answer rides the Approval Relay as a typed verdict
 
-Date: 2026-08-28 · Status: Accepted · Source: [#103](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/103)
+Date: 2026-08-28 · Status: Superseded by [ADR 0015](0015-a-held-question-opens-the-reply-window.md) · Source: [#103](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/103)
 
 ADR 0013 closes the Session inbox to answers to a Session's own question: the inbox carries peer words, not the user's authority, and Claude Code refuses to treat them as the user's answer. `AskUserQuestion` raises the same `PermissionRequest` hook as a permission dialog, however, and its payload carries the whole question plus `prompt_id`. On Claude Code 2.1.246, returning a denial whose message is the answer places that message in the Session as the tool result and the Session continues on it. The hook is therefore the route that exists; what was missing was a seam value able to name an answer without pretending it was allow or deny.
 
