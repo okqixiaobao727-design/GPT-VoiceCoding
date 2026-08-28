@@ -1,4 +1,5 @@
 import Foundation
+import ShellTestSupport
 import Testing
 
 @testable import ShellCore
@@ -131,32 +132,18 @@ import Testing
     }
 
     @Test func theCredentialFileOverridesTheInheritedValueInTheRealChild() async throws {
-        let directory = URL(fileURLWithPath: "/tmp/gvc-launch-token-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let config = directory.appendingPathComponent("config.toml")
-        try Data(
-            """
-            [adapters.settings.companion_channel]
-            token_env = "GVC_LAUNCH_TEST_TOKEN"
-            """.utf8
-        ).write(to: config)
-        let file = directory.appendingPathComponent("environment")
-        try Data("GVC_LAUNCH_TEST_TOKEN=file-wins\n".utf8).write(to: file)
-        #expect(chmod(file.path, 0o600) == 0)
-        #expect(setenv("GVC_LAUNCH_TEST_TOKEN", "inherited-loses", 1) == 0)
-        defer { unsetenv("GVC_LAUNCH_TEST_TOKEN") }
+        let fixture = try TelegramCredentialFixture(tokenVariable: "GVC_LAUNCH_TEST_TOKEN")
+        try fixture.writeEnvironment("GVC_LAUNCH_TEST_TOKEN=file-wins\n")
 
         let collected = Collector()
         let command = EngineCommand(
             executable: "/bin/sh",
             arguments: ["-c", "printf '%s' \"$GVC_LAUNCH_TEST_TOKEN\" 1>&2"],
             source: .developerPath)
-        let credentials = TelegramCredentials(
-            configPath: config.path, environmentPath: file.path)
-
         _ = try ProcessLauncher(
-            readPath: LoginShellPath.unasked, credentials: credentials
+            readPath: LoginShellPath.unasked,
+            environment: ["GVC_LAUNCH_TEST_TOKEN": "inherited-loses"],
+            credentials: fixture.credentials
         ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
         _ = await collected.exitCode()
 

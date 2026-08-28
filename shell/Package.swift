@@ -19,13 +19,20 @@ let package = Package(
         // without one.
         .target(name: "ShellCore"),
         .executableTarget(name: "GPTVoiceCodingShell", dependencies: ["ShellCore"]),
+        .target(
+            name: "ShellTestSupport",
+            dependencies: ["ShellCore"],
+            path: "Tests/ShellTestSupport"),
         .testTarget(
             name: "ShellCoreTests",
-            dependencies: ["ShellCore", .product(name: "Testing", package: "swift-testing")]),
+            dependencies: [
+                "ShellCore", "ShellTestSupport",
+                .product(name: "Testing", package: "swift-testing"),
+            ]),
         .testTarget(
             name: "GPTVoiceCodingShellTests",
             dependencies: [
-                "GPTVoiceCodingShell", "ShellCore",
+                "GPTVoiceCodingShell", "ShellCore", "ShellTestSupport",
                 .product(name: "Testing", package: "swift-testing"),
             ]),
     ]

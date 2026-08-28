@@ -1,5 +1,6 @@
 import Foundation
 import ShellCore
+import ShellTestSupport
 import Testing
 
 @testable import GPTVoiceCodingShell
@@ -7,23 +8,24 @@ import Testing
 @MainActor
 @Suite struct ShellModelTests {
     @Test func aMissingNamedVariableStopsAtPreflight() throws {
-        let directory = URL(
-            fileURLWithPath: "/tmp/gvc-shell-preflight-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let config = directory.appendingPathComponent("config.toml")
-        try Data(
-            """
-            [adapters.settings.companion_channel]
-            token_env = "A_TELEGRAM_TOKEN"
-            """.utf8
-        ).write(to: config)
-        let credentials = TelegramCredentials(
-            configPath: config.path,
-            environmentPath: directory.appendingPathComponent("environment").path)
+        let fixture = try TelegramCredentialFixture()
 
-        let state = ShellModel.preflight(credentials: credentials)
+        let state = ShellModel.preflight(credentials: fixture.credentials)
 
         #expect(state == .missing)
+    }
+
+    @Test func closingTheCredentialRowClearsAFailedSaveHint() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // GPTVoiceCodingShellTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // shell
+            .appendingPathComponent("Sources/GPTVoiceCodingShell/ControlPanelView.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let row =
+            source.components(separatedBy: "private struct TelegramCredentialRow: View").last?
+            .components(separatedBy: "private struct EngineHealthRow: View").first ?? ""
+
+        #expect(row.contains(".onDisappear { shell.clearCredentialSaveFailure() }"))
     }
 }

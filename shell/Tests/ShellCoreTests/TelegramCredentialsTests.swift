@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import ShellTestSupport
 import Testing
 
 @testable import ShellCore
@@ -10,11 +11,12 @@ import Testing
             try withFiles(environment: "A_TELEGRAM_TOKEN=123:abc\n", mode: mode) { config, file in
                 let reading = TelegramCredentials(configPath: config, environmentPath: file).load()
 
-                guard case .unsafe(let detail) = reading.state else {
+                guard case .unsafe(.permissions(let path)) = reading.state else {
                     Issue.record("expected mode \(String(mode, radix: 8)) to be unsafe")
                     return
                 }
-                #expect(detail.contains("0600"))
+                #expect(path == file)
+                #expect(reading.state.failureDetail?.contains("0600") == true)
                 #expect(reading.environment.isEmpty)
             }
         }
@@ -165,24 +167,11 @@ import Testing
         mode: mode_t,
         _ body: (String, String) throws -> Void
     ) throws {
-        let directory = URL(fileURLWithPath: "/tmp/gvc-telegram-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-
-        let config = directory.appendingPathComponent("config.toml")
-        try Data(
-            """
-            [adapters.settings.companion_channel]
-            token_env = "A_TELEGRAM_TOKEN"
-            chat_id = "123"
-            """.utf8
-        ).write(to: config)
-        let file = directory.appendingPathComponent("environment")
+        let fixture = try TelegramCredentialFixture()
         if let environment {
-            try Data(environment.utf8).write(to: file)
-            #expect(chmod(file.path, mode) == 0)
+            try fixture.writeEnvironment(environment, mode: mode)
         }
 
-        try body(config.path, file.path)
+        try body(fixture.configPath, fixture.environmentPath)
     }
 }

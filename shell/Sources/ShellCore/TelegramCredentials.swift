@@ -13,19 +13,33 @@ import Foundation
 /// stopping launch. Here the Swift parent owns that work, reads no shell syntax,
 /// and adds the private-file and menu-bar contracts legacy did not have.
 public struct TelegramCredentials: Sendable {
+    public enum UnsafeReason: Equatable, Sendable {
+        case permissions(path: String)
+    }
+
+    public enum FileProblem: Equatable, Sendable {
+        case notUTF8
+        case readFailed(String)
+        case missingAssignment(line: Int)
+        case invalidVariableName(line: Int)
+        case duplicateVariable(line: Int, name: String)
+    }
+
+    public enum UnreadableReason: Equatable, Sendable {
+        case configuration(path: String, reason: String)
+        case inspection(path: String, code: Int32)
+        case environment(path: String, problem: FileProblem)
+    }
+
     public enum State: Equatable, Sendable {
         case ready
         case notConfigured
         case missing
-        case unsafe(String)
-        case unreadable(String)
+        case unsafe(UnsafeReason)
+        case unreadable(UnreadableReason)
 
         public var failureDetail: String? {
-            switch self {
-            case .ready, .notConfigured: return nil
-            case .missing: return "Telegram token not set"
-            case .unsafe(let detail), .unreadable(let detail): return detail
-            }
+            TelegramCredentialSentence.state(self)
         }
 
         public var allowsEngineStart: Bool {
@@ -55,39 +69,55 @@ public struct TelegramCredentials: Sendable {
             .appendingPathComponent("environment").path
     }
 
-    public func load() -> Reading {
-        let tokenVariable: String?
+    private enum ConfigurationReading {
+        case named(String)
+        case notConfigured
+        case failed(State)
+    }
+
+    /// The one mapping from configuration-reader failures into this module's
+    /// state. Both load and save consume the same typed result.
+    private func configurationReading() -> ConfigurationReading {
         do {
-            tokenVariable = try Self.configuredTokenVariable(in: configPath)
+            guard let variable = try Self.configuredTokenVariable(in: configPath) else {
+                return .notConfigured
+            }
+            return .named(variable)
         } catch let failure as ConfigurationFailure {
-            return Reading(state: .unreadable(failure.detail), environment: [:])
-        } catch let failure as CredentialFileFailure {
-            return Reading(state: .unreadable(failure.detail), environment: [:])
+            return .failed(
+                .unreadable(.configuration(path: configPath, reason: failure.detail)))
+        } catch is InvalidTokenVariable {
+            return .failed(
+                .unreadable(
+                    .configuration(
+                        path: configPath,
+                        reason: "[adapters.settings.companion_channel] token_env must name an "
+                            + "environment variable")))
         } catch {
-            return Reading(
-                state: .unreadable(
-                    "The engine configuration at \(configPath) could not be read: "
-                        + error.localizedDescription),
-                environment: [:])
+            return .failed(
+                .unreadable(
+                    .configuration(path: configPath, reason: error.localizedDescription)))
         }
-        guard let tokenVariable else {
-            return Reading(state: .notConfigured, environment: [:])
+    }
+
+    public func load() -> Reading {
+        let tokenVariable: String
+        switch configurationReading() {
+        case .named(let variable): tokenVariable = variable
+        case .notConfigured: return Reading(state: .notConfigured, environment: [:])
+        case .failed(let state): return Reading(state: state, environment: [:])
         }
 
         var metadata = stat()
         guard lstat(environmentPath, &metadata) == 0 else {
             if errno == ENOENT { return Reading(state: .missing, environment: [:]) }
             return Reading(
-                state: .unreadable(
-                    "Telegram credentials could not be inspected: \(String(cString: strerror(errno)))"
-                ),
+                state: .unreadable(.inspection(path: environmentPath, code: errno)),
                 environment: [:])
         }
         guard metadata.st_mode & 0o077 == 0 else {
             return Reading(
-                state: .unsafe(
-                    "Telegram credentials at \(environmentPath) must be private like mode 0600; "
-                        + "group or other permissions are not allowed"),
+                state: .unsafe(.permissions(path: environmentPath)),
                 environment: [:])
         }
 
@@ -95,12 +125,16 @@ public struct TelegramCredentials: Sendable {
         do {
             environment = try Self.environment(in: Self.utf8File(at: environmentPath))
         } catch let failure as CredentialFileFailure {
-            return Reading(state: .unreadable(failure.detail), environment: [:])
+            return Reading(
+                state: .unreadable(
+                    .environment(path: environmentPath, problem: failure.problem)),
+                environment: [:])
         } catch {
             return Reading(
                 state: .unreadable(
-                    "Telegram credentials at \(environmentPath) could not be read: "
-                        + error.localizedDescription),
+                    .environment(
+                        path: environmentPath,
+                        problem: .readFailed(error.localizedDescription))),
                 environment: [:])
         }
 
@@ -121,28 +155,17 @@ public struct TelegramCredentials: Sendable {
     /// file, and the rename is the one visible change a concurrent launch can see.
     public func save(token: String) throws -> Reading {
         guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw TelegramCredentialSaveFailure.invalid("The Telegram bot token cannot be empty")
+            throw TelegramCredentialSaveFailure.emptyToken
         }
         guard !token.contains("\n"), !token.contains("\r"), !token.contains("\0") else {
-            throw TelegramCredentialSaveFailure.invalid(
-                "The Telegram bot token cannot contain a line break or null byte")
+            throw TelegramCredentialSaveFailure.invalidTokenCharacters
         }
 
         let variable: String
-        do {
-            guard let configured = try Self.configuredTokenVariable(in: configPath) else {
-                throw CredentialFileFailure(
-                    "[adapters.settings.companion_channel] token_env is not configured")
-            }
-            variable = configured
-        } catch let failure as ConfigurationFailure {
-            throw TelegramCredentialSaveFailure.refused(failure.detail)
-        } catch let failure as CredentialFileFailure {
-            throw TelegramCredentialSaveFailure.refused(failure.detail)
-        } catch {
-            throw TelegramCredentialSaveFailure.refused(
-                "The engine configuration at \(configPath) could not be read: "
-                    + error.localizedDescription)
+        switch configurationReading() {
+        case .named(let configured): variable = configured
+        case .notConfigured: throw TelegramCredentialSaveFailure.tokenNotConfigured
+        case .failed(let state): throw TelegramCredentialSaveFailure.refused(state)
         }
 
         let current = load()
@@ -151,10 +174,9 @@ public struct TelegramCredentials: Sendable {
         case .ready, .missing:
             environment = current.environment
         case .notConfigured:
-            throw TelegramCredentialSaveFailure.refused(
-                "[adapters.settings.companion_channel] token_env is not configured")
-        case .unsafe(let detail), .unreadable(let detail):
-            throw TelegramCredentialSaveFailure.refused(detail)
+            throw TelegramCredentialSaveFailure.tokenNotConfigured
+        case .unsafe, .unreadable:
+            throw TelegramCredentialSaveFailure.refused(current.state)
         }
         environment[variable] = token
         let original: String?
@@ -162,11 +184,15 @@ public struct TelegramCredentials: Sendable {
             do {
                 original = try Self.utf8File(at: environmentPath)
             } catch let failure as CredentialFileFailure {
-                throw TelegramCredentialSaveFailure.refused(failure.detail)
+                throw TelegramCredentialSaveFailure.refused(
+                    .unreadable(
+                        .environment(path: environmentPath, problem: failure.problem)))
             } catch {
                 throw TelegramCredentialSaveFailure.refused(
-                    "Telegram credentials at \(environmentPath) could not be read: "
-                        + error.localizedDescription)
+                    .unreadable(
+                        .environment(
+                            path: environmentPath,
+                            problem: .readFailed(error.localizedDescription))))
             }
         } else {
             original = nil
@@ -176,8 +202,8 @@ public struct TelegramCredentials: Sendable {
         do {
             try Self.replaceFile(at: environmentPath, with: Data(rendered.utf8))
         } catch {
-            throw TelegramCredentialSaveFailure.write(
-                "Telegram credentials could not be saved: \(error.localizedDescription)")
+            throw TelegramCredentialSaveFailure.writeFailed(
+                path: environmentPath, reason: error.localizedDescription)
         }
         return Reading(state: .ready, environment: environment)
     }
@@ -196,9 +222,7 @@ public struct TelegramCredentials: Sendable {
                 of: config)
         else { return nil }
         guard isEnvironmentName(named) else {
-            throw CredentialFileFailure(
-                "[adapters.settings.companion_channel] token_env must name an "
-                    + "environment variable")
+            throw InvalidTokenVariable()
         }
         return named
     }
@@ -206,7 +230,7 @@ public struct TelegramCredentials: Sendable {
     private static func utf8File(at path: String) throws -> String {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         guard let text = String(data: data, encoding: .utf8) else {
-            throw CredentialFileFailure("The file at \(path) is not UTF-8")
+            throw CredentialFileFailure(.notUTF8)
         }
         return text
     }
@@ -220,17 +244,14 @@ public struct TelegramCredentials: Sendable {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
             guard let separator = line.firstIndex(of: "=") else {
-                throw CredentialFileFailure(
-                    "Telegram credentials line \(offset + 1) must be KEY=VALUE")
+                throw CredentialFileFailure(.missingAssignment(line: offset + 1))
             }
             let name = String(line[..<separator])
             guard isEnvironmentName(name) else {
-                throw CredentialFileFailure(
-                    "Telegram credentials line \(offset + 1) has an invalid variable name")
+                throw CredentialFileFailure(.invalidVariableName(line: offset + 1))
             }
             guard environment[name] == nil else {
-                throw CredentialFileFailure(
-                    "Telegram credentials line \(offset + 1) repeats \(name)")
+                throw CredentialFileFailure(.duplicateVariable(line: offset + 1, name: name))
             }
             environment[name] = String(line[line.index(after: separator)...])
         }
@@ -297,10 +318,12 @@ public struct TelegramCredentials: Sendable {
     }
 }
 
-private struct CredentialFileFailure: Error {
-    let detail: String
+private struct InvalidTokenVariable: Error {}
 
-    init(_ detail: String) { self.detail = detail }
+private struct CredentialFileFailure: Error {
+    let problem: TelegramCredentials.FileProblem
+
+    init(_ problem: TelegramCredentials.FileProblem) { self.problem = problem }
 }
 
 private struct POSIXFailure: LocalizedError {
@@ -310,22 +333,72 @@ private struct POSIXFailure: LocalizedError {
 }
 
 public enum TelegramCredentialSaveFailure: Error, Equatable, Sendable {
-    case invalid(String)
-    case refused(String)
-    case write(String)
+    case emptyToken
+    case invalidTokenCharacters
+    case tokenNotConfigured
+    case refused(TelegramCredentials.State)
+    case writeFailed(path: String, reason: String)
 
     public var detail: String {
-        switch self {
-        case .invalid(let detail), .refused(let detail), .write(let detail): return detail
-        }
+        TelegramCredentialSentence.save(self)
     }
 }
 
 public struct TelegramCredentialPreflightFailure: Error, Equatable, Sendable,
     CustomStringConvertible
 {
-    public let detail: String
+    public let state: TelegramCredentials.State
 
-    public init(_ detail: String) { self.detail = detail }
-    public var description: String { detail }
+    public init(_ state: TelegramCredentials.State) { self.state = state }
+    public var description: String {
+        TelegramCredentialSentence.state(state) ?? "Telegram credentials are unavailable"
+    }
+}
+
+private enum TelegramCredentialSentence {
+    static func state(_ state: TelegramCredentials.State) -> String? {
+        switch state {
+        case .ready, .notConfigured: return nil
+        case .missing: return "Telegram token not set"
+        case .unsafe(.permissions(let path)):
+            return "Telegram credentials at \(path) must be private like mode 0600; "
+                + "group or other permissions are not allowed"
+        case .unreadable(.configuration(let path, let reason)):
+            return "The engine configuration at \(path) could not be read: \(reason)"
+        case .unreadable(.inspection(_, let code)):
+            return "Telegram credentials could not be inspected: \(String(cString: strerror(code)))"
+        case .unreadable(.environment(let path, let problem)):
+            return environment(path: path, problem: problem)
+        }
+    }
+
+    static func save(_ failure: TelegramCredentialSaveFailure) -> String {
+        switch failure {
+        case .emptyToken: return "The Telegram bot token cannot be empty"
+        case .invalidTokenCharacters:
+            return "The Telegram bot token cannot contain a line break or null byte"
+        case .tokenNotConfigured:
+            return "[adapters.settings.companion_channel] token_env is not configured"
+        case .refused(let state):
+            return Self.state(state) ?? "Telegram credentials are unavailable"
+        case .writeFailed(let path, let reason):
+            return "Telegram credentials at \(path) could not be saved: \(reason)"
+        }
+    }
+
+    private static func environment(
+        path: String, problem: TelegramCredentials.FileProblem
+    ) -> String {
+        switch problem {
+        case .notUTF8: return "The file at \(path) is not UTF-8"
+        case .readFailed(let reason):
+            return "Telegram credentials at \(path) could not be read: \(reason)"
+        case .missingAssignment(let line):
+            return "Telegram credentials line \(line) must be KEY=VALUE"
+        case .invalidVariableName(let line):
+            return "Telegram credentials line \(line) has an invalid variable name"
+        case .duplicateVariable(let line, let name):
+            return "Telegram credentials line \(line) repeats \(name)"
+        }
+    }
 }

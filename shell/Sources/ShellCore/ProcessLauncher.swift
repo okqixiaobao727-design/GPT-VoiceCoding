@@ -58,16 +58,19 @@ public struct ProcessLauncher: EngineLaunching {
     /// child's environment; it does not own a surface, so it hands the outcome to
     /// whoever does and keeps no state.
     private let report: @Sendable (LoginShellPath.Outcome) -> Void
+    private let environment: [String: String]
 
     public init(
         log: @escaping @Sendable (String) -> Void = ProcessLauncher.unifiedLog,
         readPath: @escaping LoginShellPath.Reader = LoginShellPath.readFromLoginShell,
         report: @escaping @Sendable (LoginShellPath.Outcome) -> Void = { _ in },
+        environment: [String: String] = ProcessInfo.processInfo.environment,
         credentials: TelegramCredentials? = nil
     ) {
         self.log = log
         self.readPath = readPath
         self.report = report
+        self.environment = environment
         self.credentials = credentials
         // The child's stderr is a pipe this process reads and may stop reading.
         BrokenPipes.ignore()
@@ -96,8 +99,7 @@ public struct ProcessLauncher: EngineLaunching {
         if let credentials {
             let reading = credentials.load()
             guard reading.state.allowsEngineStart else {
-                throw TelegramCredentialPreflightFailure(
-                    reading.state.failureDetail ?? "Telegram credentials are unavailable")
+                throw TelegramCredentialPreflightFailure(reading.state)
             }
             credentialEnvironment = reading.environment
         } else {
@@ -105,7 +107,7 @@ public struct ProcessLauncher: EngineLaunching {
         }
 
         let path = LoginShellPath.apply(
-            to: ProcessInfo.processInfo.environment, read: readPath, log: log)
+            to: environment, read: readPath, log: log)
         let launchOverhead = Date().timeIntervalSince(askedAt)
         // Every spawn, including the ones that worked: the surface clears its
         // own warning by being told the next spawn was fine, and a report that

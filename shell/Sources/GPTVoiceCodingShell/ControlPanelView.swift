@@ -137,6 +137,7 @@ private struct TelegramCredentialRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .onDisappear { shell.clearCredentialSaveFailure() }
     }
 
     private var status: String {
