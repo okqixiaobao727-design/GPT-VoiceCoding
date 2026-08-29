@@ -177,7 +177,7 @@ private struct EngineHealthRow: View {
             return "The engine keeps failing to start (\(attempts) attempts)"
         case .stopped(.anotherEngineIsListening):
             return "Another engine is already running; this shell did not start it"
-        case .cannotSpawn(let reason): return reason.detail
+        case .cannotSpawn: return "There is no engine to start"
         case .shutDown: return "The engine was stopped"
         }
     }
