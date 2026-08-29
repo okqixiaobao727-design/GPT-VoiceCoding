@@ -234,6 +234,13 @@ def preflight(
     person: telegram_person.TelegramPerson,
 ) -> None:
     """Step 0. Everything here is a refusal, never a failure."""
+    permission_ground = journey_module.codex_permission_ground_refusal(
+        run_directory,
+        environment=os.environ,
+    )
+    if permission_ground is not None:
+        _refuse(permission_ground)
+
     if not bundle.exists():
         _refuse(f"no bundle at {bundle}")
     if not support.bundled_python(bundle).exists():

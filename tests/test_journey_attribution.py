@@ -20,9 +20,11 @@ mirror a thing that breaks loudly rather than an acceptance step that goes quiet
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import journey
+import pytest
 import support
 
 from gpt_voicecoding.control_plane.payloads import session_document
@@ -135,6 +137,120 @@ class TestTheSwitchesWaitIsResolvable:
 
 
 class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
+    def test_the_documented_root_keeps_codex_permission_targets_outside_writable_ground(
+        self,
+    ) -> None:
+        run_directory = support.ACCEPTANCE_ROOT / "20260829T090000Z"
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal is None
+
+    def test_a_slash_tmp_root_refuses_both_codex_permission_consumers(self) -> None:
+        configured_root = Path("/tmp/gpt-voicecoding-acceptance")
+        run_directory = configured_root / "20260829T090100Z"
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal == (
+            "configured acceptance root /tmp/gpt-voicecoding-acceptance puts Codex "
+            "permission targets inside writable ground for pinned `--sandbox workspace-write`, "
+            "so Codex can write them without approval: approval target "
+            "/tmp/gpt-voicecoding-acceptance/20260829T090100Z/outside-the-sandbox/relay.txt "
+            "is under /tmp; switches target /tmp/gpt-voicecoding-acceptance/"
+            "20260829T090100Z/outside-the-sandbox/switches.txt is under /tmp"
+        )
+
+    def test_a_tmpdir_root_is_also_writable_without_codex_approval(self) -> None:
+        configured_root = Path("/private/var/folders/example/T/gpt-voicecoding-acceptance")
+        run_directory = configured_root / "20260829T090200Z"
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal == (
+            "configured acceptance root /private/var/folders/example/T/"
+            "gpt-voicecoding-acceptance puts Codex permission targets inside writable ground "
+            "for pinned `--sandbox workspace-write`, so Codex can write them without approval: "
+            "approval target /private/var/folders/example/T/gpt-voicecoding-acceptance/"
+            "20260829T090200Z/outside-the-sandbox/relay.txt is under TMPDIR "
+            "(/private/var/folders/example/T); switches target /private/var/folders/example/T/"
+            "gpt-voicecoding-acceptance/20260829T090200Z/outside-the-sandbox/switches.txt "
+            "is under TMPDIR (/private/var/folders/example/T)"
+        )
+
+    def test_a_realpath_alias_cannot_bypass_the_slash_tmp_rule(self) -> None:
+        configured_root = Path("/private/tmp/gpt-voicecoding-acceptance")
+        run_directory = configured_root / "20260829T090250Z"
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal == (
+            "configured acceptance root /private/tmp/gpt-voicecoding-acceptance puts Codex "
+            "permission targets inside writable ground for pinned `--sandbox workspace-write`, "
+            "so Codex can write them without approval: approval target /private/tmp/"
+            "gpt-voicecoding-acceptance/20260829T090250Z/outside-the-sandbox/relay.txt is under "
+            "/tmp; switches target /private/tmp/gpt-voicecoding-acceptance/"
+            "20260829T090250Z/outside-the-sandbox/switches.txt is under /tmp"
+        )
+
+    def test_a_permission_consumer_cannot_move_back_inside_the_workspace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_directory = support.ACCEPTANCE_ROOT / "20260829T090300Z"
+        workspace = support.workspace_path(run_directory, journey.CODEX.name)
+        codex_with_inside_relay = replace(
+            journey.CODEX,
+            relayed=lambda _: journey.writing_at(
+                workspace / journey.RELAY_FILE, journey.RELAY_WORD
+            ),
+        )
+        monkeypatch.setattr(journey, "CODEX", codex_with_inside_relay)
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal == (
+            f"configured acceptance root {support.ACCEPTANCE_ROOT} puts Codex permission targets "
+            "inside writable ground for pinned `--sandbox workspace-write`, so Codex can write "
+            f"them without approval: approval target {workspace / journey.RELAY_FILE} is under "
+            f"Session workspace ({workspace})"
+        )
+
+    def test_a_permission_consumer_with_no_target_is_refused_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run_directory = support.ACCEPTANCE_ROOT / "20260829T090400Z"
+        codex_with_unverifiable_switch = replace(
+            journey.CODEX,
+            actionable=lambda _: journey.Instruction(words="wait for permission"),
+        )
+        monkeypatch.setattr(journey, "CODEX", codex_with_unverifiable_switch)
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment={"TMPDIR": "/private/var/folders/example/T/"},
+        )
+
+        assert refusal == (
+            f"configured acceptance root {support.ACCEPTANCE_ROOT} cannot establish that every "
+            "Codex permission target is outside writable ground for pinned `--sandbox "
+            "workspace-write`: switches instruction has no filesystem target to validate"
+        )
+
     def test_each_run_gets_a_distinct_workspace_basename(self, tmp_path: Path) -> None:
         run = tmp_path / "20260827T091500Z"
         run.mkdir()
@@ -161,6 +277,62 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
             tmp_path.parent / journey.OUTSIDE_THE_SANDBOX / journey.SWITCH_FILE
         )
         assert instruction.content == journey.SWITCH_WORD
+
+
+class TestTheCodexPermissionPolicyReadbackRemainsExact:
+    def test_the_lane_pins_only_workspace_write(self) -> None:
+        assert journey.CODEX.arguments == ("--sandbox", "workspace-write")
+
+    def test_the_exact_product_policy_is_sound(self, tmp_path: Path) -> None:
+        rollout = self._rollout(
+            tmp_path,
+            {
+                "sandbox_policy": {"type": "workspace-write"},
+                "approval_policy": "on-request",
+                "approvals_reviewer": "user",
+            },
+        )
+
+        policy = journey.CODEX.policy_at(rollout)
+
+        assert (policy.named, policy.unsound) == (
+            "sandbox 'workspace-write', approval_policy 'on-request', approvals_reviewer 'user' "
+            "(codex's own `turn_context`, codex.jsonl)",
+            "",
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "reported"),
+        (
+            ("sandbox_policy", {"type": "danger-full-access"}, "sandbox is 'danger-full-access'"),
+            ("approval_policy", "never", "approval_policy is 'never'"),
+            ("approvals_reviewer", "auto_review", "approvals_reviewer is 'auto_review'"),
+        ),
+    )
+    def test_any_nonexact_product_policy_is_unsound(
+        self,
+        tmp_path: Path,
+        field: str,
+        value: object,
+        reported: str,
+    ) -> None:
+        payload = {
+            "sandbox_policy": {"type": "workspace-write"},
+            "approval_policy": "on-request",
+            "approvals_reviewer": "user",
+            field: value,
+        }
+        rollout = self._rollout(tmp_path, payload)
+
+        policy = journey.CODEX.policy_at(rollout)
+
+        assert reported in policy.unsound
+
+    @staticmethod
+    def _rollout(tmp_path: Path, payload: dict[str, object]) -> Path:
+        rollout = tmp_path / "codex.jsonl"
+        rollout.write_text(json.dumps({"type": "turn_context", "payload": payload}) + "\n")
+        return rollout
 
 
 class TestTheProductsOwnNoticesAreAttributable:

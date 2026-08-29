@@ -70,7 +70,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -505,6 +505,54 @@ CODEX = Lane(
 #: Both lanes, in the order they are walked. Named here so the run can declare up
 #: front what it promised to observe — see `Verdict.expected_lanes`.
 LANES = (CLAUDE, CODEX)
+
+
+def codex_permission_ground_refusal(
+    run_directory: Path, *, environment: Mapping[str, str]
+) -> str | None:
+    """Why this run cannot provoke either Codex permission, or None when it can.
+
+    New harness behaviour: legacy has no real-environment acceptance runner or
+    permission-trigger-ground check. Its `bridge/daemon.py:1901-2052` is runtime
+    Stop-detail handling, not an acceptance preflight, so there is nothing to port.
+    """
+    workspace = support.workspace_path(run_directory, CODEX.name)
+    consumers = (
+        ("approval", CODEX.relayed(workspace)),
+        ("switches", CODEX.actionable(workspace)),
+    )
+    writable_roots = [
+        (f"Session workspace ({workspace})", workspace),
+        ("/tmp", Path("/tmp")),
+    ]
+    if temporary_directory := environment.get("TMPDIR"):
+        temporary_root = Path(temporary_directory).expanduser()
+        writable_roots.append((f"TMPDIR ({temporary_root})", temporary_root))
+    affected: list[str] = []
+    unverifiable: list[str] = []
+    for name, instruction in consumers:
+        target = instruction.path_in(workspace)
+        if target is None:
+            unverifiable.append(f"{name} instruction has no filesystem target to validate")
+            continue
+        resolved_target = target.expanduser().resolve(strict=False)
+        for root_name, root in writable_roots:
+            if resolved_target.is_relative_to(root.expanduser().resolve(strict=False)):
+                affected.append(f"{name} target {target} is under {root_name}")
+                break
+    if unverifiable:
+        return (
+            f"configured acceptance root {run_directory.parent} cannot establish that every "
+            f"Codex permission target is outside writable ground for pinned `--sandbox "
+            f"{hand_started.WANTED_SANDBOX}`: {'; '.join(unverifiable)}"
+        )
+    if not affected:
+        return None
+    return (
+        f"configured acceptance root {run_directory.parent} puts Codex permission targets "
+        f"inside writable ground for pinned `--sandbox {hand_started.WANTED_SANDBOX}`, so Codex "
+        f"can write them without approval: {'; '.join(affected)}"
+    )
 
 
 # --- the walk ---------------------------------------------------------------

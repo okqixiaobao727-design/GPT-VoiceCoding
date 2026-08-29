@@ -968,9 +968,14 @@ def new_run_directory(identifier: str | None = None) -> Path:
     return directory
 
 
+def workspace_path(run_directory: Path, lane: str) -> Path:
+    """The one disposable-workspace location used by run construction and preflight."""
+    return run_directory / f"workspace-{lane}-{run_directory.name}"
+
+
 def fresh_workspace(run_directory: Path, lane: str, path_value: str) -> Path:
     """A disposable `git init` directory, one per lane, kept with the run."""
-    workspace = run_directory / f"workspace-{lane}-{run_directory.name}"
+    workspace = workspace_path(run_directory, lane)
     workspace.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "init", "--quiet", str(workspace)],
