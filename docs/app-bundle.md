@@ -161,8 +161,11 @@ shell or dotenv expansion. Variable names are environment identifiers and may
 appear only once. It must have no group or other permission bits (`chmod 600`
 is the documented mode); make it 0644 once and confirm the panel refuses to load
 it and says why, then restore 0600. Neither the token nor the file contents are
-displayed back or written to a log. Saving through the panel writes a new 0600
-file, atomically replaces the old one, and restarts the engine in order.
+displayed back or written to a log. If this preflight held the engine at launch,
+repairing the file by hand starts that engine exactly once; later hand edits do
+not reload or restart an engine that is already running. Saving through the panel
+still writes a new 0600 file, atomically replaces the old one, and restarts the
+engine in order.
 
 This adapts the first generation's proven file-to-environment preflight
 (`legacy@1d32845:bridge-serve:103-139`). That launcher sourced shell syntax and

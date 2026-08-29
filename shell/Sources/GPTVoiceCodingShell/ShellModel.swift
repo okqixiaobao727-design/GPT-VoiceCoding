@@ -42,12 +42,14 @@ final class ShellModel {
     private let supervisor: EngineSupervisor
     private let pathOutcomes: PathOutcomes
     private let credentials: TelegramCredentials
+    private var credentialStartRecovery = CredentialStartRecovery()
+    private var credentialFileObserver: CredentialFileObserver?
     /// Installation reconcile and initial preflight, in their required order.
     /// A token saved immediately after app launch waits for this rather than
     /// starting the engine ahead of installation.
     private var preparation: Task<Void, Never>?
 
-    init() {
+    convenience init() {
         // The socket path is read from the same configuration the engine is
         // spawned with, never computed from the state path.
         var resolved = EngineLocation(
@@ -61,13 +63,8 @@ final class ShellModel {
         } catch {
             failure = "\(error)"
         }
-        location = resolved
-        locationFailure = failure
         let credentials = TelegramCredentials(configPath: resolved.configPath)
-        self.credentials = credentials
-        credentialState = Self.preflight(credentials: credentials)
-        credentialSaveFailure = nil
-        panel = ControlPanel(client: UnixSocketControlPlane(path: resolved.socketPath))
+        let panel = ControlPanel(client: UnixSocketControlPlane(path: resolved.socketPath))
 
         let configPath = resolved.configPath
         let resources = Bundle.main.resourceURL
@@ -75,7 +72,6 @@ final class ShellModel {
         // learns is left in a box this model reads afterwards rather than pushed
         // through a callback it cannot yet form.
         let outcomes = PathOutcomes()
-        pathOutcomes = outcomes
         let supervisor = EngineSupervisor(
             launcher: ProcessLauncher(
                 report: { outcomes.record($0) }, credentials: credentials),
@@ -83,18 +79,65 @@ final class ShellModel {
             resolveCommand: {
                 try EngineCommand.resolve(resources: resources, configPath: configPath)
             })
-        self.supervisor = supervisor
+        self.init(
+            location: resolved,
+            locationFailure: failure,
+            credentials: credentials,
+            panel: panel,
+            supervisor: supervisor,
+            pathOutcomes: outcomes)
 
         preparation = Task { await self.begin() }
     }
 
+    private init(
+        location: EngineLocation,
+        locationFailure: String?,
+        credentials: TelegramCredentials,
+        panel: ControlPanel,
+        supervisor: EngineSupervisor,
+        pathOutcomes: PathOutcomes
+    ) {
+        self.location = location
+        self.locationFailure = locationFailure
+        self.credentials = credentials
+        credentialState = Self.preflight(credentials: credentials)
+        credentialSaveFailure = nil
+        self.panel = panel
+        self.supervisor = supervisor
+        self.pathOutcomes = pathOutcomes
+        preparation = nil
+    }
+
+    /// The shell assembly seam. Production supplies the concrete process and
+    /// socket adapters above; focused tests supply a supervised inert child.
+    convenience init(
+        location: EngineLocation,
+        credentials: TelegramCredentials,
+        panel: ControlPanel,
+        supervisor: EngineSupervisor
+    ) {
+        self.init(
+            location: location,
+            locationFailure: nil,
+            credentials: credentials,
+            panel: panel,
+            supervisor: supervisor,
+            pathOutcomes: PathOutcomes())
+    }
+
     private func begin() async {
         await reconcileInstallation()
+        await startEngineAfterInstallation()
+    }
+
+    /// Start immediately or hold one recovery watch, after Installation has run.
+    /// Split at this lifecycle boundary so tests never reconcile the real machine.
+    func startEngineAfterInstallation() async {
         await supervisor.observe { [weak self] health in
             Task { @MainActor in await self?.healthChanged(health) }
         }
-        guard credentialState.allowsEngineStart else { return }
-        await supervisor.start()
+        await applyCredentialAction(credentialStartRecovery.prepare(for: credentialState))
     }
 
     /// The credential gate used at assembly and tested without starting the app.
@@ -145,7 +188,41 @@ final class ShellModel {
     private func readWhatTheLauncherLearned() async {
         engineOutput = await supervisor.lines()
         pathFailure = pathOutcomes.latest?.reason
-        credentialState = Self.preflight(credentials: credentials)
+        await credentialSourceChanged()
+    }
+
+    private func credentialSourceChanged() async {
+        let state = Self.preflight(credentials: credentials)
+        credentialState = state
+        await applyCredentialAction(
+            credentialStartRecovery.credentialChanged(to: state, health: health))
+    }
+
+    private func applyCredentialAction(_ action: CredentialStartRecovery.Action) async {
+        switch action {
+        case .none:
+            return
+        case .start:
+            stopCredentialObservation()
+            await supervisor.start()
+        case .watch:
+            do {
+                credentialFileObserver = try CredentialFileObserver(
+                    path: credentials.environmentPath,
+                    changed: { [weak self] in
+                        Task { @MainActor in await self?.credentialSourceChanged() }
+                    })
+            } catch {
+                return
+            }
+            // Close the gap between the preflight read and arming the observer.
+            await credentialSourceChanged()
+        }
+    }
+
+    private func stopCredentialObservation() {
+        credentialFileObserver?.cancel()
+        credentialFileObserver = nil
     }
 
     /// How often the open dropdown re-reads. Slow enough that it is not a
@@ -181,6 +258,8 @@ final class ShellModel {
             let reading = try credentials.save(token: token)
             credentialState = reading.state
             credentialSaveFailure = nil
+            credentialStartRecovery.cancel()
+            stopCredentialObservation()
         } catch let failure as TelegramCredentialSaveFailure {
             credentialSaveFailure = failure.detail
             return false
@@ -201,6 +280,8 @@ final class ShellModel {
     /// start to trip over.
     func stopEngine() async {
         stopping = true
+        credentialStartRecovery.cancel()
+        stopCredentialObservation()
         await supervisor.shutDown()
     }
 
