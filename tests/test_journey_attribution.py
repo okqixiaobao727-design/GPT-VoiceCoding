@@ -50,6 +50,23 @@ THE_STRANGERS_PROMPT = (
 )
 
 
+@pytest.fixture
+def isolated_codex_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """A Codex config stack that cannot inherit this machine's writable roots."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setattr(
+        journey,
+        "CODEX_SYSTEM_CONFIG",
+        tmp_path / "system-config.toml",
+        raising=False,
+    )
+    return {
+        "CODEX_HOME": str(codex_home),
+        "TMPDIR": "/private/var/folders/example/T/",
+    }
+
+
 def session(target: SessionTarget = MINE, *, task: str | None = "port the log") -> Session:
     return Session(
         target=target,
@@ -138,24 +155,26 @@ class TestTheSwitchesWaitIsResolvable:
 
 class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
     def test_the_documented_root_keeps_codex_permission_targets_outside_writable_ground(
-        self,
+        self, isolated_codex_environment: dict[str, str]
     ) -> None:
         run_directory = support.ACCEPTANCE_ROOT / "20260829T090000Z"
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal is None
 
-    def test_a_slash_tmp_root_refuses_both_codex_permission_consumers(self) -> None:
+    def test_a_slash_tmp_root_refuses_both_codex_permission_consumers(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
         configured_root = Path("/tmp/gpt-voicecoding-acceptance")
         run_directory = configured_root / "20260829T090100Z"
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal == (
@@ -167,13 +186,15 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
             "20260829T090100Z/outside-the-sandbox/switches.txt is under /tmp"
         )
 
-    def test_a_tmpdir_root_is_also_writable_without_codex_approval(self) -> None:
+    def test_a_tmpdir_root_is_also_writable_without_codex_approval(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
         configured_root = Path("/private/var/folders/example/T/gpt-voicecoding-acceptance")
         run_directory = configured_root / "20260829T090200Z"
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal == (
@@ -187,13 +208,15 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
             "is under TMPDIR (/private/var/folders/example/T)"
         )
 
-    def test_a_realpath_alias_cannot_bypass_the_slash_tmp_rule(self) -> None:
+    def test_a_realpath_alias_cannot_bypass_the_slash_tmp_rule(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
         configured_root = Path("/private/tmp/gpt-voicecoding-acceptance")
         run_directory = configured_root / "20260829T090250Z"
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal == (
@@ -206,7 +229,9 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
         )
 
     def test_a_permission_consumer_cannot_move_back_inside_the_workspace(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        isolated_codex_environment: dict[str, str],
     ) -> None:
         run_directory = support.ACCEPTANCE_ROOT / "20260829T090300Z"
         workspace = support.workspace_path(run_directory, journey.CODEX.name)
@@ -220,7 +245,7 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal == (
@@ -231,7 +256,9 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
         )
 
     def test_a_permission_consumer_with_no_target_is_refused_closed(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        isolated_codex_environment: dict[str, str],
     ) -> None:
         run_directory = support.ACCEPTANCE_ROOT / "20260829T090400Z"
         codex_with_unverifiable_switch = replace(
@@ -242,7 +269,7 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
 
         refusal = journey.codex_permission_ground_refusal(
             run_directory,
-            environment={"TMPDIR": "/private/var/folders/example/T/"},
+            environment=isolated_codex_environment,
         )
 
         assert refusal == (
@@ -250,6 +277,71 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
             "Codex permission target is outside writable ground for pinned `--sandbox "
             "workspace-write`: switches instruction has no filesystem target to validate"
         )
+
+    def test_a_configured_writable_root_refuses_both_permission_consumers(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
+        codex_home = Path(isolated_codex_environment["CODEX_HOME"])
+        codex_home.joinpath("config.toml").write_text(
+            f'[sandbox_workspace_write]\nwritable_roots = ["{support.ACCEPTANCE_ROOT}"]\n',
+            encoding="utf-8",
+        )
+        run_directory = support.ACCEPTANCE_ROOT / "20260829T090500Z"
+        workspace = support.workspace_path(run_directory, journey.CODEX.name)
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment=isolated_codex_environment,
+        )
+
+        assert refusal is not None
+        assert f"Codex configured writable root ({support.ACCEPTANCE_ROOT})" in refusal
+        assert f"approval target {journey.CODEX.relayed(workspace).path_in(workspace)}" in refusal
+        assert (
+            f"switches target {journey.CODEX.actionable(workspace).path_in(workspace)}" in refusal
+        )
+
+    def test_an_invalid_writable_root_config_is_refused_closed(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
+        codex_home = Path(isolated_codex_environment["CODEX_HOME"])
+        codex_home.joinpath("config.toml").write_text(
+            'sandbox_workspace_write = "not a table"\n',
+            encoding="utf-8",
+        )
+        run_directory = support.ACCEPTANCE_ROOT / "20260829T090600Z"
+
+        refusal = journey.codex_permission_ground_refusal(
+            run_directory,
+            environment=isolated_codex_environment,
+        )
+
+        assert refusal is not None
+        assert (
+            "cannot establish that every Codex permission target is outside writable ground"
+            in refusal
+        )
+        assert "sandbox_workspace_write" in refusal
+
+    def test_user_writable_roots_override_the_system_config_value(
+        self, isolated_codex_environment: dict[str, str]
+    ) -> None:
+        Path(journey.CODEX_SYSTEM_CONFIG).write_text(
+            f'[sandbox_workspace_write]\nwritable_roots = ["{support.ACCEPTANCE_ROOT}"]\n',
+            encoding="utf-8",
+        )
+        codex_home = Path(isolated_codex_environment["CODEX_HOME"])
+        codex_home.joinpath("config.toml").write_text(
+            '[sandbox_workspace_write]\nwritable_roots = ["/opt/codex-extra-root"]\n',
+            encoding="utf-8",
+        )
+
+        refusal = journey.codex_permission_ground_refusal(
+            support.ACCEPTANCE_ROOT / "20260829T090700Z",
+            environment=isolated_codex_environment,
+        )
+
+        assert refusal is None
 
     def test_each_run_gets_a_distinct_workspace_basename(self, tmp_path: Path) -> None:
         run = tmp_path / "20260827T091500Z"

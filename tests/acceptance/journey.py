@@ -70,6 +70,7 @@ import json
 import os
 import re
 import time
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -506,6 +507,62 @@ CODEX = Lane(
 #: front what it promised to observe — see `Verdict.expected_lanes`.
 LANES = (CLAUDE, CODEX)
 
+#: The system layer Codex documents below the user's `$CODEX_HOME/config.toml`.
+#: The lane has no profile flag and its fresh Git workspace has no project config,
+#: so these are the only configurable layers that can add writable roots beneath
+#: the lane's `--sandbox workspace-write` pin.
+CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
+
+
+def _codex_configured_writable_roots(
+    environment: Mapping[str, str],
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Additional workspace-write roots from the effective Codex config layers."""
+    codex_home = Path(environment.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+    configured: tuple[Path, object] | None = None
+    unverifiable: list[str] = []
+    for config_path in (CODEX_SYSTEM_CONFIG, codex_home / "config.toml"):
+        try:
+            with config_path.open("rb") as config_file:
+                config = tomllib.load(config_file)
+        except FileNotFoundError:
+            continue
+        except (OSError, tomllib.TOMLDecodeError) as unreadable:
+            unverifiable.append(f"Codex config {config_path} cannot be read ({unreadable})")
+            continue
+        workspace_write = config.get("sandbox_workspace_write")
+        if workspace_write is None:
+            continue
+        if not isinstance(workspace_write, Mapping):
+            unverifiable.append(
+                f"Codex config {config_path} has a non-table `sandbox_workspace_write`"
+            )
+            continue
+        if "writable_roots" not in workspace_write:
+            continue
+        configured = (config_path, workspace_write["writable_roots"])
+
+    if configured is None:
+        return [], unverifiable
+    source, values = configured
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        unverifiable.append(
+            f"Codex config {source} has a non-string `sandbox_workspace_write.writable_roots`"
+        )
+        return [], unverifiable
+
+    writable_roots: list[tuple[str, Path]] = []
+    for value in values:
+        root = Path(value).expanduser()
+        if not value.strip() or not root.is_absolute():
+            unverifiable.append(
+                f"Codex config {source} has an unverifiable writable root {value!r}; "
+                "use an absolute path"
+            )
+            continue
+        writable_roots.append((f"Codex configured writable root ({root}) from {source}", root))
+    return writable_roots, unverifiable
+
 
 def codex_permission_ground_refusal(
     run_directory: Path, *, environment: Mapping[str, str]
@@ -528,8 +585,9 @@ def codex_permission_ground_refusal(
     if temporary_directory := environment.get("TMPDIR"):
         temporary_root = Path(temporary_directory).expanduser()
         writable_roots.append((f"TMPDIR ({temporary_root})", temporary_root))
+    configured_roots, unverifiable = _codex_configured_writable_roots(environment)
+    writable_roots.extend(configured_roots)
     affected: list[str] = []
-    unverifiable: list[str] = []
     for name, instruction in consumers:
         target = instruction.path_in(workspace)
         if target is None:
