@@ -13,24 +13,30 @@ struct CredentialStartRecovery {
         case watch
     }
 
-    private var preflightHeldTheEngine = false
-    private var recoveryStartInFlight = false
+    private enum Phase {
+        case inactive
+        case watching
+        case startInFlight
+    }
+
+    private var phase = Phase.inactive
 
     mutating func prepare(for state: TelegramCredentials.State) -> Action {
         guard !state.allowsEngineStart else { return .start }
-        preflightHeldTheEngine = true
+        phase = .watching
         return .watch
     }
 
     mutating func credentialChanged(
         to state: TelegramCredentials.State, health: EngineHealth
     ) -> Action {
-        guard preflightHeldTheEngine, state.allowsEngineStart else { return .none }
-        guard !recoveryStartInFlight else { return .none }
+        guard phase != .inactive, state.allowsEngineStart else { return .none }
+        guard phase != .startInFlight else { return .none }
         switch health {
-        case .notStarted, .cannotSpawn:
-            recoveryStartInFlight = true
-            return .start
+        case .notStarted, .cannotSpawn(.credentials):
+            return beginStart()
+        case .cannotSpawn(.command), .cannotSpawn(.launch):
+            return finishRecovery()
         case .running:
             return finishRecovery()
         case .restarting, .stopped, .shutDown:
@@ -41,28 +47,32 @@ struct CredentialStartRecovery {
     mutating func engineChanged(
         to health: EngineHealth, credentialState: TelegramCredentials.State
     ) -> Action {
-        guard preflightHeldTheEngine else { return .none }
+        guard phase != .inactive else { return .none }
         switch health {
         case .running:
             return finishRecovery()
-        case .cannotSpawn:
-            guard recoveryStartInFlight else { return .none }
-            recoveryStartInFlight = false
+        case .cannotSpawn(.credentials):
+            phase = .watching
             guard credentialState.allowsEngineStart else { return .none }
+            return beginStart()
+        case .cannotSpawn(.command), .cannotSpawn(.launch):
             return finishRecovery()
         case .notStarted, .restarting, .stopped, .shutDown:
             return .none
         }
     }
 
+    private mutating func beginStart() -> Action {
+        phase = .startInFlight
+        return .start
+    }
+
     private mutating func finishRecovery() -> Action {
-        preflightHeldTheEngine = false
-        recoveryStartInFlight = false
+        phase = .inactive
         return .stopWatching
     }
 
     mutating func cancel() {
-        preflightHeldTheEngine = false
-        recoveryStartInFlight = false
+        phase = .inactive
     }
 }

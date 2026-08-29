@@ -212,8 +212,28 @@ import Testing
             return false
         })
 
-        #expect(state == .cannotSpawn("no python3 on the path"))
+        #expect(state == .cannotSpawn(.command("no python3 on the path")))
         #expect(launcher.launchCount() == 0)
+        await supervisor.shutDown()
+    }
+
+    @Test func aCredentialPreflightFailureKeepsItsTypedReason() async {
+        let log = HealthLog()
+        let supervisor = EngineSupervisor(
+            launcher: CredentialRefusingLauncher(state: .missing),
+            socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            observer: { log.record($0) })
+
+        await supervisor.start()
+        let state = await log.wait(for: {
+            if case .cannotSpawn = $0 { return true }
+            return false
+        })
+
+        #expect(state == .cannotSpawn(.credentials(.missing)))
         await supervisor.shutDown()
     }
 
@@ -281,6 +301,18 @@ import Testing
         #expect(launcher.lastChild()?.stopRequested == true)
         #expect(launcher.lastChild()?.stopForced == true)
         #expect(EngineSupervisor.stopGraceSeconds == 5)
+    }
+}
+
+private struct CredentialRefusingLauncher: EngineLaunching {
+    let state: TelegramCredentials.State
+
+    func launch(
+        _ command: EngineCommand,
+        stderr: @escaping @Sendable (Data) -> Void,
+        exited: @escaping @Sendable (Int32) -> Void
+    ) throws -> EngineProcess {
+        throw TelegramCredentialPreflightFailure(state)
     }
 }
 

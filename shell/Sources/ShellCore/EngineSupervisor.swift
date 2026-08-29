@@ -56,6 +56,22 @@ public struct SystemClock: SupervisorClock {
     }
 }
 
+/// The typed reason supervision could not create a child, without discarding the
+/// user-facing detail each source already knows.
+public enum CannotSpawnReason: Equatable, Sendable {
+    case command(String)
+    case credentials(TelegramCredentials.State)
+    case launch(String)
+
+    public var detail: String {
+        switch self {
+        case .command(let detail), .launch(let detail): return detail
+        case .credentials(let state):
+            return state.failureDetail ?? "Telegram credentials are unavailable"
+        }
+    }
+}
+
 /// What the shell knows about its child, and nothing it inferred about the engine
 /// itself. Whether the engine is *usable* is a control-plane question, asked
 /// separately; this is process parenthood alone.
@@ -66,8 +82,8 @@ public enum EngineHealth: Equatable, Sendable {
     case restarting(after: TimeInterval, attempt: Int)
     /// Stopped spawning, on purpose, and waiting for a person.
     case stopped(StopReason)
-    /// There is nothing to spawn. Not a crash — an installation that cannot run.
-    case cannotSpawn(String)
+    /// A child could not be created. The typed reason says which launch boundary refused it.
+    case cannotSpawn(CannotSpawnReason)
     /// Stopped because the shell is going away.
     case shutDown
 }
@@ -207,10 +223,10 @@ public actor EngineSupervisor {
             do {
                 command = try resolveCommand()
             } catch let failure as EngineCommandFailure {
-                ending = .cannotSpawn(failure.detail)
+                ending = .cannotSpawn(.command(failure.detail))
                 break
             } catch {
-                ending = .cannotSpawn("\(error)")
+                ending = .cannotSpawn(.command("\(error)"))
                 break
             }
 
@@ -229,8 +245,11 @@ public actor EngineSupervisor {
                     exited: { [weak self] code in
                         Task { await self?.childExited(code) }
                     })
+            } catch let failure as TelegramCredentialPreflightFailure {
+                ending = .cannotSpawn(.credentials(failure.state))
+                break
             } catch {
-                ending = .cannotSpawn("\(error)")
+                ending = .cannotSpawn(.launch("\(error)"))
                 break
             }
             child = process

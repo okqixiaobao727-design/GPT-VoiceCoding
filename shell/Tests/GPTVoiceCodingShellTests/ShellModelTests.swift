@@ -41,22 +41,18 @@ import Testing
         await shell.model.stopEngine()
     }
 
-    @Test func aCredentialThatChangesDuringSpawnCanBeRepairedAgain() async throws {
+    @Test func aCredentialRepairedBeforeSpawnFailureIsPublishedCanStartAgain() async throws {
         let fixture = try TelegramCredentialFixture()
         let launcher = CredentialRacingLauncher(fixture: fixture)
         let (_, model) = makeShell(fixture: fixture, launcher: launcher)
         await model.startEngineAfterInstallation()
 
         try fixture.writeEnvironment("A_TELEGRAM_TOKEN=first-repair\n")
-        #expect(
-            await waitUntil {
-                if case .cannotSpawn = model.health { return true }
-                return false
-            })
-        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=second-repair\n")
 
         #expect(await waitUntil { launcher.launchCount >= 2 })
         #expect(await waitUntil { model.credentialState == .ready })
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(launcher.launchCount == 2)
         await model.stopEngine()
     }
 
@@ -121,6 +117,27 @@ import Testing
             recovery.engineChanged(to: .running(pid: 123), credentialState: .ready)
                 == .stopWatching)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .none)
+    }
+
+    @Test func anEarlySecondRepairRestartsOnlyATypedCredentialFailure() {
+        var credentialFailure = CredentialStartRecovery()
+
+        #expect(credentialFailure.prepare(for: .missing) == .watch)
+        #expect(
+            credentialFailure.credentialChanged(to: .ready, health: .notStarted) == .start)
+        #expect(
+            credentialFailure.engineChanged(
+                to: .cannotSpawn(.credentials(.missing)), credentialState: .ready)
+                == .start)
+        #expect(credentialFailure.credentialChanged(to: .ready, health: .notStarted) == .none)
+
+        var launchFailure = CredentialStartRecovery()
+        #expect(launchFailure.prepare(for: .missing) == .watch)
+        #expect(launchFailure.credentialChanged(to: .ready, health: .notStarted) == .start)
+        #expect(
+            launchFailure.engineChanged(
+                to: .cannotSpawn(.launch("permission denied")), credentialState: .ready)
+                == .stopWatching)
     }
 
     @Test func invalidCredentialChangesKeepThePreflightHoldOpen() {
@@ -216,31 +233,26 @@ private struct UnreachableControlPlane: ControlPlaneDialing {
 }
 
 private final class RecordingEngineLauncher: EngineLaunching, @unchecked Sendable {
-    private let lock = NSLock()
-    private var launches = 0
+    private let launches = LaunchCounter()
 
-    var launchCount: Int { lock.withLock { launches } }
+    var launchCount: Int { launches.value }
 
     func launch(
         _ command: EngineCommand,
         stderr: @escaping @Sendable (Data) -> Void,
         exited: @escaping @Sendable (Int32) -> Void
     ) throws -> EngineProcess {
-        let pid = lock.withLock {
-            launches += 1
-            return Int32(launches + 2000)
-        }
-        return HeldEngineProcess(pid: pid, exited: exited)
+        let attempt = launches.increment()
+        return HeldEngineProcess(pid: Int32(attempt + 2000), exited: exited)
     }
 
 }
 
 private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendable {
     private let fixture: TelegramCredentialFixture
-    private let lock = NSLock()
-    private var launches = 0
+    private let launches = LaunchCounter()
 
-    var launchCount: Int { lock.withLock { launches } }
+    var launchCount: Int { launches.value }
 
     init(fixture: TelegramCredentialFixture) {
         self.fixture = fixture
@@ -251,13 +263,12 @@ private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendab
         stderr: @escaping @Sendable (Data) -> Void,
         exited: @escaping @Sendable (Int32) -> Void
     ) throws -> EngineProcess {
-        let attempt = lock.withLock {
-            launches += 1
-            return launches
-        }
+        let attempt = launches.increment()
         if attempt == 1 {
             try fixture.writeEnvironment("not-an-assignment\n")
-            throw TelegramCredentialPreflightFailure(fixture.credentials.load().state)
+            let failure = TelegramCredentialPreflightFailure(fixture.credentials.load().state)
+            try fixture.writeEnvironment("A_TELEGRAM_TOKEN=second-repair\n")
+            throw failure
         }
         return HeldEngineProcess(pid: Int32(attempt + 3000), exited: exited)
     }
@@ -265,22 +276,35 @@ private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendab
 }
 
 private final class NonCredentialFailingLauncher: EngineLaunching, @unchecked Sendable {
-    private let lock = NSLock()
-    private var launches = 0
+    private let launches = LaunchCounter()
 
-    var launchCount: Int { lock.withLock { launches } }
+    var launchCount: Int { launches.value }
 
     func launch(
         _ command: EngineCommand,
         stderr: @escaping @Sendable (Data) -> Void,
         exited: @escaping @Sendable (Int32) -> Void
     ) throws -> EngineProcess {
-        lock.withLock { launches += 1 }
+        _ = launches.increment()
         throw NonCredentialLaunchFailure()
     }
 }
 
 private struct NonCredentialLaunchFailure: Error {}
+
+private final class LaunchCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int { lock.withLock { count } }
+
+    func increment() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+}
 
 private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32

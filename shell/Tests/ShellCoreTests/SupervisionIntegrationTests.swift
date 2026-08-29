@@ -108,7 +108,18 @@ import Testing
             return false
         })
 
-        #expect(state != nil)
+        guard let state else {
+            Issue.record("The failed launch did not publish a health state")
+            return
+        }
+        guard case .cannotSpawn(let reason) = state else {
+            Issue.record("The failed launch was not reported as cannot-spawn")
+            return
+        }
+        guard case .launch = reason else {
+            Issue.record("A process launch failure lost its typed reason")
+            return
+        }
         await supervisor.shutDown()
     }
 }
