@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -118,3 +121,50 @@ def test_unreadable_explicit_probe_is_an_actionable_preflight_refusal(tmp_path: 
             repository,
             environment={"GPTVOICECODING_ACCEPTANCE_REALTIME_PROBE": str(probe)},
         )
+
+
+def test_missing_probe_records_refused_and_exits_before_external_setup(tmp_path: Path) -> None:
+    fake_dependencies = tmp_path / "fake-dependencies"
+    fake_telethon = fake_dependencies / "telethon"
+    fake_telethon.mkdir(parents=True)
+    fake_telethon.joinpath("__init__.py").write_text("class TelegramClient: pass\n")
+    fake_telethon.joinpath("errors.py").write_text(
+        "class SessionPasswordNeededError(Exception): pass\n"
+    )
+    run_root = tmp_path / "acceptance-runs"
+    missing = tmp_path / "missing-rt-prototype.py"
+    repository = Path(__file__).resolve().parents[1]
+    python_path = os.pathsep.join(
+        part for part in (str(fake_dependencies), os.environ.get("PYTHONPATH")) if part
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-m",
+            "acceptance",
+            "tests/acceptance/test_realtime_probe.py",
+            "-q",
+        ],
+        cwd=repository,
+        env={
+            **os.environ,
+            "PYTHONPATH": python_path,
+            "GPTVOICECODING_ACCEPTANCE_ROOT": str(run_root),
+            "GPTVOICECODING_ACCEPTANCE_REALTIME_PROBE": str(missing),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+    )
+
+    assert completed.returncode != 0
+    verdict_paths = tuple(run_root.glob("*/verdict.json"))
+    assert len(verdict_paths) == 1, completed.stdout + completed.stderr
+    verdict = json.loads(verdict_paths[0].read_text())
+    assert verdict["result"] == "REFUSED"
+    assert str(missing) in verdict["reason"]
+    assert "GPTVOICECODING_ACCEPTANCE_REALTIME_PROBE" in verdict["reason"]
+    assert not tuple(run_root.glob("*/realtime-probe.log"))
