@@ -15,7 +15,7 @@ import Testing
         #expect(shell.launcher.launchCount == 0)
 
         try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
-        #expect(await shell.launcher.waitForLaunches(1))
+        #expect(await waitUntil { shell.launcher.launchCount >= 1 })
         try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=still-ready\n")
         try? await Task.sleep(for: .milliseconds(50))
 
@@ -30,30 +30,60 @@ import Testing
 
         try shell.fixture.writeEnvironment("not-an-assignment\n")
         #expect(
-            await waitForShellState {
+            await waitUntil {
                 if case .unreadable = shell.model.credentialState { return true }
                 return false
             })
         #expect(shell.launcher.launchCount == 0)
 
         try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
-        #expect(await shell.launcher.waitForLaunches(1))
+        #expect(await waitUntil { shell.launcher.launchCount >= 1 })
         await shell.model.stopEngine()
+    }
+
+    @Test func aCredentialThatChangesDuringSpawnCanBeRepairedAgain() async throws {
+        let fixture = try TelegramCredentialFixture()
+        let launcher = CredentialRacingLauncher(fixture: fixture)
+        let socketPath = fixture.directory.appendingPathComponent("engine.sock").path
+        let supervisor = EngineSupervisor(
+            launcher: launcher,
+            socketPath: socketPath,
+            resolveCommand: {
+                EngineCommand(
+                    executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            })
+        let model = ShellModel(
+            location: EngineLocation(configPath: fixture.configPath, socketPath: socketPath),
+            credentials: fixture.credentials,
+            panel: ControlPanel(client: UnreachableControlPlane()),
+            supervisor: supervisor)
+        await model.startEngineAfterInstallation()
+
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=first-repair\n")
+        #expect(
+            await waitUntil {
+                if case .cannotSpawn = model.health { return true }
+                return false
+            })
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=second-repair\n")
+
+        #expect(await waitUntil { launcher.launchCount >= 2 })
+        #expect(await waitUntil { model.credentialState == .ready })
+        await model.stopEngine()
     }
 
     @Test func repairingTheCredentialCannotRestartAnAlreadyRunningEngine() async throws {
         let shell = try ShellHarness()
         await shell.model.startEngineAfterInstallation()
         await shell.supervisor.start()
-        #expect(await shell.launcher.waitForLaunches(1))
+        #expect(await waitUntil { shell.launcher.launchCount >= 1 })
         #expect(
-            await waitForShellState {
+            await waitUntil {
                 if case .running = shell.model.health { return true }
                 return false
             })
 
         try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
-        #expect(await waitForShellState { shell.model.credentialState == .ready })
         try? await Task.sleep(for: .milliseconds(50))
 
         #expect(shell.launcher.launchCount == 1)
@@ -65,7 +95,7 @@ import Testing
         await shell.model.startEngineAfterInstallation()
 
         #expect(await shell.model.saveTelegramToken("ready"))
-        #expect(await shell.launcher.waitForLaunches(1))
+        #expect(await waitUntil { shell.launcher.launchCount >= 1 })
         try? await Task.sleep(for: .milliseconds(50))
 
         #expect(shell.launcher.launchCount == 1)
@@ -77,6 +107,8 @@ import Testing
 
         #expect(recovery.prepare(for: .missing) == .watch)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .start)
+        #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .start)
+        #expect(recovery.engineChanged(to: .running(pid: 123)) == .stopWatching)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .none)
     }
 
@@ -100,7 +132,9 @@ import Testing
         var recovery = CredentialStartRecovery()
 
         #expect(recovery.prepare(for: .missing) == .watch)
-        #expect(recovery.credentialChanged(to: .ready, health: .running(pid: 123)) == .none)
+        #expect(
+            recovery.credentialChanged(to: .ready, health: .running(pid: 123))
+                == .stopWatching)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .none)
     }
 
@@ -156,18 +190,6 @@ private final class ShellHarness {
     }
 }
 
-@MainActor
-private func waitForShellState(
-    within seconds: TimeInterval = 3, _ condition: @escaping @MainActor () -> Bool
-) async -> Bool {
-    let deadline = Date().addingTimeInterval(seconds)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return false
-}
-
 private struct UnreachableControlPlane: ControlPlaneDialing {
     func ask(_ request: Request) async throws -> Reply {
         throw ControlPlaneFailure.engineUnreachable("not connected in this shell test")
@@ -192,14 +214,35 @@ private final class RecordingEngineLauncher: EngineLaunching, @unchecked Sendabl
         return HeldEngineProcess(pid: pid, exited: exited)
     }
 
-    func waitForLaunches(_ expected: Int, within seconds: TimeInterval = 3) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if launchCount >= expected { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return false
+}
+
+private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendable {
+    private let fixture: TelegramCredentialFixture
+    private let lock = NSLock()
+    private var launches = 0
+
+    var launchCount: Int { lock.withLock { launches } }
+
+    init(fixture: TelegramCredentialFixture) {
+        self.fixture = fixture
     }
+
+    func launch(
+        _ command: EngineCommand,
+        stderr: @escaping @Sendable (Data) -> Void,
+        exited: @escaping @Sendable (Int32) -> Void
+    ) throws -> EngineProcess {
+        let attempt = lock.withLock {
+            launches += 1
+            return launches
+        }
+        if attempt == 1 {
+            try fixture.writeEnvironment("not-an-assignment\n")
+            throw TelegramCredentialPreflightFailure(fixture.credentials.load().state)
+        }
+        return HeldEngineProcess(pid: Int32(attempt + 3000), exited: exited)
+    }
+
 }
 
 private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {

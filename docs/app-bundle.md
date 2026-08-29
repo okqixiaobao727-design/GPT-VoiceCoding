@@ -168,9 +168,11 @@ still writes a new 0600 file, atomically replaces the old one, and restarts the
 engine in order.
 
 This adapts the first generation's proven file-to-environment preflight
-(`legacy@1d32845:bridge-serve:103-139`). That launcher sourced shell syntax and
-had no menu-bar editor; this shell deliberately accepts only the strict format
-above and adds the write-only Control Panel path.
+(`legacy@1d32845:bridge-serve:103-139`) and its `RunAtLoad` plus `KeepAlive`
+retry after every exit (`legacy@1d32845:scripts/launch-agent.py:12-15,53-70`).
+That launcher sourced shell syntax and had no menu-bar editor; this shell
+deliberately accepts only the strict format above and adds the write-only Control
+Panel path.
 
 **1. The microphone.** `python3 scripts/microphone_grant_proof.py --reset`, and
 follow it. The prompt must name the app.

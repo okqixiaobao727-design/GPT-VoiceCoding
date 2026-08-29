@@ -9,6 +9,7 @@ struct CredentialStartRecovery {
     enum Action: Equatable {
         case none
         case start
+        case stopWatching
         case watch
     }
 
@@ -24,9 +25,21 @@ struct CredentialStartRecovery {
         to state: TelegramCredentials.State, health: EngineHealth
     ) -> Action {
         guard preflightHeldTheEngine, state.allowsEngineStart else { return .none }
+        switch health {
+        case .notStarted, .cannotSpawn:
+            return .start
+        case .running:
+            return engineChanged(to: health)
+        case .restarting, .stopped, .shutDown:
+            return .none
+        }
+    }
+
+    mutating func engineChanged(to health: EngineHealth) -> Action {
+        guard preflightHeldTheEngine else { return .none }
+        guard case .running = health else { return .none }
         preflightHeldTheEngine = false
-        guard health == .notStarted else { return .none }
-        return .start
+        return .stopWatching
     }
 
     mutating func cancel() {

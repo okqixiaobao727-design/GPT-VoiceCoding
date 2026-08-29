@@ -15,7 +15,7 @@ import Testing
 
         try fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
 
-        #expect(await changes.waitForChange())
+        #expect(await waitUntil { changes.value > 0 })
     }
 
     @Test func repairingUnsafePermissionsRaisesAChange() async throws {
@@ -29,7 +29,7 @@ import Testing
 
         #expect(chmod(fixture.environmentPath, 0o600) == 0)
 
-        #expect(await changes.waitForChange())
+        #expect(await waitUntil { changes.value > 0 })
     }
 
     @Test func anAtomicReplacementKeepsTheReplacementUnderObservation() async throws {
@@ -42,11 +42,11 @@ import Testing
         defer { observer.cancel() }
 
         _ = try fixture.credentials.save(token: "second")
-        #expect(await changes.waitForChange())
+        #expect(await waitUntil { changes.value > 0 })
         let afterReplacement = changes.value
         try fixture.writeEnvironment("A_TELEGRAM_TOKEN=third\n")
 
-        #expect(await changes.waitForMore(than: afterReplacement))
+        #expect(await waitUntil { changes.value > afterReplacement })
     }
 }
 
@@ -60,21 +60,4 @@ private final class ChangeCounter: @unchecked Sendable {
 
     var value: Int { lock.withLock { count } }
 
-    func waitForChange(within seconds: TimeInterval = 3) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if lock.withLock({ count > 0 }) { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return false
-    }
-
-    func waitForMore(than previous: Int, within seconds: TimeInterval = 3) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if value > previous { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return false
-    }
 }

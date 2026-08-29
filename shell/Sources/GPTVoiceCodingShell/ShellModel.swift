@@ -176,6 +176,7 @@ final class ShellModel {
     private func healthChanged(_ health: EngineHealth) async {
         self.health = health
         await readWhatTheLauncherLearned()
+        await applyCredentialAction(credentialStartRecovery.engineChanged(to: health))
     }
 
     /// What the last spawn left behind: the engine's own words, and what asking
@@ -188,7 +189,7 @@ final class ShellModel {
     private func readWhatTheLauncherLearned() async {
         engineOutput = await supervisor.lines()
         pathFailure = pathOutcomes.latest?.reason
-        await credentialSourceChanged()
+        credentialState = Self.preflight(credentials: credentials)
     }
 
     private func credentialSourceChanged() async {
@@ -203,8 +204,9 @@ final class ShellModel {
         case .none:
             return
         case .start:
-            stopCredentialObservation()
             await supervisor.start()
+        case .stopWatching:
+            stopCredentialObservation()
         case .watch:
             do {
                 credentialFileObserver = try CredentialFileObserver(
@@ -237,6 +239,9 @@ final class ShellModel {
         while !Task.isCancelled {
             await panel.refresh()
             await readWhatTheLauncherLearned()
+            await applyCredentialAction(
+                credentialStartRecovery.credentialChanged(
+                    to: credentialState, health: health))
             try? await Task.sleep(for: Self.readInterval)
         }
     }
