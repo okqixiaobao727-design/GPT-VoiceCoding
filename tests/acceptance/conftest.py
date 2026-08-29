@@ -19,6 +19,7 @@ import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Never
 
 import pytest
 
@@ -108,7 +109,7 @@ def _ensure_run_directory() -> Path:
     return _run_directory
 
 
-def _refuse(reason: str) -> None:
+def _refuse(reason: str) -> Never:
     """Refuse, and leave the reason somewhere that outlives the terminal.
 
     `docs/acceptance-design.md` § Preflight: a refusal produces "verdict
@@ -142,6 +143,14 @@ def _refuse(reason: str) -> None:
 def far_side() -> support.FarSideDeadlines:
     """The far-side waits this run used, so the journal and the verdict agree on them."""
     return FAR_SIDE
+
+
+@pytest.fixture(scope="session")
+def realtime_probe() -> Path:
+    try:
+        return support.realtime_probe_path(REPOSITORY)
+    except support.RealtimeProbeUnavailable as missing:
+        _refuse(str(missing))
 
 
 @pytest.fixture(scope="session")
@@ -224,6 +233,7 @@ def person(bot: dict, journal: support.Journal) -> Iterator[telegram_person.Tele
 
 @pytest.fixture(scope="session", autouse=True)
 def preflight(
+    realtime_probe: Path,
     bundle: Path,
     provenance: support.Provenance,
     engine_path: str,

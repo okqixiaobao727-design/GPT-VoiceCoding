@@ -33,17 +33,6 @@ import support
 
 pytestmark = pytest.mark.acceptance
 
-#: Where the probe lives. The sibling checkout is the convention this repository
-#: already documents for the legacy reference; the variable is for a machine that
-#: keeps it elsewhere. No user's path appears here.
-PROBE_VARIABLE = "GPTVOICECODING_ACCEPTANCE_REALTIME_PROBE"
-DEFAULT_PROBE = (
-    Path(__file__).resolve().parents[2].parent
-    / "GPT-VoiceCoding-legacy"
-    / "scripts"
-    / "rt_prototype.py"
-)
-
 #: Thirty seconds, the figure `docs/app-bundle.md` gives for this probe. It has
 #: no duration flag — it runs until interrupted — so the harness interrupts it,
 #: which is the `Ctrl-C hangs up cleanly` path its own usage line describes.
@@ -56,27 +45,13 @@ TOTAL_FRAMES = re.compile(r"total remote frames:\s*(\d+)")
 FIRST_FRAME = re.compile(r"first remote audio frame received")
 
 
-def probe_path() -> Path:
-    override = os.environ.get(PROBE_VARIABLE)
-    return Path(override).expanduser() if override else DEFAULT_PROBE
-
-
-def test_the_realtime_contract(run_directory, journal, verdict, engine_path) -> None:
-    probe = probe_path()
-    if not probe.exists():
-        verdict.record(
-            "probe",
-            "0b realtime contract probe",
-            support.SKIPPED,
-            f"no probe at {probe}; set {PROBE_VARIABLE} to the legacy checkout's "
-            f"scripts/rt_prototype.py",
-        )
-        pytest.skip(f"no realtime probe at {probe}")
-
+def test_the_realtime_contract(
+    realtime_probe: Path, run_directory, journal, verdict, engine_path
+) -> None:
     transcript = run_directory / "realtime-probe.log"
     command = [
         str(support.bundled_python()),
-        str(probe),
+        str(realtime_probe),
         "--silent",
         "--cwd",
         str(run_directory),

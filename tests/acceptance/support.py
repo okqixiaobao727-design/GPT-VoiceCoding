@@ -34,7 +34,7 @@ import subprocess
 import threading
 import time
 import tomllib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -58,6 +58,16 @@ DEFAULT_BUNDLE = Path("/Applications/GPT-VoiceCoding.app")
 
 #: The engine's real configuration, the one the run derives its own from.
 SOURCE_CONFIG_VARIABLE = "GPTVOICECODING_ACCEPTANCE_SOURCE_CONFIG"
+REALTIME_PROBE_VARIABLE = "GPTVOICECODING_ACCEPTANCE_REALTIME_PROBE"
+
+#: The maintained probe stays in the sibling legacy checkout; this relative
+#: location is the repository convention, never a maintainer-specific path.
+LEGACY_REALTIME_PROBE = Path("GPT-VoiceCoding-legacy/scripts/rt_prototype.py")
+
+
+class RealtimeProbeUnavailable(Exception):
+    """The required external probe cannot be used by this acceptance run."""
+
 
 #: Darwin caps an AF_UNIX path at 103 bytes, so the run's socket cannot live in
 #: the run directory — that path is already 70 characters before the run id. The
@@ -89,6 +99,39 @@ def source_config_path() -> Path:
         return Path(override).expanduser()
     engine = Path.home() / "Library" / "Application Support" / "GPT-VoiceCoding" / "engine"
     return engine / "config.toml"
+
+
+def realtime_probe_path(
+    repository: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    override = (environment if environment is not None else os.environ).get(REALTIME_PROBE_VARIABLE)
+    if override:
+        probe = Path(override).expanduser()
+    else:
+        common_directory = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        primary_checkout = Path(common_directory).resolve().parent
+        probe = primary_checkout.parent / LEGACY_REALTIME_PROBE
+
+    if not probe.is_file() or not os.access(probe, os.R_OK):
+        raise RealtimeProbeUnavailable(
+            f"no usable realtime probe at {probe}; set {REALTIME_PROBE_VARIABLE} "
+            "to the legacy checkout's scripts/rt_prototype.py"
+        )
+    return probe
 
 
 # --- the journal ------------------------------------------------------------
