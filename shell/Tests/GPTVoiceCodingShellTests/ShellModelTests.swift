@@ -44,19 +44,7 @@ import Testing
     @Test func aCredentialThatChangesDuringSpawnCanBeRepairedAgain() async throws {
         let fixture = try TelegramCredentialFixture()
         let launcher = CredentialRacingLauncher(fixture: fixture)
-        let socketPath = fixture.directory.appendingPathComponent("engine.sock").path
-        let supervisor = EngineSupervisor(
-            launcher: launcher,
-            socketPath: socketPath,
-            resolveCommand: {
-                EngineCommand(
-                    executable: "/usr/bin/true", arguments: [], source: .developerPath)
-            })
-        let model = ShellModel(
-            location: EngineLocation(configPath: fixture.configPath, socketPath: socketPath),
-            credentials: fixture.credentials,
-            panel: ControlPanel(client: UnreachableControlPlane()),
-            supervisor: supervisor)
+        let (_, model) = makeShell(fixture: fixture, launcher: launcher)
         await model.startEngineAfterInstallation()
 
         try fixture.writeEnvironment("A_TELEGRAM_TOKEN=first-repair\n")
@@ -69,6 +57,27 @@ import Testing
 
         #expect(await waitUntil { launcher.launchCount >= 2 })
         #expect(await waitUntil { model.credentialState == .ready })
+        await model.stopEngine()
+    }
+
+    @Test func aNonCredentialSpawnFailureDoesNotBecomeACredentialRetry() async throws {
+        let fixture = try TelegramCredentialFixture()
+        let launcher = NonCredentialFailingLauncher()
+        let (_, model) = makeShell(fixture: fixture, launcher: launcher)
+        await model.startEngineAfterInstallation()
+
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=first-repair\n")
+        #expect(await waitUntil { launcher.launchCount >= 1 })
+        #expect(
+            await waitUntil {
+                if case .cannotSpawn = model.health { return true }
+                return false
+            })
+
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=duplicate-ready\n")
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(launcher.launchCount == 1)
         await model.stopEngine()
     }
 
@@ -107,8 +116,10 @@ import Testing
 
         #expect(recovery.prepare(for: .missing) == .watch)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .start)
-        #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .start)
-        #expect(recovery.engineChanged(to: .running(pid: 123)) == .stopWatching)
+        #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .none)
+        #expect(
+            recovery.engineChanged(to: .running(pid: 123), credentialState: .ready)
+                == .stopWatching)
         #expect(recovery.credentialChanged(to: .ready, health: .notStarted) == .none)
     }
 
@@ -171,23 +182,31 @@ private final class ShellHarness {
     init() throws {
         let fixture = try TelegramCredentialFixture()
         let launcher = RecordingEngineLauncher()
-        let socketPath = fixture.directory.appendingPathComponent("engine.sock").path
-        let supervisor = EngineSupervisor(
-            launcher: launcher,
-            socketPath: socketPath,
-            resolveCommand: {
-                EngineCommand(
-                    executable: "/usr/bin/true", arguments: [], source: .developerPath)
-            })
+        let (supervisor, model) = makeShell(fixture: fixture, launcher: launcher)
         self.fixture = fixture
         self.launcher = launcher
         self.supervisor = supervisor
-        model = ShellModel(
-            location: EngineLocation(configPath: fixture.configPath, socketPath: socketPath),
-            credentials: fixture.credentials,
-            panel: ControlPanel(client: UnreachableControlPlane()),
-            supervisor: supervisor)
+        self.model = model
     }
+}
+
+@MainActor
+private func makeShell(
+    fixture: TelegramCredentialFixture, launcher: any EngineLaunching
+) -> (supervisor: EngineSupervisor, model: ShellModel) {
+    let socketPath = fixture.directory.appendingPathComponent("engine.sock").path
+    let supervisor = EngineSupervisor(
+        launcher: launcher,
+        socketPath: socketPath,
+        resolveCommand: {
+            EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+        })
+    let model = ShellModel(
+        location: EngineLocation(configPath: fixture.configPath, socketPath: socketPath),
+        credentials: fixture.credentials,
+        panel: ControlPanel(client: UnreachableControlPlane()),
+        supervisor: supervisor)
+    return (supervisor, model)
 }
 
 private struct UnreachableControlPlane: ControlPlaneDialing {
@@ -244,6 +263,24 @@ private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendab
     }
 
 }
+
+private final class NonCredentialFailingLauncher: EngineLaunching, @unchecked Sendable {
+    private let lock = NSLock()
+    private var launches = 0
+
+    var launchCount: Int { lock.withLock { launches } }
+
+    func launch(
+        _ command: EngineCommand,
+        stderr: @escaping @Sendable (Data) -> Void,
+        exited: @escaping @Sendable (Int32) -> Void
+    ) throws -> EngineProcess {
+        lock.withLock { launches += 1 }
+        throw NonCredentialLaunchFailure()
+    }
+}
+
+private struct NonCredentialLaunchFailure: Error {}
 
 private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32

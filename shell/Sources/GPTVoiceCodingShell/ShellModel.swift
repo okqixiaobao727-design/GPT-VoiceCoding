@@ -176,7 +176,9 @@ final class ShellModel {
     private func healthChanged(_ health: EngineHealth) async {
         self.health = health
         await readWhatTheLauncherLearned()
-        await applyCredentialAction(credentialStartRecovery.engineChanged(to: health))
+        await applyCredentialAction(
+            credentialStartRecovery.engineChanged(
+                to: health, credentialState: credentialState))
     }
 
     /// What the last spawn left behind: the engine's own words, and what asking
