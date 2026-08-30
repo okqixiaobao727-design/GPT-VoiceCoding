@@ -34,18 +34,46 @@ import Testing
             contentsOf: Data("config: [delegate] model is required\n".utf8))
         try stderr.pipe.fileHandleForWriting.close()
 
-        stderr.finish()
+        await stderr.waitUntilDrained()
 
-        // Which of the two readers got the bytes is Foundation's to decide, and
-        // the handler delivers on its own queue — so wait for the words rather
-        // than assuming they have landed by the time `finish()` returns.
-        try await said.waits(for: "config: [delegate] model is required\n")
+        // The drain wait returns only after the one reader's delivery has returned.
+        #expect(said.text() == "config: [delegate] model is required\n")
         #expect(!stderr.isMonitoring)
     }
 
-    @Test func finishingAnAlreadyDrainedPipeFindsNothingTwice() async throws {
-        // The watch has already seen the end, and only later does `finish()` run.
-        // It must find nothing, say nothing twice, and not hang with no writer.
+    @Test func waitingUntilDrainedWaitsForAnInFlightDelivery() async throws {
+        let gate = DeliveryGate()
+        let stderr = InheritedStderr(deliver: { chunk in
+            await gate.holdDelivery(chunk)
+        })
+        stderr.read()
+
+        let refusal = Data("config: refusal\n".utf8)
+        try stderr.pipe.fileHandleForWriting.write(contentsOf: refusal)
+        try stderr.pipe.fileHandleForWriting.close()
+        await gate.waitUntilDeliveryStarts()
+
+        let draining = Task {
+            await gate.recordDrainWaitCalled()
+            await stderr.waitUntilDrained()
+            await gate.recordDrainWaitReturned()
+        }
+        await gate.waitUntilDrainWaitIsCalled()
+        await gate.releaseDelivery()
+        await draining.value
+
+        #expect(
+            await gate.events() == [
+                .deliveryStarted,
+                .drainWaitCalled,
+                .deliveryFinished(refusal),
+                .drainWaitReturned,
+            ])
+    }
+
+    @Test func waitingForAnAlreadyDrainedPipeFindsNothingTwice() async throws {
+        // The watch has already seen the end, and only later does the drain wait
+        // run. It must find nothing, say nothing twice, and not hang with no writer.
         let said = Collected()
         let stderr = InheritedStderr(deliver: { said.add($0) })
         stderr.read()
@@ -55,7 +83,7 @@ import Testing
         try stderr.pipe.fileHandleForWriting.close()
         try await waitUntil("the watch came down") { !stderr.isMonitoring }
 
-        stderr.finish()
+        await stderr.waitUntilDrained()
 
         #expect(said.text() == "starting\n")
         #expect(!stderr.isMonitoring)
@@ -97,4 +125,59 @@ private final class Collected: @unchecked Sendable {
             self.text() == expected
         }
     }
+}
+
+private enum DeliveryEvent: Equatable {
+    case deliveryStarted
+    case drainWaitCalled
+    case deliveryFinished(Data)
+    case drainWaitReturned
+}
+
+private actor DeliveryGate {
+    private var recorded: [DeliveryEvent] = []
+    private var deliveryStarted = false
+    private var drainWaitCalled = false
+    private var releaseRequested = false
+    private var deliveryStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var drainWaitCallWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdDelivery(_ chunk: Data) async {
+        recorded.append(.deliveryStarted)
+        deliveryStarted = true
+        for waiter in deliveryStartWaiters { waiter.resume() }
+        deliveryStartWaiters.removeAll()
+
+        if !releaseRequested {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        recorded.append(.deliveryFinished(chunk))
+    }
+
+    func waitUntilDeliveryStarts() async {
+        guard !deliveryStarted else { return }
+        await withCheckedContinuation { deliveryStartWaiters.append($0) }
+    }
+
+    func recordDrainWaitCalled() {
+        recorded.append(.drainWaitCalled)
+        drainWaitCalled = true
+        for waiter in drainWaitCallWaiters { waiter.resume() }
+        drainWaitCallWaiters.removeAll()
+    }
+
+    func waitUntilDrainWaitIsCalled() async {
+        guard !drainWaitCalled else { return }
+        await withCheckedContinuation { drainWaitCallWaiters.append($0) }
+    }
+
+    func releaseDelivery() {
+        releaseRequested = true
+        for waiter in releaseWaiters { waiter.resume() }
+        releaseWaiters.removeAll()
+    }
+
+    func recordDrainWaitReturned() { recorded.append(.drainWaitReturned) }
+    func events() -> [DeliveryEvent] { recorded }
 }

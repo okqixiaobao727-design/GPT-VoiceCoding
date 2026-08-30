@@ -76,11 +76,7 @@ public struct ProcessLauncher: EngineLaunching {
         BrokenPipes.ignore()
     }
 
-    public func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    public func launch(_ command: EngineCommand) throws -> EngineProcess {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: command.executable)
         process.arguments = command.arguments
@@ -123,20 +119,28 @@ public struct ProcessLauncher: EngineLaunching {
         }
         process.environment = environment
 
-        let errors = InheritedStderr(deliver: stderr)
+        let (stderr, stderrContinuation) = AsyncStream.makeStream(of: Data.self)
+        let exit = ProcessExit()
+        let errors = InheritedStderr(deliver: { chunk in
+            stderrContinuation.yield(chunk)
+        })
         process.standardError = errors.pipe
         errors.read()
 
         process.terminationHandler = { finished in
-            // The residue reaches the Retry panel **before** the exit does; the
-            // ordering, and why it is load-bearing, belong to `finish()`.
-            errors.finish()
             // A signal is not an exit code. Reported apart so a kill is never
             // mistaken for the engine's own "I could not start".
             let code =
                 finished.terminationReason == .uncaughtSignal
                 ? -finished.terminationStatus : finished.terminationStatus
-            exited(code)
+            exit.resolve(code)
+            Task {
+                // The residue reaches the Retry panel **before** the exit does;
+                // the ordering belongs to `waitUntilDrained()`. `ProcessExit`
+                // records the death first so shutdown never signals a reaped pid.
+                await errors.waitUntilDrained()
+                stderrContinuation.finish()
+            }
         }
 
         do {
@@ -151,22 +155,42 @@ public struct ProcessLauncher: EngineLaunching {
             errors.abandon()
             throw error
         }
-        return SpawnedEngine(process, launchOverhead: launchOverhead)
+        return SpawnedEngine(
+            process, stderr: stderr, exit: exit, launchOverhead: launchOverhead)
     }
 }
 
 final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     private let process: Process
+    private let stderr: AsyncStream<Data>
+    private let exit: ProcessExit
 
     /// What pre-spawn environment assembly cost, so the supervisor can discount it.
     let launchOverhead: TimeInterval
 
-    init(_ process: Process, launchOverhead: TimeInterval = 0) {
+    fileprivate init(
+        _ process: Process,
+        stderr: AsyncStream<Data>,
+        exit: ProcessExit,
+        launchOverhead: TimeInterval = 0
+    ) {
         self.process = process
+        self.stderr = stderr
+        self.exit = exit
         self.launchOverhead = launchOverhead
     }
 
     var processIdentifier: Int32 { process.processIdentifier }
+    var hasExited: Bool { exit.hasExited }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        for await chunk in stderr {
+            await deliveringStderr(chunk)
+        }
+        return await exit.value()
+    }
 
     /// `SIGTERM`, which the engine handles: loops cancelled, adapters closed in
     /// reverse, socket removed. Killing it outright would leave its own debris
@@ -182,5 +206,35 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     func forceStop() {
         guard process.isRunning else { return }
         kill(process.processIdentifier, SIGKILL)
+    }
+}
+
+private final class ProcessExit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var code: Int32?
+    private var waiters: [CheckedContinuation<Int32, Never>] = []
+
+    var hasExited: Bool { lock.withLock { code != nil } }
+
+    func resolve(_ code: Int32) {
+        let waiting: [CheckedContinuation<Int32, Never>] = lock.withLock {
+            guard self.code == nil else { return [] }
+            self.code = code
+            let waiting = waiters
+            waiters.removeAll()
+            return waiting
+        }
+        for waiter in waiting { waiter.resume(returning: code) }
+    }
+
+    func value() async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let finished: Int32? = lock.withLock {
+                if let code { return code }
+                waiters.append(continuation)
+                return nil
+            }
+            if let finished { continuation.resume(returning: finished) }
+        }
     }
 }

@@ -10,28 +10,15 @@ import Foundation
 /// also ended the pipe; keeping the duplicate open is what lets a later startup
 /// refusal reach the shell without reading the engine's log.
 ///
-/// **The ordering constraint the code cannot show:** `finish()` delivers the
-/// residue *before* its caller reports the exit. A process that dies immediately
-/// after writing its reason is the ordinary case here — exit 2 is precisely that
-/// — and reporting the death first would race the words that explain it out of
-/// existence. They are the only explanation the Retry panel ever gets.
+/// **Legacy: adapted.** GPT-VoiceCoding-legacy at `1d32845` had no menu-bar
+/// shell or Retry panel; `scripts/launch-agent.py:60-67` sent inherited stderr
+/// to launchd's log. This reader preserves the rewrite's shell seam (#33).
 ///
-/// **How far that holds, exactly.** It holds for the case this pipe exists for: a
-/// refusal is a single short write, well under the 64 KB pipe buffer, so it
-/// arrives in one delivery, whole and ahead of the exit.
-///
-/// It does **not** hold for a large message — a traceback — that straddles the
-/// buffer while the process is dying. `finish()` clears the readability handler,
-/// which stops the next invocation but not one already running on Foundation's
-/// own queue, so that handler can be inside `availableData` while `finish()` is
-/// inside `readToEnd()`. The two readers then split the message between them and
-/// can deliver it out of order, and the handler's delivery can land after the
-/// exit has already been reported.
-///
-/// That is issue #33, along with the same guarantee failing a layer up in
-/// `EngineSupervisor`. It is stated here rather than left implied because a
-/// promise documented without its limit is worse than one never written down:
-/// the next reader trusts it exactly where it is weakest.
+/// `read()` is the pipe's only reader. It forwards chunks through one consumer,
+/// so their bytes stay in source order and deliveries never overlap.
+/// `waitUntilDrained()` waits for the pipe's end and for every delivery to
+/// return. Its caller can then report the exit knowing none of this run's
+/// explanation can arrive afterward (#33).
 final class InheritedStderr: @unchecked Sendable {
     /// The child's end. `Process.standardError` is given the whole pipe rather
     /// than its write handle, so that Foundation closes *this* process's copy of
@@ -40,58 +27,80 @@ final class InheritedStderr: @unchecked Sendable {
     /// notice.
     let pipe = Pipe()
 
-    private let deliver: @Sendable (Data) -> Void
-    private let lock = NSLock()
+    private let deliver: @Sendable (Data) async -> Void
+    private let chunks: AsyncStream<Data>
+    private let chunkContinuation: AsyncStream<Data>.Continuation
+    private let readerQueue = DispatchQueue(label: "GPTVoiceCoding.InheritedStderr")
     private var monitoring = false
+    private var deliveryTask: Task<Void, Never>?
 
-    init(deliver: @escaping @Sendable (Data) -> Void) {
+    init(deliver: @escaping @Sendable (Data) async -> Void) {
         self.deliver = deliver
+        (chunks, chunkContinuation) = AsyncStream.makeStream(of: Data.self)
     }
 
     /// Whether this is still watching the pipe.
-    var isMonitoring: Bool { lock.withLock { monitoring } }
+    var isMonitoring: Bool { readerQueue.sync { monitoring } }
 
     /// Begin forwarding what the engine says.
     func read() {
-        lock.withLock { monitoring = true }
+        let chunks = chunks
+        let deliver = deliver
+        let deliveryTask = Task {
+            for await chunk in chunks {
+                await deliver(chunk)
+            }
+        }
+        readerQueue.sync {
+            monitoring = true
+            self.deliveryTask = deliveryTask
+        }
         pipe.fileHandleForReading.readabilityHandler = { [self] handle in
-            let chunk = handle.availableData
-            // An empty read **is** the end of the pipe, and a descriptor at its
-            // end is permanently readable — so a watch that reads emptiness and
-            // returns is asked again at once, and again, for as long as the
-            // watch is up. Stop watching, which is the only thing the end of a
-            // pipe ever asks for.
-            guard !chunk.isEmpty else { return stopMonitoring() }
-            deliver(chunk)
+            readerQueue.sync {
+                guard monitoring else { return }
+                let chunk = handle.availableData
+                guard chunk.isEmpty else {
+                    chunkContinuation.yield(chunk)
+                    return
+                }
+                // A descriptor at the end of a pipe is permanently readable.
+                // Take the watch down in the same serialized turn that observes
+                // it, or Foundation can enqueue another empty read in between.
+                handle.readabilityHandler = nil
+                monitoring = false
+                chunkContinuation.finish()
+            }
         }
     }
 
-    /// Stop watching, then hand over whatever is still in the pipe.
+    /// Wait until the one reader has reached EOF and every delivery has returned.
     ///
-    /// Called when the process is known to be gone. See the ordering constraint
-    /// above: the caller reports the exit only once this has returned.
-    func finish() {
-        stopMonitoring()
-        if let remaining = try? pipe.fileHandleForReading.readToEnd(), !remaining.isEmpty {
-            deliver(remaining)
-        }
+    /// Called when the process is known to be gone, so its last writer is already
+    /// closed and the reader is guaranteed to reach the end it awaits. A
+    /// descendant that still owns the inherited writer intentionally keeps this
+    /// pending too: reporting the run's exit before that writer closes would make
+    /// the complete-before-exit promise false.
+    func waitUntilDrained() async {
+        let task: Task<Void, Never>? = readerQueue.sync { self.deliveryTask }
+        await task?.value
     }
 
     /// Give up on a pipe that will never end by itself.
     ///
-    /// `finish()`'s drain waits for the end of the pipe, and after a launch that
-    /// never spawned there is no end coming: Foundation closes this process's
-    /// copy of the write end when it hands the pipe to a child, so a child that
-    /// was never made leaves this process holding it, waiting on itself. There
-    /// is nothing to drain either — nothing ever wrote.
+    /// `waitUntilDrained()` waits for the end of the pipe, and after a launch
+    /// that never spawned there is no end coming: Foundation closes this
+    /// process's copy of the write end when it hands the pipe to a child, so a
+    /// child that was never made leaves this process holding it, waiting on
+    /// itself. There is nothing to drain either — nothing ever wrote. This path
+    /// runs only after a spawn that never happened, so its readability handler
+    /// never fires.
     func abandon() {
-        stopMonitoring()
+        readerQueue.sync {
+            monitoring = false
+            chunkContinuation.finish()
+            pipe.fileHandleForReading.readabilityHandler = nil
+        }
         try? pipe.fileHandleForWriting.close()
         try? pipe.fileHandleForReading.close()
-    }
-
-    private func stopMonitoring() {
-        pipe.fileHandleForReading.readabilityHandler = nil
-        lock.withLock { monitoring = false }
     }
 }

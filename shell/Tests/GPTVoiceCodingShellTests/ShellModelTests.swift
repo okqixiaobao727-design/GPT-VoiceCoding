@@ -237,13 +237,9 @@ private final class RecordingEngineLauncher: EngineLaunching, @unchecked Sendabl
 
     var launchCount: Int { launches.value }
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         let attempt = launches.increment()
-        return HeldEngineProcess(pid: Int32(attempt + 2000), exited: exited)
+        return HeldEngineProcess(pid: Int32(attempt + 2000))
     }
 
 }
@@ -258,11 +254,7 @@ private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendab
         self.fixture = fixture
     }
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         let attempt = launches.increment()
         if attempt == 1 {
             try fixture.writeEnvironment("not-an-assignment\n")
@@ -270,7 +262,7 @@ private final class CredentialRacingLauncher: EngineLaunching, @unchecked Sendab
             try fixture.writeEnvironment("A_TELEGRAM_TOKEN=second-repair\n")
             throw failure
         }
-        return HeldEngineProcess(pid: Int32(attempt + 3000), exited: exited)
+        return HeldEngineProcess(pid: Int32(attempt + 3000))
     }
 
 }
@@ -280,11 +272,7 @@ private final class NonCredentialFailingLauncher: EngineLaunching, @unchecked Se
 
     var launchCount: Int { launches.value }
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         _ = launches.increment()
         throw NonCredentialLaunchFailure()
     }
@@ -308,25 +296,45 @@ private final class LaunchCounter: @unchecked Sendable {
 
 private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32
-    private let exited: @Sendable (Int32) -> Void
     private let lock = NSLock()
-    private var hasExited = false
+    private var code: Int32?
+    private var exitWaiter: CheckedContinuation<Int32, Never>?
 
-    init(pid: Int32, exited: @escaping @Sendable (Int32) -> Void) {
+    init(pid: Int32) {
         processIdentifier = pid
-        self.exited = exited
+    }
+
+    var hasExited: Bool { lock.withLock { code != nil } }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let finished: Int32? = lock.withLock {
+                if let code { return code }
+                exitWaiter = continuation
+                return nil
+            }
+            if let finished { continuation.resume(returning: finished) }
+        }
     }
 
     func requestStop() {
-        let shouldExit = lock.withLock {
-            guard !hasExited else { return false }
-            hasExited = true
-            return true
-        }
-        if shouldExit { exited(-SIGTERM) }
+        resolve(-SIGTERM)
     }
 
     func forceStop() {
         requestStop()
+    }
+
+    private func resolve(_ code: Int32) {
+        let waiting: CheckedContinuation<Int32, Never>? = lock.withLock {
+            guard self.code == nil else { return nil }
+            self.code = code
+            let waiter = exitWaiter
+            exitWaiter = nil
+            return waiter
+        }
+        waiting?.resume(returning: code)
     }
 }

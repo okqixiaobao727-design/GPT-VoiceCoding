@@ -12,11 +12,8 @@ import Testing
         let collected = Collector()
         let command = EngineCommand(
             executable: "/bin/sh", arguments: ["-c", script], source: .developerPath)
-        let process = try! ProcessLauncher().launch(
-            command,
-            stderr: { collected.add($0) },
-            exited: { collected.finish($0) })
-        let code = await collected.exitCode()
+        let process = try! ProcessLauncher().launch(command)
+        let code = await process.waitForExit { collected.add($0) }
         return (code, collected.lines(), process.processIdentifier)
     }
 
@@ -26,6 +23,30 @@ import Testing
         let outcome = await run("echo 'config: [delegate] model is required' 1>&2; exit 2")
         #expect(outcome.code == EngineExitCode.couldNotStart)
         #expect(outcome.stderr == ["config: [delegate] model is required"])
+    }
+
+    @Test func outputLargerThanThePipeBufferArrivesByteForByteBeforeExit() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gvc-large-stderr-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let macOSPipeBufferBytes = 64 * 1024
+        let payload = Data(
+            (0...macOSPipeBufferBytes).map { offset in UInt8(offset % Int(UInt8.max)) })
+        let payloadFile = directory.appendingPathComponent("payload")
+        try payload.write(to: payloadFile)
+        let command = EngineCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "cat \"$1\" >&2; exit 2", "gvc-large-stderr", payloadFile.path],
+            source: .developerPath)
+        let collected = ByteCollector()
+
+        let process = try ProcessLauncher(readPath: LoginShellPath.unasked).launch(command)
+        let code = await process.waitForExit { collected.add($0) }
+
+        #expect(code == EngineExitCode.couldNotStart)
+        #expect(collected.data() == payload)
     }
 
     @Test func aCleanExitIsZeroAndNotASignal() async {
@@ -61,9 +82,8 @@ import Testing
             executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
         let collected = Collector()
 
-        _ = try! ProcessLauncher(log: { said.add($0) }).launch(
-            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-        _ = await collected.exitCode()
+        let process = try! ProcessLauncher(log: { said.add($0) }).launch(command)
+        _ = await process.waitForExit { collected.add($0) }
 
         // Exactly one, because a line per spawn is a diagnostic and two would be
         // the beginning of a log nobody reads.
@@ -83,11 +103,11 @@ import Testing
         let command = EngineCommand(
             executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
 
-        _ = try! ProcessLauncher(
+        let process = try! ProcessLauncher(
             readPath: { _, _ in .ranOutOfTime },
             report: { seen.add($0) }
-        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-        _ = await collected.exitCode()
+        ).launch(command)
+        _ = await process.waitForExit { collected.add($0) }
 
         #expect(seen.all.count == 1)
         #expect(seen.all.first?.reason != nil)
@@ -102,11 +122,11 @@ import Testing
         let command = EngineCommand(
             executable: "/bin/sh", arguments: ["-c", "exit 0"], source: .developerPath)
 
-        _ = try! ProcessLauncher(
+        let process = try! ProcessLauncher(
             readPath: { _, _ in .said("/opt/homebrew/bin:/usr/bin") },
             report: { seen.add($0) }
-        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-        _ = await collected.exitCode()
+        ).launch(command)
+        _ = await process.waitForExit { collected.add($0) }
 
         #expect(seen.all.first?.reason == nil)
         if case .adopted(_, let path) = seen.all.first {
@@ -124,9 +144,10 @@ import Testing
             executable: "/bin/sh", arguments: ["-c", "printf '%s' \"$PATH\" 1>&2"],
             source: .developerPath)
 
-        _ = try! ProcessLauncher(readPath: { _, _ in .said("/opt/only-here") }).launch(
-            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-        _ = await collected.exitCode()
+        let process = try! ProcessLauncher(
+            readPath: { _, _ in .said("/opt/only-here") }
+        ).launch(command)
+        _ = await process.waitForExit { collected.add($0) }
 
         #expect(collected.lines() == ["/opt/only-here"])
     }
@@ -140,12 +161,12 @@ import Testing
             executable: "/bin/sh",
             arguments: ["-c", "printf '%s' \"$GVC_LAUNCH_TEST_TOKEN\" 1>&2"],
             source: .developerPath)
-        _ = try ProcessLauncher(
+        let process = try ProcessLauncher(
             readPath: LoginShellPath.unasked,
             environment: ["GVC_LAUNCH_TEST_TOKEN": "inherited-loses"],
             credentials: fixture.credentials
-        ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-        _ = await collected.exitCode()
+        ).launch(command)
+        _ = await process.waitForExit { collected.add($0) }
 
         #expect(collected.lines() == ["file-wins"])
     }
@@ -177,10 +198,10 @@ import Testing
             let credentials = TelegramCredentials(
                 configPath: config.path, environmentPath: file.path)
 
-            _ = try ProcessLauncher(
+            let process = try ProcessLauncher(
                 readPath: LoginShellPath.unasked, credentials: credentials
-            ).launch(command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
-            _ = await collected.exitCode()
+            ).launch(command)
+            _ = await process.waitForExit { collected.add($0) }
 
             #expect(collected.lines() == ["started"])
         }
@@ -208,7 +229,7 @@ import Testing
         let before = openDescriptors()
         for _ in 0..<attempts {
             #expect(throws: (any Error).self) {
-                try launcher.launch(missing, stderr: { _ in }, exited: { _ in })
+                try launcher.launch(missing)
             }
         }
         let leaked = openDescriptors() - before
@@ -243,13 +264,12 @@ import Testing
         let collected = Collector()
         let command = EngineCommand(
             executable: "/bin/sh", arguments: ["-c", "sleep 30"], source: .developerPath)
-        let process = try! ProcessLauncher().launch(
-            command, stderr: { collected.add($0) }, exited: { collected.finish($0) })
+        let process = try! ProcessLauncher().launch(command)
 
         process.requestStop()
 
         // SIGTERM: the engine stops in order rather than leaving its socket behind.
-        let code = await collected.exitCode()
+        let code = await process.waitForExit { collected.add($0) }
         #expect(code == -SIGTERM)
     }
 }
@@ -277,31 +297,16 @@ private final class Sentences: @unchecked Sendable {
 private final class Collector: @unchecked Sendable {
     private let lock = NSLock()
     private var ring = StderrRing()
-    private var code: Int32?
-    private var waiter: CheckedContinuation<Int32, Never>?
 
     func add(_ chunk: Data) { lock.withLock { ring.ingest(chunk) } }
 
-    func finish(_ status: Int32) {
-        let waiting: CheckedContinuation<Int32, Never>? = lock.withLock {
-            code = status
-            let waiter = self.waiter
-            self.waiter = nil
-            return waiter
-        }
-        waiting?.resume(returning: status)
-    }
-
     func lines() -> [String] { lock.withLock { ring.lines } }
+}
 
-    func exitCode() async -> Int32 {
-        await withCheckedContinuation { continuation in
-            let finished: Int32? = lock.withLock {
-                if let code { return code }
-                waiter = continuation
-                return nil
-            }
-            if let finished { continuation.resume(returning: finished) }
-        }
-    }
+private final class ByteCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collected = Data()
+
+    func add(_ chunk: Data) { lock.withLock { collected.append(chunk) } }
+    func data() -> Data { lock.withLock { collected } }
 }

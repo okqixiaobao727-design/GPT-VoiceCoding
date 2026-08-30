@@ -180,20 +180,58 @@ import Testing
         await supervisor.shutDown()
     }
 
-    @Test func aRestartStartsAFreshRing() async throws {
-        // The previous run's complaint is not this run's, and showing it beside a
-        // healthy engine would be the shell reporting news that has been fixed.
-        let clock = TestClock()
+    @Test func exitHealthWaitsUntilTheRunsStderrHasBeenDelivered() async {
         let log = HealthLog()
-        let (supervisor, _) = supervisor(
-            script: [.init(uptime: 0.2, code: 2, stderr: "config: old news\n")],
-            clock: clock, log: log)
+        let process = ControlledExitProcess(
+            pid: 4242, stderr: Data("config: ordered refusal\n".utf8), code: 2)
+        let supervisor = EngineSupervisor(
+            launcher: SingleProcessLauncher(process: process),
+            socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            socketAnswers: { _ in true }, observer: { log.record($0) })
 
         await supervisor.start()
+        await process.waitUntilStderrReturns()
+
+        #expect(await supervisor.lines() == ["config: ordered refusal"])
+        #expect(await supervisor.health == .running(pid: 4242))
+        #expect(!log.all().contains(.stopped(.anotherEngineIsListening)))
+
+        await process.allowExit()
+        let stopped = await log.wait(for: { $0 == .stopped(.anotherEngineIsListening) })
+        #expect(stopped == .stopped(.anotherEngineIsListening))
+        await supervisor.shutDown()
+    }
+
+    @Test func aFinishedRunCannotDeliverIntoTheNextRunsFreshRing() async throws {
+        let clock = TestClock()
+        let log = HealthLog()
+        let first = PendingTailProcess(pid: 1001)
+        let launcher = PendingTailLauncher(first: first, clock: clock)
+        let supervisor = EngineSupervisor(
+            launcher: launcher, socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            clock: clock, socketAnswers: { _ in false }, observer: { log.record($0) })
+
+        await supervisor.start()
+        await first.waitUntilTailIsPending()
+
+        // The first run has an accepted final delivery that has not happened yet.
+        // It cannot finish, so the supervisor cannot clear the ring or launch run 2.
+        #expect(launcher.launchCount() == 1)
+        #expect(await supervisor.lines() == ["config: first half"])
+
+        await first.releaseTail()
         _ = await log.wait(for: { $0 == .running(pid: 1002) })
 
-        let held = await supervisor.lines()
-        #expect(held.isEmpty)
+        // The nonescaping delivery closure died with run 1. Both of its chunks
+        // completed before run 2 cleared the ring, so neither can arrive late.
+        #expect(launcher.launchCount() == 2)
+        #expect(await supervisor.lines().isEmpty)
         await supervisor.shutDown()
     }
 
@@ -281,6 +319,31 @@ import Testing
         #expect(launcher.lastChild()?.stopForced == false)
     }
 
+    @Test func shutdownDoesNotForceAChildThatExitedWhileItsStderrStillDrains() async {
+        let process = ExitedButDrainingProcess(pid: 4242)
+        let clock = GatedGraceClock()
+        let supervisor = EngineSupervisor(
+            launcher: DrainingExitedLauncher(process: process),
+            socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            clock: clock)
+
+        await supervisor.start()
+        await process.waitUntilDrainIsHeld()
+
+        let shutdown = Task { await supervisor.shutDown() }
+        await clock.waitUntilGraceStarts()
+        await clock.expireGrace()
+
+        #expect(await process.waitForForceDecision() == .exitChecked)
+        #expect(!process.stopForced)
+
+        await process.releaseDrain()
+        await shutdown.value
+    }
+
     @Test func aChildThatIgnoresTheAskingIsStoppedAnyway() async throws {
         // A shell that cannot quit because its child will not listen is the same
         // dishonest wait this design exists to remove. The bound is stated once,
@@ -307,11 +370,7 @@ import Testing
 private struct CredentialRefusingLauncher: EngineLaunching {
     let state: TelegramCredentials.State
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         throw TelegramCredentialPreflightFailure(state)
     }
 }
@@ -338,11 +397,7 @@ private final class SlowToSpawnLauncher: EngineLaunching, @unchecked Sendable {
         self.clock = clock
     }
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         let count = lock.withLock {
             launches += 1
             return launches
@@ -350,24 +405,227 @@ private final class SlowToSpawnLauncher: EngineLaunching, @unchecked Sendable {
         // Before the child exists: this is the login shell, and it is exactly
         // what the supervisor must not count.
         clock.advance(readCost)
-        let process = SlowlySpawnedProcess(
-            pid: Int32(2000 + count), launchOverhead: readCost)
-        // And this is the child's own life, which it must.
-        clock.advance(uptime)
-        exited(code)
-        return process
+        return SlowlySpawnedProcess(
+            pid: Int32(2000 + count), launchOverhead: readCost,
+            uptime: uptime, code: code, clock: clock)
     }
 }
 
 private final class SlowlySpawnedProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32
     let launchOverhead: TimeInterval
+    private let uptime: TimeInterval
+    private let code: Int32
+    private let clock: TestClock
+    private let lock = NSLock()
+    private var exited = false
 
-    init(pid: Int32, launchOverhead: TimeInterval) {
+    init(
+        pid: Int32,
+        launchOverhead: TimeInterval,
+        uptime: TimeInterval,
+        code: Int32,
+        clock: TestClock
+    ) {
         processIdentifier = pid
         self.launchOverhead = launchOverhead
+        self.uptime = uptime
+        self.code = code
+        self.clock = clock
+    }
+
+    var hasExited: Bool { lock.withLock { exited } }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        // This is the child's own life, distinct from the launch overhead above.
+        clock.advance(uptime)
+        lock.withLock { exited = true }
+        return code
     }
 
     func requestStop() {}
     func forceStop() {}
+}
+
+private struct SingleProcessLauncher: EngineLaunching {
+    let process: ControlledExitProcess
+
+    func launch(_ command: EngineCommand) throws -> EngineProcess { process }
+}
+
+private final class ControlledExitProcess: EngineProcess, @unchecked Sendable {
+    let processIdentifier: Int32
+    private let stderr: Data
+    private let code: Int32
+    private let gate = ProcessGate()
+    private let lock = NSLock()
+    private var exited = false
+
+    init(pid: Int32, stderr: Data, code: Int32) {
+        processIdentifier = pid
+        self.stderr = stderr
+        self.code = code
+    }
+
+    var hasExited: Bool { lock.withLock { exited } }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        await deliveringStderr(stderr)
+        await gate.reachAndWait()
+        lock.withLock { exited = true }
+        return code
+    }
+
+    func waitUntilStderrReturns() async { await gate.waitUntilReached() }
+    func allowExit() async { await gate.release() }
+    func requestStop() {}
+    func forceStop() {}
+}
+
+private final class PendingTailLauncher: EngineLaunching, @unchecked Sendable {
+    private let first: PendingTailProcess
+    private let clock: TestClock
+    private let lock = NSLock()
+    private var launches = 0
+
+    init(first: PendingTailProcess, clock: TestClock) {
+        self.first = first
+        self.clock = clock
+    }
+
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
+        let attempt = lock.withLock {
+            launches += 1
+            return launches
+        }
+        if attempt == 1 { return first }
+        return FakeProcess(pid: Int32(1000 + attempt), run: nil, clock: clock)
+    }
+
+    func launchCount() -> Int { lock.withLock { launches } }
+}
+
+private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
+    let processIdentifier: Int32
+    private let gate = ProcessGate()
+    private let lock = NSLock()
+    private var exited = false
+
+    init(pid: Int32) { processIdentifier = pid }
+
+    var hasExited: Bool { lock.withLock { exited } }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        await deliveringStderr(Data("config: first half\n".utf8))
+        await gate.reachAndWait()
+        await deliveringStderr(Data("config: final tail\n".utf8))
+        lock.withLock { exited = true }
+        return 2
+    }
+
+    func waitUntilTailIsPending() async { await gate.waitUntilReached() }
+    func releaseTail() async { await gate.release() }
+    func requestStop() {}
+    func forceStop() {}
+}
+
+private actor ProcessGate {
+    private var reached = false
+    private var released = false
+    private var reachedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func reachAndWait() async {
+        reached = true
+        for waiter in reachedWaiters { waiter.resume() }
+        reachedWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilReached() async {
+        guard !reached else { return }
+        await withCheckedContinuation { reachedWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        for waiter in releaseWaiters { waiter.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
+private struct DrainingExitedLauncher: EngineLaunching {
+    let process: ExitedButDrainingProcess
+
+    func launch(_ command: EngineCommand) throws -> EngineProcess { process }
+}
+
+private enum ForceDecision: Equatable {
+    case exitChecked
+    case forced
+}
+
+private final class ExitedButDrainingProcess: EngineProcess, @unchecked Sendable {
+    let processIdentifier: Int32
+    private let drain = ProcessGate()
+    private let lock = NSLock()
+    private let decisions: AsyncStream<ForceDecision>
+    private let decisionContinuation: AsyncStream<ForceDecision>.Continuation
+    private var exited = false
+    private var forced = false
+
+    init(pid: Int32) {
+        processIdentifier = pid
+        (decisions, decisionContinuation) = AsyncStream.makeStream(of: ForceDecision.self)
+    }
+
+    var hasExited: Bool {
+        let observed = lock.withLock { exited }
+        decisionContinuation.yield(.exitChecked)
+        return observed
+    }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        lock.withLock { exited = true }
+        await drain.reachAndWait()
+        return 0
+    }
+
+    func waitUntilDrainIsHeld() async { await drain.waitUntilReached() }
+    func releaseDrain() async { await drain.release() }
+    func requestStop() {}
+
+    func forceStop() {
+        lock.withLock { forced = true }
+        decisionContinuation.yield(.forced)
+    }
+
+    var stopForced: Bool { lock.withLock { forced } }
+
+    func waitForForceDecision() async -> ForceDecision? {
+        for await decision in decisions { return decision }
+        return nil
+    }
+}
+
+private final class GatedGraceClock: SupervisorClock, @unchecked Sendable {
+    private let grace = ProcessGate()
+
+    var now: TimeInterval { 0 }
+
+    func sleep(_ seconds: TimeInterval) async {
+        await grace.reachAndWait()
+    }
+
+    func waitUntilGraceStarts() async { await grace.waitUntilReached() }
+    func expireGrace() async { await grace.release() }
 }
