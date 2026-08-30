@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -36,6 +37,8 @@ from gpt_voicecoding.adapters.agent.codex.approvals import (
     tool_name_for,
     voice_menu,
 )
+from gpt_voicecoding.adapters.agent.codex.discovery import ProcessEvidence
+from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.adapters.agent.codex.shared_daemon import DaemonAddress, SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
@@ -55,6 +58,7 @@ from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget
 
 THREAD = "01a02110-d18f-74a0-916d-de1208e9977a"
+ROOT_THREAD = "01a02110-d18f-74a0-916d-de1208e9977b"
 TARGET = SessionTarget(agent=AgentKind.CODEX, session_id=THREAD)
 TURN = "01a02110-d9ab-7763-a185-7079c7fbffe0"
 APPROVAL = "item/commandExecution/requestApproval"
@@ -101,12 +105,17 @@ class Codex(FakeAppServer):
         #: What the daemon says started this thread. `None` is what a daemon too
         #: old to record one says, and is the ordinary case (#112).
         self.thread_source: str | None = None
+        self.parent_thread_id: str | None = None
+        self.workspace = self.path.parent / "workspace"
 
         self.answers("initialize", {})
         self.answers(
             "thread/resume",
-            lambda _p: {
-                "thread": {"id": self.thread_id, "status": {"type": self.status}},
+            lambda params: {
+                "thread": {
+                    "id": params.get("threadId"),
+                    "status": {"type": self.status},
+                },
                 "approvalPolicy": self.approval_policy,
                 "approvalsReviewer": self.reviewer,
             },
@@ -138,14 +147,26 @@ class Codex(FakeAppServer):
         self.delivered.append(params["clientUserMessageId"])
         return {"turnId": TURN}
 
-    def _thread_read(self, _params: dict) -> dict:
+    def _thread_read(self, params: dict) -> dict:
+        asked = params.get("threadId")
+        is_parent = self.parent_thread_id is not None and asked == self.parent_thread_id
         items = []
-        if self.readback_shows_words:
+        if not is_parent and self.readback_shows_words:
             for landed in self.delivered:
                 items.extend([{"type": "userMessage", "clientId": landed}] * self.readback_copies)
-        thread: dict[str, Any] = {"id": self.thread_id, "turns": [{"items": items}]}
-        if self.thread_source is not None:
-            thread["threadSource"] = self.thread_source
+        thread_id = str(self.parent_thread_id if is_parent else self.thread_id)
+        thread: dict[str, Any] = {
+            "id": thread_id,
+            "sessionId": self.parent_thread_id or self.thread_id,
+            "cwd": str(self.workspace),
+            "status": {"type": self.status},
+            "turns": [{"items": items}],
+        }
+        source = "user" if is_parent else self.thread_source
+        if source is not None:
+            thread["threadSource"] = source
+        if not is_parent and self.parent_thread_id is not None:
+            thread["parentThreadId"] = self.parent_thread_id
         return {"thread": thread}
 
 
@@ -1178,15 +1199,37 @@ async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = Non
     the machine is reached through the daemon it joined (#76, #77).
     """
 
-    async def no_other_sessions() -> list[Any]:
-        """The machine's own `codex` processes are nobody's business here."""
-        return []
+    if server.thread_source in {"subagent", "guardian_review"}:
+        server.parent_thread_id = ROOT_THREAD
+        server.answers("thread/loaded/list", {"data": [ROOT_THREAD, server.thread_id]})
+    live_root = server.parent_thread_id or server.thread_id
+    home = server.path.parent / "codex-home"
+    sessions = home / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / f"rollout-2026-08-31T00-00-00-{live_root}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "session_id": live_root,
+                    "cwd": str(server.workspace),
+                    "thread_source": "user",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    async def live_processes() -> tuple[Candidate, ...]:
+        """The one fake interactive TUI, paired with this test's isolated rollout tree."""
+        return (Candidate(pid=991, workspace=server.workspace, session_id=live_root),)
 
     return CodexAgentAdapter(
         sink=sink,
         settings=settings or quick(),
         daemon=daemon_at(server.path),
-        processes=no_other_sessions,
+        process_evidence=ProcessEvidence(list_sessions=live_processes, home=home),
     )
 
 
@@ -1221,9 +1264,9 @@ class TestNotSubscribingToAChildProcess:
                     await adapter.aclose()
 
         lane, resumed, watching = asyncio.run(scenario())
-        assert [row.child.kind for row in lane.rows] == [ChildKind.CHILD]
-        assert resumed == []
-        assert watching == ()
+        assert [row.child.kind for row in lane.rows] == [ChildKind.MAIN, ChildKind.CHILD]
+        assert [call["threadId"] for call in resumed] == [ROOT_THREAD]
+        assert watching == (SessionTarget(agent=AgentKind.CODEX, session_id=ROOT_THREAD, pid=991),)
 
     def test_the_users_own_thread_is_resumed_as_it_always_was(self, socket_path: Path) -> None:
         """The rule is about children. Adopting a Session is how prompts arrive at all."""
@@ -1240,7 +1283,7 @@ class TestNotSubscribingToAChildProcess:
 
         resumed, watching = asyncio.run(scenario())
         assert len(resumed) == 1
-        assert watching == (TARGET,)
+        assert watching == (SessionTarget(agent=AgentKind.CODEX, session_id=THREAD, pid=991),)
 
     def test_a_thread_that_names_no_source_is_resumed_too(self, socket_path: Path) -> None:
         """Absent is not a claim — the same reading `discovery._child_of` gives it."""
@@ -1417,7 +1460,7 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
                     await adapter.aclose()
 
         request = asyncio.run(scenario())
-        assert request.target == TARGET
+        assert request.target == SessionTarget(agent=AgentKind.CODEX, session_id=THREAD, pid=991)
         # The shell text does **not** travel (#109). It reached the user until
         # then, on the one lane whose extractor was not the shared one: a summary
         # is description-class text only, and `command` is what

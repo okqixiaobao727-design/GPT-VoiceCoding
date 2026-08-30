@@ -9,31 +9,39 @@ answering `{"data": [id, …]}`, and each id is described by `thread/read` as
 `{"thread": {"id", "name", "cwd", "status"}}` — measured on 0.149.1 by #82's
 prototype (`661d3d9`), not assumed.
 
-**The process table is what is left when it is not** — and it is not, often. A
-TUI that started while the daemon was down is never adopted by a daemon that
-starts later (#82, measured), so "the daemon is up" and "the daemon knows about
-this Session" are different questions and the second one has to keep an answer.
-Those rows are `degraded`, not an error: they are true, they are just thinner.
+**The process table supplies current liveness and, sometimes, exact identity.**
+A TUI that started while the daemon was down is never adopted by a daemon that
+starts later (#82, measured), so an exact `resume <UUID>` process may compose
+with its explicit user rollout even when the daemon does not hold it. A TUI
+whose argv carries no shared thread id is liveness evidence but not a confirmed
+main Session, so it has no roster row (#144).
 
-**A loaded thread is only a roster row while a TUI is open in its workspace**
-(#123). Zero matching processes means the TUI exited and the daemon merely kept
-the resumable main or child thread loaded, so it is not a row; two or more mean only
-that the join is ambiguous, so the thread stays live and pidless. A fresh TUI in
-that workspace can temporarily claim the old thread until its first turn writes
-its own id, when the existing identity rule corrects it. Nothing here unloads or
-stops a thread. This is **adapted** from legacy, where the wrapper waited on the
-TUI process and released its runtime after that process exited
+**A loaded root is a roster row only when a live interactive process carries the
+same exact thread id as a native daemon thread or rollout** (#144). A workspace
+is a place, not an identity: another TUI in the same directory cannot keep a
+historical root alive. Daemon and process observations with the same thread id
+compose into one row. If more than one process observation names it, the logical
+Session remains one row and its pid is omitted rather than guessed. Nothing here
+unloads or stops a thread. This is **adapted** from legacy, where the wrapper
+waited on the TUI process and released its runtime after that process exited
 (`legacy@1d32845:bridge/codex.py:1922-1930,1947-1957`).
 
-**A Session that has not been spoken to has no id at all**, because `codex`
-writes the rollout carrying one at its first *turn* (#73). Such a row is
-addressed by its pid alone, and gains its id later without becoming a second row
-— see `core.sessions._better_known`.
+**A native Child Process lives with its proven root's Session tree** (#144).
+`threadSource` classifies it, `parentThreadId` links it, and `sessionId` must name
+the same tree as one live root. A child from a historical tree is not kept alive
+by an unrelated TUI in the workspace, and a process observation that contradicts
+the daemon's child classification never promotes it to a main Session.
+
+**A Session whose live process exposes no exact id has no roster row.** Codex
+writes a rollout at its first *turn* (#73), but a rollout's workspace and time
+cannot prove which process owns it. The row appears only when the process argv
+and native evidence expose one shared id; PID-only evidence never enters the
+roster (#144).
 
 **Unreachability gets no row and no field.** #68 removed that vocabulary: a
-process-table row is listed like any other, and a Relay into a Session the
-daemon cannot load returns the existing `FAILED` grade with its reason, before
-the wire (#82). The roster's job is to say what exists.
+Relay into a Session the daemon cannot load returns the existing `FAILED` grade
+with its reason, before the wire (#82). The roster's job is to say what is
+proven to exist.
 """
 
 from __future__ import annotations
@@ -41,7 +49,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -109,13 +117,10 @@ STATUS_TYPES: Final = {
 #: and they are #79's Child Process rows — which it cannot classify if this
 #: module deletes them first. The two rules meet here and nowhere else.
 #:
-#: **A thread that names no source is kept**, because absent is not a claim: an
-#: older daemon says nothing about any thread, and nothing about that machine
-#: changes. `null` reads the same way as omitted, and deliberately: the field is
-#: an `Option` that is always serialised, so a 0.149.1 daemon spells "no source
-#: recorded" as `"threadSource": null` and a 0.130-era one spells it by leaving
-#: the key out. Two spellings, one absence of a claim — dropping on `null` would
-#: empty the roster of every thread whose source the daemon never recorded.
+#: **A thread that names no source is not called an errand**, because absent is
+#: not a claim. It remains unclassified when rows are projected: an explicit
+#: user rollout may still identify the live TUI, but daemon silence alone cannot
+#: confirm a native root (#144). `null` and omission are the same silence.
 #:
 #: **Legacy has no filter of this kind, and that is the citation.** Its Codex
 #: roster was the rollout index (`legacy@1d32845:bridge/codex.py:1020-1026`,
@@ -151,6 +156,7 @@ SESSION_THREAD_SOURCES: Final = frozenset({"user", "subagent", "guardian_review"
 #: outcome and drops the invisibility (#67 port table, P11, *adapt*).
 CHILD_THREAD_SOURCES: Final = SESSION_THREAD_SOURCES - {rollouts.USER_THREAD_SOURCE}
 PARENT_THREAD_ID: Final = "parentThreadId"
+SESSION_TREE_ID: Final = "sessionId"
 
 #: What the daemon calls the thread's first user message. On the cheap read like
 #: the ones above, and read for one question only: whether the name codex gave
@@ -237,6 +243,32 @@ class DaemonClient(Protocol):
 ProcessLister = Callable[[], Awaitable[tuple[Candidate, ...]]]
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessEvidence:
+    """The process-table reading and rollout tree that make one evidence source.
+
+    The two inputs are inseparable: an argv thread id can use an explicit user
+    rollout to supply root classification when the daemon omits it. Keeping
+    them behind one provider prevents a test or caller from injecting one half
+    while accidentally reading the machine's real other half.
+    """
+
+    list_sessions: ProcessLister = enumerate_sessions
+    home: Path | None = None
+
+    async def identities(self) -> tuple[ProcessIdentity, ...]:
+        """Live interactive runs carrying a thread id shared with native evidence."""
+        return _from_processes(await self.list_sessions(), home=self.home)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessIdentity:
+    """One exact process-to-thread join and whether its rollout proves a user root."""
+
+    candidate: Candidate
+    rollout_root: bool
+
+
 class TurnCache:
     """Every loaded thread's `Progress`, read at most once per change (#76).
 
@@ -313,8 +345,7 @@ class TurnCache:
 async def discover(
     client: DaemonClient | None = None,
     *,
-    processes: ProcessLister = enumerate_sessions,
-    home: Path | None = None,
+    evidence: ProcessEvidence | None = None,
     turns: TurnCache | None = None,
     daemon_note: str = "",
     projects: ProjectNames | None = None,
@@ -331,33 +362,60 @@ async def discover(
     every five seconds. The caller keeps it across ticks; this call prunes it
     back to what the daemon still holds. Given nothing, each pass says it once,
     which is what a one-shot reading wants anyway.
+
+    Process identity is read first because only a thread id carried by both a
+    live TUI and native Codex evidence can prove which daemon root is current.
+    Workspace, time, and equal evidence counts never join identities. The
+    resulting `LaneDiscovery` contains logical Sessions, not one row per source
+    of evidence.
     """
     try:
-        candidates = await processes()
+        process_identities = await (evidence or ProcessEvidence()).identities()
     except (OSError, TimeoutError) as unreadable:
         return LaneDiscovery(error=f"the process table could not be read: {unreadable}")
 
     threads, daemon_error = await _threads(client, reported_non_sessions)
     names = projects or ProjectNames()
-    rows: list[SessionInspection] = []
-    claimed: set[int] = set()
+    processes_by_thread: dict[str, list[ProcessIdentity]] = {}
+    for identity in process_identities:
+        thread_id = identity.candidate.session_id
+        if thread_id is not None:
+            processes_by_thread.setdefault(thread_id, []).append(identity)
 
+    classified: list[tuple[dict[str, Any], ChildClassification]] = []
     for thread in threads:
-        child = _child_of(thread)
-        workspace_pids = _pids_in_workspace(thread, candidates)
-        if workspace_pids == ():
-            continue
-        # **A Child Process never takes a workspace's TUI.** A subagent runs
-        # inside the daemon and has no process of its own, so the one `codex`
-        # running in that directory is its parent's — and the join is
-        # first-come (`_pid_for`), so a child reaching it first would leave the
-        # user's own Session addressable by its thread id alone. #112 fixed the
-        # same first-come hazard for the phantom by dropping it before the
-        # join; a child keeps its row while the parent's TUI is present, so it
-        # is excluded from claiming that process instead.
-        pid = _pid_for(workspace_pids, claimed) if child.is_main else None
-        if pid is not None:
-            claimed.add(pid)
+        thread_id = str(thread["id"])
+        classification = _child_of(thread)
+        matches = processes_by_thread.get(thread_id, [])
+        if classification is None and any(match.rollout_root for match in matches):
+            classification = MAIN_SESSION
+        if classification is not None:
+            classified.append((thread, classification))
+    live_roots = {
+        str(thread["id"]): (thread, processes_by_thread[str(thread["id"])])
+        for thread, child in classified
+        if child.is_main and str(thread["id"]) in processes_by_thread
+    }
+    live_tree_ids = {
+        tree_id
+        for thread, _matches in live_roots.values()
+        if (tree_id := _session_tree_id(thread)) is not None
+    }
+    daemon_child_ids = {str(thread["id"]) for thread, child in classified if not child.is_main}
+    rows: list[SessionInspection] = []
+
+    for thread, child in classified:
+        thread_id = str(thread["id"])
+        if child.is_main:
+            live = live_roots.get(thread_id)
+            if live is None:
+                continue
+            matches = live[1]
+            pid = matches[0].candidate.pid if len(matches) == 1 else None
+        else:
+            if _session_tree_id(thread) not in live_tree_ids:
+                continue
+            pid = None
         progress = (
             await turns.progress_for(client, thread)
             if turns is not None and client is not None
@@ -374,21 +432,32 @@ async def discover(
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
 
-    for candidate in candidates:
-        if candidate.pid not in claimed:
-            rows.append(await _named(_from_process(candidate, home=home), names))
+    for thread_id, matches in processes_by_thread.items():
+        if thread_id in live_roots or thread_id in daemon_child_ids:
+            continue
+        if not any(match.rollout_root for match in matches):
+            continue
+        candidate = matches[0].candidate
+        pid = candidate.pid if len(matches) == 1 else None
+        rows.append(
+            await _named(
+                _from_process(candidate, session_id=thread_id, pid=pid),
+                names,
+            )
+        )
     return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
 
 
 def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspection]:
     """Each child's parent named by the address that parent's own row carries.
 
-    `parentThreadId` names a thread, but a Session's address is the thread *and*
-    the pid `_pid_for` joined to it, so a parent named from the field alone is an
-    address no row in the roster holds. #79's acceptance `child` step reads this
-    link to say a child is listed under its parent, and it failed on exactly that
-    difference: the child pointed at `codex:01a040cc-…` while the Session that
-    spawned it was `codex:01a040cc-…:36628`.
+    `parentThreadId` names a thread, but a Session's address may also carry the
+    pid its exact process/rollout observation supplied, so a parent named from
+    the field alone can be an address no row in the roster holds. #79's
+    acceptance `child` step reads this link to say a child is listed under its
+    parent, and it failed on exactly that difference: the child pointed at
+    `codex:01a040cc-…` while the Session that spawned it was
+    `codex:01a040cc-…:36628`.
 
     **After the loop, not inside it**, because the pid is joined as each thread
     is read and the daemon lists a child before its parent as readily as after.
@@ -495,17 +564,15 @@ def _errand_of(thread: Mapping[str, Any]) -> str | None:
 
     The reason is carried back rather than a bare `False` because a row that
     stops appearing is a row somebody comes looking for, and "dropped" is not
-    an answer to that question. Read before the workspace join, so a thread that
-    is not a Session cannot take the pid of one that is: both threads of #79's
-    measurement named the same `cwd`, and `_pid_for` gives it to whichever is
-    listed first.
+    an answer to that question. Read before evidence composition, so a daemon
+    errand cannot consume or be promoted by a process observation carrying the
+    same workspace.
     """
     if thread.get(EPHEMERAL) is True:
         return f"{EPHEMERAL}, so the daemon will not even write it to disk"
-    # Only a word disqualifies a thread. `null`, a missing key, and a shape this
-    # build has never seen are all the daemon declining to classify it, and a
-    # roster that deletes rows over a value it cannot read is worse than one
-    # that lists a thread it should not have.
+    # Only a word identifies an errand. `null`, a missing key, and a shape this
+    # build has never seen are all the daemon declining to classify it; row
+    # projection separately refuses to promote that silence into a native root.
     source = thread.get(THREAD_SOURCE)
     if isinstance(source, str) and source not in SESSION_THREAD_SOURCES:
         return f"{THREAD_SOURCE} is {source!r}, which is codex's own errand"
@@ -534,30 +601,10 @@ async def read_thread(
     return thread
 
 
-def _pid_for(workspace_pids: tuple[int, ...] | None, claimed: set[int]) -> int | None:
-    """The TUI running this thread, when exactly one process can be it.
-
-    Joined on the workspace, because that is the only field the two sources
-    share — the daemon does not report a pid and the process table does not
-    report a thread. Two unclaimed TUIs in one directory cannot be told apart,
-    so neither is claimed: a row addressed by the wrong pid is worse than one
-    addressed by its thread id alone, which still reaches the daemon.
-    """
-    matches = [pid for pid in workspace_pids or () if pid not in claimed]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _pids_in_workspace(
-    thread: Mapping[str, Any], candidates: tuple[Candidate, ...]
-) -> tuple[int, ...] | None:
-    """Running TUIs in the stated workspace; `None` when no workspace was stated."""
-    cwd = thread.get("cwd")
-    if not isinstance(cwd, str) or not cwd.strip():
-        return None
-    wanted = os.path.realpath(cwd)
-    return tuple(
-        candidate.pid for candidate in candidates if os.path.realpath(candidate.workspace) == wanted
-    )
+def _session_tree_id(thread: Mapping[str, Any]) -> str | None:
+    """The native Session tree this daemon thread says it belongs to."""
+    tree_id = thread.get(SESSION_TREE_ID)
+    return tree_id.strip() if isinstance(tree_id, str) and tree_id.strip() else None
 
 
 def _status_of(thread: Mapping[str, Any]) -> str | None:
@@ -603,8 +650,8 @@ def _from_thread(
     )
 
 
-def _child_of(thread: Mapping[str, Any]) -> ChildClassification:
-    """Whether this thread is the user's own, or one another thread spawned (#79).
+def _child_of(thread: Mapping[str, Any]) -> ChildClassification | None:
+    """Whether this is a proven root, a proven child, or unclassified (#79, #144).
 
     Read off the same two fields `_errand_of` reads, on the same cheap
     `thread/read`, and against `CHILD_THREAD_SOURCES` — the half of #112's
@@ -612,15 +659,16 @@ def _child_of(thread: Mapping[str, Any]) -> ChildClassification:
     itself never reaches this function, having been dropped as an errand.
 
     **A word decides; an absence does not.** `null`, a missing key and a shape
-    this build cannot read are all the daemon declining to classify a thread,
-    and the ordinary state of every thread an older daemon holds. Reading that
-    silence as `child` would make every Session on such a machine unaddressable
-    — the exact mirror of the phantom #112 was opened for, and the worse of the
-    two mistakes, because the roster would list Sessions nobody could reach.
+    this build cannot read are all the daemon declining to classify a thread.
+    They return `None`: only an exact process identity with an explicit user
+    rollout may supply the missing root classification. PID-only evidence never
+    enters the roster.
     """
     source = thread.get(THREAD_SOURCE)
-    if not isinstance(source, str) or source not in CHILD_THREAD_SOURCES:
+    if source == rollouts.USER_THREAD_SOURCE:
         return MAIN_SESSION
+    if not isinstance(source, str) or source not in CHILD_THREAD_SOURCES:
+        return None
     # The parent is carried where the daemon names it and is `None` where it
     # does not — which is ordinary, not malformed: `parentThreadId` is `null`
     # on every thread the daemon recorded none for. The locked type settles
@@ -769,21 +817,41 @@ def _short_thread_id(thread_id: str | None) -> str | None:
     return short or None
 
 
-def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspection:
-    """One running TUI the daemon does not hold, named as well as disk allows.
+def _from_processes(
+    candidates: tuple[Candidate, ...], *, home: Path | None
+) -> tuple[ProcessIdentity, ...]:
+    """Exact live process identities, with explicit rollout-root evidence.
 
-    Its thread id comes from the newest rollout whose own `cwd` is this
-    workspace **and which was written after this process started**, and only
-    once the Session has taken a turn — before that there is genuinely no id,
-    and the row is addressed by pid.
+    A candidate without a thread id shared through its argv is absent. An exact
+    id remains useful when the daemon itself classifies that thread as `user`;
+    an exact matching rollout additionally lets discovery recover that root
+    classification from an older daemon that omitted `threadSource`.
 
-    The start-time bound is what keeps the workspace join honest. A workspace
-    outlives the Sessions run in it and rollouts stay on disk, so the newest one
-    in a directory is only *this* Session's if this Session could have written
-    it. Without the bound a fresh TUI adopts the id of whatever ran there last,
-    and `core.sessions._better_known` — which refuses to let a known id be
-    overwritten by `None` — then protects that wrong id from every later,
-    honest reading.
+    The rollout override requires the same id in argv, filename and
+    `session_meta`, the same real workspace, and explicit `thread_source=user`.
+    No count, timestamp, or workspace-only observation can manufacture the
+    shared key (#144).
+    """
+    identities: list[ProcessIdentity] = []
+    for candidate in candidates:
+        thread_id = candidate.session_id
+        if thread_id is None:
+            continue
+        located = rollouts.locate(thread_id, home=home)
+        meta = rollouts.session_meta(located) if isinstance(located, Path) else None
+        rollout_root = (
+            meta is not None
+            and rollouts.session_id_in(meta) == thread_id
+            and meta.get("thread_source") == rollouts.USER_THREAD_SOURCE
+            and (workspace := rollouts.workspace_in(meta)) is not None
+            and os.path.realpath(workspace) == os.path.realpath(candidate.workspace)
+        )
+        identities.append(ProcessIdentity(candidate=candidate, rollout_root=rollout_root))
+    return tuple(identities)
+
+
+def _from_process(candidate: Candidate, *, session_id: str, pid: int | None) -> SessionInspection:
+    """One running TUI whose native root identity was independently proven.
 
     **The state is `RUNNING` because nothing here can see one.** A process is
     not evidence of a Reply Window, and `RUNNING` is the reading that holds a
@@ -791,13 +859,11 @@ def _from_process(candidate: Candidate, *, home: Path | None) -> SessionInspecti
     matters more here than anywhere: this Session's Relay would fail at the wire
     anyway (#82), and a held Relay is one the user gets back.
     """
-    rollout = rollouts.newest_for(candidate.workspace, home=home, since=candidate.started_at)
-    meta = rollouts.session_meta(rollout) if rollout is not None else None
     return SessionInspection(
         target=SessionTarget(
             agent=AgentKind.CODEX,
-            session_id=rollouts.session_id_in(meta) if meta is not None else None,
-            pid=candidate.pid,
+            session_id=session_id,
+            pid=pid,
         ),
         workspace=candidate.workspace,
         lifecycle=SessionLifecycle.LIVE,

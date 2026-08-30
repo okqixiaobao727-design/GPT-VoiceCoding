@@ -16,20 +16,19 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent._project import ProjectNames
-from gpt_voicecoding.adapters.agent.codex import discovery
+from gpt_voicecoding.adapters.agent.codex import discovery, rollouts
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
-    SessionLifecycle,
     SessionState,
     WaitingKind,
 )
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 THREAD = "01a03b06-f995-7b60-bc9f-e2152ee4ed32"
 OTHER_THREAD = "01a0385e-4872-7353-bdc5-8966c6165a8e"
@@ -39,9 +38,18 @@ OTHER_THREAD = "01a0385e-4872-7353-bdc5-8966c6165a8e"
 STARTED_AT = 1_787_700_000.0
 
 
-def running(pid: int, workspace: Path | str, *, started_at: float = STARTED_AT) -> Candidate:
-    """One TUI in the process table, as `processes.enumerate_sessions` yields it."""
-    return Candidate(pid=pid, workspace=Path(workspace), started_at=started_at)
+def running(
+    pid: int,
+    workspace: Path | str,
+    *,
+    session_id: str | None = None,
+) -> Candidate:
+    """One TUI in the process table, with an exact native id only when observed."""
+    return Candidate(
+        pid=pid,
+        workspace=Path(workspace),
+        session_id=session_id,
+    )
 
 
 class FakeDaemon:
@@ -75,7 +83,14 @@ def thread(
     Omitted rather than empty by default, because the two are different claims
     to `_thread_name` (#113) and most of this file is about neither.
     """
-    described = {"id": thread_id, "cwd": cwd, "status": {"type": status}, "name": name}
+    described = {
+        "id": thread_id,
+        "cwd": cwd,
+        "status": {"type": status},
+        "name": name,
+        "threadSource": "user",
+        "sessionId": thread_id,
+    }
     if preview is not None:
         described["preview"] = preview
     return described
@@ -102,6 +117,19 @@ def write_rollout(
         json.dumps({"type": "session_meta", "payload": payload}) + "\n",
         encoding="utf-8",
     )
+    return path
+
+
+def write_live_user_rollout(
+    home: Path,
+    thread_id: str,
+    workspace: Path | str,
+    *,
+    written_at: float = STARTED_AT + 60,
+) -> Path:
+    """An explicit user rollout carrying the fixture process's exact native id."""
+    path = write_rollout(home, thread_id, Path(workspace), source=rollouts.USER_THREAD_SOURCE)
+    os.utime(path, (written_at, written_at))
     return path
 
 
@@ -143,8 +171,10 @@ def found(
     return asyncio.run(
         discover(
             client,  # type: ignore[arg-type]
-            processes=listing(*candidates),
-            home=home,
+            evidence=discovery.ProcessEvidence(
+                list_sessions=listing(*candidates),  # type: ignore[arg-type]
+                home=home,
+            ),
             daemon_note=daemon_note,
             projects=ProjectNames(ask=git or not_a_repository()),  # type: ignore[arg-type]
         )
@@ -152,16 +182,32 @@ def found(
 
 
 def found_with_tuis(client: FakeDaemon, *, git: object = None) -> object:
-    """Discover daemon fixtures with one running TUI in each represented workspace."""
+    """Discover daemon roots with exact process and native-rollout identity."""
     workspaces = {
         Path(str(described["cwd"]))
         for described in client.threads.values()
         if isinstance(described.get("cwd"), str) and str(described["cwd"]).strip()
     }
-    candidates = tuple(
-        running(101 + index, workspace) for index, workspace in enumerate(sorted(workspaces))
-    )
-    return found(client, *candidates, git=git)
+    with tempfile.TemporaryDirectory(prefix="gvc-codex-discovery-") as directory:
+        home = Path(directory)
+        written_workspaces: set[Path] = set()
+        candidates: list[Candidate] = []
+        for described in client.threads.values():
+            source = described.get("threadSource")
+            workspace = Path(str(described.get("cwd", "")))
+            if (
+                described.get("ephemeral") is True
+                or source in discovery.CHILD_THREAD_SOURCES
+                or (isinstance(source, str) and source not in discovery.SESSION_THREAD_SOURCES)
+                or workspace not in workspaces
+                or workspace in written_workspaces
+            ):
+                continue
+            thread_id = str(described["id"])
+            write_live_user_rollout(home, thread_id, workspace)
+            candidates.append(running(101 + len(candidates), workspace, session_id=thread_id))
+            written_workspaces.add(workspace)
+        return found(client, *candidates, home=home, git=git)
 
 
 class TestTheDaemonIsTheAuthorityWhenItIsUp:
@@ -200,54 +246,141 @@ class TestTheDaemonIsTheAuthorityWhenItIsUp:
 
 
 class TestJoiningAThreadToItsProcess:
-    def test_the_tui_running_a_thread_is_found_by_its_workspace(self) -> None:
+    def test_live_tui_without_a_shared_id_does_not_impersonate_an_exited_root(
+        self, tmp_path: Path
+    ) -> None:
+        """A historical rollout plus an unidentified live TUI is not a 1:1 identity join."""
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
+
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
             running(101, "/tmp/w"),
+            home=tmp_path,
+        )
+
+        assert lane.rows == ()
+
+    def test_the_tui_running_a_thread_is_found_by_its_exact_rollout(self, tmp_path: Path) -> None:
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
+        unclassified = thread(THREAD, cwd="/tmp/w")
+        unclassified.pop("threadSource")
+        lane = found(
+            FakeDaemon({THREAD: unclassified}),
+            running(101, "/tmp/w", session_id=THREAD),
+            home=tmp_path,
         )
         assert len(lane.rows) == 1
         assert lane.rows[0].target.pid == 101
 
-    def test_a_claimed_process_does_not_also_get_a_row_of_its_own(self) -> None:
+    def test_exact_daemon_and_process_evidence_produce_one_row(self, tmp_path: Path) -> None:
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
-            running(101, "/tmp/w"),
+            running(101, "/tmp/w", session_id=THREAD),
+            home=tmp_path,
         )
         assert [row.target.pid for row in lane.rows] == [101]
 
-    def test_two_tuis_in_one_directory_are_not_guessed_between(self) -> None:
-        """A row addressed by the wrong pid is worse than one addressed by its id."""
+    def test_two_live_roots_in_one_workspace_remain_two_logical_sessions(
+        self, tmp_path: Path
+    ) -> None:
+        """Each exact argv id joins its own native root without workspace pairing."""
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w", written_at=STARTED_AT + 60)
+        write_live_user_rollout(tmp_path, OTHER_THREAD, "/tmp/w", written_at=STARTED_AT + 120)
+        roots = {
+            THREAD: dict(thread(THREAD, cwd="/tmp/w"), threadSource="user", sessionId=THREAD),
+            OTHER_THREAD: dict(
+                thread(OTHER_THREAD, cwd="/tmp/w"),
+                threadSource="user",
+                sessionId=OTHER_THREAD,
+            ),
+        }
+
+        lane = found(
+            FakeDaemon(roots),
+            running(101, "/tmp/w", session_id=THREAD),
+            running(102, "/tmp/w", session_id=OTHER_THREAD),
+            home=tmp_path,
+        )
+
+        assert {(row.target.session_id, row.target.pid) for row in lane.rows} == {
+            (THREAD, 101),
+            (OTHER_THREAD, 102),
+        }
+
+    def test_multiple_post_start_roots_fail_closed_to_the_live_process(
+        self, tmp_path: Path
+    ) -> None:
+        """One TUI cannot prove which of two roots is current, even in one workspace."""
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w", written_at=STARTED_AT + 60)
+        write_live_user_rollout(tmp_path, OTHER_THREAD, "/tmp/w", written_at=STARTED_AT + 120)
+        roots = {
+            THREAD: dict(thread(THREAD, cwd="/tmp/w"), threadSource="user", sessionId=THREAD),
+            OTHER_THREAD: dict(
+                thread(OTHER_THREAD, cwd="/tmp/w"),
+                threadSource="user",
+                sessionId=OTHER_THREAD,
+            ),
+        }
+
+        lane = found(FakeDaemon(roots), running(101, "/tmp/w"), home=tmp_path)
+
+        assert lane.rows == ()
+
+    def test_unclassified_daemon_and_rollout_evidence_never_confirm_a_root(
+        self, tmp_path: Path
+    ) -> None:
+        """TTY proves a live TUI; silence about native identity proves no thread id."""
+        rollout = write_rollout(tmp_path, THREAD, Path("/tmp/w"))
+        os.utime(rollout, (STARTED_AT + 60, STARTED_AT + 60))
+        unclassified = thread(THREAD, cwd="/tmp/w")
+        unclassified.pop("threadSource")
+
+        lane = found(
+            FakeDaemon({THREAD: unclassified}),
+            running(101, "/tmp/w", session_id=THREAD),
+            home=tmp_path,
+        )
+
+        assert lane.rows == ()
+
+    def test_one_root_and_two_unidentified_live_tuis_fail_closed(self, tmp_path: Path) -> None:
+        """TTY liveness without a shared native key is not a confirmed main Session."""
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
             running(101, "/tmp/w"),
             running(102, "/tmp/w"),
+            home=tmp_path,
         )
-        by_id = next(row for row in lane.rows if row.target.session_id == THREAD)
-        assert by_id.target.pid is None
-        assert by_id.lifecycle is SessionLifecycle.LIVE
-        # Both processes are still listed; neither was swallowed by the thread.
-        assert sorted(row.target.pid or 0 for row in lane.rows) == [0, 101, 102]
+        assert lane.rows == ()
 
     def test_a_thread_with_no_process_is_not_a_session(self) -> None:
         lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
         assert lane.rows == ()
 
-    def test_a_resumed_thread_becomes_a_session_again(self) -> None:
+    def test_a_resumed_thread_becomes_a_session_again(self, tmp_path: Path) -> None:
         daemon = FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")})
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
 
         assert found(daemon).rows == ()
-        assert [row.target.session_id for row in found(daemon, running(101, "/tmp/w")).rows] == [
-            THREAD
-        ]
+        assert [
+            row.target.session_id
+            for row in found(
+                daemon,
+                running(101, "/tmp/w", session_id=THREAD),
+                home=tmp_path,
+            ).rows
+        ] == [THREAD]
 
 
 class TestWhenTheDaemonIsNotThere:
-    def test_a_running_tui_is_still_listed(self) -> None:
-        """#82: a TUI started while the daemon was down is never adopted later."""
+    def test_an_unidentified_running_tui_is_not_a_confirmed_session(self) -> None:
+        """TTY liveness without a shared native identity stays outside the roster."""
         lane = found(None, running(101, "/tmp/w"))
-        assert [row.target.pid for row in lane.rows] == [101]
+        assert lane.rows == ()
 
-    def test_those_rows_say_where_they_came_from(self) -> None:
+    def test_the_lane_still_reports_why_daemon_evidence_is_absent(self) -> None:
         lane = found(None, running(101, "/tmp/w"))
         assert lane.degraded is not None
         assert lane.error is None  # the lane looked; it just looked with less
@@ -294,7 +427,7 @@ class TestWhenTheDaemonIsNotThere:
             FakeDaemon({}, raises=ConnectionRefusedError("no socket")),
             running(101, "/tmp/w"),
         )
-        assert [row.target.pid for row in lane.rows] == [101]
+        assert lane.rows == ()
         assert lane.degraded is not None
         assert lane.degraded.startswith(discovery.NO_DAEMON)
         assert "no socket" in lane.degraded  # the daemon's own words, not a summary
@@ -305,7 +438,7 @@ class TestWhenTheDaemonIsNotThere:
                 return {"data": "not a list"}
 
         lane = found(Odd({}), running(101, "/tmp/w"))
-        assert [row.target.pid for row in lane.rows] == [101]
+        assert lane.rows == ()
         assert lane.degraded is not None
 
     def test_a_daemon_that_answered_unreadably_is_not_reported_as_silent(self) -> None:
@@ -334,24 +467,31 @@ class TestWhenTheDaemonIsNotThere:
 
 
 class TestASessionNobodyHasSpokenToYet:
-    def test_it_is_addressed_by_its_pid_alone(self, tmp_path: Path) -> None:
-        """Measured (#73): `codex` writes the rollout naming it at its first turn."""
+    def test_it_is_not_a_confirmed_session_without_a_shared_native_id(self, tmp_path: Path) -> None:
+        """A PID and workspace are liveness evidence, not native root identity."""
         lane = found(None, running(101, "/tmp/w"), home=tmp_path)
-        assert lane.rows[0].target.session_id is None
-        assert lane.rows[0].target.pid == 101
+        assert lane.rows == ()
 
     def test_once_it_has_a_rollout_the_row_carries_its_thread_id(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        write_rollout(tmp_path, THREAD, workspace)
+        write_live_user_rollout(tmp_path, THREAD, workspace)
 
-        lane = found(None, running(101, workspace), home=tmp_path)
+        lane = found(None, running(101, workspace, session_id=THREAD), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
         assert lane.rows[0].target.pid == 101
 
-    def test_it_holds_its_relay_rather_than_delivering_into_a_turn_it_cannot_see(self) -> None:
+    def test_it_holds_its_relay_rather_than_delivering_into_a_turn_it_cannot_see(
+        self, tmp_path: Path
+    ) -> None:
         """A process is not evidence of a Reply Window."""
-        assert found(None, running(101, "/tmp/w")).rows[0].state is (SessionState.RUNNING)
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
+        lane = found(
+            None,
+            running(101, "/tmp/w", session_id=THREAD),
+            home=tmp_path,
+        )
+        assert lane.rows[0].state is SessionState.RUNNING
 
     def test_it_does_not_inherit_the_thread_the_last_session_here_left_behind(
         self, tmp_path: Path
@@ -369,16 +509,14 @@ class TestASessionNobodyHasSpokenToYet:
         os.utime(rollout, (STARTED_AT - 3600, STARTED_AT - 3600))
 
         lane = found(None, running(101, workspace), home=tmp_path)
-        assert lane.rows[0].target.session_id is None
-        assert lane.rows[0].target.pid == 101
+        assert lane.rows == ()
 
     def test_but_it_does_claim_the_rollout_it_wrote_itself(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        rollout = write_rollout(tmp_path, THREAD, workspace)
-        os.utime(rollout, (STARTED_AT + 60, STARTED_AT + 60))
+        write_live_user_rollout(tmp_path, THREAD, workspace)
 
-        lane = found(None, running(101, workspace), home=tmp_path)
+        lane = found(None, running(101, workspace, session_id=THREAD), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
 
     def test_it_does_not_take_the_thread_id_of_a_child_it_spawned(self, tmp_path: Path) -> None:
@@ -399,23 +537,22 @@ class TestASessionNobodyHasSpokenToYet:
         spawned = write_rollout(tmp_path, OTHER_THREAD, workspace, source="subagent")
         os.utime(spawned, (STARTED_AT + 120, STARTED_AT + 120))
 
-        lane = found(None, running(101, workspace), home=tmp_path)
+        lane = found(None, running(101, workspace, session_id=THREAD), home=tmp_path)
         assert lane.rows[0].target.session_id == THREAD
 
-    def test_a_rollout_too_old_to_say_still_names_the_session(self, tmp_path: Path) -> None:
-        """0.130.0 wrote no `thread_source`, and its Sessions are still Sessions.
-
-        Absence fails **open** here, exactly as it does on the daemon route
-        (`_child_of`): the alternative is a build that stops recognising every
-        Session written by a codex older than the field.
-        """
+    def test_a_rollout_that_cannot_classify_its_root_is_not_a_session(self, tmp_path: Path) -> None:
+        """An older rollout remains useful history, but is not positive root identity."""
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         rollout = write_rollout(tmp_path, THREAD, workspace)
         os.utime(rollout, (STARTED_AT + 60, STARTED_AT + 60))
 
-        lane = found(None, running(101, workspace), home=tmp_path)
-        assert lane.rows[0].target.session_id == THREAD
+        lane = found(
+            None,
+            running(101, workspace, session_id=THREAD),
+            home=tmp_path,
+        )
+        assert lane.rows == ()
 
 
 class TestWhatEachRowIsCalled:
@@ -442,14 +579,14 @@ class TestWhatEachRowIsCalled:
         """The daemon is where a thread name comes from, so these rows take the id."""
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        write_rollout(tmp_path, THREAD, workspace)
+        write_live_user_rollout(tmp_path, THREAD, workspace)
 
-        lane = found(None, running(101, workspace), home=tmp_path)
+        lane = found(None, running(101, workspace, session_id=THREAD), home=tmp_path)
         assert str(lane.rows[0].name) == f"workspace · {THREAD[:8]}"
 
-    def test_a_session_with_no_thread_id_yet_has_no_name_yet(self) -> None:
-        """#73: `codex` writes the id at the first turn, and there is nothing else to use."""
-        assert found(None, running(101, "/tmp/w")).rows[0].name is None
+    def test_a_tui_with_no_thread_id_has_no_roster_name(self) -> None:
+        """No identity means no Session row for the naming rule to decorate."""
+        assert found(None, running(101, "/tmp/w")).rows == ()
 
     def test_the_project_half_is_the_repository_when_the_workspace_is_in_one(self) -> None:
         async def inside_a_repository(asked: Path) -> str | None:
@@ -635,14 +772,24 @@ class TestANameThatIsOnlyThePromptReadBack:
 class TestWhenTheLaneCannotLookAtAll:
     def test_a_process_table_that_cannot_be_read_is_a_lane_error(self) -> None:
         lane = asyncio.run(
-            discover(None, processes=refusing_processes(OSError("no ps")))  # type: ignore[arg-type]
+            discover(
+                None,
+                evidence=discovery.ProcessEvidence(
+                    list_sessions=refusing_processes(OSError("no ps"))  # type: ignore[arg-type]
+                ),
+            )
         )
         assert lane.rows == ()
         assert lane.error is not None
 
     def test_and_it_carries_no_rows_so_core_leaves_the_roster_alone(self) -> None:
         lane = asyncio.run(
-            discover(None, processes=refusing_processes(TimeoutError()))  # type: ignore[arg-type]
+            discover(
+                None,
+                evidence=discovery.ProcessEvidence(
+                    list_sessions=refusing_processes(TimeoutError())  # type: ignore[arg-type]
+                ),
+            )
         )
         assert lane.rows == ()
         assert not lane.enumerated
@@ -696,9 +843,19 @@ def daemon_holding(*threads: dict) -> FakeDaemon:
 def sourced(thread_id: str, source: str | None) -> dict:
     """One thread the daemon holds, described only by where it came from."""
     described = thread(thread_id, cwd="/tmp/w")
-    if source is not None:
+    if source is None:
+        described.pop("threadSource")
+    else:
         described["threadSource"] = source
     return described
+
+
+def in_native_tree(child: dict, *, child_first: bool = False) -> FakeDaemon:
+    """One child and its proven live native root, sharing Codex's tree identity."""
+    root = dict(sourced(OTHER_THREAD, "user"), sessionId=OTHER_THREAD)
+    described = dict(child, sessionId=OTHER_THREAD)
+    held = (described, root) if child_first else (root, described)
+    return daemon_holding(*held)
 
 
 class TestThreadsTheDaemonRunsForItself:
@@ -742,18 +899,19 @@ class TestThreadsTheDaemonRunsForItself:
             "gvc-110-probe.c45yj3u_ · Reply with the single word READY. Do"
         ]
 
-    def test_the_session_keeps_its_process_even_when_the_phantom_is_listed_first(self) -> None:
-        """Both threads name the same `cwd`, and the pid join is first-come.
-
-        On the recorded run the Session happened to be listed first and took the
-        pid. Nothing promised that order: listed the other way round, the
-        phantom claims the workspace's only TUI and the real Session goes
-        pidless — a Session addressable by id alone, because of a thread that is
-        not one. Dropping it before the join is what makes the order stop
-        mattering.
-        """
+    def test_the_session_keeps_its_process_even_when_the_phantom_is_listed_first(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact user rollout composes with its thread; daemon order is irrelevant."""
+        write_live_user_rollout(tmp_path, str(RECORDED_SESSION["id"]), PROBE_WORKSPACE)
         lane = found(
-            daemon_holding(RECORDED_PHANTOM, RECORDED_SESSION), running(43261, PROBE_WORKSPACE)
+            daemon_holding(RECORDED_PHANTOM, RECORDED_SESSION),
+            running(
+                43261,
+                PROBE_WORKSPACE,
+                session_id=str(RECORDED_SESSION["id"]),
+            ),
+            home=tmp_path,
         )
         assert [(row.target.session_id, row.target.pid) for row in lane.rows] == [
             (RECORDED_SESSION["id"], 43261)
@@ -775,33 +933,35 @@ class TestThreadsTheDaemonRunsForItself:
 
     def test_a_subagent_thread_is_kept_for_the_child_process_rule(self) -> None:
         """#79 classifies it; it cannot classify a row this module deleted."""
-        lane = found_with_tuis(daemon_holding(sourced(THREAD, "subagent")))
+        root = dict(sourced(OTHER_THREAD, "user"), sessionId=OTHER_THREAD)
+        child = dict(sourced(THREAD, "subagent"), sessionId=OTHER_THREAD)
+        lane = found_with_tuis(daemon_holding(root, child))
         assert [row.target.session_id for row in lane.rows if not row.child.is_main] == [THREAD]
 
     def test_a_guardian_review_thread_is_kept_for_the_same_reason(self) -> None:
         """One delegate class split by a boolean: `codex-rs/core/src/codex_delegate.rs:111`."""
-        lane = found_with_tuis(daemon_holding(sourced(THREAD, "guardian_review")))
+        root = dict(sourced(OTHER_THREAD, "user"), sessionId=OTHER_THREAD)
+        child = dict(sourced(THREAD, "guardian_review"), sessionId=OTHER_THREAD)
+        lane = found_with_tuis(daemon_holding(root, child))
         assert [row.target.session_id for row in lane.rows if not row.child.is_main] == [THREAD]
 
-    def test_a_daemon_too_old_to_say_changes_nothing(self) -> None:
-        """Absent is not "not user". A 0.130-era daemon names no source at all."""
+    def test_an_exact_user_rollout_supplies_an_old_daemons_missing_source(self) -> None:
+        """A 0.130-era daemon can omit source; exact rollout evidence supplies `user`."""
         lane = found_with_tuis(daemon_holding(sourced(THREAD, None)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
-    def test_a_thread_the_daemon_declined_to_classify_is_kept_too(self) -> None:
+    def test_an_exact_user_rollout_supplies_a_null_daemon_source(self) -> None:
         """`null` is how a 0.149.1 daemon spells the same absence.
 
         `thread_source` is an `Option` that is always serialised, so "no source
-        recorded" reaches this build as `"threadSource": null` — the ordinary
-        state of every thread codex started without classifying, and of every
-        older thread a current daemon loads. Read as a *value* rather than as an
-        absence, it would empty the roster of all of them.
+        recorded" reaches this build as `"threadSource": null`. It is not root
+        classification by itself; the fixture's exact user rollout is.
         """
         lane = found_with_tuis(daemon_holding(dict(sourced(THREAD, None), threadSource=None)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
-    def test_a_source_field_of_a_shape_this_build_cannot_read_is_kept(self) -> None:
-        """Fails open, like every other unreadable field here: a roster lists."""
+    def test_an_exact_user_rollout_supplies_an_unreadable_daemon_source(self) -> None:
+        """An unreadable daemon field says nothing; the exact user rollout says root."""
         lane = found_with_tuis(daemon_holding(dict(sourced(THREAD, None), threadSource=7)))
         assert [row.target.session_id for row in lane.rows] == [THREAD]
 
@@ -831,13 +991,87 @@ class TestTheChildProcessRule:
     and drops the invisibility: the row is listed, under its parent.
     """
 
+    def test_only_the_live_native_tree_becomes_roster_rows(self, tmp_path: Path) -> None:
+        """Exact shared identity makes one root live; `sessionId` carries its children."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        write_live_user_rollout(tmp_path, THREAD, workspace)
+        children = (
+            ("01a03b06-f995-7b60-bc9f-e2152ee4ed33", "subagent"),
+            ("01a03b06-f995-7b60-bc9f-e2152ee4ed34", "subagent"),
+            ("01a03b06-f995-7b60-bc9f-e2152ee4ed35", "guardian_review"),
+        )
+        root = dict(sourced(THREAD, "user"), cwd=str(workspace), sessionId=THREAD)
+        child_threads = [
+            dict(
+                sourced(thread_id, source),
+                cwd=str(workspace),
+                sessionId=THREAD,
+                parentThreadId=THREAD,
+            )
+            for thread_id, source in children
+        ]
+        historical = dict(sourced(OTHER_THREAD, "user"), cwd=str(workspace), sessionId=OTHER_THREAD)
+        historical_child = dict(
+            sourced("01a0385e-4872-7353-bdc5-8966c6165a8f", "subagent"),
+            cwd=str(workspace),
+            sessionId=OTHER_THREAD,
+            parentThreadId=OTHER_THREAD,
+        )
+
+        lane = found(
+            daemon_holding(root, *child_threads, historical, historical_child),
+            running(101, workspace, session_id=THREAD),
+            home=tmp_path,
+        )
+
+        assert [
+            (
+                row.target.session_id,
+                row.target.pid,
+                row.child.kind,
+                row.child.parent.session_id if row.child.parent is not None else None,
+                row.child.parent.pid if row.child.parent is not None else None,
+            )
+            for row in lane.rows
+        ] == [
+            (THREAD, 101, ChildKind.MAIN, None, None),
+            *[(thread_id, None, ChildKind.CHILD, THREAD, 101) for thread_id, _source in children],
+        ]
+
+    def test_exact_user_rollout_supplies_a_daemon_roots_missing_source(
+        self, tmp_path: Path
+    ) -> None:
+        """Exact live identity keeps native children when daemon root classification is absent."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        write_live_user_rollout(tmp_path, THREAD, workspace)
+        root = dict(sourced(THREAD, None), cwd=str(workspace), sessionId=THREAD)
+        child_id = "01a03b06-f995-7b60-bc9f-e2152ee4ed33"
+        child = dict(
+            sourced(child_id, "subagent"),
+            cwd=str(workspace),
+            sessionId=THREAD,
+            parentThreadId=THREAD,
+        )
+
+        lane = found(
+            daemon_holding(root, child),
+            running(101, workspace, session_id=THREAD),
+            home=tmp_path,
+        )
+
+        assert [row.target.session_id for row in lane.rows] == [THREAD, child_id]
+        assert lane.rows[0].target.pid == 101
+        assert lane.rows[1].child.parent == lane.rows[0].target
+
     def test_a_subagent_thread_is_a_child(self) -> None:
-        lane = found_with_tuis(daemon_holding(sourced(THREAD, "subagent")))
+        lane = found_with_tuis(in_native_tree(sourced(THREAD, "subagent")))
         child = next(row for row in lane.rows if row.target.session_id == THREAD)
         assert child.child.kind is ChildKind.CHILD
 
     def test_a_guardian_review_thread_is_a_child(self) -> None:
-        lane = found_with_tuis(daemon_holding(sourced(THREAD, "guardian_review")))
+        lane = found_with_tuis(in_native_tree(sourced(THREAD, "guardian_review")))
         child = next(row for row in lane.rows if row.target.session_id == THREAD)
         assert child.child.kind is ChildKind.CHILD
 
@@ -865,10 +1099,9 @@ class TestTheChildProcessRule:
     def test_a_child_is_listed_under_the_thread_that_spawned_it(self) -> None:
         """`parentThreadId` rides on the same read the classification does."""
         described = dict(sourced(THREAD, "subagent"), parentThreadId=OTHER_THREAD)
-        lane = found_with_tuis(daemon_holding(described))
-        assert lane.rows[0].child.parent == SessionTarget(
-            agent=AgentKind.CODEX, session_id=OTHER_THREAD
-        )
+        lane = found_with_tuis(in_native_tree(described))
+        rows = {row.target.session_id: row for row in lane.rows}
+        assert rows[THREAD].child.parent == rows[OTHER_THREAD].target
 
     def test_a_child_whose_parent_the_daemon_does_not_name_is_still_a_child(self) -> None:
         """The locked type's own rule: demoting it over a missing link opens the Relay.
@@ -878,9 +1111,10 @@ class TestTheChildProcessRule:
         arrives without one is the ordinary case and not a malformed row.
         """
         lane = found_with_tuis(
-            daemon_holding(dict(sourced(THREAD, "subagent"), parentThreadId=None))
+            in_native_tree(dict(sourced(THREAD, "subagent"), parentThreadId=None))
         )
-        assert lane.rows[0].child == ChildClassification(kind=ChildKind.CHILD, parent=None)
+        child = next(row for row in lane.rows if row.target.session_id == THREAD)
+        assert child.child == ChildClassification(kind=ChildKind.CHILD, parent=None)
 
     def test_a_child_is_never_named(self) -> None:
         """#78's rule, held where the row is made as well as where it is kept.
@@ -891,9 +1125,10 @@ class TestTheChildProcessRule:
         the user says to reach a Session, and there is nothing here to reach.
         """
         lane = found_with_tuis(
-            daemon_holding(dict(sourced(THREAD, "subagent"), name="tidy the tests"))
+            in_native_tree(dict(sourced(THREAD, "subagent"), name="tidy the tests"))
         )
-        assert lane.rows[0].name is None
+        child = next(row for row in lane.rows if row.target.session_id == THREAD)
+        assert child.name is None
 
     def test_the_child_list_is_the_keep_list_without_the_user(self) -> None:
         """Derived, not written out beside it, so the two cannot disagree (#112, #79).
@@ -907,25 +1142,31 @@ class TestTheChildProcessRule:
         assert discovery.CHILD_THREAD_SOURCES == discovery.SESSION_THREAD_SOURCES - {"user"}
         assert "user" not in discovery.CHILD_THREAD_SOURCES
 
-    def test_a_child_never_takes_the_workspaces_tui(self) -> None:
-        """A subagent runs inside the daemon; the pid in that directory is not its.
-
-        The same first-come join #112 fixed for the phantom, and it bites
-        harder here: a child *keeps* its row, so a child that claimed the pid
-        would leave the user's own Session addressable by id alone while an
-        unrelayable row held its process.
-        """
-        child = dict(sourced(THREAD, "subagent"), cwd="/tmp/w", parentThreadId=OTHER_THREAD)
-        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w")
-        lane = found(daemon_holding(child, parent), running(4321, "/tmp/w"))
+    def test_a_child_never_takes_the_roots_tui(self, tmp_path: Path) -> None:
+        """Only the exact user rollout composes with the process; a child has no PID."""
+        child = dict(
+            sourced(THREAD, "subagent"),
+            cwd="/tmp/w",
+            sessionId=OTHER_THREAD,
+            parentThreadId=OTHER_THREAD,
+        )
+        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w", sessionId=OTHER_THREAD)
+        write_live_user_rollout(tmp_path, OTHER_THREAD, "/tmp/w")
+        lane = found(
+            daemon_holding(child, parent),
+            running(4321, "/tmp/w", session_id=OTHER_THREAD),
+            home=tmp_path,
+        )
         held = {row.target.session_id: row.target.pid for row in lane.rows}
         assert held == {THREAD: None, OTHER_THREAD: 4321}
 
-    def test_a_child_names_its_parent_by_the_address_that_parents_row_carries(self) -> None:
+    def test_a_child_names_its_parent_by_the_address_that_parents_row_carries(
+        self, tmp_path: Path
+    ) -> None:
         """One Session, one address — and this one has the workspace's pid in it.
 
         `parentThreadId` names a thread, but a Session's address is that thread
-        *and* the pid `_pid_for` joined to it, so a parent named from the field
+        *and* the pid its exact rollout joined to it, so a parent named from the field
         alone points at an address no row in the roster holds. #79's acceptance
         `child` step reads exactly this link, and failed on exactly this
         difference: it saw the child listed under `codex:01a040cc-…` while the
@@ -934,9 +1175,19 @@ class TestTheChildProcessRule:
         The child is listed *before* its parent here, because the daemon orders
         threads however it likes and the answer may not depend on that order.
         """
-        child = dict(sourced(THREAD, "subagent"), cwd="/tmp/w", parentThreadId=OTHER_THREAD)
-        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w")
-        lane = found(daemon_holding(child, parent), running(4321, "/tmp/w"))
+        child = dict(
+            sourced(THREAD, "subagent"),
+            cwd="/tmp/w",
+            sessionId=OTHER_THREAD,
+            parentThreadId=OTHER_THREAD,
+        )
+        parent = dict(sourced(OTHER_THREAD, "user"), cwd="/tmp/w", sessionId=OTHER_THREAD)
+        write_live_user_rollout(tmp_path, OTHER_THREAD, "/tmp/w")
+        lane = found(
+            daemon_holding(child, parent),
+            running(4321, "/tmp/w", session_id=OTHER_THREAD),
+            home=tmp_path,
+        )
         rows = {row.target.session_id: row for row in lane.rows}
         assert rows[THREAD].child.parent == rows[OTHER_THREAD].target
         assert rows[THREAD].child.parent.pid == 4321
@@ -952,7 +1203,7 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
     long as the daemon holds the thread, saying the same thing.
     """
 
-    def test_the_phantom_is_never_read_for_its_turns(self) -> None:
+    def test_the_phantom_is_never_read_for_its_turns(self, tmp_path: Path) -> None:
         """The expensive read (558,875 bytes, #76) is not spent on a non-Session.
 
         Dropping it after the row was built would still cost this, every tick,
@@ -971,10 +1222,20 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
                 return await super().request(method, params)
 
         daemon = Counting({str(held["id"]): held for held in (RECORDED_SESSION, RECORDED_PHANTOM)})
+        write_live_user_rollout(tmp_path, str(RECORDED_SESSION["id"]), PROBE_WORKSPACE)
         asyncio.run(
             discover(
                 daemon,  # type: ignore[arg-type]
-                processes=listing(running(101, PROBE_WORKSPACE)),
+                evidence=discovery.ProcessEvidence(
+                    list_sessions=listing(
+                        running(
+                            101,
+                            PROBE_WORKSPACE,
+                            session_id=str(RECORDED_SESSION["id"]),
+                        )
+                    ),  # type: ignore[arg-type]
+                    home=tmp_path,
+                ),
                 turns=discovery.TurnCache(),
                 projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
             )
@@ -990,7 +1251,9 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
                 asyncio.run(
                     discover(
                         daemon,  # type: ignore[arg-type]
-                        processes=listing(),
+                        evidence=discovery.ProcessEvidence(
+                            list_sessions=listing()  # type: ignore[arg-type]
+                        ),
                         reported_non_sessions=skipped,
                         projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
                     )
@@ -1013,7 +1276,9 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
         asyncio.run(
             discover(
                 daemon_holding(RECORDED_SESSION, RECORDED_PHANTOM),  # type: ignore[arg-type]
-                processes=listing(),
+                evidence=discovery.ProcessEvidence(
+                    list_sessions=listing()  # type: ignore[arg-type]
+                ),
                 reported_non_sessions=skipped,
                 projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
             )

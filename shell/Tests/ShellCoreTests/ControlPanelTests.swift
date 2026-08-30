@@ -105,7 +105,8 @@ private let allSwitchesOff = """
             Issue.record("expected a reading")
             return
         }
-        #expect(reading.sessions == 4)
+        #expect(reading.sessions == 1)
+        #expect(reading.childProcesses == 3)
         #expect(
             reading.sessionRows.map(\.target.sessionID)
                 == ["parent-1", "child-2", "child-1", "orphan-1"])
