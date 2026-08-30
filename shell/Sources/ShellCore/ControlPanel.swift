@@ -40,7 +40,10 @@ public struct EngineStatus: Equatable, Sendable {
     public var pendingApprovals: Int
 
     public var callIsUp: Bool { callID != nil }
-    public var sessions: Int { sessionRows.count }
+    /// Logical live main Sessions, not every visible roster row.
+    public var sessions: Int { sessionRows.count { !$0.isChild } }
+    /// Visible subordinate rows, kept apart from the Session count.
+    public var childProcesses: Int { sessionRows.count { $0.isChild } }
     public var emptyRosterMessage: String? {
         sessionRows.isEmpty ? "No live Sessions" : nil
     }

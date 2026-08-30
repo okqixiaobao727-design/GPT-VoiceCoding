@@ -235,6 +235,9 @@ private struct StatusSection: View {
     let panel: ControlPanel
 
     var body: some View {
+        let sessionNoun = status.sessions == 1 ? "session" : "sessions"
+        let childProcessNoun = status.childProcesses == 1 ? "child process" : "child processes"
+
         VStack(alignment: .leading, spacing: 8) {
             // Never gated by any switch, including the master (ADR 0002).
             ForEach(status.switches) { reading in
@@ -251,7 +254,9 @@ private struct StatusSection: View {
             SessionRoster(status: status)
 
             Text(
-                "\(status.sessions) sessions · \(status.pendingRelays) pending relays · "
+                "\(status.sessions) \(sessionNoun) · "
+                    + "\(status.childProcesses) \(childProcessNoun) · "
+                    + "\(status.pendingRelays) pending relays · "
                     + "\(status.pendingApprovals) pending approvals"
             )
             .font(.caption).foregroundStyle(.secondary)

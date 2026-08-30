@@ -12,16 +12,15 @@ import asyncio
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.codex.processes import (
-    START_TIME_GRANULARITY_SECONDS,
     Candidate,
     enumerate_sessions,
     is_interactive,
+    session_id_from_argv,
 )
 
 CODEX = "/Users/simon/.nvm/versions/node/v24.13.0/lib/node_modules/@openai/codex/bin/codex"
 
-#: One held moment, so a start time derived from an elapsed duration is exact.
-NOW = 1_787_700_000.0
+THREAD = "01a03b06-f995-7b60-bc9f-e2152ee4ed32"
 
 #: ChatGPT.app's own app-server, verbatim and shortened. The `-c` value is the
 #: whole point: it sits where the subcommand would be.
@@ -75,11 +74,6 @@ class TestSessions:
         assert is_interactive([CODEX, "fork", "--last"])
 
 
-#: The `etime` column every fixture below carries. `ps` emits it for every
-#: process, so a listing without one is not a shape this reader has to meet.
-ELAPSED = "05:00"
-
-
 class TestReadingTheProcessTable:
     """The two commands are injected: what is under test is the reading."""
 
@@ -93,27 +87,50 @@ class TestReadingTheProcessTable:
         return run
 
     def found(self, listing: str, cwds: dict[int, str]) -> tuple[Candidate, ...]:
-        return asyncio.run(
-            enumerate_sessions(run=self.build(listing, cwds), now=lambda: NOW)  # type: ignore[arg-type]
-        )
+        return asyncio.run(enumerate_sessions(run=self.build(listing, cwds)))  # type: ignore[arg-type]
 
     def test_a_session_is_reported_by_pid_and_workspace(self) -> None:
-        rows = self.found(f"  101 {ELAPSED} {CODEX}\n", {101: "/tmp/workspace"})
+        rows = self.found(f"  101 10 ttys001 {CODEX}\n", {101: "/tmp/workspace"})
         assert rows == (
             Candidate(
                 pid=101,
                 workspace=Path("/tmp/workspace"),
-                started_at=NOW - 300.0 - START_TIME_GRANULARITY_SECONDS,
             ),
         )
+
+    def test_a_resumed_uuid_is_the_processes_exact_native_identity(self) -> None:
+        rows = self.found(
+            f"  101 10 ttys001 {CODEX} resume {THREAD}\n",
+            {101: "/tmp/workspace"},
+        )
+        assert rows[0].session_id == THREAD
+
+    def test_a_resume_name_is_not_an_exact_native_identity(self) -> None:
+        assert session_id_from_argv([CODEX, "resume", "named-session"]) is None
+
+    def test_a_fork_uuid_names_the_source_not_the_new_session(self) -> None:
+        assert session_id_from_argv([CODEX, "fork", THREAD]) is None
+
+    def test_only_a_process_with_a_controlling_terminal_is_a_session(self) -> None:
+        """The detached shape captured by #144 is not a live interactive run."""
+        listing = "\n".join(
+            (
+                f"  101 10 ttys001 {CODEX}",
+                f"  102 1 ?? {CODEX}",
+            )
+        )
+
+        rows = self.found(listing, {101: "/tmp/live", 102: "/tmp/detached"})
+
+        assert [row.pid for row in rows] == [101]
 
     def test_the_jobs_beside_it_are_left_out(self) -> None:
         listing = "\n".join(
             (
-                f"  101 {ELAPSED} {CODEX}",
-                f"  102 {ELAPSED} {CODEX} mcp-server",
-                f"  103 {ELAPSED} {' '.join(CHATGPT_APP_SERVER)}",
-                f"  104 {ELAPSED} /usr/bin/python3 codex",
+                f"  101 10 ttys001 {CODEX}",
+                f"  102 10 ttys002 {CODEX} mcp-server",
+                f"  103 10 ttys003 {' '.join(CHATGPT_APP_SERVER)}",
+                "  104 10 ttys004 /usr/bin/python3 codex",
             )
         )
         rows = self.found(listing, {n: "/tmp" for n in (101, 102, 103, 104)})
@@ -121,10 +138,10 @@ class TestReadingTheProcessTable:
 
     def test_a_process_whose_cwd_cannot_be_read_is_left_out(self) -> None:
         """It ended between the listing and the lookup, or it is not ours."""
-        assert self.found(f"  101 {ELAPSED} {CODEX}\n", {}) == ()
+        assert self.found(f"  101 10 ttys001 {CODEX}\n", {}) == ()
 
     def test_no_codex_at_all_is_an_empty_answer_not_a_failure(self) -> None:
-        assert self.found(f"  1 {ELAPSED} /sbin/launchd\n", {}) == ()
+        assert self.found("  1 0 ?? /sbin/launchd\n", {}) == ()
 
     def test_a_line_the_table_wrapped_or_mangled_is_skipped(self) -> None:
         assert self.found("not a process line\n\n", {}) == ()
@@ -141,46 +158,3 @@ class TestReadingTheProcessTable:
         except OSError:
             return
         raise AssertionError("a process table that cannot be read must not read as empty")
-
-
-class TestWhenTheProcessStarted:
-    """A row that will be joined to a rollout has to say when its process began.
-
-    The join `discovery.py` makes is *workspace to rollout*, and a workspace
-    outlives the Sessions run in it: yesterday's rollout sits in the same
-    directory as today's fresh TUI. Without a start time the newest rollout in
-    the workspace is claimed by whoever is running there now, which names an
-    un-spoken-to Session with a dead thread's id — and `_better_known` then
-    protects that wrong id from ever being corrected.
-
-    `etime` rather than `lstart` because its shape is fixed and its content is
-    not a localised date; macOS `ps` has no `etimes`, measured 2026-08-26.
-    """
-
-    def enumerated(
-        self, listing: str, cwds: dict[int, str], *, now: float
-    ) -> tuple[Candidate, ...]:
-        async def run(argv: list[str]) -> str:
-            if argv[0].endswith("ps"):
-                return listing
-            pid = int(argv[argv.index("-p") + 1])
-            return f"p{pid}\nfcwd\nn{cwds[pid]}\n" if pid in cwds else ""
-
-        return asyncio.run(enumerate_sessions(run=run, now=lambda: now))  # type: ignore[arg-type]
-
-    def test_minutes_and_seconds(self) -> None:
-        rows = self.enumerated(f"  101 05:00 {CODEX}\n", {101: "/tmp/w"}, now=1000.0)
-        assert rows[0].started_at == 1000.0 - 300.0 - START_TIME_GRANULARITY_SECONDS
-
-    def test_hours_are_read_too(self) -> None:
-        rows = self.enumerated(f"  101 02:05:00 {CODEX}\n", {101: "/tmp/w"}, now=10_000.0)
-        assert rows[0].started_at == 10_000.0 - 7500.0 - START_TIME_GRANULARITY_SECONDS
-
-    def test_days_are_read_too(self) -> None:
-        rows = self.enumerated(f"  101 2-02:05:00 {CODEX}\n", {101: "/tmp/w"}, now=1_000_000.0)
-        expected = 1_000_000.0 - (2 * 86_400 + 7500.0) - START_TIME_GRANULARITY_SECONDS
-        assert rows[0].started_at == expected
-
-    def test_an_unreadable_elapsed_time_leaves_the_process_out(self) -> None:
-        """A row that cannot say when it started cannot be joined to a rollout safely."""
-        assert self.enumerated(f"  101 ??? {CODEX}\n", {101: "/tmp/w"}, now=1000.0) == ()

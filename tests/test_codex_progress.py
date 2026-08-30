@@ -12,21 +12,31 @@ read, and the tests below are mostly about *which reads happen*.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.codex import CodexAgentAdapter
-from gpt_voicecoding.adapters.agent.codex.discovery import TurnCache, discover
+from gpt_voicecoding.adapters.agent.codex.discovery import ProcessEvidence, TurnCache, discover
 from gpt_voicecoding.seams.agent import (
     ProgressRole,
     SessionLifecycle,
     SessionState,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
-from test_codex_discovery import THREAD, FakeDaemon, running, thread
+from test_codex_discovery import (
+    THREAD,
+    FakeDaemon,
+    running,
+    thread,
+    write_live_user_rollout,
+)
 from test_codex_thread_tail import MEASURED, MEASURED_SECONDS, spoke, told, turn
 
 WORKSPACE = "/tmp/workspace"
+_HOME_GUARD = tempfile.TemporaryDirectory(prefix="gvc-codex-progress-")
+TEST_HOME = Path(_HOME_GUARD.name)
+write_live_user_rollout(TEST_HOME, THREAD, WORKSPACE)
 
 
 class TurnedDaemon(FakeDaemon):
@@ -66,12 +76,16 @@ def once() -> list[dict]:
 
 
 async def processes() -> tuple:
-    return (running(6548, WORKSPACE),)
+    return (running(6548, WORKSPACE, session_id=THREAD),)
 
 
 def found(daemon: FakeDaemon, cache: TurnCache | None = None):
     return asyncio.run(
-        discover(daemon, processes=processes, home=Path("/nonexistent"), turns=cache)
+        discover(
+            daemon,
+            evidence=ProcessEvidence(list_sessions=processes, home=TEST_HOME),
+            turns=cache,
+        )
     )
 
 
@@ -198,8 +212,7 @@ class TestTheDaemonNote:
         lane = asyncio.run(
             discover(
                 None,
-                processes=processes,
-                home=Path("/nonexistent"),
+                evidence=ProcessEvidence(list_sessions=processes, home=Path("/nonexistent")),
                 daemon_note="the Codex CLI is '0.148.0' and the app-server is '0.149.1'",
             )
         )
@@ -215,8 +228,7 @@ class TestTheDaemonNote:
         lane = asyncio.run(
             discover(
                 daemon,
-                processes=processes,
-                home=Path("/nonexistent"),
+                evidence=ProcessEvidence(list_sessions=processes, home=Path("/nonexistent")),
                 turns=TurnCache(),
                 daemon_note="the shared Codex daemon did not say its versions",
             )
@@ -260,7 +272,7 @@ class _HeldDaemon:
         self._client = None
 
 
-def adapter_over(daemon: object | None) -> CodexAgentAdapter:
+def adapter_over(daemon: object | None, *, home: Path = TEST_HOME) -> CodexAgentAdapter:
     """A whole adapter over this daemon, enumerating *for real*.
 
     **Nothing here stubs `discover`, and that is the point.** An earlier version
@@ -273,7 +285,7 @@ def adapter_over(daemon: object | None) -> CodexAgentAdapter:
     """
     return CodexAgentAdapter(
         daemon=_HeldDaemon(daemon),  # type: ignore[arg-type]
-        processes=processes,
+        process_evidence=ProcessEvidence(list_sessions=processes, home=home),
     )
 
 
@@ -331,20 +343,21 @@ class TestThePerTargetRead:
         assert [entry.text for entry in row.progress.recent][-1] == "and again"
 
     def test_a_session_the_daemon_does_not_hold_is_never_guessed_at(self) -> None:
-        """An unattached row's rollout is on disk; reading it is what P6 left behind."""
+        """An unattached process with no exact rollout identity is never deep-read."""
         daemon = TurnedDaemon({}, {})
-        adapter = adapter_over(daemon)
+        adapter = adapter_over(daemon, home=Path("/nonexistent"))
 
         row = asyncio.run(adapter.inspect(self.target(None, 6548)))
 
         assert daemon.deep == []
         assert row.progress is None
 
-    def test_a_daemon_that_is_not_answering_leaves_the_row_as_it_stands(self) -> None:
-        """No connection, no reading — and certainly no invented one."""
+    def test_a_pid_lookup_returns_the_exact_rollout_verified_live_row(self) -> None:
+        """The query may name a PID; the row stays live only from its exact native join."""
         adapter = adapter_over(None)
 
         row = asyncio.run(adapter.inspect(self.target(None, 6548)))
 
         assert row.progress is None
         assert row.lifecycle is SessionLifecycle.LIVE
+        assert row.target.session_id == THREAD

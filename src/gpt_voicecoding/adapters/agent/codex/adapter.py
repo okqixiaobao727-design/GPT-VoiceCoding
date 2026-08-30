@@ -151,7 +151,7 @@ class CodexAgentAdapter:
         own_socket_path: Path | None = None,
         own_log_path: Path | None = None,
         daemon: SharedDaemon | None = None,
-        processes: codex_discovery.ProcessLister | None = None,
+        process_evidence: codex_discovery.ProcessEvidence | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or CodexSettings()
@@ -195,10 +195,10 @@ class CodexAgentAdapter:
         #: The project half of every Session Name this lane composes, read once
         #: per workspace and kept for the life of the adapter (#78).
         self._projects = ProjectNames()
-        #: How the machine's own process table is read. Injected for the reason
-        #: the daemon is: a test that shelled out to `ps` would be a test whose
-        #: answer depends on what the person running it happens to have open.
-        self._processes = processes or codex_discovery.enumerate_sessions
+        #: The process table and its paired rollout root. Injected for the reason
+        #: the daemon is: tests must not shell out to `ps` or combine a fake
+        #: process reading with the machine's real rollout tree.
+        self._process_evidence = process_evidence or codex_discovery.ProcessEvidence()
         self._opened = False
 
     # -- the connection this engine owns ----------------------------------
@@ -364,7 +364,7 @@ class CodexAgentAdapter:
         client = await self._shared_daemon()
         lane = await codex_discovery.discover(
             client,
-            processes=self._processes,
+            evidence=self._process_evidence,
             turns=self._turns,
             daemon_note=self._daemon.note,
             projects=self._projects,
