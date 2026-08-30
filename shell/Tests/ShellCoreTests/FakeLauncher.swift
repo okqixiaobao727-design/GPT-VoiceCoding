@@ -50,23 +50,14 @@ final class FakeLauncher: EngineLaunching, @unchecked Sendable {
         self.deaf = deaf
     }
 
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess {
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
         let run: Run? = lock.withLock {
             launches.append(command)
             return script.isEmpty ? nil : script.removeFirst()
         }
         let process = FakeProcess(
-            pid: Int32(1000 + launchCount()), deaf: deaf, exited: exited)
+            pid: Int32(1000 + launchCount()), run: run, clock: clock, deaf: deaf)
         lock.withLock { children.append(process) }
-
-        guard let run else { return process }
-        if !run.stderr.isEmpty { stderr(Data(run.stderr.utf8)) }
-        clock.advance(run.uptime)
-        exited(run.code)
         return process
     }
 
@@ -76,16 +67,38 @@ final class FakeLauncher: EngineLaunching, @unchecked Sendable {
 
 final class FakeProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32
+    private let run: FakeLauncher.Run?
+    private let clock: TestClock
     private let deaf: Bool
-    private let exited: @Sendable (Int32) -> Void
     private let lock = NSLock()
     private var asked = false
     private var forced = false
+    private var code: Int32?
+    private var exitWaiter: CheckedContinuation<Int32, Never>?
 
-    init(pid: Int32, deaf: Bool = false, exited: @escaping @Sendable (Int32) -> Void = { _ in }) {
+    init(pid: Int32, run: FakeLauncher.Run?, clock: TestClock, deaf: Bool = false) {
         processIdentifier = pid
+        self.run = run
+        self.clock = clock
         self.deaf = deaf
-        self.exited = exited
+    }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        if let run {
+            if !run.stderr.isEmpty { await deliveringStderr(Data(run.stderr.utf8)) }
+            clock.advance(run.uptime)
+            return run.code
+        }
+        return await withCheckedContinuation { continuation in
+            let finished: Int32? = lock.withLock {
+                if let code { return code }
+                exitWaiter = continuation
+                return nil
+            }
+            if let finished { continuation.resume(returning: finished) }
+        }
     }
 
     /// A cooperating child stops; a deaf one does not, which is the case the
@@ -93,16 +106,27 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
     func requestStop() {
         lock.withLock { asked = true }
         guard !deaf else { return }
-        exited(-SIGTERM)
+        resolve(-SIGTERM)
     }
 
     func forceStop() {
         lock.withLock { forced = true }
-        exited(-SIGKILL)
+        resolve(-SIGKILL)
     }
 
     var stopRequested: Bool { lock.withLock { asked } }
     var stopForced: Bool { lock.withLock { forced } }
+
+    private func resolve(_ code: Int32) {
+        let waiting: CheckedContinuation<Int32, Never>? = lock.withLock {
+            guard self.code == nil else { return nil }
+            self.code = code
+            let waiter = exitWaiter
+            exitWaiter = nil
+            return waiter
+        }
+        waiting?.resume(returning: code)
+    }
 }
 
 /// Time the test moves. Sleeping returns at once and is recorded, so the backoff

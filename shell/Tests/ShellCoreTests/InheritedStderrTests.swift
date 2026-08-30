@@ -34,13 +34,41 @@ import Testing
             contentsOf: Data("config: [delegate] model is required\n".utf8))
         try stderr.pipe.fileHandleForWriting.close()
 
-        stderr.finish()
+        await stderr.finish()
 
-        // Which of the two readers got the bytes is Foundation's to decide, and
-        // the handler delivers on its own queue — so wait for the words rather
-        // than assuming they have landed by the time `finish()` returns.
-        try await said.waits(for: "config: [delegate] model is required\n")
+        // `finish()` returns only after the one reader's delivery has returned.
+        #expect(said.text() == "config: [delegate] model is required\n")
         #expect(!stderr.isMonitoring)
+    }
+
+    @Test func finishWaitsForAnInFlightDelivery() async throws {
+        let gate = DeliveryGate()
+        let stderr = InheritedStderr(deliver: { chunk in
+            await gate.holdDelivery(chunk)
+        })
+        stderr.read()
+
+        let refusal = Data("config: refusal\n".utf8)
+        try stderr.pipe.fileHandleForWriting.write(contentsOf: refusal)
+        try stderr.pipe.fileHandleForWriting.close()
+        await gate.waitUntilDeliveryStarts()
+
+        let finishing = Task {
+            await gate.recordFinishCalled()
+            await stderr.finish()
+            await gate.recordFinishReturned()
+        }
+        await gate.waitUntilFinishIsCalled()
+        await gate.releaseDelivery()
+        await finishing.value
+
+        #expect(
+            await gate.events() == [
+                .deliveryStarted,
+                .finishCalled,
+                .deliveryFinished(refusal),
+                .finishReturned,
+            ])
     }
 
     @Test func finishingAnAlreadyDrainedPipeFindsNothingTwice() async throws {
@@ -55,7 +83,7 @@ import Testing
         try stderr.pipe.fileHandleForWriting.close()
         try await waitUntil("the watch came down") { !stderr.isMonitoring }
 
-        stderr.finish()
+        await stderr.finish()
 
         #expect(said.text() == "starting\n")
         #expect(!stderr.isMonitoring)
@@ -97,4 +125,59 @@ private final class Collected: @unchecked Sendable {
             self.text() == expected
         }
     }
+}
+
+private enum DeliveryEvent: Equatable {
+    case deliveryStarted
+    case finishCalled
+    case deliveryFinished(Data)
+    case finishReturned
+}
+
+private actor DeliveryGate {
+    private var recorded: [DeliveryEvent] = []
+    private var deliveryStarted = false
+    private var finishCalled = false
+    private var releaseRequested = false
+    private var deliveryStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var finishCallWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdDelivery(_ chunk: Data) async {
+        recorded.append(.deliveryStarted)
+        deliveryStarted = true
+        for waiter in deliveryStartWaiters { waiter.resume() }
+        deliveryStartWaiters.removeAll()
+
+        if !releaseRequested {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        recorded.append(.deliveryFinished(chunk))
+    }
+
+    func waitUntilDeliveryStarts() async {
+        guard !deliveryStarted else { return }
+        await withCheckedContinuation { deliveryStartWaiters.append($0) }
+    }
+
+    func recordFinishCalled() {
+        recorded.append(.finishCalled)
+        finishCalled = true
+        for waiter in finishCallWaiters { waiter.resume() }
+        finishCallWaiters.removeAll()
+    }
+
+    func waitUntilFinishIsCalled() async {
+        guard !finishCalled else { return }
+        await withCheckedContinuation { finishCallWaiters.append($0) }
+    }
+
+    func releaseDelivery() {
+        releaseRequested = true
+        for waiter in releaseWaiters { waiter.resume() }
+        releaseWaiters.removeAll()
+    }
+
+    func recordFinishReturned() { recorded.append(.finishReturned) }
+    func events() -> [DeliveryEvent] { recorded }
 }

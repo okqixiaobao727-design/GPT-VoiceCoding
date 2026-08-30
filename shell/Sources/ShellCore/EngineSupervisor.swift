@@ -18,6 +18,15 @@ public protocol EngineProcess: AnyObject, Sendable {
     /// supervisor's own `startedAt` does not move — a child that reports nothing
     /// is timed exactly as it was.
     var launchOverhead: TimeInterval { get }
+    /// Wait for this run to end, delivering its inherited stderr as one ordered
+    /// byte stream along the way.
+    ///
+    /// Deliveries are serial and never overlap. This returns only after the pipe
+    /// reaches EOF and every delivery has returned; after it returns, this run
+    /// cannot deliver again.
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32
     /// Ask it to stop. `SIGTERM`: the engine stops in order — loops cancelled,
     /// adapters closed in reverse, socket removed — so the next start is not left
     /// claiming its own debris.
@@ -35,11 +44,7 @@ extension EngineProcess {
 /// How the engine is spawned. A protocol so the supervision rules can be tested
 /// without a Python interpreter, the same reason every seam here has a fake.
 public protocol EngineLaunching: Sendable {
-    func launch(
-        _ command: EngineCommand,
-        stderr: @escaping @Sendable (Data) -> Void,
-        exited: @escaping @Sendable (Int32) -> Void
-    ) throws -> EngineProcess
+    func launch(_ command: EngineCommand) throws -> EngineProcess
 }
 
 /// Time, injected, so the backoff ladder is tested rather than waited out.
@@ -112,8 +117,6 @@ public actor EngineSupervisor {
 
     private var consecutiveFastFailures = 0
     private var child: EngineProcess?
-    private var exitWaiter: CheckedContinuation<Int32, Never>?
-    private var unclaimedExit: Int32?
     /// Whether the child running now has reported its exit. Reset per spawn.
     private var childHasExited = false
     private var supervision: Task<Void, Never>?
@@ -237,14 +240,7 @@ public actor EngineSupervisor {
             let startedAt = clock.now
             let process: EngineProcess
             do {
-                process = try launcher.launch(
-                    command,
-                    stderr: { [weak self] chunk in
-                        Task { await self?.received(chunk) }
-                    },
-                    exited: { [weak self] code in
-                        Task { await self?.childExited(code) }
-                    })
+                process = try launcher.launch(command)
             } catch let failure as TelegramCredentialPreflightFailure {
                 ending = .cannotSpawn(.credentials(failure.state))
                 break
@@ -257,7 +253,10 @@ public actor EngineSupervisor {
             let overhead = process.launchOverhead
             health = .running(pid: process.processIdentifier)
 
-            let code = await nextExit()
+            let code = await process.waitForExit { [weak self] chunk in
+                await self?.received(chunk)
+            }
+            childHasExited = true
             child = nil
             if shuttingDown { break }
 
@@ -289,16 +288,6 @@ public actor EngineSupervisor {
         if shuttingDown { health = .shutDown }
     }
 
-    private func nextExit() async -> Int32 {
-        if let claimed = unclaimedExit {
-            unclaimedExit = nil
-            return claimed
-        }
-        return await withCheckedContinuation { continuation in
-            exitWaiter = continuation
-        }
-    }
-
     private func received(_ chunk: Data) {
         stderr.ingest(chunk)
     }
@@ -309,16 +298,5 @@ public actor EngineSupervisor {
     private func forceIfStillAlive(_ process: EngineProcess) {
         guard !childHasExited else { return }
         process.forceStop()
-    }
-
-    private func childExited(_ code: Int32) {
-        childHasExited = true
-        if let waiter = exitWaiter {
-            exitWaiter = nil
-            waiter.resume(returning: code)
-        } else {
-            // The exit beat the loop to the await. Hold it rather than lose it.
-            unclaimedExit = code
-        }
     }
 }
