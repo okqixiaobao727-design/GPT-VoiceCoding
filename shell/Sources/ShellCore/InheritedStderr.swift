@@ -15,10 +15,10 @@ import Foundation
 /// to launchd's log. This reader preserves the rewrite's shell seam (#33).
 ///
 /// `read()` is the pipe's only reader. It forwards chunks through one consumer,
-/// so their bytes stay in source order and deliveries never overlap. `finish()`
-/// waits for the pipe's end and for every delivery to return. Its caller can then
-/// report the exit knowing none of this run's explanation can arrive afterward
-/// (#33).
+/// so their bytes stay in source order and deliveries never overlap.
+/// `waitUntilDrained()` waits for the pipe's end and for every delivery to
+/// return. Its caller can then report the exit knowing none of this run's
+/// explanation can arrive afterward (#33).
 final class InheritedStderr: @unchecked Sendable {
     /// The child's end. `Process.standardError` is given the whole pipe rather
     /// than its write handle, so that Foundation closes *this* process's copy of
@@ -80,19 +80,20 @@ final class InheritedStderr: @unchecked Sendable {
     /// descendant that still owns the inherited writer intentionally keeps this
     /// pending too: reporting the run's exit before that writer closes would make
     /// the complete-before-exit promise false.
-    func finish() async {
+    func waitUntilDrained() async {
         let task: Task<Void, Never>? = readerQueue.sync { self.deliveryTask }
         await task?.value
     }
 
     /// Give up on a pipe that will never end by itself.
     ///
-    /// `finish()`'s drain waits for the end of the pipe, and after a launch that
-    /// never spawned there is no end coming: Foundation closes this process's
-    /// copy of the write end when it hands the pipe to a child, so a child that
-    /// was never made leaves this process holding it, waiting on itself. There
-    /// is nothing to drain either — nothing ever wrote. This path runs only after
-    /// a spawn that never happened, so its readability handler never fires.
+    /// `waitUntilDrained()` waits for the end of the pipe, and after a launch
+    /// that never spawned there is no end coming: Foundation closes this
+    /// process's copy of the write end when it hands the pipe to a child, so a
+    /// child that was never made leaves this process holding it, waiting on
+    /// itself. There is nothing to drain either — nothing ever wrote. This path
+    /// runs only after a spawn that never happened, so its readability handler
+    /// never fires.
     func abandon() {
         readerQueue.sync {
             monitoring = false

@@ -3,6 +3,9 @@ import Foundation
 /// A child of this process, from the supervisor's side.
 public protocol EngineProcess: AnyObject, Sendable {
     var processIdentifier: Int32 { get }
+    /// Whether this process's termination has already been observed, even if
+    /// its inherited stderr is still draining.
+    var hasExited: Bool { get }
     /// How long the launcher spent before this child existed.
     ///
     /// The supervisor times a run from before it asks for the launch, because
@@ -200,7 +203,7 @@ public actor EngineSupervisor {
         let deadline = Task { [clock] in
             await clock.sleep(Self.stopGraceSeconds)
             guard !Task.isCancelled else { return }
-            await self.forceIfStillAlive(stopping)
+            self.forceIfStillAlive(stopping)
         }
         await supervision?.value
         deadline.cancel()
@@ -296,7 +299,7 @@ public actor EngineSupervisor {
     /// child that stopped when it was asked must never be killed for it, and a
     /// pid that has been reaped may belong to somebody else by now.
     private func forceIfStillAlive(_ process: EngineProcess) {
-        guard !childHasExited else { return }
+        guard !process.hasExited else { return }
         process.forceStop()
     }
 }

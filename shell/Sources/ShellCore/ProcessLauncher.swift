@@ -128,16 +128,17 @@ public struct ProcessLauncher: EngineLaunching {
         errors.read()
 
         process.terminationHandler = { finished in
+            // A signal is not an exit code. Reported apart so a kill is never
+            // mistaken for the engine's own "I could not start".
+            let code =
+                finished.terminationReason == .uncaughtSignal
+                ? -finished.terminationStatus : finished.terminationStatus
+            exit.resolve(code)
             Task {
                 // The residue reaches the Retry panel **before** the exit does;
-                // the ordering, and why it is load-bearing, belong to `finish()`.
-                await errors.finish()
-                // A signal is not an exit code. Reported apart so a kill is never
-                // mistaken for the engine's own "I could not start".
-                let code =
-                    finished.terminationReason == .uncaughtSignal
-                    ? -finished.terminationStatus : finished.terminationStatus
-                await exit.resolve(code)
+                // the ordering belongs to `waitUntilDrained()`. `ProcessExit`
+                // records the death first so shutdown never signals a reaped pid.
+                await errors.waitUntilDrained()
                 stderrContinuation.finish()
             }
         }
@@ -180,6 +181,7 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     }
 
     var processIdentifier: Int32 { process.processIdentifier }
+    var hasExited: Bool { exit.hasExited }
 
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
@@ -207,19 +209,32 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     }
 }
 
-private actor ProcessExit {
+private final class ProcessExit: @unchecked Sendable {
+    private let lock = NSLock()
     private var code: Int32?
     private var waiters: [CheckedContinuation<Int32, Never>] = []
 
+    var hasExited: Bool { lock.withLock { code != nil } }
+
     func resolve(_ code: Int32) {
-        guard self.code == nil else { return }
-        self.code = code
-        for waiter in waiters { waiter.resume(returning: code) }
-        waiters.removeAll()
+        let waiting: [CheckedContinuation<Int32, Never>] = lock.withLock {
+            guard self.code == nil else { return [] }
+            self.code = code
+            let waiting = waiters
+            waiters.removeAll()
+            return waiting
+        }
+        for waiter in waiting { waiter.resume(returning: code) }
     }
 
     func value() async -> Int32 {
-        if let code { return code }
-        return await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation { continuation in
+            let finished: Int32? = lock.withLock {
+                if let code { return code }
+                waiters.append(continuation)
+                return nil
+            }
+            if let finished { continuation.resume(returning: finished) }
+        }
     }
 }

@@ -319,6 +319,31 @@ import Testing
         #expect(launcher.lastChild()?.stopForced == false)
     }
 
+    @Test func shutdownDoesNotForceAChildThatExitedWhileItsStderrStillDrains() async {
+        let process = ExitedButDrainingProcess(pid: 4242)
+        let clock = GatedGraceClock()
+        let supervisor = EngineSupervisor(
+            launcher: DrainingExitedLauncher(process: process),
+            socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            clock: clock)
+
+        await supervisor.start()
+        await process.waitUntilDrainIsHeld()
+
+        let shutdown = Task { await supervisor.shutDown() }
+        await clock.waitUntilGraceStarts()
+        await clock.expireGrace()
+
+        #expect(await process.waitForForceDecision() == .exitChecked)
+        #expect(!process.stopForced)
+
+        await process.releaseDrain()
+        await shutdown.value
+    }
+
     @Test func aChildThatIgnoresTheAskingIsStoppedAnyway() async throws {
         // A shell that cannot quit because its child will not listen is the same
         // dishonest wait this design exists to remove. The bound is stated once,
@@ -392,6 +417,8 @@ private final class SlowlySpawnedProcess: EngineProcess, @unchecked Sendable {
     private let uptime: TimeInterval
     private let code: Int32
     private let clock: TestClock
+    private let lock = NSLock()
+    private var exited = false
 
     init(
         pid: Int32,
@@ -407,11 +434,14 @@ private final class SlowlySpawnedProcess: EngineProcess, @unchecked Sendable {
         self.clock = clock
     }
 
+    var hasExited: Bool { lock.withLock { exited } }
+
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
     ) async -> Int32 {
         // This is the child's own life, distinct from the launch overhead above.
         clock.advance(uptime)
+        lock.withLock { exited = true }
         return code
     }
 
@@ -430,6 +460,8 @@ private final class ControlledExitProcess: EngineProcess, @unchecked Sendable {
     private let stderr: Data
     private let code: Int32
     private let gate = ProcessGate()
+    private let lock = NSLock()
+    private var exited = false
 
     init(pid: Int32, stderr: Data, code: Int32) {
         processIdentifier = pid
@@ -437,11 +469,14 @@ private final class ControlledExitProcess: EngineProcess, @unchecked Sendable {
         self.code = code
     }
 
+    var hasExited: Bool { lock.withLock { exited } }
+
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
     ) async -> Int32 {
         await deliveringStderr(stderr)
         await gate.reachAndWait()
+        lock.withLock { exited = true }
         return code
     }
 
@@ -477,8 +512,12 @@ private final class PendingTailLauncher: EngineLaunching, @unchecked Sendable {
 private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32
     private let gate = ProcessGate()
+    private let lock = NSLock()
+    private var exited = false
 
     init(pid: Int32) { processIdentifier = pid }
+
+    var hasExited: Bool { lock.withLock { exited } }
 
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
@@ -486,6 +525,7 @@ private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
         await deliveringStderr(Data("config: first half\n".utf8))
         await gate.reachAndWait()
         await deliveringStderr(Data("config: final tail\n".utf8))
+        lock.withLock { exited = true }
         return 2
     }
 
@@ -519,4 +559,73 @@ private actor ProcessGate {
         for waiter in releaseWaiters { waiter.resume() }
         releaseWaiters.removeAll()
     }
+}
+
+private struct DrainingExitedLauncher: EngineLaunching {
+    let process: ExitedButDrainingProcess
+
+    func launch(_ command: EngineCommand) throws -> EngineProcess { process }
+}
+
+private enum ForceDecision: Equatable {
+    case exitChecked
+    case forced
+}
+
+private final class ExitedButDrainingProcess: EngineProcess, @unchecked Sendable {
+    let processIdentifier: Int32
+    private let drain = ProcessGate()
+    private let lock = NSLock()
+    private let decisions: AsyncStream<ForceDecision>
+    private let decisionContinuation: AsyncStream<ForceDecision>.Continuation
+    private var exited = false
+    private var forced = false
+
+    init(pid: Int32) {
+        processIdentifier = pid
+        (decisions, decisionContinuation) = AsyncStream.makeStream(of: ForceDecision.self)
+    }
+
+    var hasExited: Bool {
+        let observed = lock.withLock { exited }
+        decisionContinuation.yield(.exitChecked)
+        return observed
+    }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        lock.withLock { exited = true }
+        await drain.reachAndWait()
+        return 0
+    }
+
+    func waitUntilDrainIsHeld() async { await drain.waitUntilReached() }
+    func releaseDrain() async { await drain.release() }
+    func requestStop() {}
+
+    func forceStop() {
+        lock.withLock { forced = true }
+        decisionContinuation.yield(.forced)
+    }
+
+    var stopForced: Bool { lock.withLock { forced } }
+
+    func waitForForceDecision() async -> ForceDecision? {
+        for await decision in decisions { return decision }
+        return nil
+    }
+}
+
+private final class GatedGraceClock: SupervisorClock, @unchecked Sendable {
+    private let grace = ProcessGate()
+
+    var now: TimeInterval { 0 }
+
+    func sleep(_ seconds: TimeInterval) async {
+        await grace.reachAndWait()
+    }
+
+    func waitUntilGraceStarts() async { await grace.waitUntilReached() }
+    func expireGrace() async { await grace.release() }
 }

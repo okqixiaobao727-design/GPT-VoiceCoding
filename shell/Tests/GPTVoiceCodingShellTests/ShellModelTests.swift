@@ -304,6 +304,8 @@ private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
         processIdentifier = pid
     }
 
+    var hasExited: Bool { lock.withLock { code != nil } }
+
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
     ) async -> Int32 {

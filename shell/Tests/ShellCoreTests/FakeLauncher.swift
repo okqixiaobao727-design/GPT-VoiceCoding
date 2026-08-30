@@ -83,12 +83,15 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
         self.deaf = deaf
     }
 
+    var hasExited: Bool { lock.withLock { code != nil } }
+
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
     ) async -> Int32 {
         if let run {
             if !run.stderr.isEmpty { await deliveringStderr(Data(run.stderr.utf8)) }
             clock.advance(run.uptime)
+            resolve(run.code)
             return run.code
         }
         return await withCheckedContinuation { continuation in
