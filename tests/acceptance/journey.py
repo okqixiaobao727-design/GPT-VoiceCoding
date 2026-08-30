@@ -46,7 +46,7 @@ notice land where `stop notice` is looking. Learned on run `20260826T213402Z`, w
 `stop notice` passed on a permission prompt belonging to a stale `/tmp/vcprobe`
 thread, and on a quieter machine would have failed for a reason equally
 unrelated to the lane (#109). The sibling lesson had already been learned once,
-one method over, for `pending_approvals` (`_answer_pending_approval`).
+one module over, for `pending_approvals` (`approval_effect.resolve`).
 
 ## The turns, and why there are five
 
@@ -76,6 +76,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import approval_effect
 import hand_started
 import support
 from support import LaneBlocked, StepFailed
@@ -135,6 +136,11 @@ ENGINE_STOP_LINE = r"(?i)Session stopped:"
 #: this pattern's business either** — the sentence opens with the Session's name
 #: since #109, and the attribution rule is what reads it.
 APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
+
+#: Preserve the former approval helper's observation cadence while #146 replaces
+#: its sequential waits. This is a cadence, not a deadline; all far-side ceilings
+#: still come from `FarSideDeadlines`.
+APPROVAL_EFFECT_POLL_SECONDS = 2.0
 
 
 # --- what the Sessions are asked to do --------------------------------------
@@ -472,8 +478,9 @@ CODEX = Lane(
     # 0.149.1 app-server: a write to a path outside the workspace raises
     # `item/fileChange/requestApproval`, the thread goes to `waitingOnApproval`,
     # and **the file does not appear until the approval is answered**. The same
-    # instruction aimed *inside* the workspace raised nothing, both times, which
-    # is what `approval.none` was reporting on run `20260826T122216Z`. The
+    # instruction aimed *inside* the workspace raised nothing, both times. The
+    # old sequential harness recorded only the absence after its first window;
+    # #146's replacement records a correlated terminal reason instead. The
     # directory is made by the harness, so the one refused action is the write.
     relayed=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / RELAY_FILE, RELAY_WORD
@@ -661,8 +668,8 @@ class Walk:
         #: Held for `stop notice`: the chat's high-water mark from *before* the
         #: first turn started, so the notice it looks for cannot predate the Stop.
         self.before_first_turn: int | None = None
-        #: Held for `approval`: what `relay`'s turn raised and how it was answered.
-        self.approval_evidence: str | None = None
+        #: Held for `approval`: how `relay`'s shared turn resolved its effect and authority.
+        self.approval_resolution: approval_effect.Resolution | None = None
         #: Held for `drain_boot_notice`, which writes the one `boot turn`
         #: observation once both halves of the arrangement are done.
         self.boot_turn: Turn | None = None
@@ -1089,12 +1096,15 @@ class Walk:
         if not answer.ok:
             raise StepFailed(f"relay refused: {answer.text}")
 
-        self.approval_evidence = self._answer_pending_approval(mark)
-        performed = support.wait_for(
-            lambda: relayed.performed_in(self.config.workspace),
-            deadline_seconds=self.far_side.workspace_effect_seconds,
+        self.approval_resolution = self._resolve_approval_effect(
+            scenario="relay",
+            requirement=approval_effect.ApprovalRequirement.REQUIRED,
+            instruction=relayed,
+            mark=mark,
+            effect_seconds=self.far_side.workspace_effect_seconds,
         )
-        self.turns.append(Turn("relay", time.monotonic() - started, performed))
+        resolved = self.approval_resolution.succeeded
+        self.turns.append(Turn("relay", time.monotonic() - started, resolved))
         if "delivered" not in answer.text:
             # #68's rule, and the one place it is observable: a route that cannot
             # be taken surfaces **as a graded delivery failure carrying a
@@ -1113,10 +1123,12 @@ class Walk:
                 )
                 + f". {target} is {relayed.effect_in(self.config.workspace)!r}"
             )
-        if not performed:
+        if not resolved:
             raise StepFailed(
-                f"relay answered {answer.text!r} but {target} never appeared within "
-                f"{self.far_side.workspace_effect_seconds:.0f}s — a receipt without an effect"
+                f"relay answered {answer.text!r}, but its required approval/effect resolution "
+                f"failed: {self.approval_resolution.failure}; effect observed="
+                f"{self.approval_resolution.effect_observed}; {target} contains "
+                f"{relayed.effect_in(self.config.workspace)!r}"
             )
         return f"{answer.text}; {target} contains {relayed.content}"
 
@@ -1137,14 +1149,21 @@ class Walk:
         the run #105 was opened on.
         """
         policy = self.lane.policy_at(self._record_now())
-        if self.approval_evidence is None:
+        resolution = self.approval_resolution
+        if (
+            resolution is None
+            or not resolution.succeeded
+            or resolution.terminal_reason is not approval_effect.TerminalReason.APPROVAL
+            or resolution.authority_evidence is None
+        ):
             # Each lane reports the measurement its own silence contradicts. One
             # shared sentence here is how the codex step spent a run explaining
             # what a Claude at `--permission-mode default` would have done
             # (#105): true, and about the other lane.
             raise StepFailed(
-                f"no permission was raised by the relayed instruction, so nothing "
-                f"round-tripped. Measured at {policy.named}: {self.lane.asks_about}"
+                "the relayed instruction did not complete the required authority round trip: "
+                f"{resolution.failure if resolution is not None else 'relay did not resolve'}. "
+                f"Measured at {policy.named}: {self.lane.asks_about}"
             )
         if policy.unsound:
             # A round trip that happened is not the whole claim. #105 asks this
@@ -1152,10 +1171,10 @@ class Walk:
             # reading `no policy` — or naming ground on which no permission could
             # have been raised — is the same silent pass in a new costume.
             raise StepFailed(
-                f"a permission did round-trip ({self.approval_evidence}), but the ground it was "
-                f"measured on is not the ground this lane stands on: {policy.unsound}"
+                f"a permission did round-trip ({resolution.authority_evidence}), but the ground "
+                f"it was measured on is not the ground this lane stands on: {policy.unsound}"
             )
-        return f"{self.approval_evidence}; measured at {policy.named}"
+        return f"{resolution.authority_evidence}; measured at {policy.named}"
 
     # --- companion inbound ------------------------------------------------
 
@@ -1166,17 +1185,20 @@ class Walk:
             raise StepFailed("no Session name to address an inbound message to")
         mark = self.person.latest_message_id()
         sent = self.person.send(f"@{name}: {INBOUND.words}")
-        self._answer_pending_approval(mark)
-        performed = support.wait_for(
-            lambda: INBOUND.performed_in(self.config.workspace),
-            deadline_seconds=self.far_side.workspace_effect_seconds,
+        resolution = self._resolve_approval_effect(
+            scenario="companion inbound",
+            requirement=approval_effect.ApprovalRequirement.OPTIONAL,
+            instruction=INBOUND,
+            mark=mark,
+            effect_seconds=self.far_side.workspace_effect_seconds,
         )
         inbound_lines = support.matching_lines(self.engine.log_lines(), r"(?i)inbound")
-        if not performed:
+        if not resolution.succeeded:
             raise StepFailed(
-                f"message {sent.id} addressed to @{name} was sent to the bot but "
-                f"{INBOUND.target} never appeared in {self.config.workspace}; engine.log "
-                f"inbound lines: {inbound_lines[-3:] or 'none'}"
+                f"message {sent.id} addressed to @{name} did not satisfy its optional "
+                f"approval/effect resolution: {resolution.failure}; effect observed="
+                f"{resolution.effect_observed}; engine.log inbound lines: "
+                f"{inbound_lines[-3:] or 'none'}"
             )
         if not inbound_lines:
             raise StepFailed(
@@ -1185,7 +1207,8 @@ class Walk:
             )
         return (
             f"message {sent.id} → @{name} → {INBOUND.target} contains {INBOUND.content}; "
-            f"engine.log: {inbound_lines[-1]!r}"
+            f"resolved by {resolution.terminal_reason.value} in "
+            f"{resolution.elapsed_seconds:.3f}s; engine.log: {inbound_lines[-1]!r}"
         )
 
     # --- switches ---------------------------------------------------------
@@ -1205,9 +1228,9 @@ class Walk:
         The interval before release is derived from `agent_turn_seconds` +
         `absence_window_seconds` + `DISCOVERY_SECONDS` +
         `telegram_round_trip_seconds`; the acceptance configuration keeps that
-        sum below the Approval Relay budget. The file effect is not graded here
-        — `approval` owns that assertion; this part approves only to release the
-        Session for the question proof and `child`.
+        sum below the Approval Relay budget. #146's required resolution grades
+        the announcement, Approval Relay answer and file effect together before
+        the Session proceeds to the question proof and `child`.
 
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
@@ -1236,14 +1259,6 @@ class Walk:
                 f"the switches turn did not stop on a permission (turn ended={turn.ended}, "
                 f"roster waiting_for={waiting!r})"
             )
-        pending = self._own_pending_approvals()
-        if len(pending) != 1:
-            self.bridgectl("switch", "duty", "on")
-            raise StepFailed(
-                f"the switches turn left {len(pending)} pending approvals for this Session, "
-                f"not exactly one: {pending!r}"
-            )
-        approval_id = str(pending[0]["approval_id"])
         status = self.bridgectl("status")
         if not status.ok:
             raise StepFailed(f"with Duty off, `status` refused: {status.text}")
@@ -1261,24 +1276,23 @@ class Walk:
         back_on = self.bridgectl("switch", "duty", "on")
         if not back_on.ok:
             raise StepFailed(f"`switch duty on` refused: {back_on.text}")
-        reconciled = self._await_own_message(
-            mark,
-            deadline_seconds=DISCOVERY_SECONDS + self.far_side.telegram_round_trip_seconds,
-            matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
+        resolution = self._resolve_approval_effect(
+            scenario="switches",
+            requirement=approval_effect.ApprovalRequirement.REQUIRED,
+            instruction=actionable,
+            mark=mark,
+            announcement_seconds=DISCOVERY_SECONDS + self.far_side.telegram_round_trip_seconds,
+            effect_seconds=self.far_side.workspace_effect_seconds,
         )
-        if reconciled is None:
+        if not resolution.succeeded:
             raise StepFailed(
                 f"Duty off held silence for {self.far_side.absence_window_seconds:.0f}s "
-                f"(correct), but turning Duty back on reported nothing about a Session that "
-                f"was still waiting on permission {approval_id}. The bot said "
-                f"{self._other_traffic(mark)} in that window, none of it about this Session"
+                f"(correct), but required resolution after Duty returned on failed: "
+                f"{resolution.failure}. Other traffic: {self._other_traffic(mark)}"
             )
-        approval_evidence = self._answer_pending_approval(mark)
-        if approval_evidence is None or approval_id not in approval_evidence:
-            raise StepFailed(
-                f"the reconciled permission {approval_id} could not be released through the "
-                f"Approval Relay: {approval_evidence!r}"
-            )
+        if resolution.approval_id is None or resolution.authority_evidence is None:
+            raise StepFailed(f"required switches resolution returned no authority: {resolution}")
+        approval_id = resolution.approval_id
         if not support.wait_for(
             lambda: self._roster_field("state") == "idle",
             deadline_seconds=self.far_side.agent_turn_seconds,
@@ -1303,9 +1317,9 @@ class Walk:
         question_evidence = self._accept_question()
         return (
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
-            f"still answered ({status.text.splitlines()[0]!r}); Duty on: message "
-            f"{reconciled.id} {reconciled.text!r}; {approval_evidence}; Session returned idle; "
-            f"{question_evidence}"
+            f"still answered ({status.text.splitlines()[0]!r}); Duty on: "
+            f"{resolution.authority_evidence}; effect resolved in "
+            f"{resolution.elapsed_seconds:.3f}s; Session returned idle; {question_evidence}"
         )
 
     def _accept_question(self) -> str:
@@ -1357,7 +1371,11 @@ class Walk:
                 f"turn ended={turn.ended}, waiting_for={waiting!r}, options={options!r}, "
                 f"reply_window={self._roster_field('reply_window')!r}"
             )
-        if self._own_pending_approvals():
+        question_status = support.control_plane_status(self.config.socket_path, self.journal)
+        if any(
+            isinstance(waiting, dict) and _address_of(waiting) == self.address
+            for waiting in question_status.get("pending_approvals", [])
+        ):
             raise StepFailed("the question leaked into `pending_approvals`")
 
         def is_question_notice(seen) -> bool:
@@ -1415,16 +1433,18 @@ class Walk:
                 f"{CLAUDE_ANSWER_FRAME!r}"
             )
 
-        write_permission = self._answer_pending_approval(mark)
-        if write_permission is None:
-            raise StepFailed("the continued Claude turn raised no permission for its file effect")
-        if not support.wait_for(
-            lambda: question.performed_in(self.config.workspace),
-            deadline_seconds=self.far_side.agent_turn_seconds,
-        ):
+        write_resolution = self._resolve_approval_effect(
+            scenario="question continuation",
+            requirement=approval_effect.ApprovalRequirement.REQUIRED,
+            instruction=question,
+            mark=mark,
+            effect_seconds=self.far_side.agent_turn_seconds,
+        )
+        if not write_resolution.succeeded or write_resolution.authority_evidence is None:
             raise StepFailed(
-                f"the answered question continued, but {target} contains "
-                f"{question.effect_in(self.config.workspace)!r}, not {question.content!r}"
+                "the continued Claude turn did not complete its required write authority: "
+                f"{write_resolution.failure}; {target} contains "
+                f"{question.effect_in(self.config.workspace)!r}"
             )
 
         transcript_proof: str | None = None
@@ -1459,7 +1479,7 @@ class Walk:
             )
         evidence = (
             f"question notice {announced.id}: {announced.text!r}; relay {answer.text!r}; "
-            f"{tool_result_proof}; {transcript_proof}; {write_permission}; "
+            f"{tool_result_proof}; {transcript_proof}; {write_resolution.authority_evidence}; "
             f"{target} contains {question.content}"
         )
         self.journey.observe("question", evidence)
@@ -1880,93 +1900,80 @@ class Walk:
         self.journal("turn", lane=self.lane.name, what=what, seconds=turn.seconds, ended=turn.ended)
         return turn
 
-    def _answer_pending_approval(
+    def _resolve_approval_effect(
         self,
-        mark: int,
         *,
-        verdict: tuple[str, ...] = ("allow",),
-        announcement_matches: Callable[..., bool] | None = None,
-    ) -> str | None:
-        """Answer, through the bridge, whatever authority dialog the turn raises.
+        scenario: str,
+        requirement: approval_effect.ApprovalRequirement,
+        instruction: Instruction,
+        mark: int,
+        effect_seconds: float,
+        announcement_seconds: float | None = None,
+    ) -> approval_effect.Resolution:
+        """Adapt this walk's real far sides into #146's one resolution interface."""
+        if self.address is None:
+            raise LaneBlocked(
+                f"no Session address is available for {scenario} approval/effect resolution"
+            )
 
-        Journaled rather than asserted here: a lane that stalled on an unanswered
-        permission would report a missing file where the truth is a waiting
-        dialog, and that is a worse lie than a longer journal. `approval` grades
-        what this returns.
+        def await_announcement(deadline_seconds: float) -> approval_effect.Announcement | None:
+            announced = self._await_own_message(
+                mark,
+                deadline_seconds=deadline_seconds,
+                matching=lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text)),
+            )
+            if announced is None:
+                return None
+            return approval_effect.Announcement(
+                f"announced as chat message {announced.id} ({announced.text!r})"
+            )
 
-        **Only this lane's own dialog is answered, and that is not tidiness.**
-        The engine this run spawns discovers every Session on the machine, and
-        since #77 that includes every Codex Session on the shared daemon — so
-        `pending_approvals` routinely holds dialogs belonging to somebody's open
-        work. Answering the first of them, as this did until the 2026-08-26 run,
-        grants `allow` to a stranger's permission and leaves this lane's own
-        dialog unanswered behind it: measured, on that run, as a real Codex
-        command approved by the harness and this lane's Write answered four
-        minutes late, which failed `relay` and `companion inbound` downstream.
-        The address is the filter, exactly as it is everywhere else here.
+        def answer_approval(approval_id: str) -> approval_effect.ApprovalAnswer:
+            answer = self.bridgectl("approve", approval_id, "allow")
+            return approval_effect.ApprovalAnswer(answer.ok, f"approve answered {answer.text!r}")
 
-        **And the announcement it waits for is filtered the same way** (#109).
-        Filtering the dialog and then taking any Session's announcement as proof
-        that this one reached the Companion Channel is the same defect one clause
-        later: on a machine bridging six Sessions the round trip could read green
-        while this lane's own announcement never went out. That the check is
-        possible at all is a product change #109 made — until then the
-        announcement named the tool and never the Session
-        (`core/approvals.py:52-76`).
-        """
-        deadline = time.monotonic() + self.far_side.agent_turn_seconds
-        matches = announcement_matches or (
-            lambda seen: bool(APPROVAL_ANNOUNCEMENT.search(seen.text))
+        def journal(event: str, **fields: object) -> object:
+            return self.journal(event, lane=self.lane.name, what=scenario, **fields)
+
+        return approval_effect.resolve(
+            requirement=requirement,
+            session_address=self.address,
+            deadlines=approval_effect.Deadlines(
+                resolution_seconds=self.far_side.agent_turn_seconds,
+                announcement_seconds=(
+                    announcement_seconds
+                    if announcement_seconds is not None
+                    else self.far_side.telegram_round_trip_seconds
+                ),
+                effect_seconds=effect_seconds,
+                poll_seconds=APPROVAL_EFFECT_POLL_SECONDS,
+            ),
+            collaborators=approval_effect.Collaborators(
+                effect=lambda: instruction.performed_in(self.config.workspace),
+                pending_approvals=self._pending_approvals,
+                await_announcement=await_announcement,
+                answer_approval=answer_approval,
+                journal=journal,
+                monotonic=time.monotonic,
+                wait=time.sleep,
+            ),
         )
-        while time.monotonic() < deadline:
-            pending = self._own_pending_approvals()
-            if pending:
-                announced = self._await_own_message(
-                    mark,
-                    deadline_seconds=self.far_side.telegram_round_trip_seconds,
-                    matching=matches,
-                )
-                approval_id = str(pending[0]["approval_id"])
-                answer = self.bridgectl("approve", approval_id, *verdict)
-                self.journal(
-                    "approval.answered",
-                    lane=self.lane.name,
-                    approval_id=approval_id,
-                    verdict=verdict,
-                    announced=bool(announced),
-                    reply=answer.text,
-                )
-                if not answer.ok:
-                    command = " ".join(("approve", approval_id, *verdict))
-                    raise StepFailed(f"`{command}` refused: {answer.text}")
-                if announced is None:
-                    # The design says the permission "is escalated to every outlet
-                    # — with Voice off, the Companion Channel — and the real bot's
-                    # message is read by the user-account client". A run that
-                    # answered an approval nobody was ever told about has proved
-                    # the second half of the round trip and none of the first, and
-                    # reporting that as a pass is how a silent escalation ships.
-                    raise StepFailed(
-                        f"approval {approval_id} was answered through `bridgectl approve` "
-                        f"({answer.text!r}), but it never reached the Companion Channel within "
-                        f"{self.far_side.telegram_round_trip_seconds:.0f}s"
-                    )
-                return (
-                    f"approval {approval_id}: announced as chat message {announced.id} "
-                    f"({announced.text!r}); approve answered {answer.text!r}"
-                )
-            time.sleep(2.0)
-        self.journal("approval.none", lane=self.lane.name)
-        return None
 
-    def _own_pending_approvals(self) -> list[dict]:
-        """Pending authority dialogs belonging to this walk's Session, never a stranger's."""
+    def _pending_approvals(self) -> tuple[approval_effect.PendingApproval, ...]:
+        """Every pending dialog, with enough identity for the module to correlate it."""
         data = support.control_plane_status(self.config.socket_path, self.journal)
-        return [
-            waiting
-            for waiting in data.get("pending_approvals", [])
-            if isinstance(waiting, dict) and _address_of(waiting) == self.address
-        ]
+        pending: list[approval_effect.PendingApproval] = []
+        for waiting in data.get("pending_approvals", []):
+            if not isinstance(waiting, dict):
+                continue
+            approval_id = waiting.get("approval_id")
+            pending.append(
+                approval_effect.PendingApproval(
+                    approval_id=str(approval_id) if approval_id is not None else "",
+                    session_address=_address_of(waiting),
+                )
+            )
+        return tuple(pending)
 
 
 def _address_of(row: dict) -> str:
