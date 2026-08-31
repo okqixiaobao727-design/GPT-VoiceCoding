@@ -41,10 +41,6 @@ from typing import Any, Final
 from gpt_voicecoding.adapters.agent import _naming
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude import waiting_labels
-from gpt_voicecoding.adapters.agent.claude.waiting_labels import (
-    NOTHING_READ_YET,
-    StopDisposition,
-)
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     ProgressObservation,
@@ -252,47 +248,23 @@ def _inspection(row: dict[str, Any]) -> SessionInspection | None:
 def _waiting_for(state: SessionState, label: Any) -> WaitingFor:
     """What the roster alone can honestly say a Session is waiting for.
 
-    Two things, now that Claude Code's own `waitingFor` label rides the row
-    (#150, `waiting_labels.py`). The row still carries no tool, no dialog handle
-    and no prompt, so the ordinary answer stays `UNKNOWN` with `caught_up=
-    False` — the seam's word for *ask again* — and #75 answers it from the
-    transcript that does carry those fields.
+    A `waiting` row returns the shared classifier's `WaitingFor` unchanged
+    (#150, #155). That keeps its named, never-a-stop and catch-up answers equal
+    to the Reply Window sweep's (`waiting_labels.py`).
 
-    The one thing the label settles here is the **negative**: a `dialog open` or
-    a `goal proposal` is the user driving their own TUI, and a Session at one is
-    not waiting on anybody. Saying so is what keeps a slash-command picker off
-    the roster's `needs_the_user`, which is the gate Bridge Core's reconcile
-    pass announces from.
+    This is only the base for `_overlay` (`adapter.py:618-691`), where a parked
+    dialog attaches its handle. Bridge Core reads that current handle rather
+    than a delivered-wait ledger (`core/bridge.py:765-793`, #161).
 
-    **A named wait is not promoted here yet, and #155 is why it should be.** A
-    `permission prompt` or a `sandbox request` classifies as `NAMED_NOW` with a
-    complete `WaitingFor`, and this reader throws that answer away — which is
-    the one thing `waiting_labels.py` says both readers exist not to do. The
-    sweep announces such a wait by name (`window.py:521-522`) while the row for
-    the same Session at the same moment reads `UNKNOWN`.
-
-    The reason previously recorded here — that a promoted row could only key
-    `(target, PERMISSION)` where the live path keyed `(target, approval_id)`,
-    so `core/bridge.py:762-767` would miss the dedup and announce twice — **does
-    not hold, and is retracted** (and #161 deletes that ledger outright). Both
-    paths run the same `_overlay` (`adapter.py:646-692`), which attaches a
-    parked dialog's handle to whichever of them is reading; for one dialog at
-    one moment they produce the same key. A handle-less `(target, PERMISSION)`
-    is reachable today anyway, from the transcript, since the base this function
-    returns stands only where the transcript found `NONE`.
-
-    #151, which gives a Stop Notice the Session's own progress observation,
-    reads this seam: the narrowing is a defect under repair, not a measurement
-    the roster could not make.
+    The classifier's whitelist is adapted from legacy's hook-event rule
+    (`legacy@1d32845:bridge/daemon.py:130-142,1470-1479`). Projecting it onto a
+    hook-less Session is new ground: legacy's roster was its own registration
+    store (`legacy@1d32845:bridge/store.py:1644,1930`), so such a Session did not
+    exist there to be handled.
     """
     if state is not SessionState.WAITING:
         return WaitingFor()
-    if (
-        waiting_labels.classify(label if isinstance(label, str) else None).disposition
-        is StopDisposition.NEVER_A_STOP
-    ):
-        return WaitingFor()
-    return NOTHING_READ_YET
+    return waiting_labels.classify(label if isinstance(label, str) else None).waiting_for
 
 
 def _name(row: dict[str, Any]) -> str | None:

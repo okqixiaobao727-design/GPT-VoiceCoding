@@ -21,12 +21,14 @@ from typing import Any
 
 import pytest
 
+from claude_adapter_fake import ParkedApproval, claude_waiting_roster
 from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
-from gpt_voicecoding.adapters.agent.claude.window import StopReading
+from gpt_voicecoding.adapters.agent.claude.waiting_labels import SANDBOX_TOOL_NAME
+from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher, StopReading
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -53,15 +55,6 @@ TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=3538)
 #: What the roster alone says about a Session it calls `waiting`: something is
 #: being waited on and the command does not carry what (`discovery.py`).
 ROSTER_WAITING = WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
-
-
-class _Parked:
-    """One dialog held open, as `ApprovalListener._waiting` holds it."""
-
-    def __init__(self, request: ApprovalRequest, question: WaitingFor | None = None) -> None:
-        self.target = request.target
-        self.permission = request if question is None else None
-        self.question = question
 
 
 def transcript(tmp_path: Path, records: list[dict[str, Any]]) -> Path:
@@ -93,7 +86,7 @@ def adapter_holding(
         # Parked the way a hook parks one, minus the socket: `newest_for` reads
         # this dict, and `test_claude_approval.py` owns proving a real hook gets
         # a request into it.
-        adapter._approvals._waiting[request.approval_id] = _Parked(  # noqa: SLF001
+        adapter._approvals._waiting[request.approval_id] = ParkedApproval(  # noqa: SLF001
             request, asking
         )
         del index
@@ -518,6 +511,62 @@ class TestTheRosterRow:
         roster(LaneDiscovery(error="`claude` is not on the PATH"))
         with pytest.raises(LaneUnavailable):
             asyncio.run(adapter.inspect(TARGET))
+
+
+class TestTheRosterAndReplyWindowAgree:
+    """The two readers act on one `waitingFor` classification (#155)."""
+
+    def test_a_sandbox_request_reaches_both_paths_as_the_same_wait(
+        self, tmp_path: Path, roster
+    ) -> None:
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        target = replace(TARGET, pid=os.getpid())
+        say(tmp_path, "busy", pid=target.pid, session_id=SESSION)
+        raised: list[AgentEvent] = []
+        settings = ClaudeSettings(registry_directory=sessions)
+        adapter = ClaudeAgentAdapter(progress_capture=PROGRESS_CAPTURE, settings=settings)
+        adapter._reported[target] = SessionReport(  # noqa: SLF001 - registration fact
+            session_id=SESSION,
+            pid=target.pid,
+            transcript_path=transcript(tmp_path, turn()),
+        )
+        watcher = ReplyWindowWatcher(
+            settings=settings,
+            emit=raised.append,
+            stopped_on=adapter.stop_reading,
+        )
+        watcher.watch(target)
+
+        say(
+            tmp_path,
+            "waiting",
+            pid=target.pid,
+            session_id=SESSION,
+            waiting_for="sandbox request",
+        )
+        watcher.poll_once()
+        swept = next(event for event in raised if isinstance(event, SessionStopped))
+        roster(claude_waiting_roster(target, "sandbox request"))
+        projected = asyncio.run(adapter.discover()).rows[0]
+
+        assert projected.waiting_for == swept.waiting_for
+        assert projected.waiting_for.tool_name == SANDBOX_TOOL_NAME
+
+    def test_a_named_roster_base_does_not_displace_a_parked_dialog_handle(
+        self, tmp_path: Path, roster
+    ) -> None:
+        adapter = adapter_holding(
+            transcript(tmp_path, turn()),
+            parked=(dialog(tool_name="Bash", detail="push the branch"),),
+        )
+        roster(claude_waiting_roster(TARGET, "sandbox request"))
+
+        waiting = asyncio.run(adapter.discover()).rows[0].waiting_for
+
+        assert waiting.kind is WaitingKind.PERMISSION
+        assert waiting.tool_name == "Bash"
+        assert waiting.approval_id == "a-1"
 
 
 class TestTheStopNotice:

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude.discovery import CommandResult, discover
+from gpt_voicecoding.adapters.agent.claude.waiting_labels import SANDBOX_TOOL_NAME
 from gpt_voicecoding.seams.agent import SessionState, WaitingKind
 from gpt_voicecoding.seams.identity import AgentKind
 
@@ -240,12 +241,10 @@ class TestTheKindField:
 class TestTheLabelOnAWaitingRow:
     """`claude agents --json` copies `waitingFor` onto a `waiting` row (#150).
 
-    The roster reads it for the one thing the roster can settle on its own: a
-    dialog the user is driving is not a wait on anybody. It does **not** promote
-    `permission prompt` to `PERMISSION` here, and that is deliberate — see the
-    reader's own note. The roster carries no dialog handle, so a row that
-    claimed `needs_the_user` would produce a second, unanswerable notice beside
-    the Approval Relay's for one decision.
+    The roster and the Reply Window sweep ask the same classifier, so each acts
+    on all three of its dispositions: a named wait is named, a dialog the user
+    is driving waits on nobody, and an unmeasured label asks the reader to catch
+    up rather than inventing an answer.
     """
 
     def test_a_dialog_the_user_is_driving_is_waiting_on_nobody(self) -> None:
@@ -273,40 +272,34 @@ class TestTheLabelOnAWaitingRow:
 
         assert found([row]).rows[0].state is SessionState.WAITING
 
-    def test_a_permission_prompt_row_reads_exactly_as_it_did_before_this_ticket(self) -> None:
-        """The one narrowing, pinned: a named wait is not promoted on this reader.
-
-        `classify` calls `permission prompt` a `PERMISSION` and the Reply Window
-        sweep announces it as one. This row must stay `UNKNOWN` with
-        `caught_up=False` — what the projection reported for every `waiting` row
-        before #150 — because that is what this reader currently returns, and
-        #155 is the ticket that would promote it.
-
-        The reason previously recorded here — that a promoted row would miss
-        Bridge Core's delivered-wait dedup and announce the dialog twice — is
-        retracted; #161 deleted that ledger outright. `_waiting_for` carries the
-        retraction in full.
-        """
+    def test_a_permission_prompt_is_projected_as_a_named_wait(self) -> None:
+        """A hook-less Session has no second source, so the roster's label must stand."""
         row = IDLE_ROW | {"status": "waiting", "waitingFor": "permission prompt"}
         waiting_for = found([row]).rows[0].waiting_for
 
-        assert waiting_for.kind is WaitingKind.UNKNOWN
-        assert waiting_for.kind is not WaitingKind.PERMISSION
-        assert waiting_for.caught_up is False
+        assert waiting_for.kind is WaitingKind.PERMISSION
+        assert waiting_for.caught_up is True
         assert waiting_for.approval_id is None
-        assert waiting_for.needs_the_user is False
+        assert waiting_for.needs_the_user is True
 
-    def test_a_sandbox_request_row_is_narrowed_the_same_way(self) -> None:
-        """Every named disposition, not just the one — the rule is the reader's."""
+    def test_a_sandbox_request_carries_the_classifiers_tool_name(self) -> None:
         row = IDLE_ROW | {"status": "waiting", "waitingFor": "sandbox request"}
         waiting_for = found([row]).rows[0].waiting_for
 
-        assert waiting_for.kind is WaitingKind.UNKNOWN
-        assert waiting_for.tool_name is None
+        assert waiting_for.kind is WaitingKind.PERMISSION
+        assert waiting_for.tool_name == SANDBOX_TOOL_NAME
+        assert waiting_for.needs_the_user is True
 
     def test_a_row_carrying_no_label_reads_exactly_as_it_did(self) -> None:
         """Every build before this field, and every row this reader mis-reads."""
         waiting_for = found([IDLE_ROW | {"status": "waiting"}]).rows[0].waiting_for
+
+        assert waiting_for.kind is WaitingKind.UNKNOWN
+        assert waiting_for.caught_up is False
+
+    def test_an_unmeasured_label_still_asks_the_reader_to_catch_up(self) -> None:
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "new vendor label"}
+        waiting_for = found([row]).rows[0].waiting_for
 
         assert waiting_for.kind is WaitingKind.UNKNOWN
         assert waiting_for.caught_up is False
