@@ -1395,6 +1395,25 @@ class TestWhenTheSessionsAppServerDies:
         asyncio.run(scenario())
         assert sink.of(SessionEnded) == []
 
+    def test_a_rekeyed_session_is_ended_at_its_current_target(self, socket_path: Path) -> None:
+        """The connection callback follows the watch rather than its first address."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await joined(server, sink)
+                try:
+                    await adapter.register_session(TARGET, server.path)
+                    lane = await adapter.discover()
+                    await server.drop_everyone()
+                    await _settled()
+                    return lane.rows[0].target
+                finally:
+                    await adapter.aclose()
+
+        current_target = asyncio.run(scenario())
+        assert [event.target for event in sink.of(SessionEnded)] == [current_target]
+
 
 def daemon_at(path: Path) -> SharedDaemon:
     """A shared daemon that is really there, listening on the scripted server.
@@ -1411,7 +1430,13 @@ def daemon_at(path: Path) -> SharedDaemon:
     return SharedDaemon(settings=CodexSettings(), version="test", locate=found)
 
 
-async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = None):
+async def joined(
+    server: Codex,
+    sink: Sink,
+    settings: CodexSettings | None = None,
+    *,
+    live_pids: list[int] | None = None,
+):
     """An adapter that has joined the shared daemon and registered nothing.
 
     This is the shape the product actually runs in: v1.0 launches no Session
@@ -1442,8 +1467,11 @@ async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = Non
     )
 
     async def live_processes() -> tuple[Candidate, ...]:
-        """The one fake interactive TUI, paired with this test's isolated rollout tree."""
-        return (Candidate(pid=991, workspace=server.workspace, session_id=live_root),)
+        """The fake interactive TUIs, paired with this test's isolated rollout tree."""
+        return tuple(
+            Candidate(pid=pid, workspace=server.workspace, session_id=live_root)
+            for pid in live_pids or [991]
+        )
 
     return CodexAgentAdapter(
         progress_capture=PROGRESS_CAPTURE,
@@ -1662,6 +1690,76 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
                     await adapter.aclose()
 
         assert len(asyncio.run(scenario())) == 1
+
+    @pytest.mark.parametrize("rekeys", [1, 3, 10])
+    def test_a_rekeyed_thread_stays_one_subscription_and_stops_at_its_current_target(
+        self, socket_path: Path, rekeys: int
+    ) -> None:
+        """#153: discovery may change an address without changing the Codex thread."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.thread_source = "user"
+                live_pids = [991, 992]
+                adapter = await joined(server, sink, live_pids=live_pids)
+                try:
+                    await adapter.discover()
+                    for pid in range(993, 993 + rekeys):
+                        live_pids[:] = [pid]
+                        lane = await adapter.discover()
+                        current_target = lane.rows[0].target
+
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                    return current_target, server.calls_to("thread/resume")
+                finally:
+                    await adapter.aclose()
+
+        current_target, resumed = asyncio.run(scenario())
+        assert [call["threadId"] for call in resumed] == [THREAD]
+        assert [event.target for event in sink.of(SessionStopped)] == [current_target]
+
+    def test_a_stale_relay_does_not_restore_a_superseded_target(self, socket_path: Path) -> None:
+        """Only discovery may replace the address held for a watched thread."""
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.thread_source = "user"
+                live_pids = [991, 992]
+                adapter = await joined(server, sink, live_pids=live_pids)
+                try:
+                    await adapter.discover()
+                    live_pids[:] = [993]
+                    lane = await adapter.discover()
+                    current_target = lane.rows[0].target
+
+                    await adapter.answer_relay(TARGET, "still the same thread", request_id=rid())
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                    return current_target
+                finally:
+                    await adapter.aclose()
+
+        current_target = asyncio.run(scenario())
+        assert [event.target for event in sink.of(SessionStopped)] == [current_target]
 
     def test_a_prompt_raised_by_the_users_own_turn_reaches_the_user(
         self, socket_path: Path
