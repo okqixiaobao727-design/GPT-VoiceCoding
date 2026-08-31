@@ -136,47 +136,29 @@ private enum DeliveryEvent: Equatable {
 
 private actor DeliveryGate {
     private var recorded: [DeliveryEvent] = []
-    private var deliveryStarted = false
-    private var drainWaitCalled = false
-    private var releaseRequested = false
-    private var deliveryStartWaiters: [CheckedContinuation<Void, Never>] = []
-    private var drainWaitCallWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private let deliveryStarted = OneShot<Void>()
+    private let drainWaitCalled = OneShot<Void>()
+    private let releaseRequested = OneShot<Void>()
 
     func holdDelivery(_ chunk: Data) async {
         recorded.append(.deliveryStarted)
-        deliveryStarted = true
-        for waiter in deliveryStartWaiters { waiter.resume() }
-        deliveryStartWaiters.removeAll()
-
-        if !releaseRequested {
-            await withCheckedContinuation { releaseWaiters.append($0) }
+        deliveryStarted.resolve()
+        if !releaseRequested.isResolved {
+            await releaseRequested.value()
         }
         recorded.append(.deliveryFinished(chunk))
     }
 
-    func waitUntilDeliveryStarts() async {
-        guard !deliveryStarted else { return }
-        await withCheckedContinuation { deliveryStartWaiters.append($0) }
-    }
+    func waitUntilDeliveryStarts() async { await deliveryStarted.value() }
 
     func recordDrainWaitCalled() {
         recorded.append(.drainWaitCalled)
-        drainWaitCalled = true
-        for waiter in drainWaitCallWaiters { waiter.resume() }
-        drainWaitCallWaiters.removeAll()
+        drainWaitCalled.resolve()
     }
 
-    func waitUntilDrainWaitIsCalled() async {
-        guard !drainWaitCalled else { return }
-        await withCheckedContinuation { drainWaitCallWaiters.append($0) }
-    }
+    func waitUntilDrainWaitIsCalled() async { await drainWaitCalled.value() }
 
-    func releaseDelivery() {
-        releaseRequested = true
-        for waiter in releaseWaiters { waiter.resume() }
-        releaseWaiters.removeAll()
-    }
+    func releaseDelivery() { releaseRequested.resolve() }
 
     func recordDrainWaitReturned() { recorded.append(.drainWaitReturned) }
     func events() -> [DeliveryEvent] { recorded }

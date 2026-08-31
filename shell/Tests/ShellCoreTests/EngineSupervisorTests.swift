@@ -536,29 +536,21 @@ private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
 }
 
 private actor ProcessGate {
-    private var reached = false
-    private var released = false
-    private var reachedWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private let reached = OneShot<Void>()
+    private let released = OneShot<Void>()
 
     func reachAndWait() async {
-        reached = true
-        for waiter in reachedWaiters { waiter.resume() }
-        reachedWaiters.removeAll()
-        guard !released else { return }
-        await withCheckedContinuation { releaseWaiters.append($0) }
+        // Reached is published first, and only then does this suspend: the test
+        // driving the gate has to be able to observe the halt before it lifts
+        // it. A release that already happened is not waited on at all.
+        reached.resolve()
+        guard !released.isResolved else { return }
+        await released.value()
     }
 
-    func waitUntilReached() async {
-        guard !reached else { return }
-        await withCheckedContinuation { reachedWaiters.append($0) }
-    }
+    func waitUntilReached() async { await reached.value() }
 
-    func release() {
-        released = true
-        for waiter in releaseWaiters { waiter.resume() }
-        releaseWaiters.removeAll()
-    }
+    func release() { released.resolve() }
 }
 
 private struct DrainingExitedLauncher: EngineLaunching {

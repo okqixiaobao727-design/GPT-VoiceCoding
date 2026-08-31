@@ -120,7 +120,7 @@ public struct ProcessLauncher: EngineLaunching {
         process.environment = environment
 
         let (stderr, stderrContinuation) = AsyncStream.makeStream(of: Data.self)
-        let exit = ProcessExit()
+        let exit = OneShot<Int32>()
         let errors = InheritedStderr(deliver: { chunk in
             stderrContinuation.yield(chunk)
         })
@@ -136,7 +136,7 @@ public struct ProcessLauncher: EngineLaunching {
             exit.resolve(code)
             Task {
                 // The residue reaches the Retry panel **before** the exit does;
-                // the ordering belongs to `waitUntilDrained()`. `ProcessExit`
+                // the ordering belongs to `waitUntilDrained()`. The exit latch
                 // records the death first so shutdown never signals a reaped pid.
                 await errors.waitUntilDrained()
                 stderrContinuation.finish()
@@ -163,7 +163,7 @@ public struct ProcessLauncher: EngineLaunching {
 final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     private let process: Process
     private let stderr: AsyncStream<Data>
-    private let exit: ProcessExit
+    private let exit: OneShot<Int32>
 
     /// What pre-spawn environment assembly cost, so the supervisor can discount it.
     let launchOverhead: TimeInterval
@@ -171,7 +171,7 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     fileprivate init(
         _ process: Process,
         stderr: AsyncStream<Data>,
-        exit: ProcessExit,
+        exit: OneShot<Int32>,
         launchOverhead: TimeInterval = 0
     ) {
         self.process = process
@@ -181,7 +181,7 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     }
 
     var processIdentifier: Int32 { process.processIdentifier }
-    var hasExited: Bool { exit.hasExited }
+    var hasExited: Bool { exit.isResolved }
 
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
@@ -206,35 +206,5 @@ final class SpawnedEngine: EngineProcess, @unchecked Sendable {
     func forceStop() {
         guard process.isRunning else { return }
         kill(process.processIdentifier, SIGKILL)
-    }
-}
-
-private final class ProcessExit: @unchecked Sendable {
-    private let lock = NSLock()
-    private var code: Int32?
-    private var waiters: [CheckedContinuation<Int32, Never>] = []
-
-    var hasExited: Bool { lock.withLock { code != nil } }
-
-    func resolve(_ code: Int32) {
-        let waiting: [CheckedContinuation<Int32, Never>] = lock.withLock {
-            guard self.code == nil else { return [] }
-            self.code = code
-            let waiting = waiters
-            waiters.removeAll()
-            return waiting
-        }
-        for waiter in waiting { waiter.resume(returning: code) }
-    }
-
-    func value() async -> Int32 {
-        await withCheckedContinuation { continuation in
-            let finished: Int32? = lock.withLock {
-                if let code { return code }
-                waiters.append(continuation)
-                return nil
-            }
-            if let finished { continuation.resume(returning: finished) }
-        }
     }
 }
