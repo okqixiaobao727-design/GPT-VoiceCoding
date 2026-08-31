@@ -14,11 +14,20 @@ socket; the protocol number moves when the socket changes. Refusing on the
 number is the check that means something, and refusing on the string would
 refuse every live Session on the machine the day after an upgrade.
 
-Static re-probe of the currently pinned build (2.1.238) confirmed the registry
-fields this module validates: `pid`, `sessionId`, `cwd`, `version`,
-`peerProtocol`, `messagingSocketPath` and `status`. The validated shape is
+Static re-probe against 2.1.238 confirmed the registry fields this module
+validates: `pid`, `sessionId`, `cwd`, `version`, `peerProtocol`,
+`messagingSocketPath` and `status`; the live re-probe against 2.1.251 recorded
+below found the same seven, and read a fourth word into `status`. The validated shape is
 retained so retiring its former consumer does not widen the records accepted by
 the remaining Reply Window and Session Launcher paths.
+
+**`status` has four words, and the fourth is `idle` under another name**
+(#154). Claude Code rewrites `idle` to `shell` for the pid-file write when a
+`local_bash` background task is still running, so the word says "the turn has
+ended and something is still running in the background" rather than a state of
+its own. It reaches this reader alone: `claude agents --json` maps it back to
+`busy`, so `discovery.py` never sees it. The measurement beside
+`PROVEN_AGAINST_VERSION` is what says a Session at `shell` takes the next turn.
 
 **`waitingFor` is carried, not judged.** A `waiting` record names which of that
 status's several causes it is, in the same write (#150, measured on 2.1.251).
@@ -49,7 +58,31 @@ PEER_PROTOCOL = 1
 #: The Claude Code build the pin was last re-probed against. Documentation, not
 #: a gate — `PEER_PROTOCOL` is the gate. Written down so the next re-probe knows
 #: what its baseline was.
-PROVEN_AGAINST_VERSION = "2.1.238"
+PROVEN_AGAINST_VERSION = "2.1.251"
+
+# **What `shell` was measured to mean** (#154), on 2.1.251, on Simon's machine
+# on 2026-08-31. The word is not documented anywhere, so it is written down
+# here rather than inferred, and `window.py` reads its Reply Window off this.
+#
+# *What the build does.* The reader's accepted enum is
+# `["busy","shell","idle","waiting"]`, and the write-side rewrite is
+# `pB = rb === "idle" && <background tasks running> ? "shell" : rb` — so the
+# underlying status is `idle` and the rewrite only records that a `local_bash`
+# task outlived the turn.
+#
+# *What the roster says about the same Session.* Nothing: `claude agents
+# --json` reported pid 10075 as `busy` at the same moment
+# `~/.claude/sessions/10075.json` read `status: "shell"`.
+#
+# *Whether a Relay is acted on during it.* Measured, not assumed, because a
+# Reply Window declared OPEN on assumption is exactly what this seam forbids.
+# Stimulus: one peer-inbox message — the same route `inbox.py` uses for an
+# Answer Relay — sent to pid 10075 while its record read `shell`. Registry
+# samples taken every 0.2s across the whole window: `shell` unbroken from
+# t=1788151990.1, `busy` at t=1788152012.5 (~0.5s after the send), and the
+# Session's reply came back as that turn, returning to `shell` at
+# t=1788152033.5. So a Relay delivered during `shell` is acted on as the next
+# turn, and `shell` reads OPEN.
 
 
 class RegistryError(Exception):
@@ -64,8 +97,11 @@ class SessionRecord:
     session_id: str
     cwd: Path
     version: str
-    #: What Claude Code says this Session is doing right now: `idle`, `busy` or
-    #: `waiting`. Left as the registry's own word; translating it into a Reply
+    #: What Claude Code says this Session is doing right now: `idle`, `busy`,
+    #: `shell` or `waiting`. Left as the registry's own word — including
+    #: `shell`, which is not normalised to `idle` here even though that is what
+    #: it was measured to mean, because flattening it would throw away the fact
+    #: that a background task is still running. Translating it into a Reply
     #: Window is `window.py`'s job, not this reader's.
     status: str
     name: str = ""
