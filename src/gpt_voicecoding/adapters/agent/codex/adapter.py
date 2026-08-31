@@ -283,13 +283,19 @@ class CodexAgentAdapter:
         if target in self._threads:
             return
 
+        watched: WatchedThread | None = None
+
+        def connection_lost(reason: str) -> None:
+            if watched is not None:
+                self._connection_lost(watched, reason)
+
         connection = await attach(
             socket_path,
             version=__version__,
             settings=self._settings,
             on_notification=self._heard,
             on_server_request=self._asked,
-            on_closed=lambda reason, held=target: self._connection_lost(held, reason),
+            on_closed=connection_lost,
         )
         watched = WatchedThread(target=target, socket_path=socket_path, connection=connection)
         self._threads[target] = watched
@@ -380,7 +386,7 @@ class CodexAgentAdapter:
         # adapter at all, and a prompt is raised by whatever turn the *user*
         # started — so it has to have happened before, not at the first Relay.
         for row in lane.rows:
-            await self._adopt(row)
+            await self._adopt_discovered(row)
         return replace(lane, rows=tuple(self._stopped_on(row) for row in lane.rows))
 
     async def inspect(self, target: SessionTarget) -> SessionInspection:
@@ -441,6 +447,30 @@ class CodexAgentAdapter:
         """
         return await self._daemon.client()
 
+    async def _adopt_discovered(self, row: SessionInspection) -> None:
+        """Watch the current address discovery holds for one thread.
+
+        Discovery is the authority on a Session's current target. A Relay may
+        arrive carrying an older address for the same thread, but it cannot move
+        the watch backwards; `_reachable` uses the stable thread id only to find
+        the connection that already exists.
+
+        **No legacy behaviour to port (ADR 0010).** Legacy learned Codex turn
+        ends from hooks (`legacy@1d32845:bridge/hook.py:112-186`) and never
+        watched an app-server thread, so it had no corresponding re-key state.
+        """
+        target = row.target
+        if target.session_id is None or not row.child.is_main:
+            return
+        watched = self._thread_for(target.session_id)
+        if watched is not None:
+            if watched.target != target:
+                self._threads.pop(watched.target, None)
+                watched.target = target
+                self._threads[target] = watched
+            return
+        await self._adopt(row)
+
     async def _adopt(self, row: SessionInspection) -> None:
         """Start watching one discovered thread on the shared daemon, once.
 
@@ -475,7 +505,11 @@ class CodexAgentAdapter:
         exists to avoid repeating.
         """
         target = row.target
-        if target.session_id is None or target in self._threads or not row.child.is_main:
+        if (
+            target.session_id is None
+            or self._thread_for(target.session_id) is not None
+            or not row.child.is_main
+        ):
             return
         client = await self._shared_daemon()
         if client is None:
@@ -506,6 +540,8 @@ class CodexAgentAdapter:
         words rather than a sentence invented here.
         """
         watched = self._threads.get(target)
+        if watched is None and target.session_id is not None:
+            watched = self._thread_for(target.session_id)
         if watched is not None and watched.connection.is_open:
             return watched, ""
         if target.session_id is None:
@@ -513,7 +549,7 @@ class CodexAgentAdapter:
         if watched is not None:
             # Its connection went away. Drop it so the adoption below re-keys
             # the row onto whatever the daemon is answering on now.
-            self._threads.pop(target, None)
+            self._threads.pop(watched.target, None)
         await self._adopt(SessionInspection(target=target, workspace=Path()))
         watched = self._threads.get(target)
         if watched is None:
@@ -1067,7 +1103,7 @@ class CodexAgentAdapter:
             )
         )
 
-    def _connection_lost(self, target: SessionTarget, reason: str) -> None:
+    def _connection_lost(self, watched: WatchedThread, reason: str) -> None:
         """The app-server holding that Session went away. Say so, exactly once.
 
         A Codex TUI is a thin client of its app-server, so an app-server that is
@@ -1083,8 +1119,7 @@ class CodexAgentAdapter:
         restart, and dialling a dead one in a loop would be this adapter
         inventing a recovery it cannot perform.
         """
-        watched = self._threads.get(target)
-        if watched is None:
+        if self._threads.get(watched.target) is not watched:
             return
         self._drop_and_report_ended(watched, reason)
 
