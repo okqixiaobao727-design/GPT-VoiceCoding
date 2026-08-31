@@ -36,7 +36,11 @@ from gpt_voicecoding.adapters.agent.claude import (
 )
 from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNROUTED, SessionReport
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
-from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings, SettingsError
+from gpt_voicecoding.adapters.agent.claude.settings import (
+    DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS,
+    ClaudeSettings,
+    SettingsError,
+)
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.relays import RelayPipeline
@@ -878,6 +882,21 @@ class TestWhatThisSpokeMayBeTold:
             claude_agent(
                 progress_capture=PROGRESS_CAPTURE, settings={"ack_timeout_seconds": "soon"}
             )
+
+    def test_the_catch_up_budget_defaults_rather_than_being_a_literal(self) -> None:
+        """#150's bound is configuration; a table that does not name it still starts."""
+        assert ClaudeSettings.of({}).stop_catch_up_budget_seconds == (
+            DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS
+        )
+        assert DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS > 0
+
+    def test_the_catch_up_budget_can_be_told(self) -> None:
+        assert ClaudeSettings.of({"stop_catch_up_budget_seconds": 12}).stop_catch_up_budget_seconds
+
+    def test_a_catch_up_budget_of_no_time_at_all_is_refused(self) -> None:
+        """A budget of zero is a budget that can never be spent honestly."""
+        with pytest.raises(SettingsError, match="stop_catch_up_budget_seconds"):
+            ClaudeSettings(stop_catch_up_budget_seconds=0)
 
 
 class TestTheHubStopsHoldingWhatArrived:

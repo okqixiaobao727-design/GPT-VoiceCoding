@@ -18,6 +18,10 @@ parent agent runs as a child: transcript saving off, and not listed here (#73,
 measured). So every row this returns is a main Session, and #79 owns finding the
 children some other way.
 
+**A `waiting` row carries `waitingFor`**, the same label the registry record
+carries, and it is read the same way — through `waiting_labels.py`, so this
+reader and the Reply Window sweep cannot disagree about what a wait is (#150).
+
 **No version pin.** #71's decision, taken knowingly: this rides surface that may
 move, and the safeguard is honest failure rather than a gate that would refuse
 every Session on the machine the day after an upgrade. `PROVEN_AGAINST_VERSION`
@@ -36,6 +40,11 @@ from typing import Any, Final
 
 from gpt_voicecoding.adapters.agent import _naming
 from gpt_voicecoding.adapters.agent._project import ProjectNames
+from gpt_voicecoding.adapters.agent.claude import waiting_labels
+from gpt_voicecoding.adapters.agent.claude.waiting_labels import (
+    NOTHING_READ_YET,
+    StopDisposition,
+)
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     ProgressObservation,
@@ -43,7 +52,6 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
     WaitingFor,
-    WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
@@ -220,7 +228,7 @@ def _inspection(row: dict[str, Any]) -> SessionInspection | None:
         workspace=Path(str(cwd)) if isinstance(cwd, str) and cwd.strip() else Path(),
         lifecycle=SessionLifecycle.LIVE,
         state=state,
-        waiting_for=_waiting_for(state),
+        waiting_for=_waiting_for(state, row.get("waitingFor")),
         # `progress` and `last_activity` are transcript facts (#76). `startedAt`
         # is on this row and is deliberately not read as either: when a Session
         # began is not when it last did anything.
@@ -229,19 +237,50 @@ def _inspection(row: dict[str, Any]) -> SessionInspection | None:
     )
 
 
-def _waiting_for(state: SessionState) -> WaitingFor:
+def _waiting_for(state: SessionState, label: Any) -> WaitingFor:
     """What the roster alone can honestly say a Session is waiting for.
 
-    Almost nothing. `waiting` is the permission state on the builds measured so
-    far (#73), but the roster carries no tool, no dialog handle and no prompt,
-    and a question dialog has never been observed from here — so claiming
-    `PERMISSION` would be reading one measurement as a closed set. `UNKNOWN`
-    with `caught_up=False` is the seam's own word for *ask again*, and #75
-    answers it from the transcript that does carry those fields.
+    Two things, now that Claude Code's own `waitingFor` label rides the row
+    (#150, `waiting_labels.py`). The row still carries no tool, no dialog handle
+    and no prompt, so the ordinary answer stays `UNKNOWN` with `caught_up=
+    False` — the seam's word for *ask again* — and #75 answers it from the
+    transcript that does carry those fields.
+
+    The one thing the label settles here is the **negative**: a `dialog open` or
+    a `goal proposal` is the user driving their own TUI, and a Session at one is
+    not waiting on anybody. Saying so is what keeps a slash-command picker off
+    the roster's `needs_the_user`, which is the gate Bridge Core's reconcile
+    pass announces from.
+
+    **A named wait is deliberately not promoted here, and the mechanism is the
+    `approval_id`.** `permission prompt` classifies as `PERMISSION` and the
+    Reply Window sweep announces it as one — but that sweep is handed the parked
+    dialog's handle by the hook holding it open, and a roster row has no such
+    field to carry (`seams/agent.py:181-185`). Bridge Core deduplicates a wait
+    on `(target, approval_id or kind)` (`core/bridge.py:726-731`), so a row
+    promoted to `PERMISSION` could only ever key `(target, PERMISSION)`, which
+    is not the `(target, approval_id)` the live path used for the same dialog.
+    The reconcile pass would therefore miss the dedup and escalate a *second*
+    notice — "a tool needs your permission — answer it at the terminal" — for a
+    decision the Approval Relay is already holding answerable elsewhere, which
+    is precisely the double announcement `core/bridge.py:749-768` exists to
+    prevent and which #150 exists to reduce.
+
+    Widening that key is Bridge Core's, and #150 puts it out of scope. So the
+    roster keeps its *ask again*, and its `waiting_for` is deliberately narrower
+    than the registry reader's: the classification is shared, the acting on it
+    is not. #151, which gives a Stop Notice the Session's own progress
+    observation, reads this seam and should know that the narrowing is a dedup
+    constraint rather than something the roster failed to measure.
     """
     if state is not SessionState.WAITING:
         return WaitingFor()
-    return WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+    if (
+        waiting_labels.classify(label if isinstance(label, str) else None).disposition
+        is StopDisposition.NEVER_A_STOP
+    ):
+        return WaitingFor()
+    return NOTHING_READ_YET
 
 
 def _name(row: dict[str, Any]) -> str | None:
