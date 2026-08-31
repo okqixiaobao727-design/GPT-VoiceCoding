@@ -538,6 +538,20 @@ class CodexAgentAdapter:
         from `_shared_daemon` is exactly that fact — #76 builds the client, so
         something was always attempted and `SharedDaemon.note` is the dial's own
         words rather than a sentence invented here.
+
+        **The target this is called with is a lookup key and nothing more**
+        (#158). A caller's target may be an address discovery has already
+        superseded — a Relay is answered against the thread it names, not
+        against the address it happens to carry — so once a watch is resolved by
+        thread id, its own target is the one the re-adoption and the read-back
+        below use. A closed connection is a reason to re-dial, never a reason to
+        move a thread's address; `_adopt_discovered` stays the only path that
+        moves it, which is what #153 settled.
+
+        Both the adoption key and the read-back have to move together. Re-keying
+        under the resolved target while still reading back under the caller's
+        would miss, and answer `PRE_WIRE_UNREACHABLE` for a thread this adapter
+        had just re-adopted — turning a mis-keying into a delivery failure.
         """
         watched = self._threads.get(target)
         if watched is None and target.session_id is not None:
@@ -546,12 +560,15 @@ class CodexAgentAdapter:
             return watched, ""
         if target.session_id is None:
             return None, NO_THREAD_YET
+        adopting = target
         if watched is not None:
-            # Its connection went away. Drop it so the adoption below re-keys
-            # the row onto whatever the daemon is answering on now.
-            self._threads.pop(watched.target, None)
-        await self._adopt(SessionInspection(target=target, workspace=Path()))
-        watched = self._threads.get(target)
+            # Its connection went away. Drop it so the adoption below re-dials,
+            # under the address the watch already holds rather than whichever
+            # one this call arrived with.
+            adopting = watched.target
+            self._threads.pop(adopting, None)
+        await self._adopt(SessionInspection(target=adopting, workspace=Path()))
+        watched = self._threads.get(adopting)
         if watched is None:
             note = self._daemon.note or "nothing answered where the shared Codex daemon should be"
             return None, f"{PRE_WIRE_UNREACHABLE} — {note}"
