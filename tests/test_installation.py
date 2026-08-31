@@ -236,6 +236,28 @@ def test_a_concurrent_writer_is_reported_and_not_retried(tmp_path: Path, monkeyp
 # -- the recorded intent -------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("wanted", "explanation"),
+    [
+        pytest.param(None, "never been installed", id="never recorded"),
+        pytest.param(True, "recorded as installed", id="wanted true"),
+        pytest.param(False, "was uninstalled", id="wanted false"),
+    ],
+)
+def test_reach_explains_an_absent_block_from_the_install_intent(
+    tmp_path: Path, wanted: bool | None, explanation: str
+) -> None:
+    directory = config_directory(tmp_path)
+    base = tmp_path / "support"
+    if wanted is not None:
+        assert write_intent(wanted, base) == ""
+
+    reach = hooks.reach(directory, base_dir=base)
+
+    assert reach.installed is False
+    assert explanation in reach.note
+
+
 def test_reconcile_installs_on_a_first_run_and_records_it(
     tmp_path: Path, launchd: FakeLaunchd
 ) -> None:

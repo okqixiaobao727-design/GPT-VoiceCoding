@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import json
 import shlex
+import sys
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-from gpt_voicecoding.installation import Outcome, State, replace_text
+from gpt_voicecoding.installation import Outcome, State, read_intent, replace_text
 
 #: How this item is named in a report.
 NAME: Final = "claude-hooks"
@@ -92,6 +94,14 @@ MODULE_PREFIX: Final = "gpt_voicecoding."
 #: How an interpreter is told which module to run. The whole fingerprint rests on
 #: this being the *only* way this product ever writes a hook command.
 MODULE_FLAG: Final = "-m"
+
+
+@dataclass(frozen=True, slots=True)
+class Reach:
+    """Whether this machine can reach Claude Sessions, in an operator's words."""
+
+    installed: bool
+    note: str
 
 
 def default_config_directory(environ: Mapping[str, str], home: Path | None = None) -> Path:
@@ -303,6 +313,46 @@ def inspect(config_directory: Path, interpreter: Path) -> Outcome:
         State.STALE,
         note=f"{path} carries hooks of ours that this build would write differently",
     )
+
+
+def reach(
+    config_directory: Path,
+    *,
+    base_dir: Path | None = None,
+    interpreter: Path | None = None,
+) -> Reach:
+    """Whether the configured Claude lane has the hook block it needs."""
+    standing = inspect(config_directory, interpreter or Path(sys.executable))
+    if not standing.ok or not config_directory.is_dir():
+        return Reach(installed=False, note=standing.note)
+    if standing.state is State.CURRENT:
+        return Reach(installed=True, note=f"the Claude hook block is current at {standing.note}")
+    if standing.state is State.STALE:
+        return Reach(
+            installed=False,
+            note=(
+                f"the Claude hook block is stale: {standing.note}; "
+                "run `bridge-install reconcile` to make it current"
+            ),
+        )
+
+    intent = read_intent(base_dir)
+    if intent.wanted is None:
+        note = (
+            "the Claude hook block has never been installed; "
+            "run `bridge-install reconcile` to install it"
+        )
+    elif intent.wanted:
+        note = (
+            "the Claude hook block is recorded as installed but is not present in "
+            f"{settings_path(config_directory)}"
+        )
+    else:
+        note = (
+            "the Claude hook block was uninstalled while this engine is configured "
+            "to reach Claude Sessions"
+        )
+    return Reach(installed=False, note=note)
 
 
 def install(config_directory: Path, interpreter: Path) -> Outcome:

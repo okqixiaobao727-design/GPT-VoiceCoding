@@ -19,6 +19,7 @@ import itertools
 import json
 import os
 import shutil
+import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -35,6 +36,7 @@ from gpt_voicecoding.adapters.agent.claude import (
     inbox,
 )
 from gpt_voicecoding.adapters.agent.claude.adapter import APPROVAL_UNROUTED, SessionReport
+from gpt_voicecoding.adapters.agent.claude.privacy import PRIVATE_SOCKET_MODE
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL
 from gpt_voicecoding.adapters.agent.claude.settings import (
     DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS,
@@ -45,6 +47,8 @@ from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.relays import RelayPipeline
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
+from gpt_voicecoding.installation import State, write_intent
+from gpt_voicecoding.installation import claude_hooks as hooks
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
@@ -55,7 +59,7 @@ from gpt_voicecoding.seams.agent import (
 )
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionName, SessionTarget
-from gpt_voicecoding.seams.verify import VerifyOutcome
+from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
 
 SESSION = "0b7cf6f2-0f3c-4f5e-9d1f-8a2b3c4d5e6f"
 TARGET = SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=4321)
@@ -100,6 +104,30 @@ class Sink:
         return [event for event in self.events if isinstance(event, kind)]
 
 
+class DialObserver:
+    """A real Unix socket that records connection attempts and reads no protocol."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.connections = 0
+        self._server: asyncio.Server | None = None
+
+    async def __aenter__(self) -> DialObserver:
+        self._server = await asyncio.start_unix_server(self._accept, path=str(self.path))
+        os.chmod(self.path, PRIVATE_SOCKET_MODE)
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+    async def _accept(self, _reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        writer.close()
+        await writer.wait_closed()
+
+
 @pytest.fixture
 def socket_path() -> Iterator[Path]:
     """A private directory, under a root short enough to bind.
@@ -135,12 +163,44 @@ def quick(**overrides: Any) -> ClaudeSettings:
     return ClaudeSettings(**defaults)
 
 
+def install_claude_hooks(config_directory: Path) -> None:
+    config_directory.mkdir(parents=True, exist_ok=True)
+    outcome = hooks.install(config_directory, Path(sys.executable))
+    assert (outcome.ok, outcome.state) == (True, State.CURRENT)
+
+
+async def observe_registered_verify(
+    socket_path: Path,
+    *,
+    settings: ClaudeSettings,
+    installation_base_dir: Path,
+    claude_config_directory: Path | None = None,
+) -> tuple[VerifyResult, int]:
+    """Verify with one registered inbox and report whether its socket was dialled."""
+    async with DialObserver(socket_path) as inbox:
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            settings=settings,
+            claude_config_directory=claude_config_directory,
+            installation_base_dir=installation_base_dir,
+        )
+        adapter.register_session(TARGET, socket_path)
+        try:
+            result = await adapter.verify()
+            await asyncio.sleep(0)
+            return result, inbox.connections
+        finally:
+            await adapter.aclose()
+
+
 def reaching(
     path: Path,
     sink: Sink,
     settings: ClaudeSettings | None = None,
     *,
     transcript_path: Path | None = None,
+    claude_config_directory: Path | None = None,
+    installation_base_dir: Path | None = None,
 ) -> ClaudeAgentAdapter:
     """An adapter that already knows where one Session's inbox listens.
 
@@ -153,6 +213,8 @@ def reaching(
         progress_capture=PROGRESS_CAPTURE,
         sink=sink,
         settings=settings or quick(registry_directory=path.parent),
+        claude_config_directory=claude_config_directory,
+        installation_base_dir=installation_base_dir,
     )
     adapter.register_session(TARGET, path)
     adapter._reported[TARGET] = SessionReport(  # noqa: SLF001 - seeding one registration
@@ -827,22 +889,166 @@ class TestFailingBeforeTheWordsLeave:
 
 
 class TestReportingWhatIsLoaded:
-    def test_verify_names_this_implementation_and_passes_with_nothing_registered(self) -> None:
+    def test_verify_refuses_divergent_roots_before_inspection_or_dial(
+        self, tmp_path: Path, socket_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_root = tmp_path / "claude-b"
+        config_root.mkdir()
+        (config_root / "settings.json").write_text("{not json", encoding="utf-8")
+        monkeypatch.setenv(hooks.CONFIG_DIRECTORY_VARIABLE, str(config_root))
+        settings = quick()
+
+        result, connections = asyncio.run(
+            observe_registered_verify(
+                socket_path,
+                settings=settings,
+                installation_base_dir=tmp_path / "support",
+            )
+        )
+
+        assert result.outcome is VerifyOutcome.FAIL
+        assert str(config_root) in result.detail
+        assert str(settings.registry_directory) in result.detail
+        assert "not JSON" not in result.detail
+        assert connections == 0
+
+    def test_verify_uses_the_installation_resolver_when_roots_agree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_root = tmp_path / ".claude-b"
+        install_claude_hooks(config_root)
+        monkeypatch.setenv(hooks.CONFIG_DIRECTORY_VARIABLE, str(config_root))
+
         result = asyncio.run(
             ClaudeAgentAdapter(
                 progress_capture=PROGRESS_CAPTURE,
+                settings=quick(registry_directory=config_root / "sessions" / "mine"),
+                installation_base_dir=tmp_path / "support",
+            ).verify()
+        )
+
+        assert result.outcome is VerifyOutcome.PASS
+        assert "hook block is current" in result.detail
+
+    def test_verify_refuses_a_missing_config_directory_before_dial(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        config_root = tmp_path / ".claude"
+
+        result, connections = asyncio.run(
+            observe_registered_verify(
+                socket_path,
+                settings=quick(registry_directory=config_root / "sessions"),
+                claude_config_directory=config_root,
+                installation_base_dir=tmp_path / "support",
+            )
+        )
+
+        assert result.outcome is VerifyOutcome.FAIL
+        assert "no Claude config directory" in result.detail
+        assert connections == 0
+
+    def test_verify_carries_each_absent_intent_note_without_dialling(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        details: list[str] = []
+        for index, wanted in enumerate((None, True, False)):
+            config_root = tmp_path / f"claude-{index}"
+            config_root.mkdir()
+            base = tmp_path / f"support-{index}"
+            if wanted is not None:
+                assert write_intent(wanted, base) == ""
+            expected = hooks.reach(config_root, base_dir=base)
+
+            result, connections = asyncio.run(
+                observe_registered_verify(
+                    socket_path.with_name(f"intent-{index}.sock"),
+                    settings=quick(registry_directory=config_root / "sessions"),
+                    claude_config_directory=config_root,
+                    installation_base_dir=base,
+                )
+            )
+
+            assert result.outcome is VerifyOutcome.FAIL
+            assert result.detail == expected.note
+            assert connections == 0
+            details.append(result.detail)
+
+        assert len(set(details)) == 3
+
+    def test_verify_reports_a_stale_block_without_dialling(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        config_root = tmp_path / ".claude"
+        config_root.mkdir()
+        assert hooks.install(config_root, Path("/old/engine/python")).state is State.CURRENT
+
+        result, connections = asyncio.run(
+            observe_registered_verify(
+                socket_path,
+                settings=quick(registry_directory=config_root / "sessions"),
+                claude_config_directory=config_root,
+                installation_base_dir=tmp_path / "support",
+            )
+        )
+
+        assert result.outcome is VerifyOutcome.FAIL
+        assert "hook block is stale" in result.detail
+        assert "bridge-install reconcile" in result.detail
+        assert connections == 0
+
+    def test_verify_carries_a_malformed_settings_failure_without_dialling(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        config_root = tmp_path / ".claude"
+        config_root.mkdir()
+        (config_root / "settings.json").write_text("{not json", encoding="utf-8")
+
+        result, connections = asyncio.run(
+            observe_registered_verify(
+                socket_path,
+                settings=quick(registry_directory=config_root / "sessions"),
+                claude_config_directory=config_root,
+                installation_base_dir=tmp_path / "support",
+            )
+        )
+
+        assert result.outcome is VerifyOutcome.FAIL
+        assert "not JSON, so this install would destroy it" in result.detail
+        assert "no hooks of ours" not in result.detail
+        assert connections == 0
+
+    def test_verify_names_this_implementation_and_passes_with_nothing_registered(
+        self, tmp_path: Path
+    ) -> None:
+        config_root = tmp_path / ".claude"
+        install_claude_hooks(config_root)
+        result = asyncio.run(
+            ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+                settings=quick(registry_directory=config_root / "sessions"),
+                claude_config_directory=config_root,
+                installation_base_dir=tmp_path / "support",
             ).verify()
         )
         assert result.outcome is VerifyOutcome.PASS
         assert result.loaded.endswith(":ClaudeAgentAdapter")
+        assert "hook block is current" in result.detail
         assert "no Claude Session is registered" in result.detail
 
     def test_verify_passes_when_a_registered_inbox_answers(self, socket_path: Path) -> None:
         """A dial and an immediate close: anything written would be a real message."""
+        install_claude_hooks(socket_path.parent)
 
         async def scenario():
             async with FakeInbox(socket_path) as session:
-                adapter = reaching(socket_path, Sink())
+                adapter = reaching(
+                    socket_path,
+                    Sink(),
+                    settings=quick(registry_directory=socket_path.parent / "sessions"),
+                    claude_config_directory=socket_path.parent,
+                    installation_base_dir=socket_path.parent / "support",
+                )
                 try:
                     return await adapter.verify(), session.received
                 finally:
@@ -856,8 +1062,16 @@ class TestReportingWhatIsLoaded:
     def test_verify_fails_and_names_the_layer_when_no_inbox_answers(
         self, socket_path: Path
     ) -> None:
+        install_claude_hooks(socket_path.parent)
+
         async def scenario():
-            adapter = reaching(socket_path, Sink())
+            adapter = reaching(
+                socket_path,
+                Sink(),
+                settings=quick(registry_directory=socket_path.parent / "sessions"),
+                claude_config_directory=socket_path.parent,
+                installation_base_dir=socket_path.parent / "support",
+            )
             try:
                 return await adapter.verify()
             finally:
@@ -872,6 +1086,17 @@ class TestWhatThisSpokeMayBeTold:
     def test_an_unknown_key_refuses_to_start_and_lists_what_there_is(self) -> None:
         with pytest.raises(SettingsError, match="ack_timeout_secondz"):
             claude_agent(progress_capture=PROGRESS_CAPTURE, settings={"ack_timeout_secondz": 5})
+
+    @pytest.mark.parametrize(
+        "machine_dependency",
+        ["claude_config_directory", "installation_base_dir", "interpreter"],
+    )
+    def test_machine_dependencies_are_not_settings_keys(self, machine_dependency: str) -> None:
+        with pytest.raises(SettingsError, match=machine_dependency):
+            claude_agent(
+                progress_capture=PROGRESS_CAPTURE,
+                settings={machine_dependency: "/tmp/not-user-config"},
+            )
 
     def test_a_text_budget_larger_than_the_line_budget_can_never_be_spent(self) -> None:
         with pytest.raises(SettingsError, match="must fit inside"):
