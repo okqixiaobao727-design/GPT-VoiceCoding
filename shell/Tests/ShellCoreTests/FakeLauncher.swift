@@ -73,8 +73,7 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
     private let lock = NSLock()
     private var asked = false
     private var forced = false
-    private var code: Int32?
-    private var exitWaiter: CheckedContinuation<Int32, Never>?
+    private let exit = OneShot<Int32>()
 
     init(pid: Int32, run: FakeLauncher.Run?, clock: TestClock, deaf: Bool = false) {
         processIdentifier = pid
@@ -83,7 +82,7 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
         self.deaf = deaf
     }
 
-    var hasExited: Bool { lock.withLock { code != nil } }
+    var hasExited: Bool { exit.isResolved }
 
     func waitForExit(
         deliveringStderr: @Sendable (Data) async -> Void
@@ -91,17 +90,10 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
         if let run {
             if !run.stderr.isEmpty { await deliveringStderr(Data(run.stderr.utf8)) }
             clock.advance(run.uptime)
-            resolve(run.code)
+            exit.resolve(run.code)
             return run.code
         }
-        return await withCheckedContinuation { continuation in
-            let finished: Int32? = lock.withLock {
-                if let code { return code }
-                exitWaiter = continuation
-                return nil
-            }
-            if let finished { continuation.resume(returning: finished) }
-        }
+        return await exit.value()
     }
 
     /// A cooperating child stops; a deaf one does not, which is the case the
@@ -109,27 +101,16 @@ final class FakeProcess: EngineProcess, @unchecked Sendable {
     func requestStop() {
         lock.withLock { asked = true }
         guard !deaf else { return }
-        resolve(-SIGTERM)
+        exit.resolve(-SIGTERM)
     }
 
     func forceStop() {
         lock.withLock { forced = true }
-        resolve(-SIGKILL)
+        exit.resolve(-SIGKILL)
     }
 
     var stopRequested: Bool { lock.withLock { asked } }
     var stopForced: Bool { lock.withLock { forced } }
-
-    private func resolve(_ code: Int32) {
-        let waiting: CheckedContinuation<Int32, Never>? = lock.withLock {
-            guard self.code == nil else { return nil }
-            self.code = code
-            let waiter = exitWaiter
-            exitWaiter = nil
-            return waiter
-        }
-        waiting?.resume(returning: code)
-    }
 }
 
 /// Time the test moves. Sleeping returns at once and is recorded, so the backoff
