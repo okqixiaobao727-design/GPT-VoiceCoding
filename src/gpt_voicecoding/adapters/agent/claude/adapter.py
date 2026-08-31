@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -90,6 +91,7 @@ from gpt_voicecoding.adapters.agent.claude.transcript import (
     TranscriptUnavailable,
 )
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher, StopReading
+from gpt_voicecoding.installation import claude_hooks
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -205,10 +207,18 @@ class ClaudeAgentAdapter:
         progress_capture: ProgressCapture,
         sink: EventSink | None = None,
         settings: ClaudeSettings | None = None,
+        claude_config_directory: Path | None = None,
+        installation_base_dir: Path | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or ClaudeSettings()
         self._progress_capture = progress_capture
+        self._claude_config_directory = (
+            claude_config_directory
+            if claude_config_directory is not None
+            else claude_hooks.default_config_directory(os.environ)
+        )
+        self._installation_base_dir = installation_base_dir
         #: The inbox socket each registered Session's own `SessionStart` hook
         #: reported. Read, never built: 2.1.245 derives the directory from
         #: `CLAUDE_CODE_TMPDIR` or `$XDG_RUNTIME_DIR` and accepts
@@ -821,19 +831,42 @@ class ClaudeAgentAdapter:
         return None
 
     async def verify(self) -> VerifyResult:
-        """Report what is loaded, and whether any registered inbox really answers.
+        """Report what is installed and loaded, then whether an inbox answers.
 
-        A dial and an immediate close, deliberately: this verb runs at start-up
-        against every Session on the machine, and anything written here would
-        land in a real conversation. What it proves is that the address the
-        registration reported is a socket somebody is still listening on.
+        Ask Installation first, dial second. A missing hook block explains why
+        the inbox roster may be empty and fails without trying any registered
+        address. A dial is an immediate close: anything written here would land
+        in a real conversation. It proves only that somebody still listens at the
+        address a Session's registration reported.
         """
         loaded = f"{type(self).__module__}:{type(self).__name__}"
+        registry_directory = self._settings.registry_directory
+        if not registry_directory.is_relative_to(self._claude_config_directory):
+            return VerifyResult(
+                outcome=VerifyOutcome.FAIL,
+                loaded=loaded,
+                detail=(
+                    f"Claude hooks are checked under {self._claude_config_directory}, but "
+                    f"the Session registry is at {registry_directory}"
+                ),
+            )
+        reach = claude_hooks.reach(
+            self._claude_config_directory,
+            base_dir=self._installation_base_dir,
+        )
+        if not reach.installed:
+            return VerifyResult(
+                outcome=VerifyOutcome.FAIL,
+                loaded=loaded,
+                detail=reach.note,
+            )
         if not self._inboxes:
             return VerifyResult(
                 outcome=VerifyOutcome.PASS,
                 loaded=loaded,
-                detail="no Claude Session is registered, so there is no inbox to reach",
+                detail=(
+                    f"{reach.note}; no Claude Session is registered, so there is no inbox to reach"
+                ),
             )
 
         answered: list[SessionTarget] = []

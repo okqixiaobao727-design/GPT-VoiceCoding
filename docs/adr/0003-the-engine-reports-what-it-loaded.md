@@ -13,3 +13,5 @@ The check is level-triggered with three outcomes: **pass** (configured and loade
 ## Consequences
 
 This is the rule for every seam with a pluggable adapter; `verify` is a seam verb for this reason.
+
+**Amended by [#159](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/159): `MANUAL` is structurally unavailable to an adapter that reports a real loaded implementation.** A far side that is uninstalled rather than unconfigured therefore reports `FAIL`: the adapter is configured and loaded, and the machine does not have what it needs to reach that far side.
