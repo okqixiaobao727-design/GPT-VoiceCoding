@@ -264,26 +264,26 @@ def _waiting_for(state: SessionState, label: Any) -> WaitingFor:
     the roster's `needs_the_user`, which is the gate Bridge Core's reconcile
     pass announces from.
 
-    **A named wait is deliberately not promoted here, and the mechanism is the
-    `approval_id`.** `permission prompt` classifies as `PERMISSION` and the
-    Reply Window sweep announces it as one — but that sweep is handed the parked
-    dialog's handle by the hook holding it open, and a roster row has no such
-    field to carry (`seams/agent.py:181-185`). Bridge Core deduplicates a wait
-    on `(target, approval_id or kind)` (`core/bridge.py:726-731`), so a row
-    promoted to `PERMISSION` could only ever key `(target, PERMISSION)`, which
-    is not the `(target, approval_id)` the live path used for the same dialog.
-    The reconcile pass would therefore miss the dedup and escalate a *second*
-    notice — "a tool needs your permission — answer it at the terminal" — for a
-    decision the Approval Relay is already holding answerable elsewhere, which
-    is precisely the double announcement `core/bridge.py:749-768` exists to
-    prevent and which #150 exists to reduce.
+    **A named wait is not promoted here yet, and #155 is why it should be.** A
+    `permission prompt` or a `sandbox request` classifies as `NAMED_NOW` with a
+    complete `WaitingFor`, and this reader throws that answer away — which is
+    the one thing `waiting_labels.py` says both readers exist not to do. The
+    sweep announces such a wait by name (`window.py:521-522`) while the row for
+    the same Session at the same moment reads `UNKNOWN`.
 
-    Widening that key is Bridge Core's, and #150 puts it out of scope. So the
-    roster keeps its *ask again*, and its `waiting_for` is deliberately narrower
-    than the registry reader's: the classification is shared, the acting on it
-    is not. #151, which gives a Stop Notice the Session's own progress
-    observation, reads this seam and should know that the narrowing is a dedup
-    constraint rather than something the roster failed to measure.
+    The reason previously recorded here — that a promoted row could only key
+    `(target, PERMISSION)` where the live path keyed `(target, approval_id)`,
+    so `core/bridge.py:762-767` would miss the dedup and announce twice — **does
+    not hold, and is retracted** (and #161 deletes that ledger outright). Both
+    paths run the same `_overlay` (`adapter.py:646-692`), which attaches a
+    parked dialog's handle to whichever of them is reading; for one dialog at
+    one moment they produce the same key. A handle-less `(target, PERMISSION)`
+    is reachable today anyway, from the transcript, since the base this function
+    returns stands only where the transcript found `NONE`.
+
+    #151, which gives a Stop Notice the Session's own progress observation,
+    reads this seam: the narrowing is a defect under repair, not a measurement
+    the roster could not make.
     """
     if state is not SessionState.WAITING:
         return WaitingFor()
