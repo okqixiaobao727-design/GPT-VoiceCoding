@@ -101,9 +101,10 @@ CODEX_HOME_VARIABLE: Final = "CODEX_HOME"
 DEFAULT_CODEX_HOME_NAME: Final = ".codex"
 
 #: The standalone managed binary, under the symlink Codex's updater moves. #82
-#: chose this over the user's `PATH` deliberately: what `codex` resolves to in an
-#: interactive shell is whatever the user's shell says, which on this product's
-#: own author's machine was a gen-1 wrapper function.
+#: chose this over the user's `PATH` deliberately, so both this LaunchAgent and
+#: the Codex adapter derive the same file from the same ``CODEX_HOME``. What
+#: `codex` resolves to in an interactive shell is whatever the user's shell says,
+#: which on this product's own author's machine was a gen-1 wrapper function.
 MANAGED_BINARY_PARTS: Final = ("packages", "standalone", "current", "codex")
 
 #: What the job runs. `start` waits until the daemon's initialize is ready and

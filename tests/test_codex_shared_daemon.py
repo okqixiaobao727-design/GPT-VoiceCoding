@@ -29,6 +29,7 @@ from gpt_voicecoding.adapters.agent.codex.shared_daemon import (
     locate,
 )
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
+from gpt_voicecoding.installation import codex_launch_agent
 
 SOCKET = Path("/tmp/app-server-control.sock")
 
@@ -55,6 +56,25 @@ def running(**extra: object) -> dict[str, object]:
 
 class TestFindingIt:
     """One lookup, ported from #82's prototype rather than invented again."""
+
+    def test_the_default_probe_runs_installations_managed_binary(self, tmp_path: Path) -> None:
+        environ = {"CODEX_HOME": str(tmp_path / "codex-home")}
+        probed: list[str] = []
+
+        async def record(executable: str) -> tuple[None, str]:
+            probed.append(executable)
+            return None, "no daemon"
+
+        daemon = SharedDaemon(
+            settings=CodexSettings.of(None, environ=environ),
+            version="test",
+            locate=record,
+        )
+
+        asyncio.run(daemon.client())
+
+        expected = codex_launch_agent.managed_binary(codex_launch_agent.default_codex_home(environ))
+        assert [Path(executable).resolve() for executable in probed] == [expected.resolve()]
 
     def test_the_socket_path_comes_from_the_daemon_itself(self) -> None:
         """Never derived from `CODEX_HOME`: the daemon is the one that knows."""
