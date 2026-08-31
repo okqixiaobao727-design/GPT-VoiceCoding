@@ -8,9 +8,29 @@ is open — but it leaves a Claude Session unreachable in the assembled engine, 
 observing it is this module's whole job.
 
 **A Reply Window is a level, not an event.** Claude Code publishes exactly that
-in its registry record: a `status` field carrying `idle`, `busy` or `waiting`,
-rewritten sub-second. Reading the field that *is* the level beats reconstructing
-it from a stream of events.
+in its registry record: a `status` field carrying `idle`, `busy`, `shell` or
+`waiting`, rewritten sub-second. Reading the field that *is* the level beats
+reconstructing it from a stream of events.
+
+**`shell` is `idle` with a background task still running, and it is OPEN**
+(#154). The build rewrites `idle` to it for the pid-file write when a
+`local_bash` task outlives the turn, and only this reader ever sees the word —
+`claude agents --json` maps it back to `busy`. Reading it as a state nobody had
+looked at made it CLOSED by the whitelist's own correct rule, and left a Session
+that was accepting input unreachable until its background task finished. The
+window is OPEN because a Relay delivered during `shell` was *measured* to be
+acted on as the next turn, not because the two words looked alike; the
+measurement is beside `registry.PROVEN_AGAINST_VERSION`, and without it this
+would have stayed CLOSED.
+
+**Legacy has no behaviour to port here, and that is the citation** (ADR 0010).
+Legacy learned a finished turn from the `Stop` hook event rather than from any
+polled status word (`legacy@1d32845:bridge/daemon.py:194-211`, whose rule is
+"`Stop` is a finished turn"), so it had no registry `status` to read, no fourth
+word to miss, and a background shell could not delay a stop it was told about by
+an event. The lateness this fixes is a v2 defect introduced when the rewrite
+swapped that event for a poll — *dropped, because* the source of truth changed
+and the polled vocabulary was never completed.
 
 **`waiting` is CLOSED.** It means *a* dialog is on screen, and a dialog blocks
 every Relay there is — verified live: three routes, all enqueued, none
@@ -35,10 +55,16 @@ baseline this watcher compares against and stays silent; Bridge Core learns the
 starting level by *asking* — the Agent seam's `reply_window`, answered here by
 `level` — at the moment it enters the Session in its roster.
 
-**A turn stop is an observed active status reaching `idle`.** Both `busy` and
-`waiting` belong to the same active turn: `waiting` is that turn paused at a
-permission dialog, not the next user prompt. A missing, torn or unrecognised
-record does not prove activity and does not erase activity already observed.
+**A turn stop is an observed active status reaching an open one.** `idle` is
+one such word and `shell` is the other, because the turn has equally ended in
+both — waiting for the background task to drain before saying so delayed the
+notice for exactly as long as that task ran (#154). Both `busy` and `waiting`
+belong to the same active turn: `waiting` is that turn paused at a permission
+dialog, not the next user prompt. `shell → idle` is therefore not a second stop:
+the turn was already over, so nothing is left active for that edge to end.
+
+A missing, torn or unrecognised record does not prove activity and does not
+erase activity already observed.
 That distinction prevents the first `idle` record written after registration
 from being announced as a turn that stopped, while still surviving an ordinary
 mid-turn registry rewrite. A whole active-to-idle cycle that begins and ends
@@ -142,10 +168,19 @@ from gpt_voicecoding.seams.identity import SessionTarget
 
 _log = logging.getLogger(__name__)
 
-#: The one registry status that means "awaiting the user's next instruction".
-#: A whitelist rather than a blacklist: a new status this build has never seen
-#: must read as CLOSED, and a blacklist would let it read as OPEN.
-STATUS_MEANING_OPEN = "idle"
+#: The registry statuses that mean "awaiting the user's next instruction", and
+#: therefore also "the turn has ended". A whitelist rather than a blacklist: a
+#: new status this build has never seen must read as CLOSED, and a blacklist
+#: would let it read as OPEN.
+#:
+#: `shell` is `idle` wearing a second hat (#154): Claude Code rewrites the word
+#: to it when the Session is idle *and* a `local_bash` background task is still
+#: running. The turn has ended and the Session takes the next one, which is why
+#: both words sit in one set rather than `shell` being a status of its own. The
+#: measurement that says so is beside `registry.PROVEN_AGAINST_VERSION`.
+#: Legacy read no polled status at all, so there is nothing to port (ADR
+#: 0010; see this module's docstring).
+STATUSES_MEANING_OPEN = frozenset(("idle", "shell"))
 
 #: Registry statuses that prove a turn is still in progress. `waiting` is the
 #: permission-dialog pause described above, so it remains part of that turn.
@@ -209,7 +244,7 @@ def _is_a_turn_in_progress(record: SessionRecord) -> bool:
 
 def window_for(record: SessionRecord | None) -> ReplyWindow:
     """What one registry record says about a Session's willingness to take a turn."""
-    if record is None or record.status != STATUS_MEANING_OPEN:
+    if record is None or record.status not in STATUSES_MEANING_OPEN:
         return ReplyWindow.CLOSED
     return ReplyWindow.OPEN
 
@@ -365,6 +400,11 @@ class ReplyWindowWatcher:
     def poll_once(self) -> None:
         """One sweep of every watched Session: death first, then the level, then the stops.
 
+        The finished-turn edge tests membership in `STATUSES_MEANING_OPEN`
+        rather than equality with `idle`, so a turn ending into `shell`
+        announces at that transition (#154) and the `shell → idle` that follows
+        finds no active turn left to end.
+
         Death first because it is terminal. A target proved gone is reported once
         and dropped, and reporting a window for it in the same breath would say a
         fact Bridge Core has already drawn from the ending.
@@ -412,7 +452,7 @@ class ReplyWindowWatcher:
             if live_record is not None:
                 if _is_a_turn_in_progress(live_record):
                     self._active_turns.add(target)
-                elif live_record.status == STATUS_MEANING_OPEN:
+                elif live_record.status in STATUSES_MEANING_OPEN:
                     self._active_turns.discard(target)
                 if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER:
                     self._at_a_dialog.setdefault(
@@ -432,7 +472,7 @@ class ReplyWindowWatcher:
                 continue
             if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER:
                 self._settle(target, live_record)
-            elif was_active and live_record.status == STATUS_MEANING_OPEN:
+            elif was_active and live_record.status in STATUSES_MEANING_OPEN:
                 self._emit(SessionStopped(target=target, waiting_for=self._what_for(target)))
 
     def _settle(self, target: SessionTarget, record: SessionRecord) -> None:

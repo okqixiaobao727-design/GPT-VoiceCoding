@@ -62,9 +62,12 @@ _log = logging.getLogger(__name__)
 #: Sessions the user can be told about is a roster of ones that are running.
 ROSTER_COMMAND: Final = ("claude", "agents", "--json")
 
-#: The build every shape below was read off, on Simon's machine on 2026-08-26.
-#: Documentation for the next re-probe, never a gate — see this module's docstring.
-PROVEN_AGAINST_VERSION: Final = "2.1.246"
+#: The build every shape below was read off. Documentation for the next
+#: re-probe, never a gate — see this module's docstring. First read on Simon's
+#: machine on 2026-08-26 against 2.1.246; re-probed there on 2026-08-31 against
+#: 2.1.251, when the roster's answer for a `shell` Session was measured (#154,
+#: below), which is the build this reader is now recorded against.
+PROVEN_AGAINST_VERSION: Final = "2.1.251"
 
 #: How long the roster command is given before it is treated as unavailable. A
 #: discovery that hangs is a discovery loop that stops, so this is a ceiling on
@@ -79,6 +82,15 @@ INTERACTIVE_KIND: Final = "interactive"
 #: Session doing something this build has not seen a word for, which is
 #: `RUNNING` — the reading that keeps a Relay waiting rather than delivering it
 #: into a state nobody has looked at.
+#:
+#: **Three words, and `shell` is deliberately not a fourth** (#154). The
+#: registry has a fourth status — `idle` with a background task still running —
+#: but this command does not publish it: measured on 2.1.251, `claude agents
+#: --json` reported a pid `busy` at the same moment that pid's registry record
+#: read `status: "shell"`. So the roster projection reports what the roster
+#: itself says, and adding `shell` here would document a row this command has
+#: never produced. The measurement is beside `registry.PROVEN_AGAINST_VERSION`,
+#: and `window.py` is the reader that acts on it.
 STATUS_WORDS: Final = {
     "idle": SessionState.IDLE,
     "busy": SessionState.RUNNING,

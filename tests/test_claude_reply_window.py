@@ -169,8 +169,10 @@ class TestWhatOneStatusMeans:
     holds the Session and every one of those reports was dropped.
     """
 
-    def test_only_idle_is_an_open_window(self, tmp_path: Path) -> None:
-        say(tmp_path, "idle")
+    @pytest.mark.parametrize("status", ["idle", "shell"])
+    def test_idle_and_shell_are_both_an_open_window(self, tmp_path: Path, status: str) -> None:
+        """`shell` is `idle` with a background task still running (#154, measured)."""
+        say(tmp_path, status)
 
         assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.OPEN
 
@@ -333,6 +335,45 @@ class TestReportingStops:
         watcher.poll_once()
 
         assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_a_turn_that_ends_into_a_background_shell_is_reported_stopped(
+        self, tmp_path: Path
+    ) -> None:
+        """`busy -> shell` is the turn ending, and is not made to wait for `idle` (#154)."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "shell")
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_the_background_task_finishing_is_not_a_second_stop(self, tmp_path: Path) -> None:
+        """`shell -> idle` is the same ended turn losing its background task (#154)."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, "busy")
+        watcher.watch(TARGET)
+
+        say(tmp_path, "shell")
+        watcher.poll_once()
+        say(tmp_path, "idle")
+        watcher.poll_once()
+
+        assert [event.target for event in sink.stops] == [TARGET]
+
+    def test_a_first_shell_record_is_not_a_turn_that_stopped(self, tmp_path: Path) -> None:
+        """Registration seeds the baseline, so an already-shell Session announces nothing."""
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        watcher.watch(TARGET)
+
+        say(tmp_path, "shell")
+        watcher.poll_once()
+
+        assert sink.stops == []
 
     def test_a_mid_turn_missing_record_does_not_erase_the_stop(self, tmp_path: Path) -> None:
         sink = AllEvents()
