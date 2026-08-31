@@ -764,7 +764,7 @@ def control_plane_payload(
     * the roster row's own fields. `_roster_lines`
       (`control_plane/commands.py:168`) renders five of them into one line, and
       the steps after `roster` need others — the Session name #78 stabilises,
-      the `waiting_for` #75 fills, the `progress` #76 reads, the
+      the `waiting_for` #75 fills, the roster progress summary #147 publishes, the
       `ChildClassification` #79 sets. None of those tickets locks a *text
       format*, and none should have to: a step asserting on the wording of that
       one line would be asking a build ticket to invent a format and then

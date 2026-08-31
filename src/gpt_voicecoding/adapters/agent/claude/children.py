@@ -88,6 +88,7 @@ from typing import Any, Final
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
+    ProgressObservation,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -408,7 +409,7 @@ def _row(parent: SessionInspection, agent_id: str, depth: object) -> SessionInsp
         waiting_for=WaitingFor(),
         # Not read, rather than read and empty. #76's progress reader answers
         # for Sessions the user can ask about, and this is not one of them.
-        progress=None,
+        progress=ProgressObservation(),
         last_activity=None,
         child=ChildClassification(
             kind=ChildKind.CHILD,

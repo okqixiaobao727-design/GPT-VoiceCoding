@@ -23,6 +23,7 @@ from app_bundle import run as bundle_run
 from app_bundle.plan import BuildPlan
 
 from gpt_voicecoding import config
+from gpt_voicecoding.seams.agent import ProgressAvailability, ProgressOmission
 from gpt_voicecoding.seams.control_plane import PROTOCOL_VERSION, Action
 
 #: What every binary in a current arm64 tree actually starts with.
@@ -430,6 +431,34 @@ class TestTheThingsThatMustAgree:
         assert body is not None, "Wire.swift no longer declares the action set as one enum"
         named = set(re.findall(r"^\s*case `?(?P<name>\w+)`?\s*$", body[0], re.MULTILINE))
         assert named == {str(action) for action in Action}
+
+    @pytest.mark.parametrize(
+        ("swift_name", "python_values"),
+        [
+            ("ProgressAvailability", {str(value) for value in ProgressAvailability}),
+            ("ProgressOmission", {str(value) for value in ProgressOmission}),
+        ],
+    )
+    def test_the_shell_and_engine_share_progress_vocabulary(
+        self,
+        swift_name: str,
+        python_values: set[str],
+    ) -> None:
+        swift = (inputs.SHELL_PACKAGE / "Sources/ShellCore/Wire.swift").read_text()
+        body = re.search(
+            rf"public enum {swift_name}: String.*?\n\}}",
+            swift,
+            re.DOTALL,
+        )
+
+        assert body is not None, f"Wire.swift no longer declares {swift_name}"
+        cases = re.findall(
+            r'^\s*case\s+(?P<name>\w+)(?:\s*=\s*"(?P<raw>[^"]+)")?\s*$',
+            body[0],
+            re.MULTILINE,
+        )
+        declared = {raw or name for name, raw in cases}
+        assert declared == python_values
 
     def test_the_shell_and_the_engine_name_the_same_default_socket_path(self) -> None:
         """The Swift shell and Python engine must meet at the same default address.

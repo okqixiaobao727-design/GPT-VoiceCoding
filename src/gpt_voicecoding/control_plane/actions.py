@@ -32,6 +32,7 @@ from typing import Any
 
 from gpt_voicecoding.control_plane import payloads
 from gpt_voicecoding.control_plane.payloads import InvalidPayload, NothingPending
+from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
@@ -66,8 +67,14 @@ def code_for(refusal: BridgeCoreError) -> ErrorCode:
 class ControlPlane:
     """The engine side of the control plane. Translation, never decision."""
 
-    def __init__(self, core: BridgeCore) -> None:
+    def __init__(
+        self,
+        core: BridgeCore,
+        *,
+        progress_publication: ProgressPublication | None = None,
+    ) -> None:
         self._core = core
+        self._progress_publication = progress_publication or ProgressPublication()
         self.handlers: dict[Action, Handler] = {
             Action.STATUS: self._status,
             Action.SWITCH: self._switch,
@@ -93,29 +100,32 @@ class ControlPlane:
         """Answer exactly one request. Never raises; a refusal is a reply."""
         handler = self.handlers.get(request.action)
         if handler is None:  # a closed action set with a hole in it
-            return Reply.refused(
-                request.action,
-                ErrorCode.UNKNOWN_ACTION,
-                f"this engine has no handler for {request.action}",
+            return self._progress_publication.final(
+                Reply.refused(
+                    request.action,
+                    ErrorCode.UNKNOWN_ACTION,
+                    f"this engine has no handler for {request.action}",
+                )
             )
         try:
-            return Reply.answered(request.action, await handler(request.payload))
+            reply = Reply.answered(request.action, await handler(request.payload))
         except InvalidPayload as unusable:
-            return Reply.refused(request.action, ErrorCode.INVALID_PAYLOAD, str(unusable))
+            reply = Reply.refused(request.action, ErrorCode.INVALID_PAYLOAD, str(unusable))
         except NothingPending as gone:
-            return Reply.refused(request.action, ErrorCode.UNKNOWN_PENDING, str(gone))
+            reply = Reply.refused(request.action, ErrorCode.UNKNOWN_PENDING, str(gone))
         except BridgeCoreError as refusal:
-            return Reply.refused(request.action, code_for(refusal), str(refusal))
+            reply = Reply.refused(request.action, code_for(refusal), str(refusal))
+        return self._progress_publication.final(reply)
 
     # ------------------------------------------------------------------
     # The actions. Each one is a payload read, a hub call, and a render.
     # ------------------------------------------------------------------
 
     async def _status(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        return payloads.status_document(self._core.status())
+        return self._progress_publication.status_document(self._core.status())
 
     async def _sessions(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        return {"sessions": payloads.status_document(self._core.status())["sessions"]}
+        return self._progress_publication.sessions_document(self._core.status())
 
     async def _progress(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """How far along one exact Session is, rendered as one roster row.
@@ -130,12 +140,10 @@ class ControlPlane:
             session.target,
             session.reply_window,
         )
-        return {
-            "session": payloads.session_document(
-                session,
-                reply_window=reply_window,
-            )
-        }
+        return self._progress_publication.exact_document(
+            session,
+            reply_window=reply_window,
+        )
 
     async def _switch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         name = payloads.read_text(payload, "name")

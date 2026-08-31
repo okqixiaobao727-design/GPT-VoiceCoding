@@ -45,6 +45,7 @@ from gpt_voicecoding.adapters.agent.claude.registry import (
     RegistryError,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings, SettingsError
+from gpt_voicecoding.seams.agent import ProgressCapture
 
 __all__ = [
     "CHANNEL_CONFIG_VARIABLE",
@@ -64,6 +65,15 @@ __all__ = [
 ]
 
 
-def claude_agent(*, sink: Any = None, settings: dict[str, Any] | None = None) -> ClaudeAgentAdapter:
+def claude_agent(
+    *,
+    progress_capture: ProgressCapture,
+    sink: Any = None,
+    settings: dict[str, Any] | None = None,
+) -> ClaudeAgentAdapter:
     """Build the adapter from an opaque settings table, refusing keys it lacks."""
-    return ClaudeAgentAdapter(sink=sink, settings=ClaudeSettings.of(settings))
+    return ClaudeAgentAdapter(
+        progress_capture=progress_capture,
+        sink=sink,
+        settings=ClaudeSettings.of(settings),
+    )

@@ -87,6 +87,9 @@ from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     LaneUnavailable,
     Option,
+    ProgressAvailability,
+    ProgressCapture,
+    ProgressObservation,
     RelayRoute,
     ReplyWindow,
     ReplyWindowChanged,
@@ -146,6 +149,7 @@ class CodexAgentAdapter:
     def __init__(
         self,
         *,
+        progress_capture: ProgressCapture,
         sink: EventSink | None = None,
         settings: CodexSettings | None = None,
         own_socket_path: Path | None = None,
@@ -186,7 +190,7 @@ class CodexAgentAdapter:
             closed=self._daemon_let_go,
         )
         #: What each loaded thread last said, read at most once per change.
-        self._turns = codex_discovery.TurnCache()
+        self._turns = codex_discovery.TurnCache(progress_capture=progress_capture)
         #: Which of the daemon's threads this lane has already said are not
         #: Sessions (#112). Kept here rather than in `discovery.py` for the
         #: reason `_turns` is: the cadence calls `discover` every five seconds,
@@ -575,25 +579,31 @@ class CodexAgentAdapter:
         ago in this same call. Reading again would be the second of two
         half-megabyte reads for one question.
 
-        **An unattached row keeps `progress=None`, and never a guessed one.** Its
+        **An unattached row keeps `progress=not_read`, and never a guessed one.** Its
         rollout is on disk and reading it would be a second source answering the
         same question with worse evidence — the port table left exactly that
-        behind (P6, P13). Bridge Core turns that `None` into the honest error #76
+        behind (P6, P13). Bridge Core turns `not_read` into the honest error #76
         asks for; it is not this adapter's to invent one.
         """
-        if row.progress is not None or row.target.session_id is None:
+        if (
+            row.progress.availability is not ProgressAvailability.NOT_READ
+            or row.target.session_id is None
+        ):
             return row
         client = await self._shared_daemon()
         if client is None:
             return row
-        described = await codex_discovery.read_thread(
-            client, row.target.session_id, with_turns=True
-        )
-        if described is None:
-            return row
+        reading = await codex_discovery.read_thread(client, row.target.session_id, with_turns=True)
+        if reading.thread is None:
+            assert reading.reason is not None
+            return replace(row, progress=ProgressObservation.unreadable(reading.reason))
+        described = reading.thread
         return replace(
             row,
-            progress=codex_discovery.progress_from(described),
+            progress=codex_discovery.progress_from(
+                described,
+                capture=self._turns.capture,
+            ),
             last_activity=thread_tail.last_activity(described) or row.last_activity,
         )
 

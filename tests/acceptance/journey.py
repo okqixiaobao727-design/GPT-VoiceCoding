@@ -959,11 +959,10 @@ class Walk:
         can be from outside — the agent's own record does not grow across the
         read, and the roster's state does not leave `idle`.
 
-        **Both surfaces are exercised, because #76 built both and they are one
-        reading.** `bridgectl progress <target>` is the verb the ticket names,
-        and it reads the Session *now*; the roster row carries the same fields so
-        a Control Panel can render them without asking a second question. The
-        step fails if either is absent, and fails if they disagree.
+        **Both publications are exercised.** `bridgectl progress <target>` is the
+        user-facing exact-detail verb. The following roster read must carry the
+        same availability, history presence and read time from the folded
+        observation, while deliberately carrying no chat body.
         """
         if self.address is None:
             raise LaneBlocked("no Session to read progress from")
@@ -973,31 +972,54 @@ class Walk:
         answer = self.bridgectl("progress", self.address)
         if not answer.ok:
             raise StepFailed(f"`bridgectl progress {self.address}` refused: {answer.text}")
+        progress_lines = [line.strip() for line in answer.text.splitlines()]
+        said = support.flatten(
+            line for line in progress_lines if line.startswith(("user: ", "assistant: "))
+        )
+        if not said:
+            raise StepFailed(
+                f"`bridgectl progress {self.address}` carried no history after a turn: "
+                f"{answer.text[:200]!r}"
+            )
+        read_at = next(
+            (
+                line.removeprefix("read at ")
+                for line in progress_lines
+                if line.startswith("read at ")
+            ),
+            None,
+        )
+        if read_at is None:
+            raise StepFailed(
+                f"`bridgectl progress {self.address}` carried no observation time: "
+                f"{answer.text[:200]!r}"
+            )
 
         row = self._roster_row()
         if row is None:
             raise StepFailed(f"{self.address} left the roster before progress could be read")
         if "progress" not in row:
             raise StepFailed(
-                f"the roster row carries no `progress`: #74 locks "
-                f"`Progress(recent, truncated, read_at)` on the inspection and #76 is the verb "
+                f"the roster row carries no `progress`: #147 locks "
+                f"`ProgressObservation` on the inspection and exact progress is the verb "
                 f"that fills it; the row has keys {sorted(row)}"
             )
         reported = row["progress"]
-        if not reported or not (reported.get("recent") if isinstance(reported, dict) else None):
-            raise StepFailed(f"progress for {self.address} is {reported!r} after a turn that ran")
-        said = support.flatten(
-            f"{entry.get('role')}: {entry.get('text')}"
-            for entry in reported["recent"]
-            if isinstance(entry, dict)
-        )
-        newest = reported["recent"][-1]
-        if isinstance(newest, dict) and str(newest.get("text", ""))[:40] not in answer.text:
+        if not isinstance(reported, dict):
+            raise StepFailed(f"roster progress for {self.address} is {reported!r}")
+        if (
+            reported.get("availability") != "readable"
+            or reported.get("has_history") is not True
+            or reported.get("read_at") != read_at
+        ):
             raise StepFailed(
-                f"the verb and the roster describe {self.address} differently — "
-                f"`bridgectl progress` said {answer.text[:200]!r} and the row says {said[:200]!r}"
+                f"the bridgectl observation and roster summary disagree for {self.address}: "
+                f"command read at {read_at!r}, summary {reported!r}"
             )
-
+        if reported.get("recent") != [] or reported.get("omission") != "status_summary":
+            raise StepFailed(
+                f"the roster carried chat body or lost history for {self.address}: {reported!r}"
+            )
         time.sleep(2.0)
         after_size = self._record_size()
         after_state = self._roster_field("state")
@@ -1007,7 +1029,7 @@ class Walk:
                 f"{after_size} bytes — that is a turn, and #76 forbids one"
             )
         return (
-            f"progress read without a turn, through `bridgectl progress` and the roster row: "
+            f"exact progress read without a turn and roster summary retained its facts: "
             f"{said[:160]!r}; record steady at {after_size} bytes; "
             f"state {before_state!r} → {after_state!r}"
         )

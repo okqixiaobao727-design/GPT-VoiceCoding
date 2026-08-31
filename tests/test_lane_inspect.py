@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.codex import CodexAgentAdapter
 from gpt_voicecoding.seams.agent import (
@@ -47,7 +48,10 @@ class TestALaneThatCouldNotLook:
 
     def test_the_claude_lane_refuses_rather_than_calling_the_session_over(self) -> None:
         adapter = answering(
-            ClaudeAgentAdapter(), LaneDiscovery(error="`claude` is not on the PATH")
+            ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+            ),
+            LaneDiscovery(error="`claude` is not on the PATH"),
         )
 
         with pytest.raises(LaneUnavailable) as refused:
@@ -57,7 +61,10 @@ class TestALaneThatCouldNotLook:
         assert refused.value.agent is AgentKind.CLAUDE
 
     def test_the_codex_lane_does_the_same(self) -> None:
-        adapter = answering(CodexAgentAdapter(), LaneDiscovery(error="the process table is shut"))
+        adapter = answering(
+            CodexAgentAdapter(progress_capture=PROGRESS_CAPTURE),
+            LaneDiscovery(error="the process table is shut"),
+        )
 
         with pytest.raises(LaneUnavailable) as refused:
             asyncio.run(adapter.inspect(CODEX))  # type: ignore[attr-defined]
@@ -70,14 +77,19 @@ class TestALaneThatLookedAndDidNotFindIt:
     """The other half of the rule: a lane that *did* look may end a row."""
 
     def test_the_claude_lane_calls_it_ended(self) -> None:
-        adapter = answering(ClaudeAgentAdapter(), LaneDiscovery())
+        adapter = answering(
+            ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+            ),
+            LaneDiscovery(),
+        )
 
         row = asyncio.run(adapter.inspect(CLAUDE))  # type: ignore[attr-defined]
 
         assert row.lifecycle is SessionLifecycle.ENDED
 
     def test_the_codex_lane_calls_it_ended(self) -> None:
-        adapter = answering(CodexAgentAdapter(), LaneDiscovery())
+        adapter = answering(CodexAgentAdapter(progress_capture=PROGRESS_CAPTURE), LaneDiscovery())
 
         row = asyncio.run(adapter.inspect(CODEX))  # type: ignore[attr-defined]
 
@@ -87,7 +99,8 @@ class TestALaneThatLookedAndDidNotFindIt:
         """`degraded` says the rows came from a weaker source, not that they are doubtful."""
         row = SessionInspection(target=CODEX, workspace=WORKSPACE)
         adapter = answering(
-            CodexAgentAdapter(), LaneDiscovery(rows=(row,), degraded="shared daemon absent")
+            CodexAgentAdapter(progress_capture=PROGRESS_CAPTURE),
+            LaneDiscovery(rows=(row,), degraded="shared daemon absent"),
         )
 
         assert asyncio.run(adapter.inspect(CODEX)) == row  # type: ignore[attr-defined]

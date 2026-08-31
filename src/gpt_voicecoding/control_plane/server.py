@@ -70,6 +70,10 @@ from gpt_voicecoding.control_plane.ownership import (
     verify_bindable,
     verify_private_directory,
 )
+from gpt_voicecoding.control_plane.progress_publication import (
+    ProgressPublication,
+    encode_reply,
+)
 from gpt_voicecoding.private_socket import start_private_unix_server
 from gpt_voicecoding.seams.control_plane import (
     MAX_REQUEST_BYTES,
@@ -125,10 +129,16 @@ class ControlPlaneServer:
         path: Path,
         max_bytes: int = MAX_REQUEST_BYTES,
         owner_of: OwnerOf = path_owner,
+        progress_publication: ProgressPublication | None = None,
     ) -> None:
+        if progress_publication is not None and progress_publication.max_bytes != max_bytes:
+            raise ValueError("the server and progress publication capacities must agree")
         self._plane = plane
         self._path = Path(path)
         self._max_bytes = max_bytes
+        self._progress_publication = progress_publication or ProgressPublication(
+            max_bytes=max_bytes
+        )
         self._owner_of = owner_of
         self._server: asyncio.AbstractServer | None = None
         #: Set once, on the way out. Every handler reads it between requests.
@@ -307,7 +317,7 @@ class ControlPlaneServer:
             return Reply.refused(request.action, ErrorCode.REFUSED, str(unexpected) or "engine bug")
 
     async def _write(self, writer: asyncio.StreamWriter, reply: Reply) -> None:
-        writer.write(json.dumps(reply.as_document(), ensure_ascii=False).encode("utf-8") + b"\n")
+        writer.write(encode_reply(self._progress_publication.final(reply)))
         await writer.drain()
 
 

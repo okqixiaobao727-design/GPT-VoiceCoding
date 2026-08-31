@@ -38,6 +38,7 @@ from gpt_voicecoding.adapters.agent import _naming
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
+    ProgressObservation,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -223,7 +224,7 @@ def _inspection(row: dict[str, Any]) -> SessionInspection | None:
         # `progress` and `last_activity` are transcript facts (#76). `startedAt`
         # is on this row and is deliberately not read as either: when a Session
         # began is not when it last did anything.
-        progress=None,
+        progress=ProgressObservation(),
         last_activity=None,
     )
 

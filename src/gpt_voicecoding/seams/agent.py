@@ -52,6 +52,7 @@ Adapters: Codex and Claude.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -229,6 +230,23 @@ class ProgressRole(StrEnum):
     ASSISTANT = "assistant"
 
 
+class ProgressAvailability(StrEnum):
+    """Whether an authoritative progress source was read, and whether it answered."""
+
+    NOT_READ = "not_read"
+    UNREADABLE = "unreadable"
+    READABLE = "readable"
+
+
+class ProgressOmission(StrEnum):
+    """Why known history is absent from, or incomplete in, one progress view."""
+
+    NONE = "none"
+    OLDER = "older"
+    STATUS_SUMMARY = "status_summary"
+    NEWEST_OVERSIZE = "newest_oversize"
+
+
 @dataclass(frozen=True, slots=True)
 class ProgressEntry:
     """One thing that was said in a Session, and by which side.
@@ -239,30 +257,138 @@ class ProgressEntry:
     Call, the Companion Channel and the Control Panel ask what a Session last
     said and what it was last told, never which turn that was or how the turn
     ended — and adding a field here later is additive rather than a second
-    widening of `Progress`.
+    widening of `ProgressObservation`.
     """
 
     role: ProgressRole
     text: str
 
     def __post_init__(self) -> None:
-        if not self.text.strip():
+        if not isinstance(self.role, ProgressRole):
+            raise ValueError("a progress entry role must use the Agent seam vocabulary")
+        if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("an entry with nothing said in it is not progress")
 
 
-@dataclass(frozen=True, slots=True)
-class Progress:
-    """How far along a Session is, in its own words, as of one reading.
+class ProgressCapture(Protocol):
+    """The publication-owned source capture strategy supplied to an Agent adapter."""
 
-    `read_at` is on the value rather than inferred by the reader, because a
-    progress line's whole meaning is when it was true. `truncated` says the
-    reader stopped early rather than that the Session said this much: a surface
-    that renders "3 steps" when there were thirty is worse than one that says so.
+    @property
+    def max_bytes(self) -> int:
+        """The canonical encoded entry capacity of the largest publication."""
+
+    def select(
+        self,
+        entries: Sequence[ProgressEntry],
+    ) -> tuple[tuple[ProgressEntry, ...], ProgressOmission]:
+        """Return the newest whole source tail and name any omission."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressObservation:
+    """One canonical reading from an Agent's authoritative progress source.
+
+    Availability is explicit because no source read, a failed source read and a
+    source that answered with no visible history are three different facts. The
+    invariants live here so neither adapter nor publisher can recreate the old
+    false equivalence between an empty tail and an omitted one (ADR 0016).
     """
 
+    availability: ProgressAvailability = ProgressAvailability.NOT_READ
+    has_history: bool | None = None
     recent: tuple[ProgressEntry, ...] = ()
-    truncated: bool = False
+    omission: ProgressOmission = ProgressOmission.NONE
     read_at: datetime | None = None
+    reason: str | None = None
+
+    @classmethod
+    def readable(
+        cls,
+        *,
+        has_history: bool,
+        read_at: datetime,
+        recent: tuple[ProgressEntry, ...] = (),
+        omission: ProgressOmission = ProgressOmission.NONE,
+    ) -> ProgressObservation:
+        return cls(
+            availability=ProgressAvailability.READABLE,
+            has_history=has_history,
+            recent=recent,
+            omission=omission,
+            read_at=read_at,
+        )
+
+    @classmethod
+    def unreadable(cls, reason: str) -> ProgressObservation:
+        return cls(availability=ProgressAvailability.UNREADABLE, reason=reason)
+
+    @classmethod
+    def from_capture(
+        cls,
+        *,
+        recent: tuple[ProgressEntry, ...],
+        omission: ProgressOmission,
+        read_at: datetime,
+    ) -> ProgressObservation:
+        """Build one readable source fact without duplicating history semantics."""
+        if omission is ProgressOmission.STATUS_SUMMARY:
+            raise ValueError("a source capture cannot be a roster summary")
+        return cls.readable(
+            has_history=bool(recent) or omission is not ProgressOmission.NONE,
+            recent=recent,
+            omission=omission,
+            read_at=read_at,
+        )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.availability, ProgressAvailability):
+            raise ValueError("progress availability must use the Agent seam vocabulary")
+        if not isinstance(self.omission, ProgressOmission):
+            raise ValueError("progress omission must use the Agent seam vocabulary")
+        if self.has_history is not None and type(self.has_history) is not bool:
+            raise ValueError("progress history presence must be true, false or absent")
+        if not isinstance(self.recent, tuple) or any(
+            not isinstance(entry, ProgressEntry) for entry in self.recent
+        ):
+            raise ValueError("progress recent must be an ordered tuple of whole entries")
+        if self.read_at is not None and not isinstance(self.read_at, datetime):
+            raise ValueError("progress read time must be a datetime or absent")
+        match self.availability:
+            case ProgressAvailability.NOT_READ:
+                if (
+                    self.has_history is not None
+                    or self.recent
+                    or self.omission is not ProgressOmission.NONE
+                    or self.read_at is not None
+                    or self.reason is not None
+                ):
+                    raise ValueError("progress that was not read carries no observed facts")
+            case ProgressAvailability.UNREADABLE:
+                if not isinstance(self.reason, str) or not self.reason.strip():
+                    raise ValueError("unreadable progress must carry its source's reason")
+                if (
+                    self.has_history is not None
+                    or self.recent
+                    or self.omission is not ProgressOmission.NONE
+                    or self.read_at is not None
+                ):
+                    raise ValueError("unreadable progress carries only its source's reason")
+            case ProgressAvailability.READABLE:
+                if self.has_history is None or self.read_at is None:
+                    raise ValueError("readable progress carries history presence and read time")
+                if self.reason is not None:
+                    raise ValueError("readable progress does not also carry an unreadable reason")
+                if not self.has_history:
+                    if self.recent or self.omission is not ProgressOmission.NONE:
+                        raise ValueError("empty history carries no entries and no omission")
+                    return
+                if not self.recent and self.omission is ProgressOmission.NONE:
+                    raise ValueError("history exists, so an empty tail must name its omission")
+                if self.recent and self.omission in (
+                    ProgressOmission.STATUS_SUMMARY,
+                    ProgressOmission.NEWEST_OVERSIZE,
+                ):
+                    raise ValueError(f"{self.omission} carries no progress entries")
 
 
 class ChildKind(StrEnum):
@@ -314,8 +440,7 @@ class SessionInspection:
     lifecycle: SessionLifecycle = SessionLifecycle.LIVE
     state: SessionState = SessionState.RUNNING
     waiting_for: WaitingFor = field(default_factory=WaitingFor)
-    #: `None` means "not read", which is not the same as "read and empty".
-    progress: Progress | None = None
+    progress: ProgressObservation = field(default_factory=ProgressObservation)
     #: Separate from `progress` on purpose: a Session can have moved without
     #: having said anything a reader would show, and #76 consumes both.
     last_activity: datetime | None = None

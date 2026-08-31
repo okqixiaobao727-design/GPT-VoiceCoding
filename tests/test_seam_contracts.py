@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import fields
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -31,6 +32,11 @@ from gpt_voicecoding.seams.agent import (
     AgentAdapter,
     ApprovalRequest,
     ApprovalVerdict,
+    ProgressAvailability,
+    ProgressEntry,
+    ProgressObservation,
+    ProgressOmission,
+    ProgressRole,
     RelayRoute,
 )
 from gpt_voicecoding.seams.call import CallAdapter, CallState
@@ -101,6 +107,106 @@ def test_every_pluggable_seam_can_be_asked_what_it_loaded(
 
 
 class TestTheAgentContract:
+    def test_progress_observation_names_every_availability_and_omission(self) -> None:
+        assert set(ProgressAvailability) == {
+            ProgressAvailability.NOT_READ,
+            ProgressAvailability.UNREADABLE,
+            ProgressAvailability.READABLE,
+        }
+        assert set(ProgressOmission) == {
+            ProgressOmission.NONE,
+            ProgressOmission.OLDER,
+            ProgressOmission.STATUS_SUMMARY,
+            ProgressOmission.NEWEST_OVERSIZE,
+        }
+
+    def test_readable_empty_history_is_the_only_nothing_said_state(self) -> None:
+        read_at = datetime(2026, 8, 30, tzinfo=UTC)
+
+        observed = ProgressObservation.readable(
+            has_history=False,
+            read_at=read_at,
+        )
+
+        assert observed.availability is ProgressAvailability.READABLE
+        assert observed.has_history is False
+        assert observed.recent == ()
+        assert observed.omission is ProgressOmission.NONE
+        assert observed.read_at == read_at
+
+    def test_history_cannot_disappear_behind_an_empty_unomitted_tail(self) -> None:
+        with pytest.raises(ValueError, match="history exists"):
+            ProgressObservation.readable(
+                has_history=True,
+                read_at=datetime(2026, 8, 30, tzinfo=UTC),
+            )
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"availability": "readable"},
+            {"omission": "none"},
+            {"has_history": "yes"},
+            {"read_at": "now"},
+        ],
+    )
+    def test_progress_observation_refuses_untyped_vocabulary(
+        self, change: dict[str, object]
+    ) -> None:
+        values: dict[str, object] = {
+            "availability": ProgressAvailability.READABLE,
+            "has_history": False,
+            "omission": ProgressOmission.NONE,
+            "read_at": datetime(2026, 8, 30, tzinfo=UTC),
+        }
+        values.update(change)
+
+        with pytest.raises(ValueError):
+            ProgressObservation(**values)  # type: ignore[arg-type]
+
+    def test_an_unreadable_observation_carries_only_its_source_reason(self) -> None:
+        observed = ProgressObservation.unreadable("the transcript could not be opened")
+
+        assert observed.availability is ProgressAvailability.UNREADABLE
+        assert observed.reason == "the transcript could not be opened"
+        assert observed.has_history is None
+        assert observed.recent == ()
+
+    def test_a_readable_tail_keeps_roles_order_and_whole_text(self) -> None:
+        read_at = datetime(2026, 8, 30, tzinfo=UTC)
+        entries = (
+            ProgressEntry(role=ProgressRole.USER, text="do the thing"),
+            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
+        )
+
+        observed = ProgressObservation.readable(
+            has_history=True,
+            recent=entries,
+            read_at=read_at,
+        )
+
+        assert observed.recent == entries
+
+    @pytest.mark.parametrize(
+        ("omission", "has_history"),
+        [
+            (ProgressOmission.NONE, False),
+            (ProgressOmission.NEWEST_OVERSIZE, True),
+        ],
+    )
+    def test_one_factory_derives_history_presence_from_a_source_capture(
+        self,
+        omission: ProgressOmission,
+        has_history: bool,
+    ) -> None:
+        observed = ProgressObservation.from_capture(
+            recent=(),
+            omission=omission,
+            read_at=datetime(2026, 8, 30, tzinfo=UTC),
+        )
+
+        assert observed.has_history is has_history
+
     def test_a_relay_returns_a_receipt_in_the_four_state_vocabulary(self) -> None:
         agent = FakeAgent()
         receipt = asyncio.run(agent.answer_relay(CODEX, "ship it", request_id=new_request_id()))

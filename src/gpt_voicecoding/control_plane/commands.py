@@ -152,7 +152,12 @@ def render(reply: Reply) -> str:
         case Action.STATUS:
             return "\n".join(_status_lines(data))
         case Action.SESSIONS:
-            return "\n".join(_roster_lines(data["sessions"]))
+            return "\n".join(
+                [
+                    *_roster_lines(data["sessions"]),
+                    *_degraded_lane_lines(data.get("degraded_lanes")),
+                ]
+            )
         case Action.PROGRESS:
             return "\n".join(_progress_lines(data["session"]))
         case Action.SWITCH:
@@ -183,6 +188,7 @@ def _status_lines(data: dict[str, object]) -> list[str]:
     lines.append(f"call: {call_id}" if call_id else "call: none")
     lines.extend(_roster_lines(data["sessions"]))
     lines.extend(_lane_lines(data.get("lanes")))
+    lines.extend(_degraded_lane_lines(data.get("degraded_lanes")))
     pending_relays = data["pending_relays"]
     pending_approvals = data["pending_approvals"]
     assert isinstance(pending_relays, list) and isinstance(pending_approvals, list)
@@ -215,14 +221,29 @@ def _progress_lines(session: object) -> list[str]:
     #: describe one Session two ways.
     lines = _roster_lines([session])[1:]
     progress = session["progress"]
-    if progress is None:
+    assert isinstance(progress, dict)
+    availability = progress["availability"]
+    if availability == "not_read":
         return [*lines, "  progress: not read"]
+    if availability == "unreadable":
+        return [*lines, "  progress: unreadable"]
+
+    assert availability == "readable"
     lines.append(f"  last activity: {session['last_activity'] or 'not read'}")
-    if progress["truncated"]:
-        lines.append("  (older entries dropped)")
-    lines.extend(f"  {entry['role']}: {entry['text']}" for entry in progress["recent"])
-    if not progress["recent"]:
+    has_history = progress["has_history"]
+    omission = progress["omission"]
+    if has_history is False:
+        assert omission == "none"
         lines.append("  nothing said yet")
+    elif omission == "older":
+        lines.append("  (older entries dropped)")
+    elif omission == "status_summary":
+        lines.append("  history exists, but this roster carries no chat text")
+    elif omission == "newest_oversize":
+        lines.append("  history exists, but the newest entry is too large to carry")
+
+    if has_history is True:
+        lines.extend(f"  {entry['role']}: {entry['text']}" for entry in progress["recent"])
     lines.append(f"  read at {progress['read_at']}")
     return lines
 
@@ -232,6 +253,13 @@ def _lane_lines(lanes: object) -> list[str]:
     if not isinstance(lanes, dict) or not lanes:
         return []
     return [f"  {agent} lane unavailable — {reason}" for agent, reason in sorted(lanes.items())]
+
+
+def _degraded_lane_lines(lanes: object) -> list[str]:
+    """Say when rows are retained but one authoritative source was unreadable."""
+    if not isinstance(lanes, dict) or not lanes:
+        return []
+    return [f"  {agent} lane degraded — {reason}" for agent, reason in sorted(lanes.items())]
 
 
 def _relay_line(data: dict[str, object]) -> str:

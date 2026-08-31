@@ -17,10 +17,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from gpt_voicecoding.adapters.agent._progress import RECENT_LIMIT
+from fakes import PROGRESS_CAPTURE, capture_for
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
 from gpt_voicecoding.adapters.agent.claude.transcript_tail import recent
-from gpt_voicecoding.seams.agent import ProgressRole
+from gpt_voicecoding.seams.agent import ProgressOmission, ProgressRole
 
 # --- the shapes Claude Code writes -------------------------------------------
 
@@ -62,7 +62,7 @@ def worked(at: int) -> dict[str, Any]:
 
 
 def texts(records: list[dict[str, Any]]) -> list[str]:
-    entries, _, _ = recent(records)
+    entries, _, _ = recent(records, capture=PROGRESS_CAPTURE)
     return [entry.text for entry in entries]
 
 
@@ -71,12 +71,15 @@ class TestWhatCountsAsProgress:
 
     def test_both_sides_are_carried_and_each_says_which_it_is(self) -> None:
         """Legacy carried the role to the wire; #74's type carries it as a field."""
-        entries, truncated, _ = recent([said("do the thing", role="user"), said("done", at=1)])
+        entries, omission, _ = recent(
+            [said("do the thing", role="user"), said("done", at=1)],
+            capture=PROGRESS_CAPTURE,
+        )
         assert [(entry.role, entry.text) for entry in entries] == [
             (ProgressRole.USER, "do the thing"),
             (ProgressRole.ASSISTANT, "done"),
         ]
-        assert truncated is False
+        assert omission is ProgressOmission.NONE
 
     def test_a_child_process_record_is_not_this_session_speaking(self) -> None:
         """#68's rule, and 32% of real records (`transcript.py:1131-1133`)."""
@@ -114,9 +117,9 @@ class TestWhatCountsAsProgress:
 
     def test_a_message_with_nothing_readable_is_not_an_entry(self) -> None:
         """`tool_result` and `thinking` never had a say; an empty entry is refused."""
-        entries, truncated, _ = recent([worked(at=1)])
+        entries, omission, _ = recent([worked(at=1)], capture=PROGRESS_CAPTURE)
         assert entries == ()
-        assert truncated is False
+        assert omission is ProgressOmission.NONE
 
     def test_the_options_of_a_question_are_part_of_what_was_said(self) -> None:
         """#66: without them the user hears the question and never hears the choices."""
@@ -161,12 +164,13 @@ class TestTheBound:
         drop rule here as well would be one implementation with two sets of tests
         that can disagree about it.
         """
-        entries, truncated, _ = recent(
-            [said(f"step {index}", at=index) for index in range(RECENT_LIMIT + 2)]
+        entries, omission, _ = recent(
+            [said("x" * 1_000), said("newest", at=1)],
+            capture=capture_for(1_024),
         )
 
-        assert len(entries) == RECENT_LIMIT
-        assert truncated is True
+        assert [entry.text for entry in entries] == ["newest"]
+        assert omission is ProgressOmission.OLDER
 
 
 class TestLastActivity:
@@ -174,22 +178,25 @@ class TestLastActivity:
 
     def test_a_session_that_worked_without_speaking_still_moved(self) -> None:
         """The whole reason the two are different fields."""
-        entries, _, moved = recent([said("done", at=0), worked(at=9)])
+        entries, _, moved = recent([said("done", at=0), worked(at=9)], capture=PROGRESS_CAPTURE)
         assert [entry.text for entry in entries] == ["done"]
         assert moved == FIRST.replace(second=9)
 
     def test_a_child_process_working_is_the_session_working(self) -> None:
         """A sidechain record is not this Session *speaking*; it is it running."""
-        _, _, moved = recent([said("mine", at=0), said("the crew's", at=4, isSidechain=True)])
+        _, _, moved = recent(
+            [said("mine", at=0), said("the crew's", at=4, isSidechain=True)],
+            capture=PROGRESS_CAPTURE,
+        )
         assert moved == FIRST.replace(second=4)
 
     def test_records_with_no_readable_time_are_passed_over(self) -> None:
         """A half-written tail must not blank the time the rest of the file proves."""
         untimed = said("later", at=0)
         untimed["timestamp"] = "not a time"
-        _, _, moved = recent([said("earlier", at=3), untimed])
+        _, _, moved = recent([said("earlier", at=3), untimed], capture=PROGRESS_CAPTURE)
         assert moved == FIRST.replace(second=3)
 
     def test_nothing_read_is_no_time_at_all(self) -> None:
         """`None` is "not read", which no consumer may render as "just now"."""
-        assert recent([]) == ((), False, None)
+        assert recent([], capture=PROGRESS_CAPTURE) == ((), ProgressOmission.NONE, None)

@@ -69,6 +69,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     AwaitingApproval,
     LaneUnavailable,
+    ProgressAvailability,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -406,8 +407,11 @@ class BridgeCore:
 
         if row.lifecycle is not SessionLifecycle.LIVE:
             raise StaleSessionError(target, reason=f"that Session is {row.lifecycle}")
+        if row.progress.availability is ProgressAvailability.UNREADABLE:
+            assert row.progress.reason is not None
+            raise LaneUnreadable(str(target.agent), row.progress.reason)
         read = self._state.sessions.observed_one(row, now=self._stamp())
-        if read.progress is None:
+        if read.progress.availability is ProgressAvailability.NOT_READ:
             raise ProgressUnavailable(target)
         return read
 

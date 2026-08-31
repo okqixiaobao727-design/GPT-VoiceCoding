@@ -10,8 +10,8 @@ Session the shared daemon does not hold has no turns to read: its rollout is on
 disk, but reading it would be a second source answering the same question with
 worse evidence, and the port table left that behind explicitly ("no rollout
 reading for daemon-attached threads" — and for unattached ones, no manufactured
-progress at all). Such a row carries `progress=None`, which is "not read", not
-"read and found nothing".
+progress at all). Such a row carries explicit `not_read` progress, never "read
+and found nothing".
 
 **Against legacy** (ADR 0010, `CLAUDE.md`). The item selection is **ported**
 whole from `legacy@1d32845:bridge/codex.py:1465-1520`: `agentMessage` is what
@@ -27,7 +27,7 @@ Claude side (`bridge/transcript.py:1568-1580`), applied to both lanes.
 1516-1520`), because no v1.0 consumer reads them — the Live Call, the Companion
 Channel and the Control Panel ask what a Session last said and what it was last
 told, never which turn that was — and `ProgressEntry` can gain a field later
-without `Progress` widening twice.
+without `ProgressObservation` widening twice.
 
 **Times are epoch seconds, measured not assumed.** `thread/read` on codex
 0.149.1 answers `updatedAt`, `recencyAt` and `createdAt` as integers —
@@ -43,8 +43,12 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from gpt_voicecoding.adapters.agent._progress import RECENT_LIMIT, RECENT_MAX_BYTES, bounded
-from gpt_voicecoding.seams.agent import ProgressEntry, ProgressRole
+from gpt_voicecoding.seams.agent import (
+    ProgressCapture,
+    ProgressEntry,
+    ProgressOmission,
+    ProgressRole,
+)
 
 #: What the agent said, and what it was told. Everything else a turn holds —
 #: `reasoning`, `commandExecution`, `fileChange`, `plan`, the tool calls, the
@@ -64,10 +68,9 @@ UPDATED_AT: Final = "updatedAt"
 
 def recent(
     thread: Mapping[str, Any],
-    limit: int = RECENT_LIMIT,
     *,
-    max_bytes: int = RECENT_MAX_BYTES,
-) -> tuple[tuple[ProgressEntry, ...], bool]:
+    capture: ProgressCapture,
+) -> tuple[tuple[ProgressEntry, ...], ProgressOmission]:
     """The newest of what this thread said, and whether anything older was dropped.
 
     A document with no `turns` list yields nothing rather than raising: it is
@@ -76,7 +79,7 @@ def recent(
     """
     turns = thread.get("turns")
     if not isinstance(turns, list):
-        return (), False
+        return (), ProgressOmission.NONE
     entries: list[ProgressEntry] = []
     for turn in turns:
         if not isinstance(turn, Mapping):
@@ -85,7 +88,7 @@ def recent(
         if not isinstance(items, list):
             continue
         entries.extend(entry for entry in map(_entry, items) if entry is not None)
-    return bounded(entries, limit, max_bytes=max_bytes)
+    return capture.select(entries)
 
 
 def moment(value: Any) -> datetime | None:

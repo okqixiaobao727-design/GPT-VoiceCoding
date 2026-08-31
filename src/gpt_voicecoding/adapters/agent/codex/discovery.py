@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol
 
 from gpt_voicecoding.adapters.agent import _naming
+from gpt_voicecoding.adapters.agent._progress import source_degradation
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import rollouts, thread_tail
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
@@ -63,7 +64,8 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     LaneDiscovery,
-    Progress,
+    ProgressCapture,
+    ProgressObservation,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -270,7 +272,7 @@ class ProcessIdentity:
 
 
 class TurnCache:
-    """Every loaded thread's `Progress`, read at most once per change (#76).
+    """Every loaded thread's `ProgressObservation`, read at most once per change (#76).
 
     **The cache is the whole reason this class exists, and it was measured.** A
     `thread/read` with `includeTurns: true` answered **558,875 bytes** for a
@@ -298,12 +300,15 @@ class TurnCache:
     That is what it means: when this was true.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, progress_capture: ProgressCapture) -> None:
+        self.capture = progress_capture
         #: thread id → (the `updatedAt` it was read at, what was read).
-        self._cache: dict[str, tuple[Any, Progress]] = {}
+        self._cache: dict[str, tuple[Any, ProgressObservation]] = {}
 
-    async def progress_for(self, client: DaemonClient, thread: dict[str, Any]) -> Progress | None:
-        """This thread's progress, read or remembered — or `None` for a live turn.
+    async def progress_for(
+        self, client: DaemonClient, thread: dict[str, Any]
+    ) -> ProgressObservation:
+        """This thread's progress, read or remembered — or `not_read` for a live turn.
 
         A thread mid-turn is not read on the cadence, for the reason the Claude
         lane does not open a `RUNNING` Session's transcript: it is the expensive
@@ -312,15 +317,16 @@ class TurnCache:
         """
         thread_id = thread.get("id")
         if not isinstance(thread_id, str) or _status_of(thread) == ACTIVE_STATUS:
-            return None
+            return ProgressObservation()
         stamp = thread.get(thread_tail.UPDATED_AT)
         cached = self._cache.get(thread_id)
         if stamp is not None and cached is not None and cached[0] == stamp:
             return cached[1]
-        described = await read_thread(client, thread_id, with_turns=True)
-        if described is None:
-            return None
-        progress = progress_from(described)
+        reading = await read_thread(client, thread_id, with_turns=True)
+        if reading.thread is None:
+            assert reading.reason is not None
+            return ProgressObservation.unreadable(reading.reason)
+        progress = progress_from(reading.thread, capture=self.capture)
         if stamp is not None:
             self._cache[thread_id] = (stamp, progress)
         return progress
@@ -419,7 +425,7 @@ async def discover(
         progress = (
             await turns.progress_for(client, thread)
             if turns is not None and client is not None
-            else None
+            else ProgressObservation()
         )
         rows.append(
             await _named(
@@ -445,7 +451,14 @@ async def discover(
                 names,
             )
         )
-    return LaneDiscovery(rows=tuple(rows), degraded=_degraded(daemon_error, daemon_note))
+    projected = tuple(rows)
+    return LaneDiscovery(
+        rows=projected,
+        degraded=source_degradation(
+            projected,
+            _degraded(daemon_error, daemon_note),
+        ),
+    )
 
 
 def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspection]:
@@ -478,16 +491,20 @@ def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspe
     return linked
 
 
-def progress_from(thread: Mapping[str, Any]) -> Progress:
+def progress_from(thread: Mapping[str, Any], *, capture: ProgressCapture) -> ProgressObservation:
     """One `thread/read` answer, as the seam holds it.
 
-    The one place a thread document becomes a `Progress`, so the cadence's cached
+    The one place a thread document becomes a `ProgressObservation`, so the cadence's cached
     read and the verb's live one cannot come back describing it two ways.
     `read_at` is stamped here because it belongs to the *reading*: it is when this
     was true, and a value carried forward from a cache hit keeps its own moment.
     """
-    entries, truncated = thread_tail.recent(thread)
-    return Progress(recent=entries, truncated=truncated, read_at=datetime.now(UTC))
+    entries, omission = thread_tail.recent(thread, capture=capture)
+    return ProgressObservation.from_capture(
+        recent=entries,
+        omission=omission,
+        read_at=datetime.now(UTC),
+    )
 
 
 def _degraded(daemon_error: str | None, note: str) -> str | None:
@@ -546,9 +563,10 @@ async def _threads(
             continue
         thread_id = listed.strip()
         held.add(thread_id)
-        described = await read_thread(client, thread_id)
-        if described is None:
+        reading = await read_thread(client, thread_id)
+        if reading.thread is None:
             continue
+        described = reading.thread
         errand = _errand_of(described)
         if errand is None:
             found.append(described)
@@ -579,9 +597,21 @@ def _errand_of(thread: Mapping[str, Any]) -> str | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadRead:
+    """One daemon read, preserving why no authoritative document arrived."""
+
+    thread: dict[str, Any] | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.thread is None) == (self.reason is None):
+            raise ValueError("a thread read carries exactly one of a document or a reason")
+
+
 async def read_thread(
     client: DaemonClient, thread_id: str, *, with_turns: bool = False
-) -> dict[str, Any] | None:
+) -> ThreadRead:
     """One thread as the daemon describes it, or `None` if it cannot describe it.
 
     `with_turns` is the expensive half and is asked for only by `TurnCache`,
@@ -592,13 +622,15 @@ async def read_thread(
             READ_METHOD, {"threadId": thread_id, "includeTurns": with_turns}
         )
     except Exception as unreadable:  # noqa: BLE001 - one bad thread is not a bad roster
-        _log.info("the daemon could not describe thread %s: %s", thread_id, unreadable)
-        return None
+        reason = f"the daemon could not describe thread {thread_id}: {unreadable}"
+        _log.info("%s", reason)
+        return ThreadRead(reason=reason)
     thread = answer.get("thread") if isinstance(answer, dict) else None
     if not isinstance(thread, dict) or thread.get("id") != thread_id:
-        _log.info("%s answered about a different thread than %s", READ_METHOD, thread_id)
-        return None
-    return thread
+        reason = f"{READ_METHOD} answered about a different thread than {thread_id}"
+        _log.info("%s", reason)
+        return ThreadRead(reason=reason)
+    return ThreadRead(thread=thread)
 
 
 def _session_tree_id(thread: Mapping[str, Any]) -> str | None:
@@ -617,7 +649,7 @@ def _status_of(thread: Mapping[str, Any]) -> str | None:
 def _from_thread(
     thread: dict[str, Any],
     pid: int | None,
-    progress: Progress | None = None,
+    progress: ProgressObservation | None = None,
     child: ChildClassification = MAIN_SESSION,
 ) -> SessionInspection:
     """One daemon-held thread as the seam holds it.
@@ -641,7 +673,7 @@ def _from_thread(
             if kind == "systemError"
             else WaitingFor()
         ),
-        progress=progress,
+        progress=progress or ProgressObservation(),
         # Free on the cheap read, and honest for a thread mid-turn too: it is
         # the thread's own account of when it last moved, which is exactly the
         # case `last_activity` exists to answer when nothing was said (#76).

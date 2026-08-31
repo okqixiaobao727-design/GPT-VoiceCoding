@@ -78,7 +78,16 @@ def session(target: SessionTarget = MINE, *, task: str | None = "port the log") 
 
 def row(one: Session) -> dict:
     """The roster row a surface reads, built the way the control plane builds it."""
-    return session_document(one)
+    return session_document(
+        one,
+        progress={
+            "availability": "not_read",
+            "has_history": None,
+            "omission": "none",
+            "read_at": None,
+            "recent": [],
+        },
+    )
 
 
 class TestWhatTheHarnessThinksNamesASession:

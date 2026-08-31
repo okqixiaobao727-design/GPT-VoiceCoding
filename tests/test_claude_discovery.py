@@ -169,8 +169,8 @@ class TestWhatItRefusesToInvent:
         assert found([IDLE_ROW]).rows[0].waiting_for.kind is WaitingKind.NONE
 
     def test_progress_is_unread_rather_than_empty(self) -> None:
-        """`None` is "not read". #76 reads it; this lane does not pretend to."""
-        assert found([IDLE_ROW]).rows[0].progress is None
+        """The roster did not read progress; it does not pretend that history is empty."""
+        assert str(found([IDLE_ROW]).rows[0].progress.availability) == "not_read"
 
     def test_last_activity_is_not_taken_from_the_start_time(self) -> None:
         """`startedAt` is when it began, which is not when it last did anything."""

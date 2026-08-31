@@ -30,9 +30,11 @@ def channel_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeCo
     return FakeCompanionChannel(sink=sink)
 
 
-def agent_taking_settings(*, sink: Any = None, settings: Any = None) -> FakeAgent:
+def agent_taking_settings(
+    *, progress_capture: Any, sink: Any = None, settings: Any = None
+) -> FakeAgent:
     handed["agent.codex"] = settings
-    return FakeAgent(sink=sink)
+    return FakeAgent(sink=sink, progress_capture=progress_capture)
 
 
 def channel_taking_only_the_sink(*, sink: Any = None) -> FakeCompanionChannel:
