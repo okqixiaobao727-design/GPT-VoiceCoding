@@ -179,3 +179,31 @@ def test_a_fork_is_two_records_under_one_session_id(tmp_path: Path) -> None:
     listed = records(tmp_path)
 
     assert len({record.session_id for record in listed}) == 1
+
+
+class TestTheLabelBesideTheStatus:
+    """`waitingFor` says which of `waiting`'s five causes this one is (#150).
+
+    Carried, never interpreted: what the word means is `waiting_labels.py`'s,
+    and this reader's job is only to stop throwing it away.
+    """
+
+    def test_the_label_is_carried_off_the_record(self, tmp_path: Path) -> None:
+        write(tmp_path, entry(status="waiting", waitingFor="dialog open"))
+
+        assert read_record(tmp_path, LIVE_PID).waiting_for_label == "dialog open"
+
+    def test_a_record_that_does_not_write_one_reads_as_no_label(self, tmp_path: Path) -> None:
+        """Older builds, and every `idle` or `busy` record on this one."""
+        write(tmp_path, entry())
+
+        assert read_record(tmp_path, LIVE_PID).waiting_for_label == ""
+
+    @pytest.mark.parametrize("written", [None, 7, "", "   "])
+    def test_a_label_that_is_not_a_word_is_no_label_rather_than_a_refusal(
+        self, tmp_path: Path, written: object
+    ) -> None:
+        """The record is still a record. A field this reader adds must not refuse one."""
+        write(tmp_path, entry(status="waiting", waitingFor=written))
+
+        assert read_record(tmp_path, LIVE_PID).waiting_for_label == ""

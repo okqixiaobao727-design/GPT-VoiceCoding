@@ -12,12 +12,18 @@ in its registry record: a `status` field carrying `idle`, `busy` or `waiting`,
 rewritten sub-second. Reading the field that *is* the level beats reconstructing
 it from a stream of events.
 
-**`waiting` is CLOSED.** It means a permission dialog is on screen, and a dialog
-blocks every Relay there is — verified live: three routes, all enqueued, none
+**`waiting` is CLOSED.** It means *a* dialog is on screen, and a dialog blocks
+every Relay there is — verified live: three routes, all enqueued, none
 delivered, none starting a turn, until a human answered the dialog. A Session in
 that state is the opposite of one awaiting the user's next instruction. Surfacing
 the dialog itself is the Approval Relay's job, not this one's, so nothing about
 it leaks out of here as a window state.
+
+**Which dialog it is matters everywhere except here** (#150). `waiting` has five
+causes and only one of them is a permission prompt; a `/model` picker writes it
+too. For the window they are one answer — every dialog takes no Relay — so this
+level is unchanged. For the *Stop* below they are three answers, read off the
+`waitingFor` label the same record carries (`waiting_labels.py`).
 
 **Anything unrecognised is CLOSED**, including a record that has vanished or
 cannot be read. The whole vocabulary of this seam rests on never claiming
@@ -48,6 +54,15 @@ the `tool_result`, and the reader correctly reported that it was waiting on
 nothing. Which of the two announcements a permission actually produces — this,
 or the `AwaitingApproval` its hook raises — is Bridge Core's policy and not this
 module's.
+
+**But not every `waiting` is that stop** (#150). Reading the bare status as one
+called the user about a slash-command picker they were looking at, and said only
+"it has not said what it is waiting for yet" when it did. `_settle` below asks
+the label which of the three a wait is: never a Stop, a Stop that can be named
+now, or a Stop nothing can name yet — and the third is *held* and re-read on
+this sweep's own cadence until it can be, or until a configured budget is spent.
+That is `caught_up=False`'s documented meaning, *ask again, never guess*,
+implemented at last.
 
 That split is #27's. Registration announced the starting level once, and the
 announcement was always dropped: an adapter is registered before Bridge Core
@@ -98,8 +113,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
+from gpt_voicecoding.adapters.agent.claude import waiting_labels
 from gpt_voicecoding.adapters.agent.claude.registry import (
     RegistryError,
     SessionRecord,
@@ -107,6 +125,10 @@ from gpt_voicecoding.adapters.agent.claude.registry import (
     read_record,
 )
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
+from gpt_voicecoding.adapters.agent.claude.waiting_labels import (
+    NOTHING_READ_YET,
+    StopDisposition,
+)
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ReplyWindow,
@@ -134,10 +156,55 @@ STATUSES_MEANING_TURN_ACTIVE = frozenset(("busy", "waiting"))
 #: purposes (above) and a **Stop** for the Stop Notice's — see `poll_once`.
 STATUS_MEANING_STALLED_ON_THE_USER = "waiting"
 
+
+@dataclass(slots=True)
+class _Dialog:
+    """One wait, from the sweep that first saw it until the Session leaves it.
+
+    `deadline` is when the catch-up budget runs out, fixed at the moment the
+    wait was first seen so an unreadable record in the middle neither restarts
+    it nor spends it twice. `settled` is what keeps a dialog that stands for as
+    long as a person takes from becoming a stream of notices: it says this
+    dialog has had its decision, which is as true of one announced as of one
+    deliberately passed over in silence.
+    """
+
+    deadline: float
+    settled: bool = False
+
+
 #: The two `SessionEnded.detail` strings, one per qualifying fact, so a reader can
 #: tell a vanished process from a pid that now belongs to somebody else.
 PROCESS_GONE = "the Session's process is no longer alive"
 PID_RECYCLED = "pid {pid} now carries a different Claude Session"
+
+
+def _is_a_turn_in_progress(record: SessionRecord) -> bool:
+    """Whether this record is evidence of a turn that is running.
+
+    `busy` always is. `waiting` is too — a dialog is that turn paused on the
+    person — **but only a dialog somebody has been told about** (#150). The
+    finished-turn Stop exists to say a turn the user was following has ended,
+    and a wait that was never announced started no such thing: a slash-command
+    picker is opened from an idle Session by the person sitting in front of it,
+    and a wait still inside its catch-up budget has deliberately said nothing
+    yet. Counting either as a turn made the `idle` that followed a Stop with
+    the emptiest notice there is — which is the reported symptom again, one
+    transition later.
+
+    So only a wait this reader can name on sight starts a turn here; a held one
+    starts it in `_settle`, at the moment it is announced, and a `dialog open`
+    never does. A turn already observed is never *erased* by any of this, only
+    not started: a Session that went `busy` and then opened a picker is still
+    mid-turn, and only `idle` ends it.
+    """
+    if record.status not in STATUSES_MEANING_TURN_ACTIVE:
+        return False
+    if record.status != STATUS_MEANING_STALLED_ON_THE_USER:
+        return True
+    return (
+        waiting_labels.classify(record.waiting_for_label).disposition is StopDisposition.NAMED_NOW
+    )
 
 
 def window_for(record: SessionRecord | None) -> ReplyWindow:
@@ -192,9 +259,15 @@ class ReplyWindowWatcher:
         settings: ClaudeSettings,
         emit: Callable[[AgentEvent], None],
         stopped_on: Callable[[SessionTarget, WaitingFor | None], WaitingFor] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         self._emit = emit
+        #: The catch-up budget is measured in seconds, so something has to
+        #: supply them. Injected because the sweep is driven by `poll_once` and
+        #: a test that had to spend the real budget in real time would either
+        #: be slow or prove nothing about it.
+        self._clock = clock
         #: What a Session that just stopped is stopped on (#75). Injected rather
         #: than read here: this class watches the registry, and what a stop is
         #: *about* lives in the Session's own transcript and in the dialogs
@@ -207,11 +280,12 @@ class ReplyWindowWatcher:
         #: Targets whose current turn has been observed in progress. Kept across
         #: unreadable records because absence is not evidence that a turn ended.
         self._active_turns: set[SessionTarget] = set()
-        #: Targets last seen holding a dialog. Kept for the same reason
-        #: `_active_turns` is: an unreadable record is not the dialog closing,
-        #: and treating it as one would announce the same dialog again on the
-        #: next readable sweep.
-        self._at_a_dialog: set[SessionTarget] = set()
+        #: The dialog each target was last seen holding, with its catch-up
+        #: budget and whether it has been decided. Kept across unreadable
+        #: records for the same reason `_active_turns` is: an unreadable record
+        #: is not the dialog closing, and treating it as one would announce the
+        #: same dialog again on the next readable sweep.
+        self._at_a_dialog: dict[SessionTarget, _Dialog] = {}
         self._polling: asyncio.Task[None] | None = None
 
     def level(self, target: SessionTarget) -> ReplyWindow:
@@ -259,14 +333,14 @@ class ReplyWindowWatcher:
         record, alive = self._observe(target)
         live_record = _record_for_live_target(target, record, alive=alive)
         self._reported[target] = window_for(live_record)
-        if live_record is not None and live_record.status in STATUSES_MEANING_TURN_ACTIVE:
+        if live_record is not None and _is_a_turn_in_progress(live_record):
             self._active_turns.add(target)
 
     def forget(self, target: SessionTarget) -> None:
         """Stop watching one Session. Its own process is untouched."""
         self._reported.pop(target, None)
         self._active_turns.discard(target)
-        self._at_a_dialog.discard(target)
+        self._at_a_dialog.pop(target, None)
 
     @property
     def watching(self) -> tuple[SessionTarget, ...]:
@@ -310,12 +384,15 @@ class ReplyWindowWatcher:
         questions are asked of one status and answered differently, which is why
         this is two lines here rather than a change to that set.
 
-        **Entering it, not being in it**, tracked on `_at_a_dialog`. A dialog
-        waits for a human, so it is readable on every sweep for as long as the
-        person takes; re-announcing it each time would turn one decision into a
-        stream of notices. The transition is taken from the last *readable*
-        status for the same reason `_active_turns` is: an unreadable record is
-        the registry being rewritten, not a dialog closing and reopening.
+        **One dialog, one decision**, tracked on `_at_a_dialog`. A dialog waits
+        for a human, so it is readable on every sweep for as long as the person
+        takes; announcing it each time would turn one decision into a stream of
+        notices. So every sweep that reads `waiting` goes to `_settle`, which
+        decides at most once per dialog — the sweeps before that decision are
+        the re-reads #150's catch-up budget is made of. The dialog is held from
+        the last *readable* status for the same reason `_active_turns` is: an
+        unreadable record is the registry being rewritten, not a dialog closing
+        and reopening.
 
         Which of the two announcements the user actually hears when a permission
         raises both this and `AwaitingApproval` is Bridge Core's policy
@@ -327,21 +404,25 @@ class ReplyWindowWatcher:
             if death is not None:
                 self._reported.pop(target, None)
                 self._active_turns.discard(target)
-                self._at_a_dialog.discard(target)
+                self._at_a_dialog.pop(target, None)
                 self._emit(SessionEnded(target=target, detail=death))
                 continue
             live_record = _record_for_live_target(target, record, alive=alive)
             was_active = target in self._active_turns
-            was_at_a_dialog = target in self._at_a_dialog
             if live_record is not None:
-                if live_record.status in STATUSES_MEANING_TURN_ACTIVE:
+                if _is_a_turn_in_progress(live_record):
                     self._active_turns.add(target)
                 elif live_record.status == STATUS_MEANING_OPEN:
                     self._active_turns.discard(target)
                 if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER:
-                    self._at_a_dialog.add(target)
+                    self._at_a_dialog.setdefault(
+                        target,
+                        _Dialog(
+                            deadline=self._clock() + self._settings.stop_catch_up_budget_seconds
+                        ),
+                    )
                 else:
-                    self._at_a_dialog.discard(target)
+                    self._at_a_dialog.pop(target, None)
             window = window_for(live_record)
             previous_window = self._reported.get(target)
             if previous_window != window:
@@ -349,20 +430,66 @@ class ReplyWindowWatcher:
                 self._emit(ReplyWindowChanged(target=target, window=window))
             if live_record is None:
                 continue
-            if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER and not was_at_a_dialog:
-                # The roster's own word, and it is `UNKNOWN` rather than `NONE`:
-                # this record says the Session is waiting and says nothing about
-                # what for, which is the seam's *ask again, never guess*.
-                self._emit(
-                    SessionStopped(
-                        target=target,
-                        waiting_for=self._what_for(
-                            target, WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
-                        ),
-                    )
-                )
+            if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER:
+                self._settle(target, live_record)
             elif was_active and live_record.status == STATUS_MEANING_OPEN:
                 self._emit(SessionStopped(target=target, waiting_for=self._what_for(target)))
+
+    def _settle(self, target: SessionTarget, record: SessionRecord) -> None:
+        """Whether this wait is a Stop, and whether it can be said yet.
+
+        Called on every sweep the record says `waiting`, not only on the edge
+        into it, because two of the three answers are *not yet* and a *not yet*
+        has to be asked again.
+
+        **The label decides which question this is** (#150,
+        `waiting_labels.py`). A `dialog open` is the user driving their own TUI
+        and is settled by saying nothing at all. A `permission prompt` is
+        announced the moment it is seen, exactly as every `waiting` was before
+        this. Everything else — a question whose text is still in flight, a
+        label nobody has measured, no label at all — is real and not yet
+        nameable, and *that* is what the catch-up budget is for.
+
+        **Holding is the whole fix.** `caught_up=False` has always meant *ask
+        again, never guess*, and nothing implemented it: the sweep announced the
+        `UNKNOWN` immediately and Bridge Core rendered "it has not said what it
+        is waiting for yet" about a Session that was not waiting for anything.
+        Here the re-read happens on the sweep's own cadence — the sweep re-reads
+        the record every tick regardless, and the transcript read behind
+        `_what_for` is cached on the file's identity — until the reading is
+        complete or the budget is spent. Only then, and once, does the honest
+        `UNKNOWN` go out (`legacy@1d32845:bridge/daemon.py:1933-1936,
+        2116-2160`, **ported** onto this sweep).
+        """
+        dialog = self._at_a_dialog[target]
+        if dialog.settled:
+            return
+        reading = waiting_labels.classify(record.waiting_for_label)
+        if reading.disposition is StopDisposition.NEVER_A_STOP:
+            # Decided, and decided to say nothing. Marked so the label going
+            # unreadable on a later sweep cannot turn it into a notice.
+            dialog.settled = True
+            return
+        if reading.disposition is StopDisposition.NAMED_NOW:
+            self._announce(target, dialog, self._what_for(target, reading.waiting_for))
+            return
+        found = self._what_for(target, NOTHING_READ_YET)
+        if found.caught_up and found.kind is not WaitingKind.NONE:
+            self._announce(target, dialog, found)
+            return
+        if self._clock() >= dialog.deadline:
+            self._announce(target, dialog, NOTHING_READ_YET)
+
+    def _announce(self, target: SessionTarget, dialog: _Dialog, waiting_for: WaitingFor) -> None:
+        """Say one dialog once, and let the turn it belongs to end afterwards.
+
+        The turn is marked in progress *here* rather than from the record,
+        because a wait nobody has been told about is not a turn anybody is
+        following — see `_is_a_turn_in_progress`.
+        """
+        dialog.settled = True
+        self._active_turns.add(target)
+        self._emit(SessionStopped(target=target, waiting_for=waiting_for))
 
     def _what_for(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
         """What this Session stopped on, asked of the reader that can tell.

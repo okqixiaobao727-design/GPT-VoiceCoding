@@ -63,6 +63,19 @@ DEFAULT_RECEIPT_POLL_SECONDS = 0.25
 #: faster would multiply reads without seeing anything sooner.
 DEFAULT_REPLY_WINDOW_POLL_SECONDS = 1.0
 
+#: How long that sweep keeps re-reading a wait it cannot yet name before it
+#: announces the honest `UNKNOWN` anyway (#150). Five seconds, on the one-second
+#: cadence above, so a wait gets about five re-reads: Claude Code writes
+#: `waiting` the moment a dialog opens and its transcript record follows — the
+#: reported cases lagged by 133 ms and 3.0 s — so a budget shorter than that
+#: would spend the whole thing on the flush and announce "it has not said what
+#: it is waiting for yet" about a question the next read would have carried.
+#: The reference implementation's equivalent was 1.0 s
+#: (`legacy@1d32845:bridge/daemon.py:2148`, `config.plist:443`), but it ran a
+#: dedicated 0.1 s poll inside a blocking hook; this one rides a sweep already
+#: turning once a second, and nothing is held up while it waits.
+DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS = 5.0
+
 
 class SettingsError(Exception):
     """The settings table names something this adapter does not have."""
@@ -81,6 +94,11 @@ class ClaudeSettings:
     #: Where Claude Code keeps the Session records the Reply Window reads.
     registry_directory: Path = DEFAULT_REGISTRY_DIRECTORY
     reply_window_poll_seconds: float = DEFAULT_REPLY_WINDOW_POLL_SECONDS
+    #: How long a Stop nothing can yet name is re-read before it is announced
+    #: as `UNKNOWN`. Policy-shaped in appearance and mechanical in fact: it is
+    #: how long this reader gives another program's file to flush, not how long
+    #: the user is made to wait for anything.
+    stop_catch_up_budget_seconds: float = DEFAULT_STOP_CATCH_UP_BUDGET_SECONDS
     receipt_poll_seconds: float = DEFAULT_RECEIPT_POLL_SECONDS
 
     def __post_init__(self) -> None:
@@ -90,6 +108,7 @@ class ClaudeSettings:
             "late_ack_timeout_seconds",
             "reply_window_poll_seconds",
             "receipt_poll_seconds",
+            "stop_catch_up_budget_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise SettingsError(f"{name} must be a positive number of seconds")

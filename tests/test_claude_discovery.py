@@ -235,3 +235,81 @@ class TestTheKindField:
         """A field that moved must not blank the roster — the worse mistake."""
         lane = found([{k: v for k, v in IDLE_ROW.items() if k != "kind"}])
         assert len(lane.rows) == 1
+
+
+class TestTheLabelOnAWaitingRow:
+    """`claude agents --json` copies `waitingFor` onto a `waiting` row (#150).
+
+    The roster reads it for the one thing the roster can settle on its own: a
+    dialog the user is driving is not a wait on anybody. It does **not** promote
+    `permission prompt` to `PERMISSION` here, and that is deliberate — see the
+    reader's own note. The roster carries no dialog handle, so a row that
+    claimed `needs_the_user` would produce a second, unanswerable notice beside
+    the Approval Relay's for one decision.
+    """
+
+    def test_a_dialog_the_user_is_driving_is_waiting_on_nobody(self) -> None:
+        """The one thing this reader does act on, and the gate it keeps clear.
+
+        `needs_the_user` is what Bridge Core's reconcile pass announces from
+        (`core/bridge.py:480`), so a `/model` picker reading false here is what
+        keeps the reported notice off that path as well as off the sweep's.
+        """
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "dialog open"}
+        waiting_for = found([row]).rows[0].waiting_for
+
+        assert waiting_for.kind is WaitingKind.NONE
+        assert waiting_for.caught_up is True
+        assert waiting_for.needs_the_user is False
+
+    def test_a_goal_proposal_is_waiting_on_nobody_either(self) -> None:
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "goal proposal"}
+
+        assert found([row]).rows[0].waiting_for.kind is WaitingKind.NONE
+
+    def test_the_row_still_says_the_session_is_waiting(self) -> None:
+        """The registry's own word for the state stands; only the wait is answered."""
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "dialog open"}
+
+        assert found([row]).rows[0].state is SessionState.WAITING
+
+    def test_a_permission_prompt_row_reads_exactly_as_it_did_before_this_ticket(self) -> None:
+        """The one narrowing, pinned: a named wait is not promoted on this reader.
+
+        `classify` calls `permission prompt` a `PERMISSION` and the Reply Window
+        sweep announces it as one. This row must stay `UNKNOWN` with
+        `caught_up=False` — what the projection reported for every `waiting` row
+        before #150 — because a roster row carries no `approval_id`, so a
+        `PERMISSION` here would key Bridge Core's delivered-wait dedup
+        `(target, PERMISSION)`, miss the live path's `(target, approval_id)`,
+        and announce the same dialog a second time. See `_waiting_for`.
+        """
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "permission prompt"}
+        waiting_for = found([row]).rows[0].waiting_for
+
+        assert waiting_for.kind is WaitingKind.UNKNOWN
+        assert waiting_for.kind is not WaitingKind.PERMISSION
+        assert waiting_for.caught_up is False
+        assert waiting_for.approval_id is None
+        assert waiting_for.needs_the_user is False
+
+    def test_a_sandbox_request_row_is_narrowed_the_same_way(self) -> None:
+        """Every named disposition, not just the one — the rule is the reader's."""
+        row = IDLE_ROW | {"status": "waiting", "waitingFor": "sandbox request"}
+        waiting_for = found([row]).rows[0].waiting_for
+
+        assert waiting_for.kind is WaitingKind.UNKNOWN
+        assert waiting_for.tool_name is None
+
+    def test_a_row_carrying_no_label_reads_exactly_as_it_did(self) -> None:
+        """Every build before this field, and every row this reader mis-reads."""
+        waiting_for = found([IDLE_ROW | {"status": "waiting"}]).rows[0].waiting_for
+
+        assert waiting_for.kind is WaitingKind.UNKNOWN
+        assert waiting_for.caught_up is False
+
+    def test_a_label_on_a_row_that_is_not_waiting_is_not_read(self) -> None:
+        """`waiting` is what makes the label mean anything; an idle row waits on nothing."""
+        row = IDLE_ROW | {"waitingFor": "permission prompt"}
+
+        assert found([row]).rows[0].waiting_for.kind is WaitingKind.NONE

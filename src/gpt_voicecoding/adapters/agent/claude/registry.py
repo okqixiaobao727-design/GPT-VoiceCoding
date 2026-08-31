@@ -20,6 +20,11 @@ fields this module validates: `pid`, `sessionId`, `cwd`, `version`,
 retained so retiring its former consumer does not widen the records accepted by
 the remaining Reply Window and Session Launcher paths.
 
+**`waitingFor` is carried, not judged.** A `waiting` record names which of that
+status's several causes it is, in the same write (#150, measured on 2.1.251).
+This reader stops at carrying the word; `waiting_labels.py` holds the table that
+says what each one means, and the builds it was measured on.
+
 **Liveness is a separate question and is asked separately.** A record parses
 whether or not its process still exists, because "the registry says this" and
 "that process is still there" are two different facts and a reader that conflates
@@ -64,6 +69,13 @@ class SessionRecord:
     #: Window is `window.py`'s job, not this reader's.
     status: str
     name: str = ""
+    #: Which of `waiting`'s several causes this one is, in Claude Code's own
+    #: word — `permission prompt`, `dialog open`, `input needed` and the rest
+    #: (#150). Written into this record in the same write as `status`, and
+    #: empty on every record that is not `waiting` and on builds that do not
+    #: write it at all. Left as the vendor's own string for the reason `status`
+    #: is: reading it is `waiting_labels.py`'s job, not this reader's.
+    waiting_for_label: str = ""
 
 
 def read_record(directory: Path, pid: int) -> SessionRecord:
@@ -152,6 +164,9 @@ def _record(path: Path, raw: str, *, expected_pid: int | None) -> SessionRecord:
         version=_text(document, "version", path, default=""),
         status=_text(document, "status", path, default=""),
         name=_text(document, "name", path, default=""),
+        # Absent, blank or not a string all read as "this record said nothing",
+        # because they are the same fact and none of them is a broken record.
+        waiting_for_label=_text(document, "waitingFor", path, default=""),
     )
 
 
