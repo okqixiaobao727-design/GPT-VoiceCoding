@@ -106,7 +106,7 @@ def registry(tmp_path: Path) -> Path:
 
 def say(
     tmp_path: Path,
-    status: str,
+    status: str | None,
     *,
     pid: int = LIVE_PID,
     session_id: str = SESSION,
@@ -117,6 +117,10 @@ def say(
     `waiting_for` is the label it writes beside `waiting`, in the same write
     (#150). A `waiting` record with none is an older build, or one of this
     build's waits that this reader has not measured.
+
+    `status=None` writes the record Claude Code writes *first*: the pid file
+    exists and carries no `status` key at all, which is what a Session looks like
+    for about a tenth of a second after it is created (#157).
     """
     document: dict[str, object] = {
         "pid": pid,
@@ -125,8 +129,9 @@ def say(
         "version": "2.1.238",
         "peerProtocol": PEER_PROTOCOL,
         "messagingSocketPath": f"/tmp/cc-socks/{pid}.sock",
-        "status": status,
     }
+    if status is not None:
+        document["status"] = status
     if waiting_for is not None:
         document["waitingFor"] = waiting_for
     (registry(tmp_path) / f"{pid}.json").write_text(json.dumps(document), encoding="utf-8")
@@ -188,6 +193,17 @@ class TestWhatOneStatusMeans:
     def test_a_status_this_build_has_never_seen_is_closed(self, tmp_path: Path) -> None:
         """A whitelist, so a new state cannot arrive claiming readiness by default."""
         say(tmp_path, "meditating")
+
+        assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
+
+    def test_a_record_that_has_not_said_yet_is_closed(self, tmp_path: Path) -> None:
+        """The creating write carries no `status` key at all (#157, measured).
+
+        The same whitelist rule, and the one instance of it that has been
+        measured rather than guarded against: a Session that has not yet said
+        what it is doing is not one that has been observed to be reachable.
+        """
+        say(tmp_path, None)
 
         assert watching(tmp_path, Sink()).level(TARGET) is ReplyWindow.CLOSED
 
@@ -373,6 +389,26 @@ class TestReportingStops:
         watcher.watch(TARGET)
 
         say(tmp_path, "shell")
+        watcher.poll_once()
+
+        assert sink.stops == []
+
+    def test_a_session_that_has_not_said_yet_does_not_end_a_turn_by_saying(
+        self, tmp_path: Path
+    ) -> None:
+        """A statusless record then `idle` is a Session starting, not a turn ending (#157).
+
+        The way this could be got wrong is to read the empty word as a turn in
+        progress; the record would then "finish" a turn that never began, and
+        Bridge Core would draw a Stop out of a Session that had done nothing.
+        """
+        sink = AllEvents()
+        watcher = watching(tmp_path, sink)
+        say(tmp_path, None)
+        watcher.watch(TARGET)
+        watcher.poll_once()
+
+        say(tmp_path, "idle")
         watcher.poll_once()
 
         assert sink.stops == []

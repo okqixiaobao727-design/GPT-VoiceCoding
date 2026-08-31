@@ -190,6 +190,14 @@ class StopReading:
 #: measurement that says so is beside `registry.PROVEN_AGAINST_VERSION`.
 #: Legacy read no polled status at all, so there is nothing to port (ADR
 #: 0010; see this module's docstring).
+#:
+#: An empty status is the whitelist's rule holding, measured (#157). It is not a
+#: fifth word but a record whose creating write carried no `status` key yet, and
+#: it reads CLOSED like anything else outside the set. Nothing is missed by
+#: that: the finished-turn edge below needs `was_active`, and a record can only
+#: be statusless before its Session's first status write — so no sweep can have
+#: seen that pid in a turn, and this cannot announce late the way `shell` did.
+#: The measurement is beside `registry.PROVEN_AGAINST_VERSION`.
 STATUSES_MEANING_OPEN = frozenset(("idle", "shell"))
 
 #: Registry statuses that prove a turn is still in progress. `waiting` is the

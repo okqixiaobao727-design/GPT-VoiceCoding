@@ -86,6 +86,52 @@ PROVEN_AGAINST_VERSION = "2.1.251"
 # A Stop at `shell` carries the same transcript-derived progress observation as
 # one at `idle`; the background task is status/activity, never synthetic speech.
 
+# **What an empty `status` was measured to be** (#157), on 2.1.251, on Simon's
+# machine on 2026-08-31. It is not a fifth status word. It is a record that has
+# not said yet.
+#
+# *Two writes, not one.* Claude Code creates the pid file first and writes
+# `status` in a second write about a tenth of a second later. The creating
+# write's object carries `pid`, `sessionId`, `cwd`, `startedAt`, `procStart`,
+# `version`, `peerProtocol`, `peerFeatures`, `kind`, `entrypoint`, `pidDomain`,
+# `tmux`, `messagingSocketPath`, `name`, `nameSource` and `nameSince` — and no
+# `status` key at all. Three launches, each a fresh pty with the inherited
+# `CLAUDE_CODE_*` markers scrubbed, the directory sampled every 1ms: the file
+# appeared without `status`, then gained `status: "idle"` and `statusUpdatedAt`
+# 117.3ms, 106.4ms and 128.9ms later. `entry_without_a_status` in
+# `tests/test_claude_registry.py` is one of those three, transcribed.
+#
+# *The word is never written empty.* The build has no site that writes
+# `status:""` into the record, and its own reader of the field is
+# `["busy","shell","idle","waiting"].includes(s) ? s : undefined` — an empty
+# string is outside that enum on the vendor's side too. So the `""` this reader
+# reports is `_text`'s default standing in for an absent key, never a word the
+# registry chose. Absent and blank are one fact here for the same reason they
+# are one fact for `waitingFor`: neither is a broken record.
+#
+# *Not a torn read.* The creating write is already complete, well-formed JSON,
+# so a half-written file is not where this comes from. 60s at 1ms across five
+# live Sessions — eight writes, including one `busy -> shell` — produced no
+# unparseable read, and no write ever dropped a `status` key it had already
+# carried. Once written, the word stays.
+#
+# *Why CLOSED is right, and structurally so.* `window.py`'s finished-turn edge
+# needs `was_active`: some earlier sweep that saw `busy` or `waiting`. A
+# statusless record exists only between a Session's creation and its first
+# status write, so no sweep can have seen that pid in a turn at all, and this
+# cannot arrive late the way `shell` did (#154). CLOSED costs one sweep of a
+# Session that was not reachable yet anyway.
+#
+# *Legacy has nothing to port here, and that is the citation* (ADR 0010).
+# Legacy never read `~/.claude/sessions` at all — no registry, no polled status
+# word, and so no vocabulary for a fifth value to be missing from
+# (`legacy@1d32845`: `grep -rn 'claude/sessions'` finds nothing). *Dropped,
+# because* the behaviour did not exist there to be ported.
+#
+# *Not measured:* whether a `bg`, `daemon` or `daemon-worker` Session carries
+# this state for longer than the creating write. Every record measured here was
+# `kind: "interactive"`.
+
 
 class RegistryError(Exception):
     """The registry does not say what this adapter needs, or does not say it clearly."""
@@ -105,6 +151,12 @@ class SessionRecord:
     #: it was measured to mean, because flattening it would throw away the fact
     #: that a background task is still running. Translating it into a Reply
     #: Window is `window.py`'s job, not this reader's.
+    #:
+    #: Empty means *this record has not said yet* (#157) — the pid file exists
+    #: but its creating write carried no `status` key, which lasts about a tenth
+    #: of a second from a Session's creation. It is not a fifth word, and the
+    #: build writes no empty one; the measurement is beside
+    #: `PROVEN_AGAINST_VERSION`.
     status: str
     name: str = ""
     #: Which of `waiting`'s several causes this one is, in Claude Code's own

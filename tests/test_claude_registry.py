@@ -52,6 +52,35 @@ def entry(pid: int = LIVE_PID, **overrides: object) -> dict[str, object]:
     return document
 
 
+def entry_without_a_status(pid: int = LIVE_PID) -> dict[str, object]:
+    """The record Claude Code writes *first*, before it has said what it is doing (#157).
+
+    Transcribed from one of the three 2.1.251 launches measured beside
+    `PROVEN_AGAINST_VERSION`. The pid and socket path are retargeted at this
+    process, `cwd` is anonymised to match `entry`, and the machine-specific
+    `tmux` pane the real record carried is dropped; every other field is the
+    live one. Its point is the key that is *not* here: the creating write
+    carries no `status` at all, for about a tenth of a second.
+    """
+    return {
+        "pid": pid,
+        "sessionId": "cfde342f-f38e-4ebe-a21a-bf167e33c6e2",
+        "cwd": "/Users/someone/work",
+        "startedAt": 1788166826467,
+        "procStart": "Mon Aug 31 09:00:25 2026",
+        "version": "2.1.251",
+        "peerProtocol": PEER_PROTOCOL,
+        "peerFeatures": ["notify_idle", "reply_across_default_dirs", "artifact_yield"],
+        "kind": "interactive",
+        "entrypoint": "cli",
+        "pidDomain": "darwin",
+        "messagingSocketPath": f"/tmp/cc-socks/{pid}.sock",
+        "name": "gpt-voicecoding-de",
+        "nameSource": "derived",
+        "nameSince": 1788166826467,
+    }
+
+
 def write(directory: Path, document: dict[str, object], *, named: int | None = None) -> Path:
     """Write one record. `named` is the filename's pid, which a record may contradict."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -207,3 +236,38 @@ class TestTheLabelBesideTheStatus:
         write(tmp_path, entry(status="waiting", waitingFor=written))
 
         assert read_record(tmp_path, LIVE_PID).waiting_for_label == ""
+
+
+class TestARecordThatHasNotSaidWhatItIsDoing:
+    """The creating write carries no `status` key, for about 100ms (#157).
+
+    Not a fifth status word — a record that has not said yet. The measurement is
+    beside `PROVEN_AGAINST_VERSION`. What matters at this seam is that such a
+    record is a *record*: refusing it would make every reader flaky for the first
+    tenth of a second of every Claude Session's life.
+    """
+
+    def test_the_creating_write_is_a_record_rather_than_a_refusal(self, tmp_path: Path) -> None:
+        write(tmp_path, entry_without_a_status())
+
+        assert read_record(tmp_path, LIVE_PID).status == ""
+
+    def test_it_is_listed_by_a_sweep_like_any_other_record(self, tmp_path: Path) -> None:
+        """A Session mid-creation is a Session, so the sweep must not skip it."""
+        write(tmp_path, entry_without_a_status())
+
+        assert [record.pid for record in records(tmp_path)] == [LIVE_PID]
+
+    @pytest.mark.parametrize("written", ["", "   ", None, 7])
+    def test_a_status_that_is_not_a_word_reads_the_same_as_an_absent_one(
+        self, tmp_path: Path, written: object
+    ) -> None:
+        """Absent and blank are one fact: neither is a word, and neither is broken.
+
+        The build writes none of these — it omits the key — but folding them
+        together is what lets this reader carry the vendor's own word without
+        having to police it.
+        """
+        write(tmp_path, entry(status=written))
+
+        assert read_record(tmp_path, LIVE_PID).status == ""
