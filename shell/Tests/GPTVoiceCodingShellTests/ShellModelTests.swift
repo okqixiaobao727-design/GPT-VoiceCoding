@@ -1,4 +1,7 @@
+import AppKit
 import Foundation
+import ObjectiveC
+import Observation
 import ShellTestSupport
 import Testing
 
@@ -7,6 +10,66 @@ import Testing
 
 @MainActor
 @Suite struct ShellModelTests {
+    @Test func appKitInitializerIsAnObjectiveCEntryPoint() {
+        var methodCount: UInt32 = 0
+        guard let methods = class_copyMethodList(ShellDelegate.self, &methodCount) else {
+            Issue.record("ShellDelegate exposes no Objective-C methods")
+            return
+        }
+        defer { free(methods) }
+
+        let ownsInitializer = (0..<Int(methodCount)).contains {
+            method_getName(methods[$0]) == #selector(NSObject.init)
+        }
+
+        #expect(ownsInitializer)
+    }
+
+    @Test func quittingBeforeAnyViewExistsStopsTheEngine() async throws {
+        let shell = try ShellHarness()
+        try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
+        await shell.model.startEngineAfterInstallation()
+        #expect(await waitUntil { shell.launcher.launchCount == 1 })
+        let delegate = ShellDelegate(shell: shell.model)
+
+        let reply = delegate.applicationShouldTerminate(NSApplication.shared)
+
+        #expect(reply == .terminateLater)
+        #expect(await waitUntil { shell.launcher.stopCount == 1 })
+    }
+
+    @Test func delegateOwnedModelStillPublishesMenuBarSymbolChanges() async throws {
+        let fixture = try TelegramCredentialFixture()
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
+        let launcher = RecordingEngineLauncher()
+        let (_, model) = makeShell(fixture: fixture, launcher: launcher)
+        let delegate = ShellDelegate(shell: model)
+        let symbolChanged = OneShot<Void>()
+        withObservationTracking {
+            _ = delegate.shell.symbol
+        } onChange: {
+            symbolChanged.resolve()
+        }
+
+        await delegate.shell.startEngineAfterInstallation()
+
+        #expect(await waitUntil { symbolChanged.isResolved })
+        #expect(await waitUntil { delegate.shell.symbol == "waveform" })
+        await delegate.shell.stopEngine()
+    }
+
+    @Test func preparationArrivingAfterTerminationCannotLaunchAnEngine() async throws {
+        let fixture = try TelegramCredentialFixture()
+        try fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
+        let launcher = RecordingEngineLauncher()
+        let (_, model) = makeShell(fixture: fixture, launcher: launcher)
+        await model.stopEngine()
+
+        await model.startEngineAfterInstallation()
+
+        #expect(launcher.launchCount == 0)
+    }
+
     @Test func aRepairedCredentialStartsThePreflightHeldEngineExactlyOnce() async throws {
         let shell = try ShellHarness()
         await shell.model.startEngineAfterInstallation()
@@ -104,6 +167,19 @@ import Testing
         try? await Task.sleep(for: .milliseconds(50))
 
         #expect(shell.launcher.launchCount == 1)
+        await shell.model.stopEngine()
+    }
+
+    @Test func panelSaveReplacesARunningEngineExactlyOnce() async throws {
+        let shell = try ShellHarness()
+        try shell.fixture.writeEnvironment("A_TELEGRAM_TOKEN=ready\n")
+        await shell.model.startEngineAfterInstallation()
+        #expect(await waitUntil { shell.launcher.launchCount == 1 })
+
+        #expect(await shell.model.saveTelegramToken("replacement"))
+
+        #expect(await waitUntil { shell.launcher.stopCount == 1 })
+        #expect(await waitUntil { shell.launcher.launchCount == 2 })
         await shell.model.stopEngine()
     }
 
@@ -234,12 +310,14 @@ private struct UnreachableControlPlane: ControlPlaneDialing {
 
 private final class RecordingEngineLauncher: EngineLaunching, @unchecked Sendable {
     private let launches = LaunchCounter()
+    private let stops = LaunchCounter()
 
     var launchCount: Int { launches.value }
+    var stopCount: Int { stops.value }
 
     func launch(_ command: EngineCommand) throws -> EngineProcess {
         let attempt = launches.increment()
-        return HeldEngineProcess(pid: Int32(attempt + 2000))
+        return HeldEngineProcess(pid: Int32(attempt + 2000), stopRequests: stops)
     }
 
 }
@@ -297,9 +375,11 @@ private final class LaunchCounter: @unchecked Sendable {
 private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
     let processIdentifier: Int32
     private let exit = OneShot<Int32>()
+    private let stopRequests: LaunchCounter?
 
-    init(pid: Int32) {
+    init(pid: Int32, stopRequests: LaunchCounter? = nil) {
         processIdentifier = pid
+        self.stopRequests = stopRequests
     }
 
     var hasExited: Bool { exit.isResolved }
@@ -311,6 +391,7 @@ private final class HeldEngineProcess: EngineProcess, @unchecked Sendable {
     }
 
     func requestStop() {
+        _ = stopRequests?.increment()
         exit.resolve(-SIGTERM)
     }
 

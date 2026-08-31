@@ -128,6 +128,7 @@ final class ShellModel {
 
     private func begin() async {
         await reconcileInstallation()
+        guard !Task.isCancelled else { return }
         await startEngineAfterInstallation()
     }
 
@@ -256,9 +257,10 @@ final class ShellModel {
         credentialSaveFailure = nil
     }
 
-    /// Replace the write-only token, then replace the child that inherited the
-    /// old environment. Stopping completes before retry starts, so two engines
-    /// never overlap on the one Telegram `getUpdates` consumer.
+    /// Replace the write-only token, then retry or replace the child that
+    /// inherited the old environment. The supervisor orders a running child's
+    /// exit before its successor, so two engines never overlap on the one
+    /// Telegram `getUpdates` consumer.
     func saveTelegramToken(_ token: String) async -> Bool {
         await preparation?.value
         do {
@@ -274,7 +276,6 @@ final class ShellModel {
             credentialSaveFailure = "Telegram credentials could not be saved: \(error)"
             return false
         }
-        await supervisor.shutDown()
         await supervisor.retry()
         return true
     }
@@ -287,6 +288,7 @@ final class ShellModel {
     /// start to trip over.
     func stopEngine() async {
         stopping = true
+        preparation?.cancel()
         credentialStartRecovery.cancel()
         stopCredentialObservation()
         await supervisor.shutDown()

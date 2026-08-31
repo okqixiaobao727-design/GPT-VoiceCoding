@@ -1,4 +1,5 @@
 import Foundation
+import ShellTestSupport
 import Testing
 
 @testable import ShellCore
@@ -298,6 +299,79 @@ import Testing
         await supervisor.shutDown()
     }
 
+    @Test func retryDuringBackoffForgivesTheFailureBeforeTheNextSpawn() async {
+        let clock = FirstBackoffGateClock()
+        let log = HealthLog()
+        let launcher = GatedFastFailureLauncher(clock: clock)
+        let supervisor = EngineSupervisor(
+            launcher: launcher, socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            clock: clock, socketAnswers: { _ in false }, observer: { log.record($0) })
+        await supervisor.start()
+        await clock.waitUntilFirstBackoffStarts()
+
+        await supervisor.retry()
+        await clock.releaseFirstBackoff()
+
+        let stopped = await log.wait(for: {
+            if case .stopped = $0 { return true }
+            return false
+        })
+        #expect(stopped == .stopped(.repeatedFailures(attempts: 5)))
+        #expect(launcher.launchCount == 6)
+        await supervisor.shutDown()
+    }
+
+    @Test func retryingARunningEngineStopsItBeforeStartingItsReplacement() async {
+        let clock = TestClock()
+        let log = HealthLog()
+        let first = PendingTailProcess(pid: 1001)
+        let launcher = PendingTailLauncher(first: first, clock: clock)
+        let supervisor = EngineSupervisor(
+            launcher: launcher, socketPath: "/tmp/gvc-test.sock",
+            resolveCommand: {
+                EngineCommand(executable: "/usr/bin/true", arguments: [], source: .developerPath)
+            },
+            clock: clock, observer: { log.record($0) })
+
+        await supervisor.start()
+        await first.waitUntilTailIsPending()
+
+        await supervisor.retry()
+        await supervisor.retry()
+
+        let stopRequested = await waitUntil(within: 0.1) { first.stopRequested }
+        #expect(stopRequested)
+        #expect(launcher.launchCount() == 1)
+
+        await first.releaseTail()
+        let replacement = await log.wait(for: { $0 == .running(pid: 1002) })
+        #expect(replacement == .running(pid: 1002))
+        #expect(launcher.launchCount() == 2)
+        await supervisor.shutDown()
+    }
+
+    @Test func replacingAChildThatIgnoresStopUsesTheBoundedForcePath() async {
+        let clock = TestClock()
+        let log = HealthLog()
+        let (supervisor, launcher) = supervisor(
+            script: [], clock: clock, log: log, deaf: true)
+        await supervisor.start()
+        _ = await log.wait(for: { $0 == .running(pid: 1001) })
+        let first = launcher.lastChild()
+
+        await supervisor.retry()
+        let replacement = await log.wait(for: { $0 == .running(pid: 1002) })
+
+        #expect(replacement == .running(pid: 1002))
+        #expect(first?.stopRequested == true)
+        #expect(first?.stopForced == true)
+        #expect(launcher.launchCount() == 2)
+        await supervisor.shutDown()
+    }
+
     @Test func shuttingDownAsksTheChildToStopAndDoesNotSpawnAnother() async throws {
         let clock = TestClock()
         let log = HealthLog()
@@ -317,6 +391,27 @@ import Testing
         // socket behind for the next start to trip over.
         #expect(launcher.lastChild()?.stopRequested == true)
         #expect(launcher.lastChild()?.stopForced == false)
+    }
+
+    @Test(arguments: [PostShutdownAttempt.start, .retry])
+    func shutdownPermanentlyRefuses(_ attempt: PostShutdownAttempt) async throws {
+        let clock = TestClock()
+        let log = HealthLog()
+        let (supervisor, launcher) = supervisor(script: [], clock: clock, log: log)
+        await supervisor.start()
+        _ = await log.wait(for: {
+            if case .running = $0 { return true }
+            return false
+        })
+        await supervisor.shutDown()
+
+        await attempt.perform(on: supervisor)
+        let spawned = await waitUntil(within: 0.1) { launcher.launchCount() > 1 }
+        let health = await supervisor.health
+        if spawned { await supervisor.shutDown() }
+
+        #expect(!spawned)
+        #expect(health == .shutDown)
     }
 
     @Test func shutdownDoesNotForceAChildThatExitedWhileItsStderrStillDrains() async {
@@ -514,6 +609,7 @@ private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
     private let gate = ProcessGate()
     private let lock = NSLock()
     private var exited = false
+    private var askedToStop = false
 
     init(pid: Int32) { processIdentifier = pid }
 
@@ -531,8 +627,9 @@ private final class PendingTailProcess: EngineProcess, @unchecked Sendable {
 
     func waitUntilTailIsPending() async { await gate.waitUntilReached() }
     func releaseTail() async { await gate.release() }
-    func requestStop() {}
+    func requestStop() { lock.withLock { askedToStop = true } }
     func forceStop() {}
+    var stopRequested: Bool { lock.withLock { askedToStop } }
 }
 
 private actor ProcessGate {
@@ -620,4 +717,82 @@ private final class GatedGraceClock: SupervisorClock, @unchecked Sendable {
 
     func waitUntilGraceStarts() async { await grace.waitUntilReached() }
     func expireGrace() async { await grace.release() }
+}
+
+enum PostShutdownAttempt: Sendable {
+    case start
+    case retry
+
+    func perform(on supervisor: EngineSupervisor) async {
+        switch self {
+        case .start: await supervisor.start()
+        case .retry: await supervisor.retry()
+        }
+    }
+}
+
+private final class FirstBackoffGateClock: SupervisorClock, @unchecked Sendable {
+    private let firstBackoff = ProcessGate()
+    private let lock = NSLock()
+    private var current: TimeInterval = 0
+    private var sleepCount = 0
+
+    var now: TimeInterval { lock.withLock { current } }
+
+    func advance(_ seconds: TimeInterval) { lock.withLock { current += seconds } }
+
+    func sleep(_ seconds: TimeInterval) async {
+        let isFirst = lock.withLock {
+            current += seconds
+            sleepCount += 1
+            return sleepCount == 1
+        }
+        if isFirst { await firstBackoff.reachAndWait() }
+    }
+
+    func waitUntilFirstBackoffStarts() async { await firstBackoff.waitUntilReached() }
+    func releaseFirstBackoff() async { await firstBackoff.release() }
+}
+
+private final class GatedFastFailureLauncher: EngineLaunching, @unchecked Sendable {
+    private let clock: FirstBackoffGateClock
+    private let lock = NSLock()
+    private var launches = 0
+
+    init(clock: FirstBackoffGateClock) { self.clock = clock }
+
+    func launch(_ command: EngineCommand) throws -> EngineProcess {
+        let pid = lock.withLock {
+            launches += 1
+            return Int32(1000 + launches)
+        }
+        return GatedFastFailureProcess(pid: pid, clock: clock)
+    }
+
+    var launchCount: Int { lock.withLock { launches } }
+}
+
+private final class GatedFastFailureProcess: EngineProcess, @unchecked Sendable {
+    let processIdentifier: Int32
+    private let clock: FirstBackoffGateClock
+    private let lock = NSLock()
+    private var exited = false
+
+    init(pid: Int32, clock: FirstBackoffGateClock) {
+        processIdentifier = pid
+        self.clock = clock
+    }
+
+    var hasExited: Bool { lock.withLock { exited } }
+
+    func waitForExit(
+        deliveringStderr: @Sendable (Data) async -> Void
+    ) async -> Int32 {
+        clock.advance(0.5)
+        lock.withLock { exited = true }
+        return 2
+    }
+
+    func requestStop() {}
+    func forceStop() {}
 }

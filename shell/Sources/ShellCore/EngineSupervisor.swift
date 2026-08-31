@@ -129,6 +129,11 @@ public actor EngineSupervisor {
     /// belongs, and `retry` would refuse to do anything.
     private var supervising = false
     private var shuttingDown = false
+    /// A caller asked to replace the running child, rather than interpret its
+    /// exit through the crash policy. The old child must finish before the loop
+    /// can consume this intent and launch its successor.
+    private var replacementRequested = false
+    private var replacementDeadline: Task<Void, Never>?
 
     public init(
         launcher: EngineLaunching,
@@ -158,22 +163,35 @@ public actor EngineSupervisor {
         observer(health)
     }
 
-    /// Begin supervising. Idempotent while a run is in flight.
+    /// Begin supervising. Idempotent while a run is in flight, and permanently
+    /// inert once shutdown has begun.
     public func start() {
-        guard !supervising else { return }
+        guard !shuttingDown, !supervising else { return }
         supervising = true
-        shuttingDown = false
         supervision = Task { await self.supervise() }
     }
 
-    /// The manual way out of a stopped state. It forgives the failure count and
-    /// starts a fresh ring, because the person pressing it is asserting that
-    /// whatever was wrong has been dealt with.
+    /// Retry a stopped engine, or replace a running one in order.
+    ///
+    /// Either path forgives the failure count and starts a fresh ring, because
+    /// the caller is asserting that whatever was wrong has been dealt with. A
+    /// running child is stopped first; its replacement cannot launch until its
+    /// exit has been observed.
+    ///
+    /// Adapted from `legacy@1d32845:bridge/__main__.py:216-242`: legacy told the
+    /// person to restart after configuration changed; this app performs that
+    /// reload as one ordered child replacement.
     public func retry() {
-        guard !supervising else { return }
+        guard !shuttingDown, !replacementRequested else { return }
         consecutiveFastFailures = 0
         stderr.clear()
-        start()
+        guard supervising else {
+            start()
+            return
+        }
+        guard let replacing = child else { return }
+        replacementRequested = true
+        replacementDeadline = stoppingDeadline(for: replacing)
     }
 
     /// How long a child gets to stop in order before it is stopped outright.
@@ -190,8 +208,13 @@ public actor EngineSupervisor {
     /// The loop is parked on the child's exit, so asking the child to stop is
     /// what releases it — and the deadline below is what guarantees that
     /// happens whether or not the child cooperates.
+    ///
+    /// Orderly teardown is ported from
+    /// `legacy@1d32845:bridge/daemon.py:727-741` and
+    /// `bridge/codex.py:395-421`; making it terminal is new to this supervisor.
     public func shutDown() async {
         shuttingDown = true
+        cancelReplacement()
         guard let stopping = child else {
             await supervision?.value
             supervision = nil
@@ -199,12 +222,7 @@ public actor EngineSupervisor {
             return
         }
 
-        stopping.requestStop()
-        let deadline = Task { [clock] in
-            await clock.sleep(Self.stopGraceSeconds)
-            guard !Task.isCancelled else { return }
-            self.forceIfStillAlive(stopping)
-        }
+        let deadline = stoppingDeadline(for: stopping)
         await supervision?.value
         deadline.cancel()
         supervision = nil
@@ -262,6 +280,10 @@ public actor EngineSupervisor {
             childHasExited = true
             child = nil
             if shuttingDown { break }
+            if replacementRequested {
+                cancelReplacement()
+                continue
+            }
 
             // The launcher's own work discounted, so a slow login shell is not
             // uptime the engine never had. Floored at zero: a launcher that
@@ -293,6 +315,21 @@ public actor EngineSupervisor {
 
     private func received(_ chunk: Data) {
         stderr.ingest(chunk)
+    }
+
+    private func stoppingDeadline(for process: EngineProcess) -> Task<Void, Never> {
+        process.requestStop()
+        return Task { [clock] in
+            await clock.sleep(Self.stopGraceSeconds)
+            guard !Task.isCancelled else { return }
+            self.forceIfStillAlive(process)
+        }
+    }
+
+    private func cancelReplacement() {
+        replacementRequested = false
+        replacementDeadline?.cancel()
+        replacementDeadline = nil
     }
 
     /// The grace period is over. Kill it only if it has not already gone: a
