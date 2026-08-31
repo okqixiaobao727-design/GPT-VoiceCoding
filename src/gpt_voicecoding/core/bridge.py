@@ -298,10 +298,6 @@ class BridgeCore:
         #: every surface in the `sessions` payload, and a monotonic reading
         #: would name no moment on the far side.
         self._stamp = stamp
-        #: Waiting instances already announced in this Engine. This never
-        #: replays anything; it prevents consecutive outlet transitions from
-        #: announcing the same on-screen dialog twice (#80).
-        self._delivered_waits: set[tuple[SessionTarget, str]] = set()
         #: An outlet transition asks the next discovery pass to reconcile its
         #: fresh rows. The transition itself performs no lane I/O (#80).
         self._reconcile_owed = False
@@ -513,16 +509,6 @@ class BridgeCore:
                     reconcile=True,
                 )
 
-    def _forget_delivered_waits_except_current(self, session: Session) -> None:
-        current = (
-            (session.target, session.waiting_for.approval_id or session.waiting_for.kind)
-            if session.lifecycle is SessionLifecycle.LIVE and session.waiting_for.needs_the_user
-            else None
-        )
-        self._delivered_waits = {
-            key for key in self._delivered_waits if key[0] != session.target or key == current
-        }
-
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
     ) -> RelayOutcome:
@@ -662,17 +648,11 @@ class BridgeCore:
             gone.extend(self._state.sessions.observe(kind, lane, now=self._stamp()))
             if lane.enumerated:
                 fresh.add(kind)
-            for current in self._state.sessions.live():
-                if current.target.agent is kind:
-                    self._forget_delivered_waits_except_current(current)
 
         for target in gone:
-            self._forget_delivered_waits(target)
             _log.info("Session %s is no longer running", target)
             for outcome in self.relays.session_ended(target):
                 await self._announce(outcome.target, outcome.report)
-        live_targets = {session.target for session in self._state.sessions.live()}
-        self._delivered_waits = {key for key in self._delivered_waits if key[0] in live_targets}
         if reconcile and self.adjudicator.outlets():
             await self._announce_current_stops(fresh)
         return tuple(gone)
@@ -693,11 +673,7 @@ class BridgeCore:
                     # the dialog stays the keyboard's — "never spoken to"
                     # includes never answered (advisor, 2026-08-27).
                     return
-                _, outcome = await self.approvals.opened(
-                    event.request, self._spoken_as(event.request.target)
-                )
-                if outcome.delivered_by is not None:
-                    self._delivered_waits.add((event.request.target, event.request.approval_id))
+                await self.approvals.opened(event.request, self._spoken_as(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
@@ -758,14 +734,28 @@ class BridgeCore:
         progress: ProgressObservation | None = None,
         reconcile: bool,
     ) -> NoticeOutcome | None:
-        """Announce one current wait through the same producer as its live event."""
-        key = (
-            (target, waiting_for.approval_id or waiting_for.kind)
-            if waiting_for.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
-            else None
-        )
-        if key is not None and key in self._delivered_waits:
-            return None
+        """Announce one current wait through the same producer as its live event.
+
+        **Bridge Core keeps no memory of what it has already announced (#161).**
+        Whether to announce is a function of this reading alone, so a wait that
+        still needs the user is reported on every outlet transition, in the same
+        words. A set of delivered waits used to suppress the repeat; it could not
+        work, because the action that invalidates it — an adapter handing an
+        unanswered dialog back to the terminal and dropping its handle — happens
+        where Bridge Core cannot see it, so any key Bridge Core computes goes
+        stale unseen.
+
+        The current handle is still *read*, just below: it decides **who**
+        announces, the Approval Relay or a Stop Notice. Reading it is not
+        recording it.
+
+        Legacy (ADR 0010) — **dropped, because** its record of what a Session was
+        last announced on is `CurrentSessionStop`
+        (`legacy@1d32845:bridge/store.py:870-897`), with its identity derived
+        from live state (`legacy@1d32845:bridge/daemon.py:1420-1493`). It is one
+        of the durable ledgers #67's port table leaves behind, and the rule that
+        replaces it is #80's — reconcile the current state and replay nothing.
+        """
         _log.info(
             "Session stopped: %s waiting on %s%s",
             target,
@@ -779,8 +769,6 @@ class BridgeCore:
                     held.approval_id, spoken_reference(session, target)
                 )
                 if outcome is not None:
-                    if key is not None and outcome.delivered_by is not None:
-                        self._delivered_waits.add(key)
                     return outcome
             # One dialog, two events, one announcement. A Session entering
             # `waiting` raises this Stop, and the same dialog reached
@@ -824,12 +812,9 @@ class BridgeCore:
                 ),
             )
         )
-        if key is not None and outcome.delivered_by is not None:
-            self._delivered_waits.add(key)
         return outcome
 
     async def _session_ended(self, event: SessionEnded) -> None:
-        self._forget_delivered_waits(event.target)
         try:
             self._state.sessions.mark_ended(event.target)
         except BridgeCoreError:
@@ -855,22 +840,15 @@ class BridgeCore:
             question_route_open = event.window is ReplyWindow.OPEN and self._question_answerable(
                 event.target
             )
-            current = (
-                held
-                if question_route_open
-                else self._state.sessions.set_state(
+            if not question_route_open:
+                self._state.sessions.set_state(
                     event.target, _state_behind(event.window, held.state)
                 )
-            )
         except BridgeCoreError:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
         if event.window is ReplyWindow.OPEN:
-            self._forget_delivered_waits_except_current(current)
             await self.relays.reply_window_opened(event.target)
-
-    def _forget_delivered_waits(self, target: SessionTarget) -> None:
-        self._delivered_waits = {key for key in self._delivered_waits if key[0] != target}
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""
