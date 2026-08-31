@@ -1740,6 +1740,16 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
         current_target, resumed = asyncio.run(scenario())
         assert [call["threadId"] for call in resumed] == [THREAD]
         assert [event.target for event in sink.of(SessionStopped)] == [current_target]
+        # The Reply Window is one of the four readers of `WatchedThread.target`
+        # (#158). This scenario already raised it and only the assertion was
+        # missing, so a re-key that moved the window's target back would have
+        # gone unseen. Only the two raised *after* the last re-key are pinned:
+        # one raised before it carries the address that was current when it was
+        # raised, which is the whole point rather than a defect.
+        assert [event.target for event in sink.of(ReplyWindowChanged)][-2:] == [
+            current_target,
+            current_target,
+        ]
 
     def test_a_stale_relay_does_not_restore_a_superseded_target(self, socket_path: Path) -> None:
         """Only discovery may replace the address held for a watched thread."""
@@ -1773,6 +1783,42 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
 
         current_target = asyncio.run(scenario())
         assert [event.target for event in sink.of(SessionStopped)] == [current_target]
+
+    def test_a_rekeyed_thread_raises_its_prompt_at_its_current_target(
+        self, socket_path: Path
+    ) -> None:
+        """#158: the approval projection reads the field the Stop reads.
+
+        Four user-visible outputs read `WatchedThread.target`. `SessionStopped`
+        and `ReplyWindowChanged` are pinned to the address discovery last set by
+        the test above, and `SessionEnded` by
+        `test_a_rekeyed_session_is_ended_at_its_current_target`. The approval
+        projection reads that same one field and had no such test, so a re-key
+        that moved it would have been caught in three readers and missed in this
+        one — the reader whose target the user's verdict is then routed back to.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                server.thread_source = "user"
+                live_pids = [991, 992]
+                adapter = await joined(server, sink, live_pids=live_pids)
+                try:
+                    await adapter.discover()
+                    live_pids[:] = [993]
+                    lane = await adapter.discover()
+                    current_target = lane.rows[0].target
+
+                    await adapter.answer_relay(TARGET, "still the same thread", request_id=rid())
+                    await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    return current_target
+                finally:
+                    await adapter.aclose()
+
+        current_target = asyncio.run(scenario())
+        assert [event.request.target for event in sink.of(AwaitingApproval)] == [current_target]
 
     def test_a_prompt_raised_by_the_users_own_turn_reaches_the_user(
         self, socket_path: Path
