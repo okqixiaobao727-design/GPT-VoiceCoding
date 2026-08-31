@@ -86,8 +86,9 @@ class Notice:
     """
 
     request_id: RequestId
-    #: The Session this attempt is about. Current-state reconciliation and its
-    #: delivered-wait memory belong to Bridge Core, not to this notice object.
+    #: The Session this attempt is about. Deciding whether a wait is announced
+    #: at all is Bridge Core's current-state reconciliation, not this notice
+    #: object's — and since #161 that decision reads only the current state.
     target: SessionTarget
     text: str
 

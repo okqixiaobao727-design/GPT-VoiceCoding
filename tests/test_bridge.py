@@ -1149,10 +1149,14 @@ class TestSwitchAdjudicationEndToEnd:
         ]
         assert hub.core.approvals.pending() == (opened,)
 
+        # The second outlet transition re-offers the same still-held permission.
+        # Bridge Core keeps no memory of the first announcement, so the user picking
+        # the phone up again is told what is still waiting for them (#161).
         hub.flip(SwitchName.VOICE, True)
         asyncio.run(hub.core.discover())
 
-        assert len(hub.channel.sent) == 1
+        assert len(hub.channel.sent) == 2
+        assert hub.channel.sent[1] == hub.channel.sent[0]
 
         hub.agent.discovery = LaneDiscovery(
             rows=(
@@ -1170,8 +1174,8 @@ class TestSwitchAdjudicationEndToEnd:
         asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
 
-        assert len(hub.channel.sent) == 2
-        assert hub.channel.sent[1] == hub.channel.sent[0]
+        assert len(hub.channel.sent) == 3
+        assert hub.channel.sent[2] == hub.channel.sent[0]
 
     def test_an_expired_permission_is_reconciled_as_answerable_only_in_the_terminal(
         self,
@@ -1215,7 +1219,7 @@ class TestSwitchAdjudicationEndToEnd:
         assert len(hub.channel.sent) == 1
         assert "terminal" in hub.channel.sent[0]
 
-    def test_consecutive_outlet_transitions_do_not_repeat_one_delivered_wait(self) -> None:
+    def test_consecutive_outlet_transitions_each_re_announce_the_same_wait(self) -> None:
         hub = Hub(duty=False, voice=False)
         hub.agent.discovery = LaneDiscovery(
             rows=(
@@ -1233,11 +1237,17 @@ class TestSwitchAdjudicationEndToEnd:
 
         hub.flip(SwitchName.DUTY, True)
         asyncio.run(hub.core.discover())
-        hub.flip(SwitchName.VOICE, True)
+        # The second transition is the Companion Channel's far side coming back,
+        # so both notices are routed the same way and the wording is comparable.
+        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
 
+        # Nothing holds this wait, so it is answerable only at the terminal.
+        # Each outlet transition reports it again, in the same words: a notice
+        # is a report of the current reading, and the reading did not move (#161).
         assert hub.agent.inspections == []
-        assert len(hub.channel.sent) == 1
+        assert len(hub.channel.sent) == 2
+        assert hub.channel.sent[1] == hub.channel.sent[0]
         assert hub.call.calls_started == 0
 
     def test_a_wait_can_be_announced_again_after_the_session_moves_on(self) -> None:
@@ -1289,7 +1299,7 @@ class TestSwitchAdjudicationEndToEnd:
         assert len(hub.channel.sent) == 2
         assert "Which release?" in hub.channel.sent[-1]
 
-    def test_discovery_clears_dedup_when_the_session_moves_on_between_transitions(
+    def test_a_wait_raised_after_the_session_moved_on_is_announced_on_the_next_transition(
         self,
     ) -> None:
         hub = Hub(duty=False, voice=False)
@@ -1338,7 +1348,7 @@ class TestSwitchAdjudicationEndToEnd:
         assert len(hub.channel.sent) == 2
         assert "Which release?" in hub.channel.sent[-1]
 
-    def test_an_open_reply_window_clears_the_previous_wait(self) -> None:
+    def test_each_stop_on_one_session_is_announced_in_its_turn(self) -> None:
         hub = Hub(voice=False)
         hub.emit(
             SessionStopped(
@@ -1511,26 +1521,6 @@ class TestWhatDiscoveryCallsAnEnding:
 
         assert self.again(hub, self.codex(session_id="xyz", pid=10)) == ()
         assert len(hub.state.sessions.live()) == 1
-
-    def test_re_keying_drops_delivered_wait_memory_for_the_old_address(self) -> None:
-        old = SessionTarget(agent=AgentKind.CODEX, session_id=None, pid=10)
-        hub = Hub(duty=False, voice=False, sessions=())
-        hub.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=old,
-                    workspace=Path("/tmp/workspace"),
-                    state=SessionState.WAITING,
-                    waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
-                ),
-            )
-        )
-        hub.flip(SwitchName.DUTY, True)
-        asyncio.run(hub.core.discover())
-
-        self.again(hub, self.codex(session_id="abc", pid=10))
-
-        assert hub.core._delivered_waits == set()  # noqa: SLF001 - the bounded cache is the contract
 
     def test_a_lane_that_could_not_look_announces_nothing(self) -> None:
         hub = self.seeing(self.codex(session_id="abc", pid=10))

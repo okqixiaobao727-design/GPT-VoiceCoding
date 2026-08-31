@@ -279,10 +279,13 @@ class TestTheLabelOnAWaitingRow:
         `classify` calls `permission prompt` a `PERMISSION` and the Reply Window
         sweep announces it as one. This row must stay `UNKNOWN` with
         `caught_up=False` — what the projection reported for every `waiting` row
-        before #150 — because a roster row carries no `approval_id`, so a
-        `PERMISSION` here would key Bridge Core's delivered-wait dedup
-        `(target, PERMISSION)`, miss the live path's `(target, approval_id)`,
-        and announce the same dialog a second time. See `_waiting_for`.
+        before #150 — because that is what this reader currently returns, and
+        #155 is the ticket that would promote it.
+
+        The reason previously recorded here — that a promoted row would miss
+        Bridge Core's delivered-wait dedup and announce the dialog twice — is
+        retracted; #161 deleted that ledger outright. `_waiting_for` carries the
+        retraction in full.
         """
         row = IDLE_ROW | {"status": "waiting", "waitingFor": "permission prompt"}
         waiting_for = found([row]).rows[0].waiting_for
