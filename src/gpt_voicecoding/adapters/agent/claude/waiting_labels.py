@@ -101,8 +101,22 @@ class LabelReading:
 #: answer something.
 #:
 #: `worker request` is a swarm worker forwarding its permission ask to the
-#: lead's mailbox. Which record carries it is unmeasured, so it is `CATCH_UP`
-#: until somebody measures it. `goal proposal` was measured: Claude itself
+#: lead's mailbox, and **no record either reader can see ever carries it**
+#: (#156, measured live on 2.1.251 on 2026-08-31, `tmux` teammate backend).
+#: An out-of-process teammate is its own process, launched with `--agent-id`
+#: and `--team-name`, and it writes **no registry record at all**: while one sat
+#: parked on "Waiting for team lead approval", `~/.claude/sessions` held no file
+#: for its pid and `claude agents --json` did not list it. The lead's record
+#: carried `permission prompt` for that same request, so the wait is announced
+#: today, named, by the label above. The entry stays `CATCH_UP` because that is
+#: the harmless reading of a label that cannot arrive — not because anything is
+#: still owed. Unmeasured, and left that way deliberately: the `in-process` and
+#: `iterm2` backends, and a teammate the vendor places elsewhere (its own
+#: vocabulary has `where: "remote"`). An in-process teammate shares the lead's
+#: app state, so if the forward path runs there at all the label would ride the
+#: *lead's* record — the one case that could put it in front of a reader.
+#:
+#: `goal proposal` was measured: Claude itself
 #: ignores one while busy, so nobody is blocked on it and it is never a Stop.
 LABELS: Final[dict[str, LabelReading]] = {
     # An AskUserQuestion dialog, an MCP elicitation or teammate setup. The
