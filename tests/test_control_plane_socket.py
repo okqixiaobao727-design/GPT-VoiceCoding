@@ -260,25 +260,49 @@ class TestOneBadLineCostsOneRequest:
         assert "bytes" in refusal.error.message
         assert after.ok
 
-    def test_a_reply_larger_than_the_bound_is_refused_by_the_surface(
+    def test_a_reply_larger_than_the_bound_is_replaced_by_a_bounded_server_refusal(
         self, socket_dir: Path
     ) -> None:
-        """The bound binds both directions: a surface reads no more than it must."""
+        """The final outbound guard never writes a line a conforming client cannot read."""
 
         class Flood:
             async def handle(self, request: Request) -> Reply:
-                return Reply.answered(request.action, {"x": "a" * MAX_REQUEST_BYTES})
+                return Reply.answered(request.action, {"x": '雪"\\' * 1_024})
 
-        async def scenario() -> None:
-            server = ControlPlaneServer(plane=Flood(), path=socket_dir / "control.sock")
+        async def scenario() -> bytes:
+            server = ControlPlaneServer(
+                plane=Flood(),
+                path=socket_dir / "control.sock",
+                max_bytes=512,
+            )
             await server.start()
             try:
-                await ask(Request(action=Action.STATUS), path=server.path)
+                asking = json.dumps(Request(action=Action.STATUS).as_document()).encode() + b"\n"
+                return await raw(server.path, asking)
             finally:
                 await server.aclose()
 
-        with pytest.raises(EngineUnreachable):
-            asyncio.run(scenario())
+        answer = asyncio.run(scenario())
+        reply = Reply.of(json.loads(answer))
+
+        assert answer.endswith(b"\n")
+        assert len(answer) <= 512
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+
+    def test_the_physical_reply_declares_protocol_five(self, socket_dir: Path) -> None:
+        async def scenario() -> bytes:
+            server = await serving(socket_dir, StubPlane())
+            try:
+                asking = json.dumps(Request(action=Action.STATUS).as_document()).encode() + b"\n"
+                return await raw(server.path, asking)
+            finally:
+                await server.aclose()
+
+        answer = asyncio.run(scenario())
+
+        assert answer.endswith(b"\n")
+        assert json.loads(answer)["protocol"] == 5
 
 
 class TestTwoSurfacesAtOnce:

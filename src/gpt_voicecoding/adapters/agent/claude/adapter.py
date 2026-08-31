@@ -60,6 +60,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._progress import source_degradation
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude import (
     children,
@@ -84,7 +85,11 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
 )
 from gpt_voicecoding.adapters.agent.claude.inbox import InboxError, ReplyInbox
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
-from gpt_voicecoding.adapters.agent.claude.transcript import Record, TranscriptReader
+from gpt_voicecoding.adapters.agent.claude.transcript import (
+    Record,
+    TranscriptReader,
+    TranscriptUnavailable,
+)
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
@@ -92,7 +97,9 @@ from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     LaneDiscovery,
     LaneUnavailable,
-    Progress,
+    ProgressAvailability,
+    ProgressCapture,
+    ProgressObservation,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -184,10 +191,15 @@ class ClaudeAgentAdapter:
     """Claude, behind the Agent seam. Implements `AgentAdapter` and `Connectable`."""
 
     def __init__(
-        self, *, sink: EventSink | None = None, settings: ClaudeSettings | None = None
+        self,
+        *,
+        progress_capture: ProgressCapture,
+        sink: EventSink | None = None,
+        settings: ClaudeSettings | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or ClaudeSettings()
+        self._progress_capture = progress_capture
         #: The inbox socket each registered Session's own `SessionStart` hook
         #: reported. Read, never built: 2.1.245 derives the directory from
         #: `CLAUDE_CODE_TMPDIR` or `$XDG_RUNTIME_DIR` and accepts
@@ -467,7 +479,12 @@ class ClaudeAgentAdapter:
         for row in lane.rows:
             rows.append(self._row_with_stop(row))
             rows.extend(self._children_under(row))
-        return replace(lane, rows=tuple(rows))
+        projected = tuple(rows)
+        return replace(
+            lane,
+            rows=projected,
+            degraded=source_degradation(projected, lane.degraded),
+        )
 
     def _children_under(self, row: SessionInspection) -> tuple[SessionInspection, ...]:
         """Every Child Process this row is running, or none because it is not running.
@@ -519,22 +536,31 @@ class ClaudeAgentAdapter:
         `inspect` gets here with a `RUNNING` row at all — the cadence returns one
         untouched — and that is the row the gate exists for.
         """
-        records = self._transcripts.records(self._transcript_path(row.target))
+        try:
+            records = self._transcripts.records(self._transcript_path(row.target))
+        except TranscriptUnavailable as unreadable:
+            return replace(row, progress=ProgressObservation.unreadable(str(unreadable)))
         waiting = (
             row.waiting_for
             if row.state is SessionState.RUNNING
             else self._overlay(row.target, row.waiting_for, records)
         )
         if records is None:
-            # No path, no file yet, or a read that failed. The roster's own word
-            # stands, and `progress` stays `None` — "not read", never "read and
-            # found nothing".
+            # No path or no file yet. The roster's own word stands and progress
+            # remains `not_read`, never "read and found nothing".
             return row if waiting == row.waiting_for else replace(row, waiting_for=waiting)
-        entries, truncated, moved = transcript_tail.recent(records)
+        entries, omission, moved = transcript_tail.recent(
+            records,
+            capture=self._progress_capture,
+        )
         return replace(
             row,
             waiting_for=waiting,
-            progress=Progress(recent=entries, truncated=truncated, read_at=datetime.now(UTC)),
+            progress=ProgressObservation.from_capture(
+                recent=entries,
+                omission=omission,
+                read_at=datetime.now(UTC),
+            ),
             last_activity=moved,
         )
 
@@ -551,7 +577,10 @@ class ClaudeAgentAdapter:
         raised by the watcher and a stop read off the roster must be the one
         reading, not two that agree most of the time.
         """
-        records = self._transcripts.records(self._transcript_path(target))
+        try:
+            records = self._transcripts.records(self._transcript_path(target))
+        except TranscriptUnavailable:
+            records = None
         return self._overlay(target, roster if roster is not None else WaitingFor(), records)
 
     def _overlay(
@@ -639,12 +668,11 @@ class ClaudeAgentAdapter:
         The cadence skips a `RUNNING` row because a Session mid-turn has not
         stopped on anything; but "how far along is it" is the question a user
         asks *precisely* while it works, so the per-target read has no such gate
-        (#76, the `progress` verb), and every row that reaches it is read here
-        rather than taken from the cadence's pass. What that costs is one pure
-        walk of records already in memory: the file itself is opened again only
-        if the Session has written to it since, because the reader's cache is
-        keyed on the file's own identity. Bypassing that cache is deliberately
-        *not* done — a hit is the proof of freshness, not a stale answer.
+        (#76, the `progress` verb). A stopped row was already read by the
+        `discover` inside this call and is returned as that one reading; a
+        running row still says `not_read` and is read exactly once here. The
+        reader's file-identity cache remains the proof that an unchanged file
+        need not be parsed again across separate calls.
 
         **A roster that could not be read is not a roster that lists nothing.**
         The two are one value apart here and a whole verdict apart for the
@@ -656,6 +684,8 @@ class ClaudeAgentAdapter:
             raise LaneUnavailable(AgentKind.CLAUDE, lane.error)
         for row in lane.rows:
             if row.target == target:
+                if row.progress.availability is not ProgressAvailability.NOT_READ:
+                    return row
                 return self._read_into(row)
         return SessionInspection(
             target=target,
@@ -906,7 +936,10 @@ class ClaudeAgentAdapter:
         settled = self._settled(outstanding)
         if settled is not None and settled.outcome is not Delivery.HELD:
             return settled
-        records = self._transcripts.records(self._transcript_path(outstanding.target))
+        try:
+            records = self._transcripts.records(self._transcript_path(outstanding.target))
+        except TranscriptUnavailable:
+            records = None
         if inbox.correlated(
             records, msg_id=outstanding.msg_id, address=outstanding.replies.address
         ):

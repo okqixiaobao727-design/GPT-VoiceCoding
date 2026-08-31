@@ -6,6 +6,18 @@ import Testing
 /// The shell's side of the contract in `docs/control-plane.md`. One JSON object
 /// per line, one reply per request, and a closed error set.
 @Suite struct WireTests {
+    @Test func protocolFiveNamesTheProgressVocabulary() {
+        #expect(controlPlaneProtocolVersion == 5)
+        #expect(
+            Set(ProgressAvailability.allCases.map(\.rawValue)) == [
+                "not_read", "unreadable", "readable",
+            ])
+        #expect(
+            Set(ProgressOmission.allCases.map(\.rawValue)) == [
+                "none", "older", "status_summary", "newest_oversize",
+            ])
+    }
+
     @Test func aRequestWithoutAPayloadOmitsTheKey() throws {
         let line = try Request(action: "live").line()
         let document = try #require(

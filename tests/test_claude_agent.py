@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from claude_inbox_fake import FakeInbox
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import (
     PROVEN_AGAINST_VERSION,
     ClaudeAgentAdapter,
@@ -145,7 +146,9 @@ def reaching(
     proof of delivery available on an accepting receiver appears.
     """
     adapter = ClaudeAgentAdapter(
-        sink=sink, settings=settings or quick(registry_directory=path.parent)
+        progress_capture=PROGRESS_CAPTURE,
+        sink=sink,
+        settings=settings or quick(registry_directory=path.parent),
     )
     adapter.register_session(TARGET, path)
     adapter._reported[TARGET] = SessionReport(  # noqa: SLF001 - seeding one registration
@@ -197,7 +200,9 @@ async def _until(settled) -> None:
 class TestRegisteringSessions:
     def test_a_registered_session_inbox_is_recorded(self, socket_path: Path, caplog) -> None:
         caplog.set_level("INFO", logger="gpt_voicecoding.adapters.agent.claude.adapter")
-        adapter = ClaudeAgentAdapter(sink=Sink(), settings=quick())
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE, sink=Sink(), settings=quick()
+        )
 
         adapter.register_session(TARGET, socket_path)
 
@@ -215,7 +220,9 @@ class TestRegisteringSessions:
         """
         sink = Sink()
 
-        ClaudeAgentAdapter(sink=sink, settings=quick()).register_session(TARGET, socket_path)
+        ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE, sink=sink, settings=quick()
+        ).register_session(TARGET, socket_path)
 
         assert sink.events == []
 
@@ -231,7 +238,11 @@ class TestTheLevelItIsAskedFor:
 
     def _adapter(self, tmp_path: Path, *, status: str = "idle") -> ClaudeAgentAdapter:
         write_record(tmp_path, status=status)
-        return ClaudeAgentAdapter(sink=Sink(), settings=quick(registry_directory=tmp_path))
+        return ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            sink=Sink(),
+            settings=quick(registry_directory=tmp_path),
+        )
 
     def test_a_session_this_adapter_holds_no_inbox_for_is_closed(self, tmp_path: Path) -> None:
         """Reading someone's record is not the same as being able to reach them.
@@ -635,7 +646,12 @@ class TestTheRoutesThisBuildReallyHas:
                     await adapter.aclose()
 
         receipt, received = asyncio.run(scenario())
-        assert RelayRoute.SUPPLEMENT not in claude_agent().supported_routes()
+        assert (
+            RelayRoute.SUPPLEMENT
+            not in claude_agent(
+                progress_capture=PROGRESS_CAPTURE,
+            ).supported_routes()
+        )
         assert receipt.outcome is Delivery.FAILED
         assert received == [], "a route this adapter lacks must put nothing on the wire"
 
@@ -675,7 +691,9 @@ class TestTheRoutesThisBuildReallyHas:
 class TestFailingBeforeTheWordsLeave:
     def test_an_unregistered_session_fails_closed(self, socket_path: Path) -> None:
         async def scenario():
-            adapter = ClaudeAgentAdapter(sink=Sink(), settings=quick())
+            adapter = ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE, sink=Sink(), settings=quick()
+            )
             try:
                 return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
             finally:
@@ -795,7 +813,9 @@ class TestFailingBeforeTheWordsLeave:
         assert "may not exceed 103" in receipt.reason
 
     def test_a_codex_session_is_not_this_adapters_to_reach(self) -> None:
-        adapter = ClaudeAgentAdapter()
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+        )
         with pytest.raises(ValueError, match="not this adapter's"):
             adapter.register_session(
                 SessionTarget(agent=AgentKind.CODEX, session_id="t-1"), Path("/tmp/x.sock")
@@ -804,7 +824,11 @@ class TestFailingBeforeTheWordsLeave:
 
 class TestReportingWhatIsLoaded:
     def test_verify_names_this_implementation_and_passes_with_nothing_registered(self) -> None:
-        result = asyncio.run(ClaudeAgentAdapter().verify())
+        result = asyncio.run(
+            ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+            ).verify()
+        )
         assert result.outcome is VerifyOutcome.PASS
         assert result.loaded.endswith(":ClaudeAgentAdapter")
         assert "no Claude Session is registered" in result.detail
@@ -843,7 +867,7 @@ class TestReportingWhatIsLoaded:
 class TestWhatThisSpokeMayBeTold:
     def test_an_unknown_key_refuses_to_start_and_lists_what_there_is(self) -> None:
         with pytest.raises(SettingsError, match="ack_timeout_secondz"):
-            claude_agent(settings={"ack_timeout_secondz": 5})
+            claude_agent(progress_capture=PROGRESS_CAPTURE, settings={"ack_timeout_secondz": 5})
 
     def test_a_text_budget_larger_than_the_line_budget_can_never_be_spent(self) -> None:
         with pytest.raises(SettingsError, match="must fit inside"):
@@ -851,7 +875,9 @@ class TestWhatThisSpokeMayBeTold:
 
     def test_a_timeout_that_is_not_a_number_of_seconds_is_refused(self) -> None:
         with pytest.raises(SettingsError, match="number of seconds"):
-            claude_agent(settings={"ack_timeout_seconds": "soon"})
+            claude_agent(
+                progress_capture=PROGRESS_CAPTURE, settings={"ack_timeout_seconds": "soon"}
+            )
 
 
 class TestTheHubStopsHoldingWhatArrived:

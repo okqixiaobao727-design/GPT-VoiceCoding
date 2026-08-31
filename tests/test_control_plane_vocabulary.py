@@ -36,16 +36,9 @@ class TestTheActionSet:
             "verify",
         }
 
-    def test_adding_an_action_did_not_move_the_protocol_version(self) -> None:
-        """`progress` is additive, and the version guards the other direction (#76).
-
-        A version exists so a surface can tell an engine that disagrees from one
-        too old to have been asked, and what it guards against is a surface
-        sending something the engine does not have. A surface built against 4
-        never sends `progress`; one that does is talking to an engine that has
-        it. Removing an action can strand a surface, which is what 4 was for.
-        """
-        assert PROTOCOL_VERSION == 4
+    def test_progress_summary_and_detail_move_the_protocol_to_five(self) -> None:
+        """A v4 renderer could misread v5 omission as silence (ADR 0016)."""
+        assert PROTOCOL_VERSION == 5
 
     def test_launching_and_closing_are_not_actions_this_engine_has(self) -> None:
         """Parked with the launcher (#72), and their absence is asserted, not assumed.
@@ -89,9 +82,9 @@ class TestARequestOnTheWire:
 
 
 class TestAReplyOnTheWire:
-    def test_dropping_launch_and_close_moved_the_protocol_version(self) -> None:
-        """A surface built against 3 sends actions this engine no longer has."""
-        assert PROTOCOL_VERSION == 4
+    def test_the_current_protocol_includes_the_version_four_action_removal(self) -> None:
+        """Version 4 removed launch/close; version 5 retains that closed set."""
+        assert PROTOCOL_VERSION == 5
 
     def test_an_answer_carries_the_action_it_answers_and_the_protocol_version(self) -> None:
         document = Reply.answered(Action.STATUS, {"call_id": None}).as_document()

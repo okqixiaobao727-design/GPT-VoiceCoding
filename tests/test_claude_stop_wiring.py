@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
@@ -31,6 +32,7 @@ from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     LaneUnavailable,
     Option,
+    ProgressCapture,
     ReplyWindowChanged,
     SessionEnded,
     SessionInspection,
@@ -71,6 +73,7 @@ def adapter_holding(
     *,
     parked: tuple[ApprovalRequest, ...] = (),
     asking: WaitingFor | None = None,
+    progress_capture: ProgressCapture = PROGRESS_CAPTURE,
 ) -> ClaudeAgentAdapter:
     """An adapter that has heard one Session's registration and holds `parked`.
 
@@ -80,7 +83,7 @@ def adapter_holding(
     reason: parking a real dialog needs a real hook process on a real socket, and
     `test_claude_approval.py` already proves that half.
     """
-    adapter = ClaudeAgentAdapter()
+    adapter = ClaudeAgentAdapter(progress_capture=progress_capture)
     adapter._reported[TARGET] = SessionReport(  # noqa: SLF001 - seeding one registration
         session_id=SESSION, pid=TARGET.pid, transcript_path=transcript_path
     )
@@ -416,7 +419,7 @@ class TestWhenTheRecordSaysNothing:
 
     def test_a_session_that_never_registered_leaves_the_roster_s_word_alone(self) -> None:
         """No `SessionStart` hook ran, so there is no path and nothing was read."""
-        adapter = ClaudeAgentAdapter()
+        adapter = ClaudeAgentAdapter(progress_capture=PROGRESS_CAPTURE)
         assert adapter.stopped_on(TARGET, ROSTER_WAITING) == ROSTER_WAITING
 
     def test_a_transcript_that_does_not_exist_yet_is_not_an_empty_one(self, tmp_path: Path) -> None:
@@ -648,6 +651,7 @@ class TestWhenTheSessionEnds:
                 raised.append(event)
 
         adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
             sink=Sink(),
             settings=ClaudeSettings(
                 registry_directory=tmp_path / "sessions", reply_window_poll_seconds=0.02

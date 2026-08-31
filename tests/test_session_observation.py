@@ -10,6 +10,7 @@ a TUI, and a lane that cannot look at all.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,11 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     LaneDiscovery,
+    ProgressAvailability,
+    ProgressEntry,
+    ProgressObservation,
+    ProgressOmission,
+    ProgressRole,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -328,6 +334,38 @@ class TestALaneThatCouldNotLook:
 
         assert registry.lane_errors() == {AgentKind.CODEX: "the process table is shut"}
         assert registry.lane_degradations() == {AgentKind.CODEX: "shared daemon absent"}
+
+    def test_an_unreadable_progress_source_keeps_the_last_observation(self) -> None:
+        registry = SessionRegistry()
+        observed = ProgressObservation.readable(
+            has_history=True,
+            recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),),
+            omission=ProgressOmission.NONE,
+            read_at=datetime.fromtimestamp(NOW, UTC),
+        )
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(codex_row(session_id="abc", pid=10, progress=observed)),
+            now=NOW,
+        )
+
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(
+                codex_row(
+                    session_id="abc",
+                    pid=10,
+                    progress=ProgressObservation.unreadable("the daemon dropped the read"),
+                ),
+                degraded="the daemon dropped the read",
+            ),
+            now=NOW + 5,
+        )
+
+        held = registry.live()[0].progress
+        assert held == observed
+        assert held.availability is ProgressAvailability.READABLE
+        assert registry.lane_degradations() == {AgentKind.CODEX: "the daemon dropped the read"}
 
 
 class TestTheNameARowKeeps:

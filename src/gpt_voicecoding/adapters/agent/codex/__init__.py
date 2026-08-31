@@ -12,6 +12,7 @@ from typing import Any
 
 from gpt_voicecoding.adapters.agent.codex.adapter import CodexAgentAdapter
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
+from gpt_voicecoding.seams.agent import ProgressCapture
 
 __all__ = [
     "CodexAgentAdapter",
@@ -23,6 +24,7 @@ __all__ = [
 
 def codex_agent(
     *,
+    progress_capture: ProgressCapture,
     sink: Any = None,
     settings: dict[str, Any] | None = None,
     own_socket_path: Path | None = None,
@@ -30,6 +32,7 @@ def codex_agent(
 ) -> CodexAgentAdapter:
     """Build the adapter from an opaque settings table, refusing keys it lacks."""
     return CodexAgentAdapter(
+        progress_capture=progress_capture,
         sink=sink,
         settings=CodexSettings.of(settings),
         own_socket_path=own_socket_path,

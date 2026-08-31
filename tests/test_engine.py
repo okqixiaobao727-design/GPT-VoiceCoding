@@ -70,8 +70,11 @@ def call_that_rides(*, sink: object = None) -> RidingCall:
     return RidingCall(sink=sink)
 
 
-def agent_that_owns_one(*, sink: object = None) -> ServerOwningAgent:
-    return ServerOwningAgent(sink=sink)  # type: ignore[arg-type]
+def agent_that_owns_one(*, progress_capture: object, sink: object = None) -> ServerOwningAgent:
+    return ServerOwningAgent(  # type: ignore[arg-type]
+        sink=sink,
+        progress_capture=progress_capture,
+    )
 
 
 CONFIG = """

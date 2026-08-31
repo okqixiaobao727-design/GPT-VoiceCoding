@@ -17,9 +17,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from gpt_voicecoding.adapters.agent._progress import RECENT_LIMIT
+from fakes import PROGRESS_CAPTURE, capture_for
 from gpt_voicecoding.adapters.agent.codex.thread_tail import last_activity, moment, recent
-from gpt_voicecoding.seams.agent import ProgressRole
+from gpt_voicecoding.seams.agent import ProgressOmission, ProgressRole
 
 #: The moment the live probe read, and the integer the daemon spelled it as.
 MEASURED_SECONDS = 1787712279
@@ -50,7 +50,7 @@ def thread(*turns: dict[str, Any], **extra: Any) -> dict[str, Any]:
 
 
 def texts(document: dict[str, Any]) -> list[str]:
-    entries, _ = recent(document)
+    entries, _ = recent(document, capture=PROGRESS_CAPTURE)
     return [entry.text for entry in entries]
 
 
@@ -58,13 +58,16 @@ class TestWhatCountsAsProgress:
     """Ported selection: what was said, never the machinery of doing the work."""
 
     def test_both_sides_are_carried_and_each_says_which_it_is(self) -> None:
-        entries, truncated = recent(thread(turn(told("do the thing"), spoke("done"))))
+        entries, omission = recent(
+            thread(turn(told("do the thing"), spoke("done"))),
+            capture=PROGRESS_CAPTURE,
+        )
 
         assert [(entry.role, entry.text) for entry in entries] == [
             (ProgressRole.USER, "do the thing"),
             (ProgressRole.ASSISTANT, "done"),
         ]
-        assert truncated is False
+        assert omission is ProgressOmission.NONE
 
     def test_the_machinery_of_doing_the_work_is_not_a_report_of_it(self) -> None:
         """`reasoning` and `commandExecution` are the two a real turn is full of."""
@@ -107,12 +110,12 @@ class TestWhatCountsAsProgress:
 
     def test_the_bound_is_the_shared_one(self) -> None:
         """One bound, one type, whichever lane the row came from."""
-        document = thread(turn(*(spoke(f"step {index}") for index in range(RECENT_LIMIT + 2))))
+        document = thread(turn(spoke("x" * 1_000), spoke("newest")))
 
-        entries, truncated = recent(document)
+        entries, omission = recent(document, capture=capture_for(1_024))
 
-        assert len(entries) == RECENT_LIMIT
-        assert truncated is True
+        assert [entry.text for entry in entries] == ["newest"]
+        assert omission is ProgressOmission.OLDER
 
 
 class TestAThreadWithNoTurns:
@@ -122,10 +125,10 @@ class TestAThreadWithNoTurns:
         document = thread()
         del document["turns"]
 
-        assert recent(document) == ((), False)
+        assert recent(document, capture=PROGRESS_CAPTURE) == ((), ProgressOmission.NONE)
 
     def test_a_thread_that_has_taken_no_turn_says_nothing_yet(self) -> None:
-        assert recent(thread()) == ((), False)
+        assert recent(thread(), capture=PROGRESS_CAPTURE) == ((), ProgressOmission.NONE)
 
 
 class TestLastActivity:

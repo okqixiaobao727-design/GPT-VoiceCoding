@@ -2,7 +2,7 @@
 
 **This is the lane's only opener of a transcript file, and that is the point.**
 What a Session stopped on (`stop_analysis`, #75) and how far along it is
-(`Progress`, #76) are two questions with one answer source, asked at the same
+(`ProgressObservation`, #76) are two questions with one answer source, asked at the same
 moment about the same Session. Two readers would mean two whole-file reads per
 tick and two answers describing two moments of a file the Session is still
 appending to — the same argument that put P3, P4 and P5 in one pass.
@@ -41,11 +41,11 @@ What keeps the cost off the cadence instead is the caller — a `RUNNING` Sessio
 is not read at all, and a stopped one is not appending, so the expensive read
 happens once per stop rather than once per tick.
 
-**An unreadable line is skipped; an unreadable file is `None`.** The last line of
+**An unreadable line is skipped; an unreadable file raises.** The last line of
 a live transcript is routinely half-written, and refusing the whole file over the
 record being appended right now would blank a Session's stop at exactly the
-moment it has one. `None` is the different fact — no path, no file yet, or a read
-that failed — and it means *the roster's own word stands*, not *nothing is
+moment it has one. `None` means no path or no file yet (`not_read`); an `OSError`
+raises `TranscriptUnavailable` (`unreadable`). Neither means *nothing is
 happening* (`legacy@1d32845:bridge/transcript.py:1213-1240`, whose lesson was that
 treating format drift as an error failed ~99% of real transcripts).
 """
@@ -66,6 +66,10 @@ _log = logging.getLogger(__name__)
 Record = Mapping[str, Any]
 
 
+class TranscriptUnavailable(Exception):
+    """The authoritative transcript exists but could not be read."""
+
+
 class TranscriptReader:
     """Every registered Session's transcript, parsed at most once per change."""
 
@@ -77,19 +81,22 @@ class TranscriptReader:
     def records(self, path: Path | None) -> tuple[Record, ...] | None:
         """This Session's records in the order it wrote them, or `None`.
 
-        `None` says the file could not be read at all — no path was registered,
-        the Session's first turn has not created it yet (#73), or the read
-        failed. It is not an empty transcript, and a caller that collapses the
-        two reports a Session as having stopped on nothing when the truth is
-        that nobody has looked.
+        `None` says there is no registered path or the first turn has not created
+        the file yet (#73). A source that exists but cannot be read raises
+        `TranscriptUnavailable`. Neither is an empty transcript.
         """
         if path is None:
             return None
         try:
             stat = path.stat()
-        except OSError:
+        except FileNotFoundError:
             self._cache.pop(path, None)
             return None
+        except OSError as unreadable:
+            self._cache.pop(path, None)
+            raise TranscriptUnavailable(
+                f"could not read the transcript at {path}: {unreadable}"
+            ) from None
         cached = self._cache.get(path)
         if cached is not None and cached[0] == stat.st_size and cached[1] == stat.st_mtime_ns:
             return cached[2]
@@ -98,7 +105,9 @@ class TranscriptReader:
         except OSError as unreadable:
             _log.info("could not read the transcript at %s: %s", path, unreadable)
             self._cache.pop(path, None)
-            return None
+            raise TranscriptUnavailable(
+                f"could not read the transcript at {path}: {unreadable}"
+            ) from None
         records = _parse(text)
         self._cache[path] = (stat.st_size, stat.st_mtime_ns, records)
         return records

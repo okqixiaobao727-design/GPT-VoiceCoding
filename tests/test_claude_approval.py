@@ -33,6 +33,7 @@ from typing import Any
 
 import pytest
 
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.claude.approval import (
     ALLOW_BEHAVIOR,
@@ -553,7 +554,10 @@ class TestTheSocketItself:
         launcher asking where to point a hook is asking about this engine's
         identity rather than about its current state.
         """
-        adapter = ClaudeAgentAdapter(settings=ClaudeSettings(socket_directory=socket_root))
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            settings=ClaudeSettings(socket_directory=socket_root),
+        )
         assert adapter.approval_socket_path() == approval_socket_path(socket_root, os.getpid())
 
     def test_two_engines_do_not_share_one_socket(self, socket_root: Path) -> None:
@@ -603,12 +607,18 @@ class TestWhichSessionRaisedIt:
     """The roster is the authority, and an ambiguous roster is not an answer."""
 
     def test_a_registered_session_is_answerable(self, socket_root: Path) -> None:
-        adapter = ClaudeAgentAdapter(settings=ClaudeSettings(socket_directory=socket_root))
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            settings=ClaudeSettings(socket_directory=socket_root),
+        )
         adapter.register_session(TARGET, socket_root / "channel.sock")
         assert adapter._registered_as(SESSION) == TARGET
 
     def test_a_session_this_engine_never_launched_is_not(self, socket_root: Path) -> None:
-        adapter = ClaudeAgentAdapter(settings=ClaudeSettings(socket_directory=socket_root))
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            settings=ClaudeSettings(socket_directory=socket_root),
+        )
         assert adapter._registered_as(SESSION) is None
 
     def test_a_resumed_session_id_naming_two_processes_is_refused(self, socket_root: Path) -> None:
@@ -619,7 +629,10 @@ class TestWhichSessionRaisedIt:
         process, and a notice naming the wrong Session is worse than a dialog
         the human answers themselves.
         """
-        adapter = ClaudeAgentAdapter(settings=ClaudeSettings(socket_directory=socket_root))
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            settings=ClaudeSettings(socket_directory=socket_root),
+        )
         adapter.register_session(TARGET, socket_root / "channel.sock")
         adapter.register_session(
             SessionTarget(agent=AgentKind.CLAUDE, session_id=SESSION, pid=TARGET.pid + 1),
@@ -945,6 +958,7 @@ class TestAQuestionRidesTheHeldHook:
         async def scenario():
             sink = Sink()
             adapter = ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
                 sink=sink,
                 settings=settings_for(socket_root),
             )
@@ -1070,6 +1084,7 @@ class TestAQuestionRidesTheHeldHook:
         async def scenario():
             sink = Sink()
             adapter = ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
                 sink=sink,
                 settings=settings_for(socket_root),
             )
@@ -1219,6 +1234,7 @@ class TestAQuestionRidesTheHeldHook:
     ) -> None:
         async def scenario():
             adapter = ClaudeAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
                 sink=Sink(),
                 settings=settings_for(socket_root),
             )

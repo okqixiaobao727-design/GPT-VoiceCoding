@@ -20,7 +20,7 @@ and the switch it would flip on is the master.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from gpt_voicecoding.core.approvals import ApprovalOutcome, PendingApproval
@@ -32,7 +32,7 @@ from gpt_voicecoding.core.verification import SeamVerification
 from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
     ChildClassification,
-    Progress,
+    ProgressObservation,
     RelayRoute,
     ReplyWindow,
     WaitingFor,
@@ -137,7 +137,10 @@ def target_document(target: SessionTarget) -> dict[str, Any]:
 
 
 def session_document(
-    session: Session, *, reply_window: ReplyWindow | None = None
+    session: Session,
+    *,
+    progress: Mapping[str, Any],
+    reply_window: ReplyWindow | None = None,
 ) -> dict[str, Any]:
     """One Session as a surface renders it: spoken by name, addressed by target.
 
@@ -158,7 +161,7 @@ def session_document(
         "lifecycle": str(session.lifecycle),
         "state": str(session.state),
         "waiting_for": waiting_for_document(session.waiting_for),
-        "progress": progress_document(session.progress),
+        "progress": dict(progress),
         "last_activity": (
             session.last_activity.isoformat() if session.last_activity is not None else None
         ),
@@ -183,20 +186,6 @@ def waiting_for_document(waiting_for: WaitingFor) -> dict[str, Any]:
         "tool_name": waiting_for.tool_name,
         "detail": waiting_for.detail,
         "approval_id": waiting_for.approval_id,
-    }
-
-
-def progress_document(progress: Progress | None) -> dict[str, Any] | None:
-    """How far along a Session is. `None` is "not read", not "read and empty"."""
-    if progress is None:
-        return None
-    return {
-        # Each entry says which side spoke it. Carried rather than inferred: a
-        # roster of bare strings reads "make it blue" and "I made it blue" the
-        # same way, and every surface would have to guess (#76).
-        "recent": [{"role": str(entry.role), "text": entry.text} for entry in progress.recent],
-        "truncated": progress.truncated,
-        "read_at": progress.read_at.isoformat() if progress.read_at is not None else None,
     }
 
 
@@ -233,12 +222,17 @@ def pending_approval_document(pending: PendingApproval) -> dict[str, Any]:
     }
 
 
-def status_document(status: Status) -> dict[str, Any]:
+def status_document(
+    status: Status,
+    *,
+    progress_for: Callable[[ProgressObservation], Mapping[str, Any]],
+) -> dict[str, Any]:
     return {
         "switches": status.switches.as_mapping(),
         "sessions": [
             session_document(
                 session,
+                progress=progress_for(session.progress),
                 reply_window=status.reply_windows.get(session.target, session.reply_window),
             )
             for session in status.sessions

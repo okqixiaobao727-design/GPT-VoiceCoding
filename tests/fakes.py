@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -38,6 +39,13 @@ from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
 from gpt_voicecoding.seams.verify import VerifyOutcome, VerifyResult
+
+PROGRESS_CAPTURE = ProgressPublication().capture
+
+
+def capture_for(max_bytes: int = 65_536):
+    """A publication-derived capture strategy for direct adapter tests."""
+    return ProgressPublication(max_bytes=max_bytes).capture
 
 
 class RecordingSink:
@@ -73,6 +81,7 @@ class FakeAgent:
         reason: str = "fake adapter",
         verify_result: VerifyResult | None = None,
         sink: EventSink | None = None,
+        progress_capture: object | None = None,
     ) -> None:
         self._routes = routes
         self.outcome = outcome
@@ -81,6 +90,7 @@ class FakeAgent:
             outcome=VerifyOutcome.PASS, loaded="tests.fakes.FakeAgent"
         )
         self.sink = sink
+        self.progress_capture = progress_capture
         self.calls: list[RelayCall] = []
         #: What this fake answers `reply_window` with, per target. Anything not
         #: named here is CLOSED.

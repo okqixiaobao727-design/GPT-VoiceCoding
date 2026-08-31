@@ -19,6 +19,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import discovery, rollouts
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
@@ -1236,7 +1237,7 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
                     ),  # type: ignore[arg-type]
                     home=tmp_path,
                 ),
-                turns=discovery.TurnCache(),
+                turns=discovery.TurnCache(progress_capture=PROGRESS_CAPTURE),
                 projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
             )
         )

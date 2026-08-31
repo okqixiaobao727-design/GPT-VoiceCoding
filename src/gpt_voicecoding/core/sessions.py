@@ -52,7 +52,8 @@ from gpt_voicecoding.seams.agent import (
     MAIN_SESSION,
     ChildClassification,
     LaneDiscovery,
-    Progress,
+    ProgressAvailability,
+    ProgressObservation,
     ReplyWindow,
     SessionInspection,
     SessionLifecycle,
@@ -91,7 +92,7 @@ class Session:
     lifecycle: SessionLifecycle = SessionLifecycle.LIVE
     state: SessionState = SessionState.RUNNING
     waiting_for: WaitingFor = field(default_factory=WaitingFor)
-    progress: Progress | None = None
+    progress: ProgressObservation = field(default_factory=ProgressObservation)
     last_activity: datetime | None = None
     child: ChildClassification = MAIN_SESSION
 
@@ -129,7 +130,11 @@ class Session:
             lifecycle=row.lifecycle,
             state=row.state,
             waiting_for=row.waiting_for,
-            progress=row.progress,
+            progress=(
+                self.progress
+                if row.progress.availability is ProgressAvailability.UNREADABLE
+                else row.progress
+            ),
             last_activity=row.last_activity,
             child=row.child,
         )

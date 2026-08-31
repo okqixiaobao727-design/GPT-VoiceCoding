@@ -21,9 +21,8 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
-from gpt_voicecoding.adapters.agent._progress import encoded_size
 from gpt_voicecoding.control_plane.actions import ControlPlane
-from gpt_voicecoding.control_plane.payloads import progress_document
+from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
@@ -37,8 +36,10 @@ from gpt_voicecoding.seams.agent import (
     ChildKind,
     LaneDiscovery,
     LaneUnavailable,
-    Progress,
+    ProgressAvailability,
     ProgressEntry,
+    ProgressObservation,
+    ProgressOmission,
     ProgressRole,
     ReplyWindow,
     ReplyWindowChanged,
@@ -63,10 +64,14 @@ CODEX_ADDRESS = {"agent": "codex", "session_id": "abc", "pid": None}
 READ_AT = datetime(2026, 8, 26, 2, 44, 39, tzinfo=UTC)
 
 
+def wire(reply: Reply) -> bytes:
+    return json.dumps(reply.as_document(), ensure_ascii=False).encode("utf-8") + b"\n"
+
+
 class Surface:
     """One assembled engine-side control plane, and the knobs a test needs."""
 
-    def __init__(self, *, duty: bool = True) -> None:
+    def __init__(self, *, duty: bool = True, max_bytes: int = 65_536) -> None:
         self.agent = FakeAgent()
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
@@ -84,7 +89,10 @@ class Surface:
             inventory=(SeamLoad(seam="call", configured="a.call"),),
             instruction_context=instruction_context(),
         )
-        self.plane = ControlPlane(self.core)
+        self.plane = ControlPlane(
+            self.core,
+            progress_publication=ProgressPublication(max_bytes=max_bytes),
+        )
 
     def ask(self, action: Action, **payload: object) -> Reply:
         return asyncio.run(self.plane.handle(Request(action=action, payload=payload)))
@@ -122,7 +130,10 @@ class TestWithEverySwitchOff:
                     target=CODEX,
                     workspace=WORKSPACE,
                     state=SessionState.IDLE,
-                    progress=Progress(read_at=READ_AT),
+                    progress=ProgressObservation.readable(
+                        has_history=False,
+                        read_at=READ_AT,
+                    ),
                 ),
             )
         )
@@ -195,6 +206,100 @@ class TestStatus:
             surface.ask(Action.SESSIONS).data["sessions"]
             == (surface.ask(Action.STATUS).data["sessions"])
         )
+
+    def test_a_session_not_yet_read_is_not_published_as_empty_history(self) -> None:
+        surface = Surface()
+        surface.register()
+
+        progress = surface.ask(Action.STATUS).data["sessions"][0]["progress"]
+
+        assert progress == {
+            "availability": "not_read",
+            "has_history": None,
+            "omission": "none",
+            "read_at": None,
+            "recent": [],
+        }
+
+    def test_sessions_reports_an_unreadable_source_as_lane_degradation(self) -> None:
+        surface = Surface()
+        surface.register()
+        reason = "the daemon dropped the progress read"
+        surface.state.sessions.observe(
+            AgentKind.CODEX,
+            LaneDiscovery(
+                rows=(
+                    SessionInspection(
+                        target=CODEX,
+                        workspace=WORKSPACE,
+                        progress=ProgressObservation.unreadable(reason),
+                    ),
+                ),
+                degraded=reason,
+            ),
+            now=1.0,
+        )
+
+        data = surface.ask(Action.SESSIONS).data
+
+        assert data["degraded_lanes"] == {"codex": reason}
+        assert data["sessions"][0]["progress"]["availability"] == "not_read"
+
+    def test_thirty_eight_large_histories_publish_every_compact_row_within_the_limit(
+        self,
+    ) -> None:
+        surface = Surface()
+        for index in range(38):
+            surface.state.sessions.register(
+                Session(
+                    target=SessionTarget(
+                        agent=AgentKind.CODEX,
+                        session_id=f"session-{index}",
+                    ),
+                    workspace=WORKSPACE,
+                    first_seen=float(index),
+                    progress=ProgressObservation.readable(
+                        has_history=True,
+                        recent=(
+                            ProgressEntry(
+                                role=ProgressRole.ASSISTANT,
+                                text="x" * 20_000,
+                            ),
+                        ),
+                        omission=ProgressOmission.NONE,
+                        read_at=READ_AT,
+                    ),
+                )
+            )
+
+        reply = surface.ask(Action.STATUS)
+
+        assert reply.ok
+        assert len(reply.data["sessions"]) == 38
+        assert all(
+            row["progress"]["recent"] == [] and row["progress"]["omission"] == "status_summary"
+            for row in reply.data["sessions"]
+        )
+        assert len(wire(reply)) <= 65_536
+
+    def test_an_over_limit_status_skeleton_returns_a_bounded_refusal_without_losing_rows(
+        self,
+    ) -> None:
+        surface = Surface(max_bytes=512)
+        surface.state.sessions.register(
+            Session(
+                target=CODEX,
+                workspace=Path("/" + "large-workspace/" * 100),
+                first_seen=0.0,
+            )
+        )
+
+        reply = surface.ask(Action.STATUS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert len(wire(reply)) <= 512
+        assert len(surface.state.sessions.all()) == 1
 
 
 class TestRefusalsKeepTheirIdentity:
@@ -354,9 +459,10 @@ class TestProgress:
                     target=CODEX,
                     workspace=WORKSPACE,
                     state=SessionState.IDLE,
-                    progress=Progress(
+                    progress=ProgressObservation.readable(
+                        has_history=True,
                         recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text=said),),
-                        truncated=True,
+                        omission=ProgressOmission.OLDER,
                         read_at=READ_AT,
                     ),
                     last_activity=READ_AT,
@@ -376,9 +482,11 @@ class TestProgress:
         session = reply.data["session"]
         assert session["target"] == CODEX_ADDRESS
         assert session["progress"] == {
-            "recent": [{"role": "assistant", "text": "done"}],
-            "truncated": True,
+            "availability": "readable",
+            "has_history": True,
+            "omission": "older",
             "read_at": READ_AT.isoformat(),
+            "recent": [{"role": "assistant", "text": "done"}],
         }
         assert session["last_activity"] == READ_AT.isoformat()
 
@@ -396,7 +504,10 @@ class TestProgress:
                         kind=WaitingKind.QUESTION,
                         prompt="Which base?",
                     ),
-                    progress=Progress(read_at=READ_AT),
+                    progress=ProgressObservation.readable(
+                        has_history=False,
+                        read_at=READ_AT,
+                    ),
                 ),
             )
         )
@@ -415,6 +526,7 @@ class TestProgress:
         surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
 
         assert surface.agent.inspections == [CODEX]
+        assert surface.agent.calls == []
 
     def test_the_reading_becomes_the_rosters_truth(self) -> None:
         """Asking for progress then asking for status cannot say two things."""
@@ -425,7 +537,13 @@ class TestProgress:
         surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
         roster = surface.ask(Action.SESSIONS).data["sessions"]
 
-        assert roster[0]["progress"]["recent"] == [{"role": "assistant", "text": "halfway"}]
+        assert roster[0]["progress"] == {
+            "availability": "readable",
+            "has_history": True,
+            "omission": "status_summary",
+            "read_at": READ_AT.isoformat(),
+            "recent": [],
+        }
 
     def test_it_ends_nothing_it_did_not_look_at(self) -> None:
         """A verb asked about one Session concludes nothing about the others."""
@@ -459,6 +577,30 @@ class TestProgress:
         assert reply.error is not None
         assert reply.error.code is ErrorCode.REFUSED
         assert "`codex` is not on PATH" in reply.error.message
+
+    def test_an_unreadable_observation_refuses_with_its_source_reason(self) -> None:
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.IDLE,
+                    progress=ProgressObservation.unreadable("the rollout could not be decoded"),
+                ),
+            )
+        )
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "the rollout could not be decoded" in reply.error.message
+        assert (
+            surface.state.sessions.resolve(CODEX).progress.availability
+            is ProgressAvailability.NOT_READ
+        )
 
     def test_a_lane_that_could_not_look_leaves_the_row_as_it_was(self) -> None:
         surface = Surface()
@@ -500,7 +642,10 @@ class TestProgress:
                     target=CODEX,
                     workspace=WORKSPACE,
                     state=SessionState.IDLE,
-                    progress=Progress(read_at=READ_AT),
+                    progress=ProgressObservation.readable(
+                        has_history=False,
+                        read_at=READ_AT,
+                    ),
                 ),
             )
         )
@@ -508,7 +653,13 @@ class TestProgress:
         reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
 
         assert reply.ok
-        assert reply.data["session"]["progress"]["recent"] == []
+        assert reply.data["session"]["progress"] == {
+            "availability": "readable",
+            "has_history": False,
+            "omission": "none",
+            "read_at": READ_AT.isoformat(),
+            "recent": [],
+        }
 
     def test_a_session_that_has_ended_is_a_stale_target_not_an_empty_answer(self) -> None:
         """#76's other honest error."""
@@ -554,14 +705,80 @@ class TestProgress:
         assert reply.error is not None
         assert surface.agent.inspections == []
 
-    def test_the_budget_is_measured_on_the_document_that_travels(self) -> None:
-        """`_progress.encoded_size` and `progress_document` are one shape (#47's lesson)."""
-        entries = (
-            ProgressEntry(role=ProgressRole.USER, text="do the thing"),
-            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
-        )
-        rendered = progress_document(Progress(recent=entries))
+    def test_a_5482_byte_entry_is_returned_whole_when_the_complete_reply_fits(self) -> None:
+        text = "x" * 5_447
+        surface = Surface()
+        surface.register()
+        surface.agent.discovery = self.stopped(said=text)
 
-        assert encoded_size(entries) == len(
-            json.dumps(rendered["recent"], ensure_ascii=False).encode("utf-8")
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.ok
+        assert reply.data["session"]["progress"]["recent"] == [{"role": "assistant", "text": text}]
+
+    def test_a_newest_entry_that_cannot_fit_is_history_not_silence(self) -> None:
+        surface = Surface(max_bytes=1_024)
+        surface.register()
+        surface.agent.discovery = self.stopped(said="x" * 2_000)
+
+        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert reply.ok
+        assert reply.data["session"]["progress"] == {
+            "availability": "readable",
+            "has_history": True,
+            "omission": "newest_oversize",
+            "read_at": READ_AT.isoformat(),
+            "recent": [],
+        }
+
+    def test_exact_progress_keeps_the_newest_whole_tail_in_chronological_order(self) -> None:
+        surface = Surface(max_bytes=1_024)
+        surface.register()
+        surface.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=WORKSPACE,
+                    state=SessionState.IDLE,
+                    progress=ProgressObservation.readable(
+                        has_history=True,
+                        recent=(
+                            ProgressEntry(role=ProgressRole.USER, text="x" * 2_000),
+                            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
+                        ),
+                        omission=ProgressOmission.NONE,
+                        read_at=READ_AT,
+                    ),
+                ),
+            )
         )
+
+        progress = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS).data["session"]["progress"]
+
+        assert progress["recent"] == [{"role": "assistant", "text": "done"}]
+        assert progress["omission"] == "older"
+
+    def test_unicode_and_json_escaping_are_measured_as_actual_wire_bytes(self) -> None:
+        text = ('雪"\\\n' * 90) + "done"
+        measuring = Surface()
+        measuring.register()
+        measuring.agent.discovery = self.stopped(said=text)
+        complete = measuring.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        exact_capacity = len(wire(complete))
+
+        fitting = Surface(max_bytes=exact_capacity)
+        fitting.register()
+        fitting.agent.discovery = self.stopped(said=text)
+        fits = fitting.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        too_small = Surface(max_bytes=exact_capacity - 1)
+        too_small.register()
+        too_small.agent.discovery = self.stopped(said=text)
+        omitted = too_small.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+
+        assert fits.data["session"]["progress"]["recent"][0]["text"] == text
+        assert len(wire(fits)) == exact_capacity
+        assert omitted.data["session"]["progress"]["recent"] == []
+        assert omitted.data["session"]["progress"]["omission"] == "newest_oversize"
+        assert len(wire(omitted)) <= exact_capacity - 1

@@ -60,13 +60,17 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Final
 
-from gpt_voicecoding.adapters.agent._progress import RECENT_LIMIT, RECENT_MAX_BYTES, bounded
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import (
     is_pipeline_noise,
     is_visible,
     visible_text,
 )
-from gpt_voicecoding.seams.agent import ProgressEntry, ProgressRole
+from gpt_voicecoding.seams.agent import (
+    ProgressCapture,
+    ProgressEntry,
+    ProgressOmission,
+    ProgressRole,
+)
 
 #: What Claude Code writes a record's time as. Read with `fromisoformat`, which
 #: takes the trailing `Z` and answers a timezone-aware value, so nothing here
@@ -80,17 +84,14 @@ _ROLES: Final = {"user": ProgressRole.USER, "assistant": ProgressRole.ASSISTANT}
 
 def recent(
     records: Sequence[Mapping[str, Any]],
-    limit: int = RECENT_LIMIT,
     *,
-    max_bytes: int = RECENT_MAX_BYTES,
-) -> tuple[tuple[ProgressEntry, ...], bool, datetime | None]:
+    capture: ProgressCapture,
+) -> tuple[tuple[ProgressEntry, ...], ProgressOmission, datetime | None]:
     """The newest of what was said, whether anything older was dropped, and when.
 
-    An empty tuple with `truncated=False` is a Session that has genuinely said
-    nothing yet; with `truncated=True` it is one whose newest entry alone is over
-    the budget. The caller reports either as `Progress`; what it may never do is
-    read the pair as "nothing is happening", which is `None` from the reader
-    above and a different fact.
+    History presence is determined before this projection. If the newest entry
+    alone exceeds the supplied capture ceiling, the empty tail is paired with
+    `newest_oversize`; it can never be mistaken for empty history.
     """
     entries: list[ProgressEntry] = []
     moved: datetime | None = None
@@ -109,8 +110,8 @@ def recent(
         if entry is not None:
             entries.append(entry)
 
-    kept, truncated = bounded(entries, limit, max_bytes=max_bytes)
-    return kept, truncated, moved
+    kept, omission = capture.select(entries)
+    return kept, omission, moved
 
 
 def _entry(record: Mapping[str, Any]) -> ProgressEntry | None:

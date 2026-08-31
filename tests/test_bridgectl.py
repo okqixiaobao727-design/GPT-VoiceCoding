@@ -228,6 +228,22 @@ class TestSayingNoOutLoud:
         assert "switch <name> on|off" in capsys.readouterr().err
 
 
+class TestRenderingLaneDegradation:
+    def test_sessions_says_when_progress_was_unreadable(self) -> None:
+        rendered = render(
+            Reply.answered(
+                Action.SESSIONS,
+                {
+                    "sessions": [],
+                    "degraded_lanes": {"codex": "the daemon dropped the progress read"},
+                },
+            )
+        )
+
+        assert "codex lane degraded" in rendered
+        assert "the daemon dropped the progress read" in rendered
+
+
 class TestNoEngineAtAll:
     def test_an_engine_that_is_not_running_is_not_a_refusal(
         self, home: Path, capsys: pytest.CaptureFixture[str]
@@ -330,17 +346,32 @@ class TestRenderingWhatProgressCameBack:
             },
         )
 
+    def progress(
+        self,
+        *,
+        availability: str = "readable",
+        has_history: bool | None = True,
+        omission: str = "none",
+        recent: list[dict[str, str]] | None = None,
+        read_at: str | None = "2026-08-26T02:44:39+00:00",
+    ) -> dict[str, object]:
+        return {
+            "availability": availability,
+            "has_history": has_history,
+            "omission": omission,
+            "read_at": read_at,
+            "recent": recent or [],
+        }
+
     def test_each_entry_says_which_side_spoke_it(self) -> None:
         rendered = render(
             self.reply(
-                {
-                    "recent": [
+                self.progress(
+                    recent=[
                         {"role": "user", "text": "do the thing"},
                         {"role": "assistant", "text": "done"},
-                    ],
-                    "truncated": False,
-                    "read_at": "2026-08-26T02:44:39+00:00",
-                }
+                    ]
+                )
             )
         )
 
@@ -351,7 +382,7 @@ class TestRenderingWhatProgressCameBack:
         """A progress line's whole meaning is when it was true."""
         rendered = render(
             self.reply(
-                {"recent": [], "truncated": False, "read_at": "2026-08-26T02:44:39+00:00"},
+                self.progress(has_history=False),
                 last_activity="2026-08-26T02:44:39+00:00",
             )
         )
@@ -362,19 +393,65 @@ class TestRenderingWhatProgressCameBack:
     def test_a_dropped_tail_is_admitted_rather_than_implied(self) -> None:
         rendered = render(
             self.reply(
-                {
-                    "recent": [{"role": "assistant", "text": "done"}],
-                    "truncated": True,
-                    "read_at": "2026-08-26T02:44:39+00:00",
-                }
+                self.progress(
+                    omission="older",
+                    recent=[{"role": "assistant", "text": "done"}],
+                )
             )
         )
 
         assert "older entries dropped" in rendered
 
     def test_not_read_is_never_rendered_as_said_nothing(self) -> None:
-        """`None` is "nobody looked", and a surface that collapsed the two lies."""
-        rendered = render(self.reply(None))
+        rendered = render(
+            self.reply(
+                self.progress(
+                    availability="not_read",
+                    has_history=None,
+                    read_at=None,
+                )
+            )
+        )
 
         assert "progress: not read" in rendered
+        assert "nothing said yet" not in rendered
+
+    def test_unreadable_is_never_rendered_as_said_nothing(self) -> None:
+        rendered = render(
+            self.reply(
+                self.progress(
+                    availability="unreadable",
+                    has_history=None,
+                    read_at=None,
+                )
+            )
+        )
+
+        assert "progress: unreadable" in rendered
+        assert "nothing said yet" not in rendered
+
+    def test_an_oversize_newest_entry_is_history_that_could_not_be_carried(self) -> None:
+        rendered = render(
+            self.reply(
+                self.progress(
+                    omission="newest_oversize",
+                )
+            )
+        )
+
+        assert "history exists" in rendered
+        assert "newest entry is too large to carry" in rendered
+        assert "nothing said yet" not in rendered
+
+    def test_a_status_summary_is_history_without_chat_text(self) -> None:
+        rendered = render(
+            self.reply(
+                self.progress(
+                    omission="status_summary",
+                )
+            )
+        )
+
+        assert "history exists" in rendered
+        assert "this roster carries no chat text" in rendered
         assert "nothing said yet" not in rendered

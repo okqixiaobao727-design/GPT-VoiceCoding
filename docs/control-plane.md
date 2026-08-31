@@ -35,6 +35,10 @@ start with a named error rather than an `OSError` from inside asyncio.
 - A line may not exceed **65536 bytes** in either direction. A request that
   overruns it is answered with `malformed_request` and that connection is closed
   — there is no honest way to resync inside a line.
+- Reply capacity is measured and written with one canonical UTF-8 JSON-line
+  encoder, including JSON escaping and the terminating newline. The server
+  performs a final outbound check. If an honest response skeleton cannot fit,
+  it sends a bounded `refused` reply; it never drops Session rows silently.
 - A connection may carry any number of requests. Connections are independent: two
   surfaces can neither wedge nor read each other.
 - Malformed input costs one request, never the server.
@@ -53,15 +57,15 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 4, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 5, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 4, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 5, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
 `action` is `null` when the line never named a usable one. `protocol` is the
-numeric protocol version, currently `4`. A missing field or JSON `null` means the
+numeric protocol version, currently `5`. A missing field or JSON `null` means the
 reply did not declare a usable version. The Swift shell refuses to interpret any
 reply whose version is missing or differs from the version it supports, and shows
 that protocol mismatch separately from an engine refusal or an unreachable engine.
@@ -87,15 +91,10 @@ the user is told.
 
 ## The actions
 
-Eight, and the set is closed. Adding one is a contract change.
-
-`progress` is the eighth. It did **not** move the protocol version, and the
-reason is what the version is for: a surface built against 4 can tell an engine
-that disagrees from one too old to have been asked, and the failure it guards
-against is a surface sending something the engine does not have. Adding an action
-cannot cause that — a surface built against 4 never sends `progress`, and one
-that does is talking to an engine that has it. *Removing* an action can, which is
-what 4 was for.
+Eight, and the set is closed. Adding one is a contract change. Protocol 5 makes
+progress availability and omission explicit and separates compact roster
+summaries from exact detail. A protocol-4 surface must report a mismatch: it
+could otherwise interpret omitted history as silence.
 
 `launch` and `close` were the eighth and ninth until protocol 4. They are parked
 with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
@@ -134,9 +133,9 @@ second question to render one line would be a second reader of the same Session:
                  "options": [{"text": "main", "recommended": true}],
                  "recommendation": "main", "tool_name": null, "detail": null,
                  "approval_id": null},
- "progress": {"recent": [{"role": "user", "text": "do the thing"},
-                         {"role": "assistant", "text": "done"}],
-              "truncated": false, "read_at": "2026-08-26T02:44:39+00:00"},
+ "progress": {"availability": "readable", "has_history": true,
+              "omission": "status_summary",
+              "read_at": "2026-08-26T02:44:39+00:00", "recent": []},
  "last_activity": "2026-08-26T02:44:39+00:00",
  "child": {"kind": "main", "parent": null},
  "reply_window": "open"}
@@ -154,12 +153,20 @@ rendered sentence. `kind` is one of `none`, `question`, `permission`, `unknown`;
 `unknown` always comes with `caught_up: false`, and means *ask again*, never
 *nothing is happening*.
 
-`progress` is `null` when nobody read it, and an object with an **empty**
-`recent` when it was read and the Session had said nothing — a surface that
-collapses the two reports a working Session as an idle one. Each entry says which
-side spoke it, so `"make it blue"` and `"I made it blue"` cannot read the same.
-It is bounded to the newest 3 entries and 3 KB per row: `truncated` says
-something older was dropped, and entries are dropped whole, never cut.
+`progress` always carries the same five fields:
+
+- `availability`: `not_read`, `unreadable`, or `readable`;
+- `has_history`: a boolean only when readable, otherwise `null`;
+- `omission`: `none`, `older`, `status_summary`, or `newest_oversize`;
+- `read_at`: the readable observation's timestamp, otherwise `null`; and
+- `recent`: ordered whole entries, each with `role` and `text`.
+
+Only `readable` plus `has_history=false` and `omission=none` means nothing has
+been said. A roster publication carries no chat body: readable history becomes
+`has_history=true`, `recent=[]`, `omission=status_summary`. `not_read` and
+`unreadable` are never inferred from an empty array. The source failure behind
+an unreadable discovery is reported as lane degradation; an exact progress read
+maps it to a typed refusal.
 
 `last_activity` is separate from `progress` on purpose. A Session can have moved
 without saying anything a reader would show, and this is the field that says so.
@@ -179,20 +186,35 @@ it and no two surfaces can disagree about one Session.
 
 ### `sessions`
 
-Payload: none. Data: `{"sessions": [...]}` — the same rows `status` carries, for a
-surface that renders only the roster.
+Payload: none. Data: `{"sessions": [...], "degraded_lanes": {...}}` — the same
+rows and lane-degradation facts `status` carries, for a surface that renders
+only the roster. The degradation map is required to distinguish a retained last
+observation from a source that was unreadable on the latest pass.
 
 ### `progress`
 
 Payload: `{"target": {"agent": "codex", "session_id": "abc", "pid": null}}`. Data:
-`{"session": { … }}` — one roster row, in exactly the shape above.
+`{"session": { … }}` — one Session row whose progress is the exact-detail
+publication. For example:
+
+```json
+{"availability": "readable", "has_history": true, "omission": "older",
+ "read_at": "2026-08-26T02:44:39+00:00",
+ "recent": [{"role": "user", "text": "do the thing"},
+            {"role": "assistant", "text": "done"}]}
+```
 
 It is a **read**: it resolves one exact identity, asks that lane and no other,
 and never starts a turn. What it adds over the same row in `sessions` is *when* —
 the Session is read at the moment it was asked about, rather than at the last
-discovery. A Session mid-turn is answered here and is deliberately not carried on
-the roster: reading it is the expensive half, and "how far along is it" is the
-question a user asks precisely while it works.
+discovery. The publisher keeps the newest complete entry and widens backwards
+while the complete encoded Reply still fits. Entries are whole or omitted;
+message text is never sliced. If the newest entry itself cannot fit, the action
+still answers honestly with `has_history=true`, `recent=[]`, and
+`omission=newest_oversize`. A Session mid-turn is answered here and is
+deliberately not read deeply by the roster cadence: reading it is the expensive
+half, and "how far along is it" is the question a user asks precisely while it
+works.
 
 **It refuses rather than answering emptily**, and the four refusals are four
 different facts:
@@ -205,7 +227,7 @@ different facts:
 | `refused` | Nothing could read how far it has got — a Codex Session the shared daemon does not hold, or one whose first turn has written no record yet. |
 
 The last one is the line this whole action is drawn around. A Session that *was*
-read and had said nothing answers normally, with an empty `recent`; a Session
+read and had said nothing answers normally with `has_history=false`; a Session
 nobody could read is a refusal. A surface handed the second as the first would
 render a working Session as an idle one.
 

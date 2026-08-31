@@ -19,15 +19,23 @@ from pathlib import Path
 
 import pytest
 
-from gpt_voicecoding.adapters.agent.claude import transcript as claude_transcript
+from fakes import FakeCall, FakeCompanionChannel, capture_for
+from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
+from gpt_voicecoding.config import of
+from gpt_voicecoding.engine.composition import Engine
 from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
+    ProgressAvailability,
+    ProgressCapture,
+    ProgressOmission,
     ProgressRole,
     SessionInspection,
     SessionState,
     WaitingFor,
     WaitingKind,
 )
+from gpt_voicecoding.seams.events import EventSink
+from gpt_voicecoding.seams.identity import AgentKind
 from test_claude_stop_analysis import called, said, turn
 from test_claude_stop_wiring import ROSTER_WAITING, TARGET, adapter_holding, roster, transcript
 
@@ -62,12 +70,52 @@ class TestTheRosterRow:
 
         found = asyncio.run(adapter.discover()).rows[0]
 
-        assert found.progress is not None
+        assert found.progress.availability is ProgressAvailability.READABLE
         assert [(entry.role, entry.text) for entry in found.progress.recent] == [
             (ProgressRole.USER, "do the thing"),
             (ProgressRole.ASSISTANT, "done"),
         ]
-        assert found.progress.truncated is False
+        assert found.progress.omission is ProgressOmission.NONE
+
+    def test_a_5482_byte_newest_entry_is_captured_whole(self, tmp_path: Path, roster) -> None:
+        """#147's deterministic regression: 5,482 encoded bytes exceed the old 3 KB."""
+        text = "x" * 5_447  # JSON role/text/list overhead is 35 bytes.
+        adapter = adapter_holding(transcript(tmp_path, [said(text)]))
+        roster(LaneDiscovery(rows=(row(SessionState.IDLE),)))
+
+        found = asyncio.run(adapter.discover()).rows[0]
+
+        assert found.progress.availability is ProgressAvailability.READABLE
+        assert found.progress.has_history is True
+        assert [entry.text for entry in found.progress.recent] == [text]
+        assert found.progress.omission is ProgressOmission.NONE
+
+    def test_a_newest_entry_larger_than_capture_is_history_not_silence(
+        self, tmp_path: Path, roster
+    ) -> None:
+        adapter = adapter_holding(
+            transcript(tmp_path, [said("x" * 2_000)]),
+            progress_capture=capture_for(1_024),
+        )
+        roster(LaneDiscovery(rows=(row(SessionState.IDLE),)))
+
+        found = asyncio.run(adapter.discover()).rows[0]
+
+        assert found.progress.availability is ProgressAvailability.READABLE
+        assert found.progress.has_history is True
+        assert found.progress.recent == ()
+        assert found.progress.omission is ProgressOmission.NEWEST_OVERSIZE
+
+    def test_a_transcript_that_cannot_be_opened_is_unreadable(self, tmp_path: Path, roster) -> None:
+        adapter = adapter_holding(tmp_path)  # a directory cannot be read as a JSONL file
+        roster(LaneDiscovery(rows=(row(SessionState.IDLE),)))
+
+        lane = asyncio.run(adapter.discover())
+        found = lane.rows[0]
+
+        assert found.progress.availability is ProgressAvailability.UNREADABLE
+        assert "could not read" in (found.progress.reason or "")
+        assert "could not read" in (lane.degraded or "")
 
     def test_the_reading_says_when_it_was_taken(self, tmp_path: Path, roster) -> None:
         """`read_at` is on the value: a progress line's meaning is when it was true."""
@@ -107,7 +155,7 @@ class TestTheRosterRow:
 
         found = asyncio.run(adapter.discover()).rows[0]
 
-        assert found.progress is None
+        assert found.progress.availability is ProgressAvailability.NOT_READ
         assert found.last_activity is None
 
     def test_a_session_with_no_transcript_yet_is_unread_rather_than_empty(self, roster) -> None:
@@ -117,7 +165,7 @@ class TestTheRosterRow:
 
         found = asyncio.run(adapter.discover()).rows[0]
 
-        assert found.progress is None
+        assert found.progress.availability is ProgressAvailability.NOT_READ
 
     def test_a_session_that_has_written_nothing_readable_is_read_and_empty(
         self, tmp_path: Path, roster
@@ -149,31 +197,105 @@ class TestThePerTargetRead:
         assert found.progress is not None
         assert [entry.text for entry in found.progress.recent] == ["do the thing", "done"]
 
-    def test_the_verb_reads_again_without_reopening_an_unchanged_file(
-        self, tmp_path: Path, roster, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """It reads; it does not hand back the cadence's row — and that is free.
+    def test_a_5482_byte_entry_is_captured_by_exact_inspect(self, tmp_path: Path, roster) -> None:
+        text = "x" * 5_447
+        adapter = adapter_holding(transcript(tmp_path, [said(text)]))
+        roster(LaneDiscovery(rows=(row(SessionState.RUNNING),)))
 
-        The verb goes through the reader on every ask, so nothing it answers is
-        older than the moment it was asked. What that costs is a `stat`: the
-        cache is keyed on the file's own identity, so an unchanged transcript is
-        not parsed twice, and a hit is the proof of freshness rather than a stale
-        answer (the advisor's amendment to #76's Q3, 2026-08-26).
-        """
-        adapter = adapter_holding(transcript(tmp_path, list(turn())))
-        roster(LaneDiscovery(rows=(row(SessionState.IDLE),)))
-        parses = 0
-        original = claude_transcript._parse  # noqa: SLF001
-
-        def counted(text: str) -> object:
-            nonlocal parses
-            parses += 1
-            return original(text)
-
-        monkeypatch.setattr(claude_transcript, "_parse", counted)
         found = asyncio.run(adapter.inspect(TARGET))
 
-        assert parses == 1  # `discover` parsed it; the verb re-read a file that had not moved
+        assert [entry.text for entry in found.progress.recent] == [text]
+
+    def test_composition_supplies_the_capture_used_by_real_inspect(
+        self,
+        tmp_path: Path,
+        roster,
+    ) -> None:
+        """Prove the derived ceiling through composition and the public Agent seam."""
+
+        def real_agent(
+            *,
+            progress_capture: ProgressCapture,
+            sink: EventSink | None = None,
+        ) -> ClaudeAgentAdapter:
+            return ClaudeAgentAdapter(progress_capture=progress_capture, sink=sink)
+
+        factories = {
+            "test:call": FakeCall,
+            "test:channel": FakeCompanionChannel,
+            "test:agent": real_agent,
+        }
+        engine = Engine.assemble(
+            of(
+                {
+                    "engine": {},
+                    "adapters": {
+                        "call": "test:call",
+                        "companion_channel": "test:channel",
+                        "agents": {"claude": "test:agent"},
+                    },
+                    "delegate": {"model": "a-model"},
+                    "log": {
+                        "max_bytes": 1,
+                        "retained_files": 0,
+                        "stripped_environment_prefixes": [],
+                    },
+                }
+            ),
+            factory_of=factories.__getitem__,
+        )
+        adapter = engine.adapters.agents[AgentKind.CLAUDE]
+        assert isinstance(adapter, ClaudeAgentAdapter)
+        path = transcript(tmp_path, [said("x" * 5_447)])
+        adapter._reported[TARGET] = SessionReport(  # noqa: SLF001 - seed registration
+            session_id=TARGET.session_id,
+            pid=TARGET.pid,
+            transcript_path=path,
+        )
+        roster(LaneDiscovery(rows=(row(SessionState.RUNNING),)))
+
+        fitting = asyncio.run(adapter.inspect(TARGET)).progress
+
+        assert [entry.text for entry in fitting.recent] == ["x" * 5_447]
+
+        transcript(tmp_path, [said("x" * 65_000)])  # 65,035 encoded bytes.
+        oversize = asyncio.run(adapter.inspect(TARGET)).progress
+
+        assert oversize.has_history is True
+        assert oversize.recent == ()
+        assert oversize.omission is ProgressOmission.NEWEST_OVERSIZE
+
+    def test_exact_inspect_preserves_oversize_history(self, tmp_path: Path, roster) -> None:
+        adapter = adapter_holding(
+            transcript(tmp_path, [said("x" * 2_000)]),
+            progress_capture=capture_for(1_024),
+        )
+        roster(LaneDiscovery(rows=(row(SessionState.RUNNING),)))
+
+        found = asyncio.run(adapter.inspect(TARGET))
+
+        assert found.progress.has_history is True
+        assert found.progress.recent == ()
+        assert found.progress.omission is ProgressOmission.NEWEST_OVERSIZE
+
+    def test_one_inspect_is_one_source_read(
+        self, tmp_path: Path, roster, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The enumeration inside inspect already read this stopped Session."""
+        adapter = adapter_holding(transcript(tmp_path, list(turn())))
+        roster(LaneDiscovery(rows=(row(SessionState.IDLE),)))
+        reads = 0
+        original = adapter._transcripts.records  # noqa: SLF001
+
+        def counted(path: Path | None) -> object:
+            nonlocal reads
+            reads += 1
+            return original(path)
+
+        monkeypatch.setattr(adapter._transcripts, "records", counted)  # noqa: SLF001
+        found = asyncio.run(adapter.inspect(TARGET))
+
+        assert reads == 1
         assert found.progress is not None
 
     def test_a_transcript_that_moved_between_the_two_is_read_again(
@@ -198,7 +320,7 @@ class TestThePerTargetRead:
 
         found = asyncio.run(adapter.inspect(TARGET))
 
-        assert found.progress is None
+        assert found.progress.availability is ProgressAvailability.NOT_READ
         assert found.last_activity is None
 
     def test_a_working_session_is_read_for_progress_and_not_for_a_stop(

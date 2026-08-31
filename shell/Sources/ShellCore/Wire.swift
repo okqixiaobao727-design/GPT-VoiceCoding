@@ -7,7 +7,22 @@ public let maxRequestBytes = 65536
 
 /// The control-plane protocol this shell can interpret. Held to the engine's
 /// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
-public let controlPlaneProtocolVersion = 4
+public let controlPlaneProtocolVersion = 5
+
+/// Whether an Agent's authoritative progress source was read and answered.
+public enum ProgressAvailability: String, Sendable, CaseIterable {
+    case notRead = "not_read"
+    case unreadable
+    case readable
+}
+
+/// Why known history is absent from or incomplete in one publication.
+public enum ProgressOmission: String, Sendable, CaseIterable {
+    case none
+    case older
+    case statusSummary = "status_summary"
+    case newestOversize = "newest_oversize"
+}
 
 /// Every action this engine has. Eight, and the set is closed — adding one is a
 /// contract change, so the shell names them rather than composing strings. The

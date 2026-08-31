@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from codex_fake import FakeAppServer, FakeRemoteError
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent._summary import SUMMARY_MAX_CHARS
 from gpt_voicecoding.adapters.agent.codex import codex_agent
 from gpt_voicecoding.adapters.agent.codex.adapter import (
@@ -214,7 +215,12 @@ def quick(**overrides: Any) -> CodexSettings:
 
 async def watching(server: Codex, sink: Sink, settings: CodexSettings | None = None):
     """An adapter already attached to one scripted Session."""
-    adapter = CodexAgentAdapter(sink=sink, settings=settings or quick(), daemon=no_daemon())
+    adapter = CodexAgentAdapter(
+        progress_capture=PROGRESS_CAPTURE,
+        sink=sink,
+        settings=settings or quick(),
+        daemon=no_daemon(),
+    )
     await adapter.register_session(TARGET, server.path)
     return adapter
 
@@ -224,7 +230,9 @@ def rid(text: str = "r-1") -> RequestId:
 
 
 def test_codex_exposes_no_question_hook_or_question_budget() -> None:
-    adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+    adapter = CodexAgentAdapter(
+        progress_capture=PROGRESS_CAPTURE, sink=Sink(), settings=quick(), daemon=no_daemon()
+    )
 
     assert adapter.question_answerable(TARGET) is False
     assert asyncio.run(adapter.sweep_question_budget(600.0)) == ()
@@ -380,7 +388,12 @@ class TestCarryingTheUsersWords:
         """
 
         async def scenario():
-            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+            adapter = CodexAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+                sink=Sink(),
+                settings=quick(),
+                daemon=no_daemon(),
+            )
             return await adapter.answer_relay(TARGET, "ship it", request_id=rid())
 
         receipt = asyncio.run(scenario())
@@ -396,6 +409,7 @@ class TestCarryingTheUsersWords:
                 return None, "codex could not be run: No such file or directory"
 
             adapter = CodexAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
                 sink=Sink(),
                 settings=quick(),
                 daemon=SharedDaemon(settings=CodexSettings(), version="t", locate=missing),
@@ -408,7 +422,12 @@ class TestCarryingTheUsersWords:
         self, socket_path: Path
     ) -> None:
         async def scenario():
-            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+            adapter = CodexAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+                sink=Sink(),
+                settings=quick(),
+                daemon=no_daemon(),
+            )
             return await adapter.approval_relay(
                 ApprovalRequest(
                     approval_id="a1",
@@ -427,7 +446,12 @@ class TestCarryingTheUsersWords:
         """#73: a Codex Session gains its thread id at its first turn."""
 
         async def scenario():
-            adapter = CodexAgentAdapter(sink=Sink(), settings=quick(), daemon=no_daemon())
+            adapter = CodexAgentAdapter(
+                progress_capture=PROGRESS_CAPTURE,
+                sink=Sink(),
+                settings=quick(),
+                daemon=no_daemon(),
+            )
             return await adapter.answer_relay(
                 SessionTarget(agent=AgentKind.CODEX, pid=4321),
                 "ship it",
@@ -441,7 +465,9 @@ class TestCarryingTheUsersWords:
 
 class TestSupplement:
     def test_both_routes_are_offered_because_steer_is_stable(self) -> None:
-        adapter = CodexAgentAdapter()
+        adapter = CodexAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+        )
         assert adapter.supported_routes() == frozenset({RelayRoute.DELIVER, RelayRoute.SUPPLEMENT})
 
     def test_a_supplement_goes_into_the_running_turn(self, socket_path: Path) -> None:
@@ -1052,7 +1078,11 @@ class TestSettings:
         assert settings.socket_directory == Path("~/sockets").expanduser()
 
     def test_the_factory_builds_an_adapter_from_a_table(self) -> None:
-        adapter = codex_agent(sink=Sink(), settings={"receipt_timeout_seconds": 2})
+        adapter = codex_agent(
+            progress_capture=PROGRESS_CAPTURE,
+            sink=Sink(),
+            settings={"receipt_timeout_seconds": 2},
+        )
         assert isinstance(adapter, CodexAgentAdapter)
 
 
@@ -1226,6 +1256,7 @@ async def joined(server: Codex, sink: Sink, settings: CodexSettings | None = Non
         return (Candidate(pid=991, workspace=server.workspace, session_id=live_root),)
 
     return CodexAgentAdapter(
+        progress_capture=PROGRESS_CAPTURE,
         sink=sink,
         settings=settings or quick(),
         daemon=daemon_at(server.path),

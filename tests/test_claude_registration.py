@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import registration
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.claude.approval import REGISTRATION_TYPE, TYPE_FIELD
@@ -128,9 +129,10 @@ class TestReachingTheEngineOverTheOneIngress:
     def adapter(self, root: Path) -> ClaudeAgentAdapter:
         (root / "sessions").mkdir(parents=True, exist_ok=True)
         return ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
             settings=ClaudeSettings(
                 registry_directory=root / "sessions", socket_directory=root / "sockets"
-            )
+            ),
         )
 
     def run(

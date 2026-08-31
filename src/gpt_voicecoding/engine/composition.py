@@ -49,6 +49,7 @@ from gpt_voicecoding import __version__
 from gpt_voicecoding.config import EngineConfig
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
+from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.control_plane.server import ControlPlaneServer
 from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.events import EventQueue
@@ -60,7 +61,7 @@ from gpt_voicecoding.core.sessions import SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard
 from gpt_voicecoding.core.verification import SeamLoad
-from gpt_voicecoding.seams.agent import AgentAdapter
+from gpt_voicecoding.seams.agent import AgentAdapter, ProgressCapture
 from gpt_voicecoding.seams.call import CallAdapter
 from gpt_voicecoding.seams.companion_channel import CompanionChannel
 from gpt_voicecoding.seams.connection import Connectable
@@ -171,7 +172,14 @@ class Engine:
     ) -> Engine:
         """Build one engine from configuration. Nothing is constructed twice."""
         events = EventQueue()
-        adapters = _adapters(config, events, factory_of)
+        progress_publication = ProgressPublication()
+        progress_capture = progress_publication.capture
+        adapters = _adapters(
+            config,
+            events,
+            factory_of,
+            progress_capture=progress_capture,
+        )
         _share_the_app_server(adapters)
 
         state = BridgeState(
@@ -223,7 +231,7 @@ class Engine:
             instruction_context=_instruction_context(config),
         )
         hub["core"] = core
-        plane = ControlPlane(core)
+        plane = ControlPlane(core, progress_publication=progress_publication)
         held["plane"] = plane
 
         return cls(
@@ -231,7 +239,12 @@ class Engine:
             core=core,
             adapters=adapters,
             plane=plane,
-            server=ControlPlaneServer(plane=plane, path=config.socket_path),
+            server=ControlPlaneServer(
+                plane=plane,
+                path=config.socket_path,
+                max_bytes=progress_publication.max_bytes,
+                progress_publication=progress_publication,
+            ),
         )
 
     async def start(
@@ -381,7 +394,11 @@ async def _answer_text(plane: ControlPlane, found: Classification) -> str:
 
 
 def _adapters(
-    config: EngineConfig, sink: EventSink, factory_of: Callable[[str], Factory]
+    config: EngineConfig,
+    sink: EventSink,
+    factory_of: Callable[[str], Factory],
+    *,
+    progress_capture: ProgressCapture,
 ) -> Adapters:
     def built(seam: str, reference: str) -> Any:
         """Construct one adapter with the sink, and its settings table if it has one.
@@ -395,6 +412,8 @@ def _adapters(
         factory = factory_of(reference)
         settings = config.adapters.settings_for(seam)
         arguments: dict[str, Any] = {"sink": sink}
+        if seam.startswith("agent."):
+            arguments["progress_capture"] = progress_capture
         if settings is not None:
             arguments["settings"] = settings
         try:

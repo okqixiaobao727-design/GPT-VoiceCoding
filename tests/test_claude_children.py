@@ -211,11 +211,11 @@ class TestAChildIsSeen:
         assert found(transcript)[0].name is None
 
     def test_it_claims_no_progress_and_no_stop(self, tmp_path: Path) -> None:
-        """`progress=None` is "not read", which is the truth: #76's reader is the parent's."""
+        """The child was not read; #76's progress reader belongs to the parent."""
         transcript = transcript_for(tmp_path, [STARTED])
         write_child(transcript)
         row = found(transcript)[0]
-        assert row.progress is None
+        assert str(row.progress.availability) == "not_read"
         assert row.last_activity is None
         assert row.state is SessionState.RUNNING
 

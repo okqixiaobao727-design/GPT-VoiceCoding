@@ -16,9 +16,13 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from fakes import PROGRESS_CAPTURE, capture_for
 from gpt_voicecoding.adapters.agent.codex import CodexAgentAdapter
 from gpt_voicecoding.adapters.agent.codex.discovery import ProcessEvidence, TurnCache, discover
 from gpt_voicecoding.seams.agent import (
+    ProgressAvailability,
+    ProgressCapture,
+    ProgressOmission,
     ProgressRole,
     SessionLifecycle,
     SessionState,
@@ -95,7 +99,7 @@ class TestTheRosterRow:
     def test_a_stopped_thread_says_what_it_has_been_saying(self) -> None:
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
 
-        row = found(daemon, TurnCache()).rows[0]
+        row = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows[0]
 
         assert row.progress is not None
         assert [(entry.role, entry.text) for entry in row.progress.recent] == [
@@ -103,20 +107,44 @@ class TestTheRosterRow:
             (ProgressRole.ASSISTANT, "done"),
         ]
 
+    def test_a_5482_byte_newest_entry_is_captured_whole(self) -> None:
+        text = "x" * 5_447  # JSON role/text/list overhead is 35 bytes.
+        daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: [turn(spoke(text))]})
+
+        row = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows[0]
+
+        assert row.progress.availability is ProgressAvailability.READABLE
+        assert row.progress.has_history is True
+        assert [entry.text for entry in row.progress.recent] == [text]
+        assert row.progress.omission is ProgressOmission.NONE
+
+    def test_a_newest_entry_larger_than_capture_is_history_not_silence(self) -> None:
+        daemon = TurnedDaemon(
+            {THREAD: stopped()},
+            {THREAD: [turn(spoke("x" * 2_000))]},
+        )
+
+        row = found(daemon, TurnCache(progress_capture=capture_for(1_024))).rows[0]
+
+        assert row.progress.availability is ProgressAvailability.READABLE
+        assert row.progress.has_history is True
+        assert row.progress.recent == ()
+        assert row.progress.omission is ProgressOmission.NEWEST_OVERSIZE
+
     def test_a_thread_mid_turn_is_not_read_deeply_at_all(self) -> None:
         """559 KB per thread per tick is what this gate is worth."""
         daemon = TurnedDaemon({THREAD: working()}, {THREAD: once()})
 
-        row = found(daemon, TurnCache()).rows[0]
+        row = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows[0]
 
         assert daemon.deep == []
         assert row.state is SessionState.RUNNING
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.NOT_READ
 
     def test_a_thread_that_has_not_moved_is_not_read_twice(self) -> None:
         """Keyed on `updatedAt`: an untouched thread cannot have a changed tail."""
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
-        cache = TurnCache()
+        cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
 
         first = found(daemon, cache).rows[0]
         second = found(daemon, cache).rows[0]
@@ -126,7 +154,7 @@ class TestTheRosterRow:
 
     def test_a_thread_that_moved_is_read_again(self) -> None:
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
-        cache = TurnCache()
+        cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
 
         found(daemon, cache)
         daemon.threads[THREAD] = stopped(updatedAt=MEASURED_SECONDS + 60)
@@ -140,7 +168,7 @@ class TestTheRosterRow:
     def test_a_thread_that_names_no_time_is_never_cached(self) -> None:
         """Without a clock there is nothing to say it has not moved."""
         daemon = TurnedDaemon({THREAD: thread(THREAD, cwd=WORKSPACE)}, {THREAD: once()})
-        cache = TurnCache()
+        cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
 
         found(daemon, cache)
         found(daemon, cache)
@@ -150,7 +178,7 @@ class TestTheRosterRow:
     def test_a_thread_the_daemon_let_go_is_forgotten(self) -> None:
         """The cache is roster-sized, not machine-lifetime-sized."""
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
-        cache = TurnCache()
+        cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
 
         found(daemon, cache)
         cache.retain(set())
@@ -169,19 +197,22 @@ class TestTheRosterRow:
             return await FakeDaemon.request(daemon, method, params)
 
         daemon.request = refuse  # type: ignore[method-assign]
-        row = found(daemon, TurnCache()).rows[0]
+        lane = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE))
+        row = lane.rows[0]
 
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.UNREADABLE
+        assert "daemon dropped the read" in (row.progress.reason or "")
         assert row.last_activity == MEASURED
+        assert "daemon dropped the read" in (lane.degraded or "")
 
     def test_last_activity_is_free_and_is_there_even_mid_turn(self) -> None:
         """It comes off the cheap read, so a working Session still has one."""
         daemon = TurnedDaemon({THREAD: working()}, {THREAD: once()})
 
-        row = found(daemon, TurnCache()).rows[0]
+        row = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows[0]
 
         assert row.last_activity == MEASURED
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.NOT_READ
 
     def test_a_lane_with_no_turn_cache_reads_no_turns(self) -> None:
         """`discover` without one is still the roster it always was (#74)."""
@@ -190,7 +221,7 @@ class TestTheRosterRow:
         row = found(daemon).rows[0]
 
         assert daemon.deep == []
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.NOT_READ
 
 
 class TestAnUnattachedRow:
@@ -199,9 +230,9 @@ class TestAnUnattachedRow:
     def test_a_process_table_row_carries_no_progress_and_no_time(self) -> None:
         daemon = TurnedDaemon({}, {})
 
-        rows = found(daemon, TurnCache()).rows
+        rows = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows
 
-        assert [row.progress for row in rows] == [None]
+        assert [row.progress.availability for row in rows] == [ProgressAvailability.NOT_READ]
         assert [row.last_activity for row in rows] == [None]
 
 
@@ -229,7 +260,7 @@ class TestTheDaemonNote:
             discover(
                 daemon,
                 evidence=ProcessEvidence(list_sessions=processes, home=Path("/nonexistent")),
-                turns=TurnCache(),
+                turns=TurnCache(progress_capture=PROGRESS_CAPTURE),
                 daemon_note="the shared Codex daemon did not say its versions",
             )
         )
@@ -239,7 +270,7 @@ class TestTheDaemonNote:
     def test_silence_is_what_a_healthy_lane_looks_like(self) -> None:
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
 
-        assert found(daemon, TurnCache()).degraded is None
+        assert found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).degraded is None
 
 
 class TestTheReadingSaysWhenItWasTaken:
@@ -247,7 +278,7 @@ class TestTheReadingSaysWhenItWasTaken:
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
 
         before = datetime.now(UTC)
-        row = found(daemon, TurnCache()).rows[0]
+        row = found(daemon, TurnCache(progress_capture=PROGRESS_CAPTURE)).rows[0]
 
         assert row.progress is not None
         assert row.progress.read_at is not None
@@ -272,7 +303,12 @@ class _HeldDaemon:
         self._client = None
 
 
-def adapter_over(daemon: object | None, *, home: Path = TEST_HOME) -> CodexAgentAdapter:
+def adapter_over(
+    daemon: object | None,
+    *,
+    home: Path = TEST_HOME,
+    progress_capture: ProgressCapture = PROGRESS_CAPTURE,
+) -> CodexAgentAdapter:
     """A whole adapter over this daemon, enumerating *for real*.
 
     **Nothing here stubs `discover`, and that is the point.** An earlier version
@@ -284,6 +320,7 @@ def adapter_over(daemon: object | None, *, home: Path = TEST_HOME) -> CodexAgent
     differently depending on what the person running it has open.
     """
     return CodexAgentAdapter(
+        progress_capture=progress_capture,
         daemon=_HeldDaemon(daemon),  # type: ignore[arg-type]
         process_evidence=ProcessEvidence(list_sessions=processes, home=home),
     )
@@ -300,7 +337,10 @@ class TestThePerTargetRead:
         """The cadence skips it; the verb does not. That is the whole difference."""
         daemon = TurnedDaemon({THREAD: working()}, {THREAD: once()})
         adapter = adapter_over(daemon)
-        assert asyncio.run(adapter.discover()).rows[0].progress is None  # the cadence skipped it
+        assert (
+            asyncio.run(adapter.discover()).rows[0].progress.availability
+            is ProgressAvailability.NOT_READ
+        )  # the cadence skipped it
         daemon.deep.clear()
 
         row = asyncio.run(adapter.inspect(self.target()))
@@ -308,6 +348,25 @@ class TestThePerTargetRead:
         assert daemon.deep == [THREAD]
         assert row.progress is not None
         assert [entry.text for entry in row.progress.recent] == ["do the thing", "done"]
+
+    def test_a_5482_byte_entry_is_captured_by_exact_inspect(self) -> None:
+        text = "x" * 5_447
+        daemon = TurnedDaemon({THREAD: working()}, {THREAD: [turn(spoke(text))]})
+
+        row = asyncio.run(adapter_over(daemon).inspect(self.target()))
+
+        assert [entry.text for entry in row.progress.recent] == [text]
+
+    def test_exact_inspect_preserves_oversize_history(self) -> None:
+        daemon = TurnedDaemon({THREAD: working()}, {THREAD: [turn(spoke("x" * 2_000))]})
+
+        row = asyncio.run(
+            adapter_over(daemon, progress_capture=capture_for(1_024)).inspect(self.target())
+        )
+
+        assert row.progress.has_history is True
+        assert row.progress.recent == ()
+        assert row.progress.omission is ProgressOmission.NEWEST_OVERSIZE
 
     def test_one_ask_is_one_deep_read_however_warm_the_cache_is(self) -> None:
         """The whole verb, counted end to end — enumeration included.
@@ -350,7 +409,7 @@ class TestThePerTargetRead:
         row = asyncio.run(adapter.inspect(self.target(None, 6548)))
 
         assert daemon.deep == []
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.NOT_READ
 
     def test_a_pid_lookup_returns_the_exact_rollout_verified_live_row(self) -> None:
         """The query may name a PID; the row stays live only from its exact native join."""
@@ -358,6 +417,6 @@ class TestThePerTargetRead:
 
         row = asyncio.run(adapter.inspect(self.target(None, 6548)))
 
-        assert row.progress is None
+        assert row.progress.availability is ProgressAvailability.NOT_READ
         assert row.lifecycle is SessionLifecycle.LIVE
         assert row.target.session_id == THREAD
