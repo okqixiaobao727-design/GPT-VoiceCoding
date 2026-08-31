@@ -43,6 +43,7 @@ from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.adapters.agent.codex.shared_daemon import DaemonAddress, SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
+from gpt_voicecoding.installation import codex_launch_agent
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
@@ -1245,6 +1246,14 @@ class TestSettings:
         assert CodexSettings.of(None) == CodexSettings()
         assert CodexSettings.of({}) == CodexSettings()
 
+    def test_the_default_executable_is_installations_managed_binary(self, tmp_path: Path) -> None:
+        environ = {"CODEX_HOME": str(tmp_path / "codex-home")}
+
+        settings = CodexSettings.of(None, environ=environ)
+
+        expected = codex_launch_agent.managed_binary(codex_launch_agent.default_codex_home(environ))
+        assert Path(settings.executable).resolve() == expected.resolve()
+
     def test_a_key_this_adapter_does_not_have_refuses_to_start(self) -> None:
         """A misspelled timeout that silently defaults is the silent fallback ban."""
         with pytest.raises(SettingsError, match="receipt_timeout_second"):
@@ -1263,7 +1272,10 @@ class TestSettings:
             CodexSettings.of({"receipt_timeout_seconds": 0})
 
     def test_paths_and_executables_are_read_as_what_they_are(self) -> None:
-        settings = CodexSettings.of({"executable": "/opt/codex", "socket_directory": "~/sockets"})
+        settings = CodexSettings.of(
+            {"executable": "/opt/codex", "socket_directory": "~/sockets"},
+            environ={"CODEX_HOME": "/not-the-configured-executable"},
+        )
         assert settings.executable == "/opt/codex"
         assert settings.socket_directory == Path("~/sockets").expanduser()
 
@@ -1272,6 +1284,7 @@ class TestSettings:
             progress_capture=PROGRESS_CAPTURE,
             sink=Sink(),
             settings={"receipt_timeout_seconds": 2},
+            environ={"CODEX_HOME": "/codex-home"},
         )
         assert isinstance(adapter, CodexAgentAdapter)
 

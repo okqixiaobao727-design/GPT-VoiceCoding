@@ -7,6 +7,8 @@ Nothing else imports an adapter (ADR 0001).
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +31,16 @@ def codex_agent(
     settings: dict[str, Any] | None = None,
     own_socket_path: Path | None = None,
     own_log_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> CodexAgentAdapter:
     """Build the adapter from an opaque settings table, refusing keys it lacks."""
     return CodexAgentAdapter(
         progress_capture=progress_capture,
         sink=sink,
-        settings=CodexSettings.of(settings),
+        settings=CodexSettings.of(
+            settings,
+            environ=os.environ if environ is None else environ,
+        ),
         own_socket_path=own_socket_path,
         own_log_path=own_log_path,
     )

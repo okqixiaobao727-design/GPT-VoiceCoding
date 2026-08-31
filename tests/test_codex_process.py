@@ -474,14 +474,19 @@ class TestOwningOne:
 
         asyncio.run(scenario())
 
-    def test_a_missing_executable_says_what_is_missing(self, socket_path: Path) -> None:
+    def test_a_missing_executable_says_what_is_missing(
+        self, tmp_path: Path, socket_path: Path
+    ) -> None:
+        missing = tmp_path / "managed-codex"
+
         async def scenario() -> None:
             owned = OwnedAppServer(
-                settings=quick(executable="definitely-not-a-real-binary-xyz"),
+                settings=quick(executable=str(missing)),
                 socket_path=socket_path,
             )
-            with pytest.raises(AppServerError, match="on PATH"):
+            with pytest.raises(AppServerError) as refused:
                 await owned.start()
+            assert str(missing) in str(refused.value) and "on PATH" not in str(refused.value)
 
         asyncio.run(scenario())
 

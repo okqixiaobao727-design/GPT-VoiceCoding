@@ -70,7 +70,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import shutil
 import signal
 import stat
 import subprocess
@@ -353,17 +352,16 @@ class OwnedAppServer:
         if on_notification is not None:
             self.listen(on_notification)
 
-        executable = shutil.which(self._settings.executable)
-        if executable is None:
-            raise AppServerError(
-                f"no {self._settings.executable!r} on PATH: this adapter drives the codex "
-                "CLI and cannot run without it"
-            )
         prepare_private_directory(self._socket_path.parent)
         self._claim_socket_path()
 
         try:
-            self._spawn(executable)
+            try:
+                self._spawn(self._settings.executable)
+            except OSError as unrunnable:
+                raise AppServerError(
+                    f"{self._settings.executable} could not be run: {unrunnable}"
+                ) from None
             await self._await_socket()
             self._connection = await attach(
                 self._socket_path,

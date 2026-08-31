@@ -20,13 +20,24 @@ own configuration, and nothing here may restate them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-#: The executable this adapter drives. A name, resolved on PATH at spawn time,
-#: because which install is on PATH is the deployment's business.
-DEFAULT_EXECUTABLE = "codex"
+from gpt_voicecoding.installation import codex_launch_agent
+
+
+def default_executable(environ: Mapping[str, str]) -> str:
+    """Derive the executable from Installation's managed binary for ``CODEX_HOME``.
+
+    #82 chose that binary over PATH. This is the first ``adapters -> installation``
+    import under ADR 0012's one-way dependency rule; Installation never imports
+    back into the engine.
+    """
+    return str(codex_launch_agent.managed_binary(codex_launch_agent.default_codex_home(environ)))
+
 
 #: A short runtime root: Darwin caps an `AF_UNIX` path at 103 bytes, and a
 #: socket under a long application-support path simply cannot be bound.
@@ -58,7 +69,7 @@ class SettingsError(Exception):
 class CodexSettings:
     """Everything this spoke may be told. Nothing policy-shaped appears here."""
 
-    executable: str = DEFAULT_EXECUTABLE
+    executable: str = field(default_factory=lambda: default_executable(os.environ))
     socket_directory: Path = DEFAULT_SOCKET_DIRECTORY
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     startup_timeout_seconds: float = DEFAULT_STARTUP_TIMEOUT_SECONDS
@@ -80,10 +91,14 @@ class CodexSettings:
                 raise SettingsError(f"{name} must be a positive number of seconds")
 
     @classmethod
-    def of(cls, table: dict[str, Any] | None) -> CodexSettings:
+    def of(
+        cls,
+        table: dict[str, Any] | None,
+        *,
+        environ: Mapping[str, str] | None = None,
+    ) -> CodexSettings:
         """Read one settings table, refusing every key it does not recognise."""
-        if not table:
-            return cls()
+        table = table or {}
         known = {field.name for field in fields(cls)}
         unknown = sorted(set(table) - known)
         if unknown:
@@ -94,6 +109,8 @@ class CodexSettings:
         read: dict[str, Any] = {}
         for key, value in table.items():
             read[key] = _typed(key, value)
+        if environ is not None:
+            read.setdefault("executable", default_executable(environ))
         return cls(**read)
 
 
