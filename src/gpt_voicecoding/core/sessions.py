@@ -115,14 +115,16 @@ class Session:
 
         Keeps what the registry knows and the lane does not — `first_seen` and
         the Session Name it has already accepted — and takes everything else
-        from the reading, because the reading is the newer truth.
+        from the reading. Progress alone keeps a readable observation when the
+        newer pass could not answer or did not read; `with_progress` is the one
+        merge rule used by both roster discovery and Stop events.
 
         `target` is the identity the registry settled on (`_better_known`),
         which is not always the one the reading carried: a tick with only
         process evidence names a Session it cannot see the id of. It is passed
         in rather than read off the row because the naming rule turns on it.
         """
-        return replace(
+        updated = replace(
             self,
             target=target,
             workspace=row.workspace,
@@ -130,14 +132,19 @@ class Session:
             lifecycle=row.lifecycle,
             state=row.state,
             waiting_for=row.waiting_for,
-            progress=(
-                self.progress
-                if row.progress.availability is ProgressAvailability.UNREADABLE
-                else row.progress
-            ),
             last_activity=row.last_activity,
             child=row.child,
         )
+        return updated.with_progress(row.progress)
+
+    def with_progress(self, progress: ProgressObservation) -> Session:
+        """Apply a new observation without replacing a readable fact with no answer."""
+        unavailable = progress.availability is ProgressAvailability.UNREADABLE
+        not_read_after_readable = (
+            progress.availability is ProgressAvailability.NOT_READ
+            and self.progress.availability is ProgressAvailability.READABLE
+        )
+        return self if unavailable or not_read_after_readable else replace(self, progress=progress)
 
     def _named_as(self, row: SessionInspection, target: SessionTarget) -> SessionName | None:
         """The Session Name this row keeps — **the one its official source states**.
@@ -542,6 +549,13 @@ class SessionRegistry:
         """
         held = self._live_row(target)
         updated = replace(held, state=state)
+        self._sessions[held.target] = updated
+        return updated
+
+    def set_progress(self, target: SessionTarget, progress: ProgressObservation) -> Session:
+        """Fold the observation carried by a Stop into that Session's roster row."""
+        held = self._live_row(target)
+        updated = held.with_progress(progress)
         self._sessions[held.target] = updated
         return updated
 

@@ -96,6 +96,7 @@ class Codex(FakeAppServer):
         self.reviewer = reviewer
         self.approval_policy = approval_policy
         self.status = status
+        self.progress_items: list[dict[str, Any]] = []
         #: When False, `turn/start` records the words but the readback never
         #: shows them — the "no proof either way" case.
         self.readback_shows_words = True
@@ -151,7 +152,7 @@ class Codex(FakeAppServer):
     def _thread_read(self, params: dict) -> dict:
         asked = params.get("threadId")
         is_parent = self.parent_thread_id is not None and asked == self.parent_thread_id
-        items = []
+        items = list(self.progress_items)
         if not is_parent and self.readback_shows_words:
             for landed in self.delivered:
                 items.extend([{"type": "userMessage", "clientId": landed}] * self.readback_copies)
@@ -887,8 +888,15 @@ class TestWhatItRaisesUpward:
     ) -> None:
         sink = Sink()
 
-        async def scenario():
+        async def scenario() -> tuple[list[dict], list[dict]]:
             async with Codex(socket_path).script(status="idle") as server:
+                server.progress_items = [
+                    {
+                        "type": "agentMessage",
+                        "id": "msg_0e4f",
+                        "text": "The app-server reports the completed diagnosis.",
+                    }
+                ]
                 adapter = await watching(server, sink)
                 try:
                     await server.notify_all(
@@ -901,10 +909,11 @@ class TestWhatItRaisesUpward:
                         {"threadId": THREAD, "status": {"type": "idle"}},
                     )
                     await _settled()
+                    return server.calls_to("thread/read"), server.calls_to("turn/start")
                 finally:
                     await adapter.aclose()
 
-        asyncio.run(scenario())
+        reads, started_turns = asyncio.run(scenario())
         # The first entry is registration reporting what the Session already is;
         # only the transitions after it are things that happened.
         assert [event.window for event in sink.of(ReplyWindowChanged)] == [
@@ -912,6 +921,187 @@ class TestWhatItRaisesUpward:
             ReplyWindow.CLOSED,
             ReplyWindow.OPEN,
         ]
+        assert len(sink.of(SessionStopped)) == 1
+        assert sink.of(SessionStopped)[0].progress.recent[-1].text == (
+            "The app-server reports the completed diagnosis."
+        )
+        assert reads[-1] == {"threadId": THREAD, "includeTurns": True}
+        assert started_turns == []
+
+    def test_a_repeated_idle_during_the_read_keeps_the_one_current_stop(
+        self, socket_path: Path
+    ) -> None:
+        sink = Sink()
+
+        async def scenario() -> None:
+            async with Codex(socket_path).script(status="idle") as server:
+                server.progress_items = [
+                    {"type": "agentMessage", "id": "msg_idle", "text": "The turn finished."}
+                ]
+                release = asyncio.Event()
+
+                async def delayed_read(params: dict) -> dict:
+                    await release.wait()
+                    return server._thread_read(params)  # noqa: SLF001 - scripted far side
+
+                server.answers("thread/read", delayed_read)
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(server.calls_to("thread/read")))
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    release.set()
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+
+        assert [event.progress.recent[-1].text for event in sink.of(SessionStopped)] == [
+            "The turn finished."
+        ]
+
+    def test_system_error_while_open_keeps_the_one_current_stop(self, socket_path: Path) -> None:
+        sink = Sink()
+
+        async def scenario() -> None:
+            async with Codex(socket_path).script(status="idle") as server:
+                release = asyncio.Event()
+
+                async def delayed_read(params: dict) -> dict:
+                    answer = server._thread_read(params)  # noqa: SLF001 - scripted far side
+                    await release.wait()
+                    return answer
+
+                server.answers("thread/read", delayed_read)
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(server.calls_to("thread/read")))
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "systemError"}},
+                    )
+                    release.set()
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+
+        assert len(sink.of(SessionStopped)) == 1
+
+    def test_a_new_turn_supersedes_the_first_read_and_only_the_second_stop_lands(
+        self, socket_path: Path
+    ) -> None:
+        sink = Sink()
+
+        async def scenario() -> None:
+            async with Codex(socket_path).script(status="idle") as server:
+                server.progress_items = [
+                    {"type": "agentMessage", "id": "msg_first", "text": "First turn."}
+                ]
+                release_first = asyncio.Event()
+                read_count = 0
+
+                async def first_read_is_delayed(params: dict) -> dict:
+                    nonlocal read_count
+                    read_count += 1
+                    answer = server._thread_read(params)  # noqa: SLF001 - scripted far side
+                    if read_count == 1:
+                        await release_first.wait()
+                    return answer
+
+                server.answers("thread/read", first_read_is_delayed)
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(server.calls_to("thread/read")))
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    server.progress_items = [
+                        {"type": "agentMessage", "id": "msg_second", "text": "Second turn."}
+                    ]
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    release_first.set()
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+
+        assert [event.progress.recent[-1].text for event in sink.of(SessionStopped)] == [
+            "Second turn."
+        ]
+
+    def test_a_resubscribe_idle_echo_during_the_read_keeps_the_current_stop(
+        self, socket_path: Path
+    ) -> None:
+        sink = Sink()
+
+        async def scenario() -> None:
+            async with Codex(socket_path).script(status="idle") as server:
+                release = asyncio.Event()
+
+                async def delayed_read(params: dict) -> dict:
+                    answer = server._thread_read(params)  # noqa: SLF001 - scripted far side
+                    await release.wait()
+                    return answer
+
+                server.answers("thread/read", delayed_read)
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "idle"}},
+                    )
+                    await _until(lambda: bool(server.calls_to("thread/read")))
+                    watched = adapter._threads[TARGET]  # noqa: SLF001 - resubscribe echo path
+                    adapter._note_status(watched, {"type": "idle"})  # noqa: SLF001
+                    release.set()
+                    await _until(lambda: bool(sink.of(SessionStopped)))
+                finally:
+                    await adapter.aclose()
+
+        asyncio.run(scenario())
+
         assert len(sink.of(SessionStopped)) == 1
 
     def test_a_session_that_never_ran_is_not_announced_as_having_stopped(
@@ -1566,6 +1756,13 @@ class TestWhatACodexRowSaysItStoppedOn:
 
         async def scenario():
             async with Codex(socket_path).script() as server:
+                server.progress_items = [
+                    {
+                        "type": "agentMessage",
+                        "id": "msg_before_dialog",
+                        "text": "The command is ready; I need permission to run it.",
+                    }
+                ]
                 adapter = await watching(server, sink)
                 try:
                     await server.notify_all(
@@ -1589,6 +1786,9 @@ class TestWhatACodexRowSaysItStoppedOn:
         assert stopped.waiting_for.tool_name == "a shell command"
         assert stopped.waiting_for.approval_id == sink.of(AwaitingApproval)[0].request.approval_id
         assert stopped.waiting_for.as_approval_request(stopped.target) is not None
+        assert stopped.progress.recent[-1].text == (
+            "The command is ready; I need permission to run it."
+        )
 
     def test_a_stop_with_no_dialog_still_says_it_stopped_on_nothing(
         self, socket_path: Path
@@ -1616,6 +1816,8 @@ class TestWhatACodexRowSaysItStoppedOn:
         asyncio.run(scenario())
         (stopped,) = sink.of(SessionStopped)
         assert stopped.waiting_for.kind is WaitingKind.NONE
+        assert stopped.progress.has_history is False
+        assert stopped.progress.recent == ()
 
     def test_a_row_with_no_dialog_is_left_exactly_as_the_roster_read_it(
         self, socket_path: Path

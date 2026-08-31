@@ -86,11 +86,10 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import (
 from gpt_voicecoding.adapters.agent.claude.inbox import InboxError, ReplyInbox
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import (
-    Record,
     TranscriptReader,
     TranscriptUnavailable,
 )
-from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
+from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher, StopReading
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -176,6 +175,16 @@ class SessionReport:
         return SessionTarget(agent=AgentKind.CLAUDE, session_id=self.session_id, pid=self.pid)
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionRead:
+    """Everything derived from one opening of a Session transcript."""
+
+    waiting_for: WaitingFor
+    progress: ProgressObservation
+    last_activity: datetime | None = None
+    source_read: bool = False
+
+
 def _pid_in(payload: dict[str, object], field: str) -> int | None:
     """A pid off the registration wire. Anything that is not a live pid is `None`."""
     value = payload.get(field)
@@ -226,7 +235,7 @@ class ClaudeAgentAdapter:
         #: rather than inside `discovery` so the cache outlives one tick.
         self._projects = ProjectNames()
         self._windows = ReplyWindowWatcher(
-            settings=self._settings, emit=self._emit, stopped_on=self.stopped_on
+            settings=self._settings, emit=self._emit, stopped_on=self.stop_reading
         )
         #: The socket this adapter owns: hook processes dial in here holding a
         #: dialog open, so this adapter is the server on this route.
@@ -536,25 +545,55 @@ class ClaudeAgentAdapter:
         `inspect` gets here with a `RUNNING` row at all — the cadence returns one
         untouched — and that is the row the gate exists for.
         """
-        try:
-            records = self._transcripts.records(self._transcript_path(row.target))
-        except TranscriptUnavailable as unreadable:
-            return replace(row, progress=ProgressObservation.unreadable(str(unreadable)))
-        waiting = (
-            row.waiting_for
-            if row.state is SessionState.RUNNING
-            else self._overlay(row.target, row.waiting_for, records)
-        )
-        if records is None:
-            # No path or no file yet. The roster's own word stands and progress
-            # remains `not_read`, never "read and found nothing".
-            return row if waiting == row.waiting_for else replace(row, waiting_for=waiting)
-        entries, omission, moved = transcript_tail.recent(
-            records,
-            capture=self._progress_capture,
-        )
+        reading = self._read_session(row.target, row.waiting_for, state=row.state)
         return replace(
             row,
+            waiting_for=reading.waiting_for,
+            progress=reading.progress,
+            last_activity=reading.last_activity if reading.source_read else row.last_activity,
+        )
+
+    def _read_session(
+        self,
+        target: SessionTarget,
+        base: WaitingFor,
+        *,
+        state: SessionState,
+    ) -> _SessionRead:
+        """One transcript opening, shared by roster, inspect, and Stop events."""
+        try:
+            records = self._transcripts.records(self._transcript_path(target))
+        except TranscriptUnavailable as unreadable:
+            waiting = base if state is SessionState.RUNNING else self._overlay(target, base, base)
+            return _SessionRead(
+                waiting_for=waiting,
+                progress=ProgressObservation.unreadable(str(unreadable)),
+            )
+        if records is None:
+            waiting = base if state is SessionState.RUNNING else self._overlay(target, base, base)
+            return _SessionRead(waiting_for=waiting, progress=ProgressObservation())
+
+        found = base if state is SessionState.RUNNING else stop_analysis.analyse(records)
+        waiting = base if state is SessionState.RUNNING else self._overlay(target, base, found)
+        anchored_question = (
+            found
+            if waiting.kind is WaitingKind.QUESTION
+            and found.kind is WaitingKind.QUESTION
+            and replace(waiting, approval_id=None) == replace(found, approval_id=None)
+            else None
+        )
+        if anchored_question is None:
+            entries, omission, moved = transcript_tail.recent(
+                records,
+                capture=self._progress_capture,
+            )
+        else:
+            entries, omission, moved = transcript_tail.recent_before_question(
+                records,
+                question=anchored_question,
+                capture=self._progress_capture,
+            )
+        return _SessionRead(
             waiting_for=waiting,
             progress=ProgressObservation.from_capture(
                 recent=entries,
@@ -562,6 +601,7 @@ class ClaudeAgentAdapter:
                 read_at=datetime.now(UTC),
             ),
             last_activity=moved,
+            source_read=True,
         )
 
     def _transcript_path(self, target: SessionTarget) -> Path | None:
@@ -569,24 +609,19 @@ class ClaudeAgentAdapter:
         report = self._reported.get(target)
         return report.transcript_path if report else None
 
-    def stopped_on(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
-        """What one Session stopped on, from its transcript and any parked dialog.
-
-        The Reply Window watcher's route to the same answer (`window.py:308-311`),
-        and the reason the overlay below is a method rather than inline: a stop
-        raised by the watcher and a stop read off the roster must be the one
-        reading, not two that agree most of the time.
-        """
-        try:
-            records = self._transcripts.records(self._transcript_path(target))
-        except TranscriptUnavailable:
-            records = None
-        return self._overlay(target, roster if roster is not None else WaitingFor(), records)
+    def stop_reading(self, target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
+        """What one Stop is about and what was said, from one transcript read."""
+        base = roster if roster is not None else WaitingFor()
+        reading = self._read_session(target, base, state=SessionState.IDLE)
+        return StopReading(waiting_for=reading.waiting_for, progress=reading.progress)
 
     def _overlay(
-        self, target: SessionTarget, base: WaitingFor, records: tuple[Record, ...] | None
+        self,
+        target: SessionTarget,
+        base: WaitingFor,
+        found: WaitingFor,
     ) -> WaitingFor:
-        """What these records and any parked dialog say this Session stopped on.
+        """What the transcript analysis and any parked dialog say this Session stopped on.
 
         Two sources, and they are ranked rather than merged, because they can
         disagree and the ranking is the behaviour (#75):
@@ -626,7 +661,6 @@ class ClaudeAgentAdapter:
         parked_question = self._approvals.newest_question_for(target)
         if parked_question is not None:
             return parked_question
-        found = base if records is None else stop_analysis.analyse(records)
         if found.kind is WaitingKind.NONE:
             # The transcript is not held up on anything, which the roster may
             # still know to be a Session waiting on the user. Its word stands.

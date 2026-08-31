@@ -147,6 +147,10 @@ class Option:
     #: rather than acted on: the recommendation is the agent's, and the choice
     #: is the user's.
     recommended: bool = False
+    #: The Session's own explanation of what choosing this option means, when
+    #: it supplied one. Carried beside the label so a surface never has to
+    #: reconstruct it from the question or transcript (#151).
+    description: str | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -596,6 +600,9 @@ class ApprovalRequest:
 class SessionStopped(Event):
     """A Session stopped and may need the user. Feeds the Stop Notice pipeline.
 
+    Its `progress` is the authoritative observation made at the Stop, so Bridge
+    Core publishes the notice and roster from one fact without another read.
+
     **What it stopped on is a `WaitingFor`, not free text.** The reference
     implementation carried a rendered sentence here, so every consumer that
     wanted the question's options — the voice menu, the Companion Channel's
@@ -604,6 +611,7 @@ class SessionStopped(Event):
     """
 
     target: SessionTarget
+    progress: ProgressObservation = field(default_factory=ProgressObservation)
     waiting_for: WaitingFor = field(default_factory=WaitingFor)
 
 

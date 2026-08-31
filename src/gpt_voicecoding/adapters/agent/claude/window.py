@@ -157,6 +157,7 @@ from gpt_voicecoding.adapters.agent.claude.waiting_labels import (
 )
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
+    ProgressObservation,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -167,6 +168,15 @@ from gpt_voicecoding.seams.agent import (
 from gpt_voicecoding.seams.identity import SessionTarget
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class StopReading:
+    """One transcript read's two answers for the Stop it produced (#151)."""
+
+    waiting_for: WaitingFor
+    progress: ProgressObservation
+
 
 #: The registry statuses that mean "awaiting the user's next instruction", and
 #: therefore also "the turn has ended". A whitelist rather than a blacklist: a
@@ -293,7 +303,7 @@ class ReplyWindowWatcher:
         *,
         settings: ClaudeSettings,
         emit: Callable[[AgentEvent], None],
-        stopped_on: Callable[[SessionTarget, WaitingFor | None], WaitingFor] | None = None,
+        stopped_on: Callable[[SessionTarget, WaitingFor | None], StopReading] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
@@ -303,12 +313,10 @@ class ReplyWindowWatcher:
         #: a test that had to spend the real budget in real time would either
         #: be slow or prove nothing about it.
         self._clock = clock
-        #: What a Session that just stopped is stopped on (#75). Injected rather
-        #: than read here: this class watches the registry, and what a stop is
-        #: *about* lives in the Session's own transcript and in the dialogs
-        #: parked on the approval socket — neither of which is a registry fact.
-        #: `None` leaves `SessionStopped.waiting_for` at its default, which is
-        #: how the window tests keep watching windows.
+        #: The progress and waiting facts for a Session that just stopped
+        #: (#75, #151). Injected rather than read here: this class watches the
+        #: registry, while both facts live in the Session's own transcript and
+        #: the dialogs parked on the approval socket.
         self._stopped_on = stopped_on
         #: The last level reported for each target, so only transitions are sent.
         self._reported: dict[SessionTarget, ReplyWindow] = {}
@@ -473,7 +481,7 @@ class ReplyWindowWatcher:
             if live_record.status == STATUS_MEANING_STALLED_ON_THE_USER:
                 self._settle(target, live_record)
             elif was_active and live_record.status in STATUSES_MEANING_OPEN:
-                self._emit(SessionStopped(target=target, waiting_for=self._what_for(target)))
+                self._emit(self._stopped_event(target, self._read_stop(target)))
 
     def _settle(self, target: SessionTarget, record: SessionRecord) -> None:
         """Whether this wait is a Stop, and whether it can be said yet.
@@ -496,7 +504,7 @@ class ReplyWindowWatcher:
         is waiting for yet" about a Session that was not waiting for anything.
         Here the re-read happens on the sweep's own cadence — the sweep re-reads
         the record every tick regardless, and the transcript read behind
-        `_what_for` is cached on the file's identity — until the reading is
+        `_read_stop` is cached on the file's identity — until the reading is
         complete or the budget is spent. Only then, and once, does the honest
         `UNKNOWN` go out (`legacy@1d32845:bridge/daemon.py:1933-1936,
         2116-2160`, **ported** onto this sweep).
@@ -511,16 +519,20 @@ class ReplyWindowWatcher:
             dialog.settled = True
             return
         if reading.disposition is StopDisposition.NAMED_NOW:
-            self._announce(target, dialog, self._what_for(target, reading.waiting_for))
+            self._announce(target, dialog, self._read_stop(target, reading.waiting_for))
             return
-        found = self._what_for(target, NOTHING_READ_YET)
-        if found.caught_up and found.kind is not WaitingKind.NONE:
+        found = self._read_stop(target, NOTHING_READ_YET)
+        if found.waiting_for.caught_up and found.waiting_for.kind is not WaitingKind.NONE:
             self._announce(target, dialog, found)
             return
         if self._clock() >= dialog.deadline:
-            self._announce(target, dialog, NOTHING_READ_YET)
+            self._announce(
+                target,
+                dialog,
+                StopReading(waiting_for=NOTHING_READ_YET, progress=found.progress),
+            )
 
-    def _announce(self, target: SessionTarget, dialog: _Dialog, waiting_for: WaitingFor) -> None:
+    def _announce(self, target: SessionTarget, dialog: _Dialog, reading: StopReading) -> None:
         """Say one dialog once, and let the turn it belongs to end afterwards.
 
         The turn is marked in progress *here* rather than from the record,
@@ -529,24 +541,22 @@ class ReplyWindowWatcher:
         """
         dialog.settled = True
         self._active_turns.add(target)
-        self._emit(SessionStopped(target=target, waiting_for=waiting_for))
+        self._emit(self._stopped_event(target, reading))
 
-    def _what_for(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
-        """What this Session stopped on, asked of the reader that can tell.
+    @staticmethod
+    def _stopped_event(target: SessionTarget, reading: StopReading) -> SessionStopped:
+        return SessionStopped(
+            target=target,
+            progress=reading.progress,
+            waiting_for=reading.waiting_for,
+        )
 
-        `roster` is what this sweep's own record already knows, handed over so
-        the reader can fall back to it rather than to nothing: a Session at a
-        dialog whose transcript has not flushed the call is `UNKNOWN`, and one
-        whose turn simply ended is waiting on nobody.
-
-        **A reader that raises must not cost the notice.** The Stop is a
-        registry fact and is already proven at this point; failing to say what it
-        is about is a poorer notice, while dropping the event would be silence
-        about a Session that needs the user. So a raise here is answered with
-        whatever the registry alone knew, which renders as the notice
-        `core/bridge.py` produced before this field existed.
-        """
-        fallback = roster if roster is not None else WaitingFor()
+    def _read_stop(self, target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
+        """Both facts from the one reader call that observed this Stop."""
+        fallback = StopReading(
+            waiting_for=roster if roster is not None else WaitingFor(),
+            progress=ProgressObservation(),
+        )
         if self._stopped_on is None:
             return fallback
         try:

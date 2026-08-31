@@ -193,12 +193,22 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     text=(
                         "The shape that works: which session, and its state — the turn "
                         "finished, it awaits an answer, it awaits permission, or it waits on "
-                        "them for something not yet readable. Then, if it asked something, the "
-                        "question in one sentence and each option by name; a description "
-                        "follows when they ask. Then whose recommendation it is, if any. Then "
-                        "what it needs from them. When the detail you were given is known to "
-                        "lag what the session is really waiting on, say that gap out loud "
-                        "rather than reading old material as if it were new."
+                        "them for something not yet readable. Then what its progress says it "
+                        "most recently said: the newest assistant entry, that it said nothing "
+                        "yet, or that it spoke but the newest entry was too large to carry. "
+                        "Then, if it asked something, the question in one sentence and each "
+                        "option by name with its description when supplied. Then whose "
+                        "recommendation it is, if any, and what it needs from them. When the "
+                        "detail you were given is known to lag what the session is really "
+                        "waiting on, say that gap out loud rather than reading old material as "
+                        "if it were new."
+                    ),
+                ),
+                Block(
+                    covers=("voice.notice.reads-progress-when-asked-for-more",),
+                    text=(
+                        "If they ask what else that session said, use the existing progress "
+                        "action for that exact session and report its recent entries."
                     ),
                 ),
                 Block(

@@ -325,9 +325,18 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/announcing.md:64-94",
             gist=(
-                "Name and state first, then the question in one sentence, then each option "
-                "by name, then whose recommendation it is, then what is needed from the "
-                "user — and when the detail is known to be stale, say the gap out loud."
+                "Name and state first, then the newest assistant progress, then the question "
+                "and described options, whose recommendation it is, and what is needed from "
+                "the user — and when the detail is stale, say the gap out loud."
+            ),
+        ),
+        Rule(
+            id="voice.notice.reads-progress-when-asked-for-more",
+            audience=Audience.VOICE,
+            source="issue/151",
+            gist=(
+                "When the user asks what else a stopped Session said, read its canonical "
+                "progress observation and report the recent entries."
             ),
         ),
         Rule(

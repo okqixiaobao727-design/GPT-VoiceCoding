@@ -92,6 +92,39 @@ def turn(said_by_user: str = "do the thing", said_back: str = "done") -> list[di
 class TestAQuestionInTheTail:
     """P3 — the decision only the user can supply."""
 
+    def test_each_option_carries_its_description(self) -> None:
+        waiting = analyse(
+            [
+                *turn(),
+                called(
+                    QUESTION_TOOL,
+                    "q1",
+                    {
+                        "questions": [
+                            {
+                                "question": "Which base should the merge use?",
+                                "options": [
+                                    {
+                                        "label": "main",
+                                        "description": "Merge into the default branch",
+                                    },
+                                    {
+                                        "label": "feature",
+                                        "description": "Keep the work isolated",
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                ),
+            ]
+        )
+
+        assert [option.description for option in waiting.options] == [
+            "Merge into the default branch",
+            "Keep the work isolated",
+        ]
+
     def test_the_prompt_its_options_and_its_recommendation_are_fields(self) -> None:
         """Legacy extracted these once, so no consumer parses text back out."""
         waiting = analyse(
