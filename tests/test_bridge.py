@@ -19,7 +19,10 @@ from pathlib import Path
 
 import pytest
 
-from fakes import FakeCall
+from claude_adapter_fake import ParkedApproval, claude_waiting_roster
+from fakes import PROGRESS_CAPTURE, FakeCall
+from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
+from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
@@ -985,6 +988,71 @@ class TestTheOneCallInvariantEndToEnd:
 
 
 class TestSwitchAdjudicationEndToEnd:
+    @pytest.mark.parametrize(
+        ("label", "named_wait"),
+        [
+            ("permission prompt", "a tool needs your permission"),
+            ("sandbox request", "sandbox network access needs your permission"),
+        ],
+    )
+    def test_reconcile_announces_a_roster_only_named_wait(
+        self, label: str, named_wait: str
+    ) -> None:
+        """A Session whose hook never ran has no other path to a Stop Notice."""
+        hub = Hub(voice=False, sessions=((CLAUDE, "inspect the roster"),))
+        hub.agent.discovery = claude_waiting_roster(CLAUDE, label)
+
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        (session,) = hub.core.status().sessions
+        assert session.waiting_for.kind is WaitingKind.PERMISSION
+        assert len(hub.channel.sent) == 1
+        assert named_wait in hub.channel.sent[0]
+        assert "it has not said what it is waiting for yet" not in hub.channel.sent[0]
+
+    def test_one_reconcile_pass_reoffers_one_promoted_wait_with_its_parked_handle_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The promoted base reaches Core with the dialog handle and no duplicate notice."""
+        hub = Hub(duty=False, voice=False, sessions=((CLAUDE, "inspect the roster"),))
+        request = ApprovalRequest(
+            approval_id="a1",
+            target=CLAUDE,
+            tool_name="Bash",
+            detail="inspect the roster",
+        )
+        lane = claude_waiting_roster(CLAUDE, "sandbox request")
+
+        async def roster(**_asked: object) -> LaneDiscovery:
+            return lane
+
+        monkeypatch.setattr(claude_adapter.claude_discovery, "discover", roster)
+        adapter = ClaudeAgentAdapter(progress_capture=PROGRESS_CAPTURE)
+        adapter._reported[CLAUDE] = SessionReport(  # noqa: SLF001 - registration fact
+            session_id=CLAUDE.session_id or "",
+            pid=CLAUDE.pid,
+        )
+        adapter._approvals._waiting["a1"] = ParkedApproval(  # noqa: SLF001 - parked hook fact
+            request
+        )
+        waiting = asyncio.run(adapter.discover()).rows[0].waiting_for
+        assert waiting.approval_id == "a1"
+        hub.core._agents[AgentKind.CLAUDE] = adapter  # noqa: SLF001 - real lane under test
+
+        hub.emit(
+            AwaitingApproval(request=request),
+            SessionStopped(target=CLAUDE, waiting_for=waiting),
+        )
+        assert hub.channel.sent == []
+        hub.state.switches.flip(SwitchName.DUTY, True)
+
+        asyncio.run(hub.core.outlets_changed())
+        asyncio.run(hub.core.discover())
+
+        assert len(hub.channel.sent) == 1
+        assert "waiting for your permission to use Bash" in hub.channel.sent[0]
+
     def test_duty_turning_on_announces_a_question_the_session_is_still_waiting_on(
         self,
     ) -> None:
