@@ -67,7 +67,11 @@ class SettingsError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class CodexSettings:
-    """Everything this spoke may be told. Nothing policy-shaped appears here."""
+    """Everything this spoke may be told. Nothing policy-shaped appears here.
+
+    An omitted ``executable`` in direct construction is derived from the real
+    process environment only. Use :meth:`of` to inject an environment.
+    """
 
     executable: str = field(default_factory=lambda: default_executable(os.environ))
     socket_directory: Path = DEFAULT_SOCKET_DIRECTORY
@@ -110,6 +114,8 @@ class CodexSettings:
         for key, value in table.items():
             read[key] = _typed(key, value)
         if environ is not None:
+            # An InitVar could remove this second call site, but would add another
+            # public environment-injection entry point alongside of().
             read.setdefault("executable", default_executable(environ))
         return cls(**read)
 

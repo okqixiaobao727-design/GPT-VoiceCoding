@@ -1246,6 +1246,32 @@ class TestSettings:
         assert CodexSettings.of(None) == CodexSettings()
         assert CodexSettings.of({}) == CodexSettings()
 
+    def test_construction_paths_agree_for_a_configured_codex_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        environ = {"CODEX_HOME": str(tmp_path / "codex-home")}
+        monkeypatch.setenv("CODEX_HOME", environ["CODEX_HOME"])
+
+        assert CodexSettings().executable == CodexSettings.of({}, environ=environ).executable
+
+    def test_construction_paths_agree_without_a_configured_codex_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
+        assert CodexSettings().executable == CodexSettings.of({}, environ={}).executable
+
+    def test_direct_construction_derives_the_executable_per_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "first"))
+        first = CodexSettings()
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "second"))
+
+        second = CodexSettings()
+
+        assert first.executable != second.executable
+
     def test_the_default_executable_is_installations_managed_binary(self, tmp_path: Path) -> None:
         environ = {"CODEX_HOME": str(tmp_path / "codex-home")}
 
@@ -1253,6 +1279,12 @@ class TestSettings:
 
         expected = codex_launch_agent.managed_binary(codex_launch_agent.default_codex_home(environ))
         assert Path(settings.executable).resolve() == expected.resolve()
+
+    def test_a_blank_executable_is_refused_on_both_construction_paths(self) -> None:
+        with pytest.raises(SettingsError, match="executable must name"):
+            CodexSettings(executable=" \t")
+        with pytest.raises(SettingsError, match="executable must name"):
+            CodexSettings.of({"executable": " \t"}, environ={"CODEX_HOME": "/codex-home"})
 
     def test_a_key_this_adapter_does_not_have_refuses_to_start(self) -> None:
         """A misspelled timeout that silently defaults is the silent fallback ban."""
