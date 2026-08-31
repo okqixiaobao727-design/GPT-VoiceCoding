@@ -83,6 +83,9 @@ class WatchedThread:
     #: thread *is*, not something it just became: announcing it as a transition
     #: would report every registration as a Session that had stopped.
     observed: bool = False
+    #: Monotonic turn generation, incremented only when the thread goes back to
+    #: active. A Stop from an earlier turn cannot announce under a newer one.
+    turn_revision: int = 0
     #: The turn `turn/steer` must name as its precondition, when one is running.
     active_turn_id: str | None = None
     routing: ApprovalRouting = ApprovalRouting.UNPINNED

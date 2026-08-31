@@ -70,6 +70,9 @@ from gpt_voicecoding.seams.agent import (
     AwaitingApproval,
     LaneUnavailable,
     ProgressAvailability,
+    ProgressObservation,
+    ProgressOmission,
+    ProgressRole,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -112,6 +115,7 @@ def stop_notice_for(
     target: SessionTarget,
     waiting_for: WaitingFor | None = None,
     *,
+    progress: ProgressObservation | None = None,
     answerable_here: bool = False,
 ) -> str:
     """The words a stopped Session is announced with.
@@ -125,8 +129,24 @@ def stop_notice_for(
     stopped_on = (
         _stopped_on(waiting_for, answerable_here=answerable_here) if waiting_for is not None else ""
     )
-    tail = f" — {stopped_on}" if stopped_on else ""
+    detail = [one for one in (_progress_at_stop(progress), stopped_on) if one]
+    tail = f" — {'; '.join(detail)}" if detail else ""
     return f"{spoken_reference(session, target)} stopped and may need you{tail}"
+
+
+def _progress_at_stop(progress: ProgressObservation | None) -> str:
+    """What the Session most recently said, from the Stop's own observation."""
+    if progress is None or progress.availability is not ProgressAvailability.READABLE:
+        return ""
+    if progress.has_history is False:
+        return "nothing said yet"
+    if progress.omission is ProgressOmission.NEWEST_OVERSIZE:
+        return "history exists, but the newest entry is too large to carry"
+    newest = next(
+        (entry for entry in reversed(progress.recent) if entry.role is ProgressRole.ASSISTANT),
+        None,
+    )
+    return f"it said: {newest.text}" if newest is not None else ""
 
 
 def spoken_reference(session: Session | None, target: SessionTarget) -> str:
@@ -169,7 +189,15 @@ def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
         case WaitingKind.QUESTION:
             parts = [waiting_for.prompt or "it asked you something"]
             if waiting_for.options:
-                parts.append("options: " + ", ".join(option.text for option in waiting_for.options))
+                parts.append(
+                    "options: "
+                    + ", ".join(
+                        f"{option.text}: {option.description}"
+                        if option.description
+                        else option.text
+                        for option in waiting_for.options
+                    )
+                )
             if waiting_for.recommendation:
                 parts.append(f"it recommends {waiting_for.recommendation}")
             if answerable_here:
@@ -710,8 +738,15 @@ class BridgeCore:
         """
         if self._spawned(event.target):
             return
+        session = self._known(event.target)
+        if session is not None:
+            session = self._state.sessions.set_progress(event.target, event.progress)
         await self._announce_waiting(
-            self._known(event.target), event.target, event.waiting_for, reconcile=False
+            session,
+            event.target,
+            event.waiting_for,
+            progress=event.progress,
+            reconcile=False,
         )
 
     async def _announce_waiting(
@@ -720,6 +755,7 @@ class BridgeCore:
         target: SessionTarget,
         waiting_for: WaitingFor,
         *,
+        progress: ProgressObservation | None = None,
         reconcile: bool,
     ) -> NoticeOutcome | None:
         """Announce one current wait through the same producer as its live event."""
@@ -774,6 +810,13 @@ class BridgeCore:
                     session,
                     target,
                     waiting_for,
+                    progress=(
+                        progress
+                        if progress is not None
+                        else session.progress
+                        if session is not None
+                        else None
+                    ),
                     answerable_here=(
                         waiting_for.kind is WaitingKind.QUESTION
                         and self._question_answerable(target)

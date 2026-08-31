@@ -1014,6 +1014,8 @@ class CodexAgentAdapter:
         watched.observed = True
 
         if first_look or window is not watched.reply_window:
+            if window is ReplyWindow.CLOSED:
+                watched.turn_revision += 1
             watched.reply_window = window
             self._emit(ReplyWindowChanged(target=watched.target, window=window))
         if kind == "active":
@@ -1027,17 +1029,43 @@ class CodexAgentAdapter:
             # `approval_id` on this event Bridge Core cannot recognise the two as
             # one dialog, so it announces the Stop as well and asks the user
             # twice for one decision (`core/bridge.py:_session_stopped`).
-            self._emit(
-                SessionStopped(
-                    target=watched.target,
-                    waiting_for=_dialog_waiting(watched)
-                    or (
-                        WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
-                        if kind == "systemError"
-                        else WaitingFor()
-                    ),
+            waiting_for = _dialog_waiting(watched) or (
+                WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+                if kind == "systemError"
+                else WaitingFor()
+            )
+            self._spawn(
+                self._emit_stopped(
+                    watched,
+                    waiting_for,
+                    turn_revision=watched.turn_revision,
                 )
             )
+
+    async def _emit_stopped(
+        self,
+        watched: WatchedThread,
+        waiting_for: WaitingFor,
+        *,
+        turn_revision: int,
+    ) -> None:
+        """Read one Stop without a turn, unless a newer status supersedes it."""
+        try:
+            progress = await self._turns.read_now(watched.connection, watched.thread_id)
+        except Exception as unreadable:  # noqa: BLE001 - a poorer Stop beats silence
+            progress = ProgressObservation.unreadable(str(unreadable))
+        if (
+            watched.turn_revision != turn_revision
+            or self._threads.get(watched.target) is not watched
+        ):
+            return
+        self._emit(
+            SessionStopped(
+                target=watched.target,
+                progress=progress,
+                waiting_for=waiting_for,
+            )
+        )
 
     def _connection_lost(self, target: SessionTarget, reason: str) -> None:
         """The app-server holding that Session went away. Say so, exactly once.
@@ -1090,9 +1118,9 @@ class CodexAgentAdapter:
     def _spawn(self, work: Any) -> None:
         """Run work off a callback, without letting it outlive this adapter.
 
-        The callers are the notification handlers, which are synchronous and
-        cannot await: a subscription retry, and the connection given back when
-        the thread it was opened for is closed.
+        The callers are notification handlers, which are synchronous and cannot
+        await: a subscription retry, a Stop observation read, and the connection
+        given back when the thread it was opened for is closed.
         """
         task = asyncio.ensure_future(work)
         self._background.add(task)

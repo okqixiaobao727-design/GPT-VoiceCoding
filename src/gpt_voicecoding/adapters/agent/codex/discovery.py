@@ -322,13 +322,28 @@ class TurnCache:
         cached = self._cache.get(thread_id)
         if stamp is not None and cached is not None and cached[0] == stamp:
             return cached[1]
+        return await self._read_now(client, thread_id, cache_stamp=stamp)
+
+    async def read_now(self, client: DaemonClient, thread_id: str) -> ProgressObservation:
+        """Read one Stop now and retain it for the matching later roster row."""
+        return await self._read_now(client, thread_id)
+
+    async def _read_now(
+        self,
+        client: DaemonClient,
+        thread_id: str,
+        *,
+        cache_stamp: Any = None,
+    ) -> ProgressObservation:
+        """The one deep-read normalization and cache path."""
         reading = await read_thread(client, thread_id, with_turns=True)
         if reading.thread is None:
             assert reading.reason is not None
             return ProgressObservation.unreadable(reading.reason)
         progress = progress_from(reading.thread, capture=self.capture)
-        if stamp is not None:
-            self._cache[thread_id] = (stamp, progress)
+        observed_stamp = reading.thread.get(thread_tail.UPDATED_AT, cache_stamp)
+        if observed_stamp is not None:
+            self._cache[thread_id] = (observed_stamp, progress)
         return progress
 
     def forget(self, thread_id: str | None) -> None:

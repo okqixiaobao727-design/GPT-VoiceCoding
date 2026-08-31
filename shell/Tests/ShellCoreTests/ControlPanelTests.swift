@@ -129,7 +129,25 @@ private let allSwitchesOff = """
                   "lifecycle": "live",
                   "state": "waiting",
                   "last_activity": "1970-01-01T00:02:03+00:00",
-                  "waiting_for": {"kind": "question"},
+                  "waiting_for": {
+                    "kind": "question",
+                    "caught_up": true,
+                    "prompt": "Which seam?",
+                    "options": [
+                      {
+                        "text": "public behavior",
+                        "description": "Exercise the adapter event",
+                        "recommended": true
+                      }
+                    ]
+                  },
+                  "progress": {
+                    "availability": "readable",
+                    "has_history": true,
+                    "omission": "status_summary",
+                    "read_at": "1970-01-01T00:02:03+00:00",
+                    "recent": []
+                  },
                   "child": {"kind": "main", "parent": null}
                 },
                 {

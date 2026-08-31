@@ -26,6 +26,7 @@ from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
+from gpt_voicecoding.adapters.agent.claude.window import StopReading
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
@@ -33,6 +34,7 @@ from gpt_voicecoding.seams.agent import (
     LaneUnavailable,
     Option,
     ProgressCapture,
+    ProgressObservation,
     ReplyWindowChanged,
     SessionEnded,
     SessionInspection,
@@ -174,7 +176,7 @@ class TestAParkedQuestionWinsOutright:
             asking=self.asking(),
         )
 
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
 
         assert waiting.kind is WaitingKind.QUESTION
         assert waiting.prompt == "Tabs or spaces?"
@@ -191,7 +193,7 @@ class TestAParkedQuestionWinsOutright:
             asking=self.asking(),
         )
 
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
 
         assert waiting.approval_id == "7333021c-1ab7-451d-9eee-91617bc4838d"
 
@@ -205,9 +207,32 @@ class TestAParkedQuestionWinsOutright:
             asking=self.asking(),
         )
 
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
 
         assert waiting.prompt == "Tabs or spaces?"
+
+    def test_an_older_question_does_not_anchor_the_current_questions_progress(
+        self, tmp_path: Path
+    ) -> None:
+        adapter = adapter_holding(
+            transcript(
+                tmp_path,
+                [
+                    said("Choose the first base.", role="user"),
+                    said("The first decision should use main."),
+                    asked("q1", ("Which base?", ["main", "feature"])),
+                    said("main", role="user"),
+                    said("The second decision needs a fresh answer."),
+                ],
+            ),
+            parked=(dialog(tool_name="AskUserQuestion", detail=""),),
+            asking=self.asking("Tabs or spaces?", "Spaces", "Tabs"),
+        )
+
+        reading = adapter.stop_reading(TARGET, ROSTER_WAITING)
+
+        assert reading.waiting_for.prompt == "Tabs or spaces?"
+        assert reading.progress.recent[-1].text == "The second decision needs a fresh answer."
 
     def test_the_question_never_projects_into_the_permission_relay(self, tmp_path: Path) -> None:
         """Question words ride Answer Relay; Approval Relay remains permissions only."""
@@ -217,7 +242,7 @@ class TestAParkedQuestionWinsOutright:
             asking=self.asking(),
         )
 
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
 
         assert waiting.as_approval_request(TARGET) is None
 
@@ -228,7 +253,7 @@ class TestAParkedQuestionWinsOutright:
             parked=(dialog(tool_name="Edit", detail="notes.md"),),
         )
 
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
 
         assert waiting.kind is WaitingKind.PERMISSION
         assert waiting.approval_id == "a-1"
@@ -248,7 +273,7 @@ class TestTheRanking:
             transcript(tmp_path, [*turn(), asked("q1", ("Which base?", ["main", "feature"]))]),
             parked=(dialog(),),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.QUESTION
         assert waiting.approval_id is None
         assert waiting.tool_name is None
@@ -269,7 +294,7 @@ class TestTheRanking:
             transcript(tmp_path, [*turn(), called("Edit", "e1", {"file_path": "/tmp/notes.md"})]),
             parked=(dialog(tool_name="Edit", detail="notes.md"),),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.PERMISSION
         # The record's own reading is not overwritten by the dialog's.
         assert waiting.tool_name == "Edit"
@@ -302,7 +327,7 @@ class TestTheRanking:
             ),
             parked=(dialog(tool_name="Read", detail="/tmp/first"),),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.PERMISSION
         assert waiting.tool_name == "Read"
         # The record's `detail` describes the record's call, so it goes with it.
@@ -325,7 +350,7 @@ class TestTheRanking:
             transcript(tmp_path, [*turn(), unnamed]),
             parked=(dialog(tool_name="Bash", detail="push the branch"),),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.tool_name == "Bash"
         assert waiting.detail == "push the branch"
         assert waiting.approval_id == "a-1"
@@ -338,7 +363,7 @@ class TestTheRanking:
             transcript(tmp_path, [*turn(), called("Bash", "b1", {"prompt": "unreadable"})]),
             parked=(dialog(tool_name="Bash", detail="push the branch"),),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.tool_name == "Bash"
         assert waiting.detail == "push the branch"
 
@@ -353,7 +378,7 @@ class TestTheRanking:
         the same fact plus a handle, from the process holding the dialog.
         """
         adapter = adapter_holding(transcript(tmp_path, turn()), parked=(dialog(),))
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.PERMISSION
         assert waiting.tool_name == "Bash"
         assert waiting.detail == "push the branch"
@@ -368,7 +393,7 @@ class TestTheRanking:
     ) -> None:
         """A dialog on screen is a stop whatever the roster and the record say."""
         adapter = adapter_holding(transcript(tmp_path, turn()), parked=(dialog(),))
-        waiting = adapter.stopped_on(TARGET, WaitingFor())
+        waiting = adapter.stop_reading(TARGET, WaitingFor()).waiting_for
         assert waiting.kind is WaitingKind.PERMISSION
         assert waiting.approval_id == "a-1"
 
@@ -376,7 +401,7 @@ class TestTheRanking:
         adapter = adapter_holding(
             transcript(tmp_path, [*turn(), called("Bash", "b1", {"description": "push"})])
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.PERMISSION
         assert waiting.approval_id is None
 
@@ -388,7 +413,7 @@ class TestTheRanking:
                 replace(dialog(tool_name="Edit", detail="/tmp/second"), approval_id="a-2"),
             ),
         )
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.tool_name == "Edit"
         assert waiting.approval_id == "a-2"
 
@@ -398,7 +423,7 @@ class TestTheRanking:
         adapter = adapter_holding(
             transcript(tmp_path, turn()), parked=(replace(dialog(), target=other),)
         )
-        assert adapter.stopped_on(TARGET, ROSTER_WAITING) == ROSTER_WAITING
+        assert adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for == ROSTER_WAITING
 
 
 class TestWhenTheRecordSaysNothing:
@@ -406,26 +431,26 @@ class TestWhenTheRecordSaysNothing:
 
     def test_a_finished_turn_stays_a_finished_turn(self, tmp_path: Path) -> None:
         adapter = adapter_holding(transcript(tmp_path, turn()))
-        assert adapter.stopped_on(TARGET, WaitingFor()).kind is WaitingKind.NONE
+        assert adapter.stop_reading(TARGET, WaitingFor()).waiting_for.kind is WaitingKind.NONE
 
     def test_a_waiting_session_whose_record_says_nothing_is_asked_again(
         self, tmp_path: Path
     ) -> None:
         """`UNKNOWN` with `caught_up=False` is the seam's word for *ask again*."""
         adapter = adapter_holding(transcript(tmp_path, turn()))
-        waiting = adapter.stopped_on(TARGET, ROSTER_WAITING)
+        waiting = adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for
         assert waiting.kind is WaitingKind.UNKNOWN
         assert waiting.caught_up is False
 
     def test_a_session_that_never_registered_leaves_the_roster_s_word_alone(self) -> None:
         """No `SessionStart` hook ran, so there is no path and nothing was read."""
         adapter = ClaudeAgentAdapter(progress_capture=PROGRESS_CAPTURE)
-        assert adapter.stopped_on(TARGET, ROSTER_WAITING) == ROSTER_WAITING
+        assert adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for == ROSTER_WAITING
 
     def test_a_transcript_that_does_not_exist_yet_is_not_an_empty_one(self, tmp_path: Path) -> None:
         """A Session's first turn creates the file (#73); before that, nobody looked."""
         adapter = adapter_holding(tmp_path / "never-written.jsonl")
-        assert adapter.stopped_on(TARGET, ROSTER_WAITING) == ROSTER_WAITING
+        assert adapter.stop_reading(TARGET, ROSTER_WAITING).waiting_for == ROSTER_WAITING
 
 
 class TestTheRosterRow:
@@ -498,6 +523,76 @@ class TestTheRosterRow:
 class TestTheStopNotice:
     """The other path: the event Bridge Core renders the Stop Notice from."""
 
+    def test_a_question_stop_carries_the_leading_text_and_option_descriptions(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        say(tmp_path, "busy", pid=os.getpid(), session_id=SESSION)
+        raised: list[AgentEvent] = []
+
+        class Sink:
+            def emit(self, event: AgentEvent) -> None:
+                raised.append(event)
+
+        adapter = ClaudeAgentAdapter(
+            progress_capture=PROGRESS_CAPTURE,
+            sink=Sink(),
+            settings=ClaudeSettings(registry_directory=sessions),
+        )
+        question = called(
+            "AskUserQuestion",
+            "q1",
+            {
+                "questions": [
+                    {
+                        "question": "Which base?",
+                        "options": [
+                            {
+                                "label": "main",
+                                "description": "Merge into the default branch",
+                            },
+                            {
+                                "label": "feature",
+                                "description": "Keep the work isolated",
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+        path = transcript(
+            tmp_path,
+            [
+                said("Please inspect the merge.", role="user"),
+                said("The default branch is the safest choice."),
+                question,
+            ],
+        )
+        target = replace(TARGET, pid=os.getpid())
+        adapter._reported[target] = SessionReport(  # noqa: SLF001 - registration fact
+            session_id=SESSION,
+            pid=os.getpid(),
+            transcript_path=path,
+        )
+        adapter.register_session(target, tmp_path / "channel.sock")
+
+        say(
+            tmp_path,
+            "waiting",
+            pid=os.getpid(),
+            session_id=SESSION,
+            waiting_for="input needed",
+        )
+        adapter._windows.poll_once()  # noqa: SLF001 - one deterministic sweep
+
+        stopped = next(event for event in raised if isinstance(event, SessionStopped))
+        assert stopped.progress.recent[-1].text == "The default branch is the safest choice."
+        assert [option.description for option in stopped.waiting_for.options] == [
+            "Merge into the default branch",
+            "Keep the work isolated",
+        ]
+
     def test_a_stop_carries_what_it_stopped_on(self, tmp_path: Path) -> None:
         """`SessionStopped.waiting_for` replaces the free-text `detail` (#74, #75)."""
         from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
@@ -507,24 +602,29 @@ class TestTheStopNotice:
         watcher = ReplyWindowWatcher(
             settings=ClaudeSettings(),
             emit=raised.append,
-            stopped_on=lambda target, roster=None: WaitingFor(
-                kind=WaitingKind.PERMISSION, tool_name="Bash", detail="push the branch"
+            stopped_on=lambda target, roster=None: StopReading(
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.PERMISSION,
+                    tool_name="Bash",
+                    detail="push the branch",
+                ),
+                progress=ProgressObservation(),
             ),
         )
-        assert watcher._what_for(TARGET).tool_name == "Bash"  # noqa: SLF001
+        assert watcher._read_stop(TARGET).waiting_for.tool_name == "Bash"  # noqa: SLF001
 
     def test_a_reader_that_raises_costs_the_words_and_never_the_notice(self) -> None:
         """A Stop is already proven at that point; silence would be the worse loss."""
         from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
         from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher
 
-        def raising(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+        def raising(target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
             raise RuntimeError("the transcript reader is broken")
 
         watcher = ReplyWindowWatcher(
             settings=ClaudeSettings(), emit=lambda event: None, stopped_on=raising
         )
-        assert watcher._what_for(TARGET) == WaitingFor()  # noqa: SLF001
+        assert watcher._read_stop(TARGET).waiting_for == WaitingFor()  # noqa: SLF001
 
 
 class TestReadingTheFileOnce:
@@ -633,7 +733,10 @@ class TestWhenTheSessionEnds:
     """
 
     def watching(
-        self, tmp_path: Path, pid: int
+        self,
+        tmp_path: Path,
+        pid: int,
+        transcript_records: list[dict[str, Any]] | None = None,
     ) -> tuple[ClaudeAgentAdapter, SessionTarget, Path, list[Any]]:
         """An adapter registered on that pid, with the transcript already parsed.
 
@@ -657,12 +760,17 @@ class TestWhenTheSessionEnds:
                 registry_directory=tmp_path / "sessions", reply_window_poll_seconds=0.02
             ),
         )
-        path = transcript(tmp_path, [*turn(), called("Bash", "b1", {"description": "push"})])
+        records = (
+            [*turn(), called("Bash", "b1", {"description": "push"})]
+            if transcript_records is None
+            else transcript_records
+        )
+        path = transcript(tmp_path, records)
         adapter._reported[target] = SessionReport(  # noqa: SLF001 - seeding one registration
             session_id=SESSION, pid=pid, transcript_path=path
         )
         adapter.register_session(target, tmp_path / "channel.sock")
-        assert adapter.stopped_on(target).kind is WaitingKind.PERMISSION  # warms the cache
+        adapter.stop_reading(target)  # warms the cache before the transition
         return adapter, target, path, raised
 
     def test_a_death_reported_is_a_session_forgotten(self, tmp_path: Path) -> None:
@@ -692,6 +800,51 @@ class TestWhenTheSessionEnds:
         adapter._windows.poll_once()  # noqa: SLF001
 
         assert [type(event) for event in raised] == [ReplyWindowChanged, SessionStopped]
+        stopped = next(event for event in raised if isinstance(event, SessionStopped))
+        assert [entry.text for entry in stopped.progress.recent if entry.role == "assistant"] == [
+            "done"
+        ]
         assert adapter.reported(target) is not None
         assert adapter.reachable() == (target,)
         assert path in adapter._transcripts._cache  # noqa: SLF001
+
+    def test_shell_and_idle_stops_carry_equal_observations(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`shell` changes background activity, not what the Session last said (#151)."""
+        read_at = claude_adapter.datetime(2026, 8, 31, 5, 8, 36, tzinfo=claude_adapter.UTC)
+
+        class FixedDateTime:
+            @staticmethod
+            def now(_timezone: object) -> object:
+                return read_at
+
+        monkeypatch.setattr(claude_adapter, "datetime", FixedDateTime)
+
+        def stop_at(status: str) -> object:
+            root = tmp_path / status
+            root.mkdir()
+            adapter, target, _path, raised = self.watching(root, os.getpid())
+            say(root, status, pid=os.getpid(), session_id=SESSION)
+            adapter._windows.poll_once()  # noqa: SLF001
+            return next(event.progress for event in raised if isinstance(event, SessionStopped))
+
+        assert stop_at("shell") == stop_at("idle")
+
+    def test_an_empty_transcript_is_readable_history_with_nothing_said(
+        self, tmp_path: Path
+    ) -> None:
+        adapter, _target, _path, raised = self.watching(
+            tmp_path,
+            os.getpid(),
+            transcript_records=[],
+        )
+        say(tmp_path, "idle", pid=os.getpid(), session_id=SESSION)
+
+        adapter._windows.poll_once()  # noqa: SLF001
+
+        stopped = next(event for event in raised if isinstance(event, SessionStopped))
+        assert stopped.progress.has_history is False
+        assert stopped.progress.recent == ()

@@ -200,6 +200,14 @@ def _tail_wait(open_calls: dict[str, _OpenCall], *, last_spoken_at: int) -> Wait
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _QuestionGroup:
+    """One prompt and the typed options offered under it."""
+
+    prompt: str
+    options: tuple[Option, ...]
+
+
 def question_in(tool_input: Any) -> WaitingFor | None:
     """Everything one `AskUserQuestion` call gives an announcement to say.
 
@@ -225,14 +233,11 @@ def question_in(tool_input: Any) -> WaitingFor | None:
     prompts: list[str] = []
     options: list[Option] = []
     recommended: list[str] = []
-    for prompt, group in _groups(tool_input):
-        if prompt:
-            prompts.append(prompt)
-        for label in group:
-            text, is_recommended = _split_recommendation(label)
-            options.append(Option(text=text, recommended=is_recommended))
-            if is_recommended:
-                recommended.append(text)
+    for group in _groups(tool_input):
+        if group.prompt:
+            prompts.append(group.prompt)
+        options.extend(group.options)
+        recommended.extend(option.text for option in group.options if option.recommended)
     if not options:
         return None
     return WaitingFor(
@@ -243,17 +248,16 @@ def question_in(tool_input: Any) -> WaitingFor | None:
     )
 
 
-def _groups(tool_input: Any) -> list[tuple[str, list[str]]]:
-    """One `AskUserQuestion` call's readable content: each prompt and its labels.
+def _groups(tool_input: Any) -> list[_QuestionGroup]:
+    """One `AskUserQuestion` call's readable content: prompts and offered options.
 
     The single place this call's shape is parsed, so what is announced and how
     many options there are can never disagree about what an option is.
 
-    `description` and `preview` are both deliberately left out. A preview holds
-    the mockups, diffs and code snippets that make an option comparable *on
-    screen* — the one thing a spoken menu can neither convey nor afford — and a
-    description is the same argument one size down: the seam's `Option` carries
-    the words the user says back, and that is the label.
+    A description is the Session's own short explanation and travels with its
+    label (#151). `preview` remains deliberately left out: it holds the mockups,
+    diffs and code snippets that make an option comparable *on screen* — the one
+    thing a spoken menu can neither convey nor afford.
 
     A call whose input never finished being written arrives as
     `__unparsedToolInput` instead of `questions`. That is unreadable rather than
@@ -264,12 +268,12 @@ def _groups(tool_input: Any) -> list[tuple[str, list[str]]]:
     questions = tool_input.get("questions")
     if not isinstance(questions, list):
         return []
-    groups: list[tuple[str, list[str]]] = []
+    groups: list[_QuestionGroup] = []
     for question in questions:
         if not isinstance(question, Mapping):
             continue
         prompt = question.get("question")
-        labels: list[str] = []
+        options: list[Option] = []
         raw = question.get("options")
         if isinstance(raw, list):
             for option in raw:
@@ -277,8 +281,26 @@ def _groups(tool_input: Any) -> list[tuple[str, list[str]]]:
                     continue
                 label = option.get("label")
                 if isinstance(label, str) and label.strip():
-                    labels.append(label.strip())
-        groups.append((prompt.strip() if isinstance(prompt, str) else "", labels))
+                    text, is_recommended = _split_recommendation(label.strip())
+                    raw_description = option.get("description")
+                    description = (
+                        raw_description.strip()
+                        if isinstance(raw_description, str) and raw_description.strip()
+                        else None
+                    )
+                    options.append(
+                        Option(
+                            text=text,
+                            recommended=is_recommended,
+                            description=description,
+                        )
+                    )
+        groups.append(
+            _QuestionGroup(
+                prompt=prompt.strip() if isinstance(prompt, str) else "",
+                options=tuple(options),
+            )
+        )
     return groups
 
 
@@ -402,11 +424,11 @@ def _question_text(tool_input: Any) -> str:
     boundary past the very call the Session is waiting on.
     """
     groups = _groups(tool_input)
-    if not any(labels for _, labels in groups):
+    if not any(group.options for group in groups):
         return ""
     lines: list[str] = []
-    for prompt, labels in groups:
-        if prompt:
-            lines.append(f"Question: {prompt}")
-        lines.extend(f"Option: {label}" for label in labels)
+    for group in groups:
+        if group.prompt:
+            lines.append(f"Question: {group.prompt}")
+        lines.extend(f"Option: {option.text}" for option in group.options)
     return "\n".join(lines)

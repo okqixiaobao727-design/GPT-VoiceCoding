@@ -32,12 +32,14 @@ from gpt_voicecoding.adapters.agent.claude.window import (
     PID_RECYCLED,
     PROCESS_GONE,
     ReplyWindowWatcher,
+    StopReading,
     death_for,
     window_for,
 )
 from gpt_voicecoding.seams.agent import (
     AgentEvent,
     Option,
+    ProgressObservation,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -501,9 +503,12 @@ class TestReportingAStopTheMomentADialogGoesUp:
         """
         asked: list[WaitingFor | None] = []
 
-        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
             asked.append(roster)
-            return roster if roster is not None else WaitingFor()
+            return StopReading(
+                waiting_for=roster if roster is not None else WaitingFor(),
+                progress=ProgressObservation(),
+            )
 
         sink = AllEvents()
         watcher = ReplyWindowWatcher(
@@ -526,9 +531,9 @@ class TestReportingAStopTheMomentADialogGoesUp:
         """An idle Session is not waiting on anything the roster knows about."""
         asked: list[WaitingFor | None] = []
 
-        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+        def stopped_on(target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
             asked.append(roster)
-            return WaitingFor()
+            return StopReading(waiting_for=WaitingFor(), progress=ProgressObservation())
 
         sink = AllEvents()
         watcher = ReplyWindowWatcher(
@@ -607,14 +612,16 @@ class Scene:
         )
         self.watcher.watch(TARGET)
 
-    def _stopped_on(self, target: SessionTarget, roster: WaitingFor | None = None) -> WaitingFor:
+    def _stopped_on(self, target: SessionTarget, roster: WaitingFor | None = None) -> StopReading:
         self.asked.append(roster)
         if roster is None:
             # A finished turn asks with nothing assumed, and the real reader
             # answers it from a transcript that is no longer held up.
-            return WaitingFor()
-        assert self.readings is not None
-        return self.readings[min(len(self.asked) - 1, len(self.readings) - 1)]
+            waiting_for = WaitingFor()
+        else:
+            assert self.readings is not None
+            waiting_for = self.readings[min(len(self.asked) - 1, len(self.readings) - 1)]
+        return StopReading(waiting_for=waiting_for, progress=ProgressObservation())
 
     def at(self, status: str, label: str | None = None) -> Scene:
         """Claude Code rewrites the record, and the sweep reads it."""

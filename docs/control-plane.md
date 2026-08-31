@@ -130,7 +130,8 @@ second question to render one line would be a second reader of the same Session:
  "workspace": "/Users/…", "first_seen": 1787222000.0,
  "lifecycle": "live", "state": "idle",
  "waiting_for": {"kind": "question", "caught_up": true, "prompt": "Which base?",
-                 "options": [{"text": "main", "recommended": true}],
+                 "options": [{"text": "main", "description": "Use the default branch",
+                              "recommended": true}],
                  "recommendation": "main", "tool_name": null, "detail": null,
                  "approval_id": null},
  "progress": {"availability": "readable", "has_history": true,
@@ -151,7 +152,9 @@ Session — no agent knows it.
 `waiting_for` is what a stopped Session stopped on, as structure rather than as a
 rendered sentence. `kind` is one of `none`, `question`, `permission`, `unknown`;
 `unknown` always comes with `caught_up: false`, and means *ask again*, never
-*nothing is happening*.
+*nothing is happening*. A question option always carries `text` and `recommended`;
+its `description` is the Agent's optional explanation of that choice, or `null`
+when the Agent supplied none.
 
 `progress` always carries the same five fields:
 

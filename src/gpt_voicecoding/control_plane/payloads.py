@@ -179,7 +179,11 @@ def waiting_for_document(waiting_for: WaitingFor) -> dict[str, Any]:
         "caught_up": waiting_for.caught_up,
         "prompt": waiting_for.prompt,
         "options": [
-            {"text": option.text, "recommended": option.recommended}
+            {
+                "text": option.text,
+                "description": option.description,
+                "recommended": option.recommended,
+            }
             for option in waiting_for.options
         ],
         "recommendation": waiting_for.recommendation,

@@ -14,6 +14,7 @@ all of it while the control plane keeps answering.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,10 @@ from gpt_voicecoding.seams.agent import (
     ChildKind,
     LaneDiscovery,
     Option,
+    ProgressEntry,
+    ProgressObservation,
+    ProgressOmission,
+    ProgressRole,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -61,6 +66,116 @@ class EndRefusingCall(FakeCall):
 
 
 class TestTheStopNoticePipelineEndToEnd:
+    def test_a_stops_progress_is_announced_and_folded_into_the_roster(self) -> None:
+        hub = Hub()
+        observed = ProgressObservation.readable(
+            has_history=True,
+            recent=(
+                ProgressEntry(
+                    role=ProgressRole.ASSISTANT,
+                    text="The registry status is the root cause.",
+                ),
+            ),
+            read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+        )
+
+        hub.emit(SessionStopped(target=CODEX, progress=observed))
+
+        assert "The registry status is the root cause." in hub.call.spoken[0]
+        assert hub.core.status().sessions[0].progress == observed
+
+    def test_a_failed_stop_read_does_not_replace_a_readable_roster_observation(self) -> None:
+        hub = Hub()
+        observed = ProgressObservation.readable(
+            has_history=True,
+            recent=(
+                ProgressEntry(
+                    role=ProgressRole.ASSISTANT,
+                    text="The readable observation remains authoritative.",
+                ),
+            ),
+            read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+        )
+        hub.emit(SessionStopped(target=CODEX, progress=observed))
+
+        for unavailable in (
+            ProgressObservation(),
+            ProgressObservation.unreadable("the daemon dropped the read"),
+        ):
+            hub.emit(
+                SessionStopped(
+                    target=CODEX,
+                    progress=unavailable,
+                )
+            )
+            assert hub.core.status().sessions[0].progress == observed
+
+    def test_a_stop_notice_speaks_the_newest_assistant_entry(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            progress=ProgressObservation.readable(
+                has_history=True,
+                recent=(
+                    ProgressEntry(
+                        role=ProgressRole.ASSISTANT,
+                        text="The diagnosis points to the session registry.",
+                    ),
+                ),
+                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+            ),
+        )
+
+        assert "The diagnosis points to the session registry." in notice
+
+    def test_a_stop_with_no_history_says_nothing_was_said_yet(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            progress=ProgressObservation.readable(
+                has_history=False,
+                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+            ),
+        )
+
+        assert "nothing said yet" in notice
+        assert "it said:" not in notice
+
+    def test_an_oversize_newest_entry_is_reported_as_existing_but_not_carried(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            progress=ProgressObservation.readable(
+                has_history=True,
+                omission=ProgressOmission.NEWEST_OVERSIZE,
+                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+            ),
+        )
+
+        assert "history exists" in notice
+        assert "newest entry is too large to carry" in notice
+        assert "nothing said yet" not in notice
+
+    def test_a_question_notice_carries_each_options_description(self) -> None:
+        notice = stop_notice_for(
+            None,
+            CODEX,
+            WaitingFor(
+                kind=WaitingKind.QUESTION,
+                prompt="Which base?",
+                options=(
+                    Option(
+                        text="main",
+                        description="Merge into the default branch",
+                    ),
+                ),
+            ),
+            answerable_here=True,
+        )
+
+        assert "main" in notice
+        assert "Merge into the default branch" in notice
+
     def test_an_answerable_question_tells_the_user_to_reply_here(self) -> None:
         notice = stop_notice_for(
             None,

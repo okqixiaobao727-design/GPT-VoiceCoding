@@ -264,6 +264,20 @@ class TestVoiceBudget:
             generate(CONTEXT)
 
 
+class TestStopNoticeInstructions:
+    def test_asking_for_more_reads_progress_recent_entries(self) -> None:
+        stop = next(
+            section
+            for section in voice_instructions(CONTEXT).sections
+            if section.title == "Announcing a session that stopped"
+        )
+        text = " ".join(block.text for block in stop.blocks)
+
+        assert "most recently said" in text
+        assert "progress" in text
+        assert "recent entries" in text
+
+
 class TestTheDelegatedSetNamesTheRealCli:
     def test_it_names_the_command_the_context_gave_it(self, instructions) -> None:
         assert str(CLI.command) in instructions.delegated.text

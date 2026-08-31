@@ -36,6 +36,7 @@ from gpt_voicecoding.seams.agent import (
     ChildKind,
     LaneDiscovery,
     LaneUnavailable,
+    Option,
     ProgressAvailability,
     ProgressEntry,
     ProgressObservation,
@@ -180,6 +181,37 @@ class TestWithEverySwitchOff:
 
 
 class TestStatus:
+    def test_question_option_descriptions_cross_the_control_plane(self) -> None:
+        surface = Surface()
+        surface.state.sessions.register(
+            Session(
+                target=CODEX,
+                workspace=WORKSPACE,
+                first_seen=0.0,
+                state=SessionState.WAITING,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="Which base?",
+                    options=(
+                        Option(
+                            text="main",
+                            description="Merge into the default branch",
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        options = surface.ask(Action.STATUS).data["sessions"][0]["waiting_for"]["options"]
+
+        assert options == [
+            {
+                "text": "main",
+                "description": "Merge into the default branch",
+                "recommended": False,
+            }
+        ]
+
     def test_status_renders_the_whole_hub(self) -> None:
         surface = Surface()
         surface.register()

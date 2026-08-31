@@ -61,8 +61,10 @@ from datetime import datetime
 from typing import Any, Final
 
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import (
+    QUESTION_TOOL,
     is_pipeline_noise,
     is_visible,
+    question_in,
     visible_text,
 )
 from gpt_voicecoding.seams.agent import (
@@ -70,6 +72,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressEntry,
     ProgressOmission,
     ProgressRole,
+    WaitingFor,
 )
 
 #: What Claude Code writes a record's time as. Read with `fromisoformat`, which
@@ -112,6 +115,41 @@ def recent(
 
     kept, omission = capture.select(entries)
     return kept, omission, moved
+
+
+def recent_before_question(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    question: WaitingFor,
+    capture: ProgressCapture,
+) -> tuple[tuple[ProgressEntry, ...], ProgressOmission, datetime | None]:
+    """Progress at a question Stop: everything before its tool-call record (#151)."""
+    for index in range(len(records) - 1, -1, -1):
+        if _question_in(records[index]) == question:
+            return recent(records[:index], capture=capture)
+    return recent(records, capture=capture)
+
+
+def _question_in(record: Mapping[str, Any]) -> WaitingFor | None:
+    """The complete `AskUserQuestion` call held by this assistant record."""
+    if record.get("type") != "assistant":
+        return None
+    message = record.get("message")
+    if not isinstance(message, Mapping):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in reversed(content):
+        if (
+            isinstance(item, Mapping)
+            and item.get("type") == "tool_use"
+            and item.get("name") == QUESTION_TOOL
+        ):
+            found = question_in(item.get("input"))
+            if found is not None:
+                return found
+    return None
 
 
 def _entry(record: Mapping[str, Any]) -> ProgressEntry | None:

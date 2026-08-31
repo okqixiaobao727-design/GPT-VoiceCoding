@@ -83,6 +83,8 @@ PROVEN_AGAINST_VERSION = "2.1.251"
 # Session's reply came back as that turn, returning to `shell` at
 # t=1788152033.5. So a Relay delivered during `shell` is acted on as the next
 # turn, and `shell` reads OPEN.
+# A Stop at `shell` carries the same transcript-derived progress observation as
+# one at `idle`; the background task is status/activity, never synthetic speech.
 
 
 class RegistryError(Exception):

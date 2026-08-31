@@ -152,6 +152,16 @@ class TestTheRosterRow:
         assert daemon.deep == [THREAD]
         assert second.progress == first.progress
 
+    def test_a_stop_read_is_reused_by_the_matching_roster_observation(self) -> None:
+        daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
+        cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
+
+        stopped_progress = asyncio.run(cache.read_now(daemon, THREAD))
+        row = found(daemon, cache).rows[0]
+
+        assert daemon.deep == [THREAD]
+        assert row.progress == stopped_progress
+
     def test_a_thread_that_moved_is_read_again(self) -> None:
         daemon = TurnedDaemon({THREAD: stopped()}, {THREAD: once()})
         cache = TurnCache(progress_capture=PROGRESS_CAPTURE)
