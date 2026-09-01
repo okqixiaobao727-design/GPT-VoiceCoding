@@ -14,8 +14,10 @@
 | [0012](0012-installation-runs-at-first-launch.md) | Installation runs at first launch, from a package that needs no engine |
 | [0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md) | The Claude Answer Relay rides the Session's own inbox socket, and an accepted write is not a receipt — **amended by 0015** |
 | [0014](0014-question-answers-ride-the-approval-hook.md) | A question answer rides the Approval Relay as a typed verdict — **superseded by 0015** |
-| [0015](0015-a-held-question-opens-the-reply-window.md) | A held question opens the Reply Window and the Answer Relay selects its hook route |
+| [0015](0015-a-held-question-opens-the-reply-window.md) | A held question opens the Reply Window and the Answer Relay selects its hook route — **amended 2026-09-01**: the engine keeps no clock on a held hook |
 | [0016](0016-progress-publishes-a-roster-summary-or-exact-detail.md) | Progress publishes one observation as a roster summary or exact detail |
+| [0017](0017-a-missed-call-is-briefed-from-a-fresh-reading.md) | A missed call is briefed from a fresh reading, never from replayed events |
+| [0018](0018-one-dial-two-audiences.md) | One dial, two audiences: the Voice hears prose, the Call Agent hears its rules |
 
 0008 (headless direct-child launcher) and 0009 (a launch carries its Opening Instruction) were removed with the launcher when v1.0 became a bridge over Sessions the user starts ([#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67), [#68](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/68)); they return with the launch map, from git history.
 

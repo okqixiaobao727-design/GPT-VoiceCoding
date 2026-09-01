@@ -159,3 +159,46 @@ every status answer.
 **Cutting message text to fit** is rejected. A partial sentence changes what the Session
 said and can cut at a secret or structural boundary. The existing whole-or-omitted rule
 stands; what changes is that omission is represented honestly.
+
+## Amendment 2026-09-01: a third publication, the History page
+
+Source: [#171](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/171), under map [#164](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/164).
+
+The 0901 flow asks for history the user can page through by voice — "the last five,
+then the five before those". The exact `progress` publication above cannot answer it: it
+widens backwards from the newest entry until the Reply is full and has no way to say
+"the ones before that". Its byte ceiling had become the page.
+
+**There is still one canonical observation; it now has three publications.** The roster
+summary and the exact detail stand as decided. The third is the **History page**:
+
+- **Bounded by a count, not by bytes.** A page holds `history_page_entries` entries
+  (`[policy]`, default 5), both roles counted, newest first. The 65,536-byte Reply
+  limit remains a ceiling on the encoded line — an entry that would push the page past
+  it is published as *existing but omitted* (`ordinal`, `role`, `omission=oversize`, no
+  text) and still occupies its slot, so a page always advances and an oversize entry
+  never blocks the ones before it. Message text is never cut; the whole-or-omitted rule
+  stands.
+- **The cursor is the entry's ordinal in the Session's visible record**, counted from
+  the oldest entry, assigned by the lane at read time. Both sources are append-only
+  for the entries this seam keeps (a Claude transcript file; a Codex thread's turns),
+  so an ordinal names the same entry across reads while the Session lives. A page
+  carries each entry's ordinal and `older: bool`; the next request passes the smallest
+  ordinal it received as `before`.
+- **A separate read, never folded into the roster.** `inspect` keeps answering the
+  newest tail and folding into the roster; a History page is read by its own Agent-seam
+  verb and is not a roster fact. A Session the lane cannot read answers with the same
+  refusals the exact publication uses; a page past the oldest entry is empty with
+  `older=false`, which is an answer, not a refusal.
+
+The exact `progress` publication and action are **retired** by this amendment: the
+Session Brief carries the newest entry whole (#166), and the History page carries
+everything before it. `sessions` retires with it — the Roster Brief is that surface.
+Removing two actions and adding `brief` and `history` changes the Control Plane action
+set, so the protocol version moves again when this lands.
+
+**Legacy.** Legacy's `progress` was a fixed tail of 12 entries / 32 KB with a boolean
+`truncated` (`legacy@1d32845:config.plist:447-452`, `bridge/transcript.py:2841`) and no
+cursor of any kind; `overview` took no arguments (`bridge/daemon.py:1552`). **Legacy has
+no paging behaviour** — the count-bounded page and the ordinal cursor are new; the
+whole-entry rule and the exact one-Session read remain adapted as above.

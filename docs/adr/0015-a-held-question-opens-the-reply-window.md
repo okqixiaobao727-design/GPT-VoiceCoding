@@ -13,3 +13,30 @@ The question hold uses the configured `CorePolicy.approval_budget_seconds` as a 
 The option canonicalisation boundary stays inside the adapter: whitespace and case are normalised only to recognise an offered label, which is then sent with its canonical spelling; any other user text is preserved verbatim inside `The user answered from GPT-VoiceCoding: …`. The hook acknowledgement remains the only positive delivery proof.
 
 Legacy classification is per behaviour, as ruled by the Advisor for #128. Answering a Session's own question through a held hook, including the framed message, `approval_ack` receipt, and engine-minted correlator, is **new**: legacy had no approval transport and never answered a question remotely (`legacy@1d32845:bridge/daemon.py:1901-2052`). Refusing a Relay while its Reply Window is CLOSED is **ported** from `legacy@1d32845:bridge/coordinator.py:392,521-530`; opening that window only for an answerable question is **adapted** from the same boundary using #77's live measurement and the answerability qualification above. Stop Notice content keeps #75 and #77's existing port classification, with the terminal-versus-reply wording **adapted** from the same measurement. The parked-question ceiling reuses the Approval budget's existing classification rather than inventing another policy, while option-label canonicalisation is **new** because legacy has no such behaviour. Live Claude Code 2.1.248 measurements for #128 found that the on-screen question remains visible and keyboard-interactable while the hook is held, and that its question request supplies no usable `prompt_id`; no Claude version pin is introduced.
+
+## Amendment 2026-09-01: the engine keeps no clock on a held hook
+
+Source: [#172](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/172), under map [#164](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/164).
+
+This ADR gave a parked question a hold ceiling: `CorePolicy.approval_budget_seconds`, passed
+through `BridgeCore.tick` into `sweep_question_budget`, so the listener would pop an expired
+question and write `ask` before Claude Code's own hook timeout did the same. The Approval Relay's
+permission budget was the same number in a second place (`core/approvals.py`, `sweep_expired`),
+with a never-deny `ask` fallback and a closing notice on expiry.
+
+Both clocks are withdrawn. A held hook's life is bounded by the wire alone: Claude Code ends the
+hook at the timeout the installed block declares (`installation/claude_hooks.py`,
+`APPROVAL_TIMEOUT_SECONDS`), or when the human answers the dialog on screen — and the listener's
+per-connection task already watches for that end and releases the parked entry
+(`adapters/agent/claude/approval.py`, `_serve`). An engine-side timer was a second clock racing
+the first, which is the objection the hook process itself records for keeping no clock of its own.
+`approval_budget_seconds`, `sweep_question_budget` and `sweep_expired` are removed; nothing in
+`CorePolicy` names a hold duration. Codex never needed a ceiling: its dialog stays answerable from
+the TUI and the voice alike until one of them answers.
+
+What a release *does* is unchanged: the Reply Window closes, the roster row keeps WAITING, a late
+Answer Relay is refused. Only who decides *when* has moved to the wire. The one terminal-only notice
+Core issued on an engine-timed release goes with the timer: the next Session Brief reads the row
+without its handle and carries `answerable_here=false`, which is what the user is told when they ask.
+The never-deny rule survives as a wire fact — a hook that ends without a verdict is silence, and
+silence is the on-screen dialog's — not as engine policy.
