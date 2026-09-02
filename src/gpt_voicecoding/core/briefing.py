@@ -39,10 +39,12 @@ the caller writes `briefing.roster(...)`, which reads the same as `#166`'s
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+from typing import Final
 
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.seams.agent import (
@@ -332,16 +334,124 @@ def _turn_ended(session: Session) -> BriefState:
 
     On the Claude lane that is FINISHED: the turn is done and the Session is
     idle for a new instruction (#165 Q7), which is legacy's own sentence
-    (`legacy@1d32845:bridge/host.py:226-234`), **ported**.
+    (`legacy@1d32845:bridge/host.py:226-234`), **ported**. Its question is
+    structural — a tool call the adapter reads — so a Claude turn that ended
+    without one ended without one, and there is nothing here to guess.
 
-    On the Codex lane it is DECISION. Codex has no question hook, so a turn that
-    ended with a question of its own looks exactly like one that ended finished,
-    and Simon's ruling (#166 B2) is to brief the ambiguity as the answerable
-    state until the heuristic that tells them apart lands — #188, on the
-    evidence in #176. The lane is asked here rather than the answer being stored
-    on the row, because it is Briefing's reading and not the lane's observation.
+    On the Codex lane the default is DECISION (#166 B2), and a turn is promoted
+    out of it only on the evidence in `_asking`. The lane is asked here rather
+    than the answer being stored on the row, because it is Briefing's reading
+    and not the lane's observation.
     """
-    return BriefState.FINISHED if session.target.agent is AgentKind.CLAUDE else BriefState.DECISION
+    if session.target.agent is AgentKind.CLAUDE:
+        return BriefState.FINISHED
+    answer = _final_answer(session.progress)
+    if answer is None or _asking(answer):
+        return BriefState.DECISION
+    return BriefState.FINISHED
+
+
+# ----------------------------------------------------------------------
+# Did the Codex turn end on a question? (#188, on the evidence in #176.)
+# ----------------------------------------------------------------------
+
+#: Codex's own word for the message that ends a turn. `MessagePhase::FinalAnswer`
+#: is documented as "the assistant's terminal answer text for the current turn"
+#: (`codex-rs/protocol/src/models.rs:909-917`) and was byte-identical to
+#: `task_complete.last_agent_message` in 562 of 562 comparisons (#176 §2.1).
+#: Compared here and nowhere else: the tail readers carry the word, this module
+#: is what it means anything to.
+FINAL_ANSWER: Final = "final_answer"
+
+#: What the user was shown, once what they were not is taken out: a fenced code
+#: block, an inline code span, and the target half of a markdown link (the label
+#: is kept, because the label is words they read). Measured: stripping code
+#: spans alone removes the one false positive a raw match makes, a `done` answer
+#: containing the literal `?? uv.lock` inside backticks (#176 §5, A → B).
+_FENCED: Final = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_CODE_SPAN: Final = re.compile(r"`+[^`]*`+")
+#: One level of balanced parentheses inside the target, because a URL may hold
+#: a pair — `…/path_(part)?run=7` — and a target cut at the first `)` leaves its
+#: query string standing in the prose, where `?` reads as an ask.
+_LINK: Final = re.compile(r"\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)")
+_AUTOLINK: Final = re.compile(r"<[a-z][a-z0-9+.-]*:[^>\s]*>", re.IGNORECASE)
+
+#: An interrogative in either width. The corpus is 98% Chinese, so `？` is not a
+#: rare spelling here; the English behaviour of this rule is **uncertain**
+#: (#176 §1.2) and errs toward DECISION, which is the cheap direction.
+_ASKS: Final = re.compile(r"[?？]")
+
+#: A labelled menu, which asks even when no interrogative survives: a line whose
+#: first word is `A`, `B` or `C` against a separator, or a named `选项 X` /
+#: `方案 X` anywhere. **No numeric-list clause, deliberately** — Codex is told to
+#: number its suggestions (`codex-rs/core/gpt_5_codex_prompt.md:47`), and it also
+#: numbers the findings of a review, which is the most common *done* shape in
+#: this corpus (#176 §3, §5). A comma is not a separator, so English prose
+#: reading "A, B and C" is not a menu.
+_OPTION_BLOCK: Final = re.compile(
+    r"^[ \t]*(?:[-*+>]\s*)?\**[ABC]\**[ \t]*[)\]】.。:：、\-—–【《]",
+    re.MULTILINE,
+)
+_NAMED_OPTION: Final = re.compile(r"(?:选项|方案)\s*[A-Za-z\d一二三四五六七八九十]")
+
+
+def _final_answer(progress: ProgressObservation) -> str | None:
+    """The newest message the source marked as this turn's answer, if it did.
+
+    **The search stops at the turn it is about.** A progress tail holds several
+    turns, and the newest thing the user said is where the newest one began — so
+    an answer found behind that is the *previous* turn's, and reading it would
+    brief a turn that is still working, or one that has produced only
+    commentary, on words it never said. `ProgressEntry` carries no `turn_id`
+    (legacy's, dropped), and the boundary is in the tail already, as the entry
+    the user put there.
+
+    **One turn opener leaves no entry, and this reads past it.** A `userMessage`
+    carrying only an image says nothing, so the Codex tail reader yields nothing
+    for it (`adapters/agent/codex/thread_tail.py::_entry`, and the seam refuses
+    an entry with no words in it) — a turn opened by an image alone that has
+    produced only commentary therefore reaches the *previous* turn's answer and
+    is briefed FINISHED. Carrying the boundary regardless of what the message
+    held needs a turn field on `ProgressEntry`, which is a widening #188 may not
+    make — `phase` is its one structural adapter change — and inventing words
+    for a wordless message is not the alternative. Left as it stands, and
+    opened as #210.
+
+    Nothing is classified without an answer, and every way of not having one
+    stays DECISION: a build old enough to mark no `phase`, a turn that has said
+    nothing yet, and a turn whose only message so far is `commentary`. A
+    `commentary` newest with this turn's answer behind it is not one of them —
+    the answer is what is classified (3 of 669 turns, #176 §2.1) — and reading
+    the commentary instead would manufacture a decision out of the mid-turn
+    question Codex's own prompt permits there.
+    """
+    for entry in reversed(progress.recent):
+        if entry.role is ProgressRole.USER:
+            return None
+        if entry.phase == FINAL_ANSWER:
+            return entry.text
+    return None
+
+
+def _asking(answer: str) -> bool:
+    """Whether a final answer shows the user is being asked something.
+
+    #176 §5's heuristic C, measured at 86% recall and a 2% false-positive rate
+    over 72 hand-labelled finals. It is a **promotion gate**, not a classifier:
+    FINISHED is claimed only when this is false, so every shape it cannot read
+    keeps #166 B2's default. The tuned phrase list that scored higher on the
+    same sample is **not adopted** — it was fitted after reading that sample's
+    misses, and its number is not an estimate of anything (#176 §5, D).
+
+    Legacy classified nothing here: `legacy@1d32845:bridge/transcript.py:431-454`
+    returned `pending_question=None` for every Codex stop, on the ground that
+    "reporting nothing is the honest answer". **Dropped, because** #166 B2
+    reversed the default to DECISION, so the choice is no longer between
+    guessing and silence but between always claiming a decision and promoting
+    out of one on evidence.
+    """
+    prose = _AUTOLINK.sub(" ", _CODE_SPAN.sub(" ", _LINK.sub(r"\1", _FENCED.sub(" ", answer))))
+    return bool(_ASKS.search(prose) or _OPTION_BLOCK.search(prose) or _NAMED_OPTION.search(prose))
 
 
 def _newest(progress: ProgressObservation) -> Newest:

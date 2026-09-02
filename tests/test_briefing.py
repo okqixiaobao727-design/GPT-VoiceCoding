@@ -128,8 +128,8 @@ class TestTheFiveStates:
         )
         assert brief.state is BriefState.UNREADABLE
 
-    def test_a_codex_turn_end_is_a_decision_until_the_finished_heuristic(self) -> None:
-        """#166 B2: DECISION by default; #188 adds the promotion to FINISHED."""
+    def test_a_codex_turn_end_whose_answer_carries_no_phase_is_a_decision(self) -> None:
+        """#166 B2's default, and #188's fallback: no `phase`, no promotion."""
         assert briefing.session(row(CODEX)).state is BriefState.DECISION
 
     def test_an_exited_session_never_appears_in_a_roster_brief(self) -> None:
@@ -137,6 +137,172 @@ class TestTheFiveStates:
         brief = briefing.roster((ended,), focus=None)
         assert brief.rows == ()
         assert sum(brief.counts.values()) == 0
+
+
+FINAL_ANSWER = "final_answer"
+COMMENTARY = "commentary"
+
+
+def codex_said(*said: tuple[str, str | None]) -> ProgressObservation:
+    """A Codex reading: what the agent said, each with the `phase` it carried."""
+    return ProgressObservation.readable(
+        has_history=True,
+        read_at=READ_AT,
+        recent=tuple(
+            ProgressEntry(role=ProgressRole.ASSISTANT, text=text, phase=phase)
+            for text, phase in said
+        ),
+    )
+
+
+def told(text: str) -> ProgressEntry:
+    """What the Session was told — and, in a tail, where a turn begins."""
+    return ProgressEntry(role=ProgressRole.USER, text=text)
+
+
+def codex_tail(*entries: ProgressEntry) -> ProgressObservation:
+    """A reading of both sides, in the order they happened."""
+    return ProgressObservation.readable(has_history=True, read_at=READ_AT, recent=entries)
+
+
+def answer(text: str, phase: str | None = FINAL_ANSWER) -> ProgressEntry:
+    return ProgressEntry(role=ProgressRole.ASSISTANT, text=text, phase=phase)
+
+
+def codex_state(*said: tuple[str, str | None]) -> BriefState:
+    return briefing.session(row(CODEX, progress=codex_said(*said))).state
+
+
+def answered(text: str) -> BriefState:
+    return codex_state((text, FINAL_ANSWER))
+
+
+class TestACodexTurnThatAskedNothing:
+    """#188: FINISHED only when the final answer shows no sign of an ask.
+
+    A promotion gate, not a classifier: the default stays #166 B2's DECISION and
+    evidence is required to leave it, so every uncertain shape below stays a
+    decision. The rule and its measurements are #176
+    (`docs/research/2026-09-01-codex-turn-end-classification.md` §5).
+    """
+
+    def test_a_final_answer_that_reports_a_result_is_finished(self) -> None:
+        assert answered("已完成并提交 1a15cb0，工作树干净。") is BriefState.FINISHED
+
+    def test_a_final_answer_that_asks_is_a_decision(self) -> None:
+        assert answered("我建议按方案处理。同意吗?") is BriefState.DECISION
+
+    def test_a_full_width_question_mark_asks_too(self) -> None:
+        """The corpus is 98% Chinese, so `？` is the common spelling of an ask."""
+        assert answered("你是否拍板按上述方案处理 #140 和 #141？") is BriefState.DECISION
+
+    def test_a_question_mark_the_user_never_saw_as_one_does_not_ask(self) -> None:
+        """A fenced block is machinery being shown, not a question being put."""
+        said = "已完成。\n\n```sh\ngit status --short   # 是否还有残留?\n```\n"
+        assert answered(said) is BriefState.FINISHED
+
+    def test_a_question_mark_inside_an_inline_code_span_does_not_ask(self) -> None:
+        """The measured false positive `A → B` removes: a literal `??`."""
+        assert answered("`git status --short` 仅显示 `?? uv.lock`。") is BriefState.FINISHED
+
+    def test_a_question_mark_in_a_link_target_does_not_ask(self) -> None:
+        """The target is an address; only the label is words the user read."""
+        said = "已完成，见 [运行记录](https://ci.example/runs?id=7)。"
+        assert answered(said) is BriefState.FINISHED
+
+    def test_a_labelled_option_block_asks_without_a_question_mark(self) -> None:
+        """`B → C`: a menu is an ask even when the interrogative is missing."""
+        said = "两条路:\n\nA) 保留当前实现\nB) 换成统一观察器\nC) 全部回退\n"
+        assert codex_state((said, FINAL_ANSWER)) is BriefState.DECISION
+
+    def test_a_named_option_asks(self) -> None:
+        assert answered("➡️ 我建议采用方案 B。") is BriefState.DECISION
+        assert answered("选项 A 最省事。") is BriefState.DECISION
+
+    def test_a_numbered_list_is_not_a_menu(self) -> None:
+        """No numeric clause, deliberately: numbered lists are how findings are
+        enumerated, which is the most common *done* shape in the corpus
+        (`codex-rs/core/gpt_5_codex_prompt.md:47`, #176 §3)."""
+        said = "未发现 Spec findings。\n\n1. 读了票\n2. 读了 diff\n3. 跑了测试\n"
+        assert codex_state((said, FINAL_ANSWER)) is BriefState.FINISHED
+
+    def test_the_answer_is_classified_even_when_commentary_came_after_it(self) -> None:
+        """3 of 669 turns end on commentary; the answer before it is the answer."""
+        assert (
+            codex_state(("同意吗？", FINAL_ANSWER), ("正在收尾…", COMMENTARY))
+            is BriefState.DECISION
+        )
+        assert (
+            codex_state(("已完成。", FINAL_ANSWER), ("正在收尾…", COMMENTARY))
+            is BriefState.FINISHED
+        )
+
+    def test_commentary_alone_is_never_promoted(self) -> None:
+        """A non-blocking mid-turn question is not the turn's answer, and a turn
+        with no answer at all is not evidence that it finished."""
+        assert codex_state(("先看一下目录。", COMMENTARY)) is BriefState.DECISION
+
+    def test_the_answer_to_an_earlier_turn_is_not_this_turn_s_answer(self) -> None:
+        """The tail carries several turns, and only this one ended (or did not).
+
+        Without the boundary a turn still working — or one that produced only
+        commentary — would be briefed FINISHED on the *previous* turn's answer,
+        which is the ticket's "no final answer → DECISION" turned inside out.
+        """
+        working = codex_tail(
+            told("do the first thing"),
+            answer("已完成第一件事。"),
+            told("now do the second"),
+            answer("先看一下目录。", COMMENTARY),
+        )
+        assert briefing.session(row(CODEX, progress=working)).state is BriefState.DECISION
+
+    def test_a_turn_that_has_said_nothing_yet_is_not_the_turn_before_it(self) -> None:
+        silent = codex_tail(told("do the thing"), answer("已完成。"), told("now do the next"))
+        assert briefing.session(row(CODEX, progress=silent)).state is BriefState.DECISION
+
+    def test_this_turn_s_answer_is_read_across_the_boundary_behind_it(self) -> None:
+        """The boundary stops the search; it does not stop this turn being read."""
+        done = codex_tail(
+            told("do the first thing"),
+            answer("同意吗？"),
+            told("now do the second"),
+            answer("已完成第二件事。"),
+        )
+        assert briefing.session(row(CODEX, progress=done)).state is BriefState.FINISHED
+
+    def test_a_link_target_that_holds_brackets_is_still_a_target(self) -> None:
+        """A URL may carry balanced parentheses, and cutting at the first one
+        leaves the query string in the prose (`?run=7` reads as an ask)."""
+        said = "已完成，见 [运行记录](https://ci.example/path_(part)?run=7)。"
+        assert answered(said) is BriefState.FINISHED
+
+    def test_a_phase_this_build_cannot_read_is_not_an_answer(self) -> None:
+        assert codex_state(("已完成。", "somethingNewIn0152")) is BriefState.DECISION
+
+    def test_a_session_nobody_read_stays_a_decision(self) -> None:
+        assert (
+            briefing.session(row(CODEX, progress=ProgressObservation())).state
+            is BriefState.DECISION
+        )
+
+    def test_the_claude_lane_is_untouched(self) -> None:
+        """Claude's question is structural, so its turn end is FINISHED whatever
+        the words were (`legacy@1d32845:bridge/host.py:226-234`)."""
+        finished = briefing.session(row(CLAUDE, progress=codex_said(("同意吗？", FINAL_ANSWER))))
+        assert finished.state is BriefState.FINISHED
+
+    def test_a_promotion_never_outranks_a_question_the_lane_reported(self) -> None:
+        """The heuristic reads a turn that stopped on nothing; a typed wait wins."""
+        brief = briefing.session(
+            row(
+                CODEX,
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=codex_said(("已完成。", FINAL_ANSWER)),
+            )
+        )
+        assert brief.state is BriefState.DECISION
 
 
 class TestWhatADecisionCarries:

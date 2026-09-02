@@ -91,6 +91,8 @@ import live_call
 import support
 from support import LaneBlocked, StepFailed
 
+from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
+
 if TYPE_CHECKING:
     # Named for a type and never imported at runtime: telethon lives behind this
     # module (`telegram_person.py`, "Telethon lives here and nowhere else"), and
@@ -407,6 +409,19 @@ ACKNOWLEDGE = Instruction(
     words="Reply with the single word READY. Do not use any tools, and do not ask anything."
 )
 
+#: The second turn `progress` drives, on the lane that has two turn endings to
+#: tell apart (`Lane.asking`). Words only, for `ACKNOWLEDGE`'s reasons — it must
+#: raise no permission — and the words it asks for are dictated rather than
+#: described, because what this turn has to produce is a *final answer* the
+#: promotion gate can read (#188): one interrogative, and no menu or code around
+#: it that would make the reading rest on something other than the question.
+ASK_A_QUESTION = Instruction(
+    words=(
+        "Reply with exactly this one line and nothing else: Should I continue? "
+        "Do not use any tools."
+    )
+)
+
 #: Turn 2 — arrives by Relay and raises a permission on the way. The file and the
 #: word are one shape for both lanes; **where** it is written is the lane's, and
 #: that is what `Lane.relayed` holds. One instruction for both lanes is what left
@@ -554,6 +569,15 @@ class Lane:
     #: The fresh authority dialog `switches` leaves pending while Duty is off:
     #: a permission on both lanes.
     actionable: Callable[[Path], Instruction]
+    #: A turn whose final answer asks the user something, on the lane where that
+    #: changes the state the user is told — or None where it changes nothing.
+    #: #188 promotes a Codex turn end out of DECISION only when its final answer
+    #: shows no sign of an ask, so the Codex lane has two turn endings to measure
+    #: and `progress` measures both. The Claude lane carries none on purpose: its
+    #: question is a tool call the adapter reads, so a Claude turn that merely
+    #: *says* something interrogative is finished and driving one here would cost
+    #: a turn to measure nothing.
+    asking: Instruction | None
     #: #128's extra acceptance route. Claude carries it; Codex explicitly
     #: records the unsupported route without grading it.
     question: Callable[[Path], Instruction] | None
@@ -612,6 +636,7 @@ CLAUDE = Lane(
     boot=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
     actionable=lambda workspace: writing(SWITCH_FILE, SWITCH_WORD),
+    asking=None,
     question=asking_the_claude_question,
     question_answer=CLAUDE_ANSWER,
     # The flag the harness passes *is* the whole policy on this lane, and Claude
@@ -695,6 +720,7 @@ CODEX = Lane(
     actionable=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / SWITCH_FILE, SWITCH_WORD
     ),
+    asking=ASK_A_QUESTION,
     question=None,
     question_answer=None,
     policy_at=lambda record: hand_started.codex_turn_policy(record),
@@ -1331,11 +1357,72 @@ class Walk:
                 f"entries `bridgectl progress {self.address}` read ({said[:200]!r}) — two "
                 f"readings of one Session that disagree"
             )
+        # #188: what the turn end is *called*. This one is `stable name`'s turn,
+        # which asked nothing (`ACKNOWLEDGE`), so both lanes owe FINISHED here —
+        # Claude because its question is structural and there was none, Codex
+        # because the promotion gate found no sign of an ask in its final answer.
+        finished = STATE_WORDING[BriefState.FINISHED]
+        called = self._briefed_state(brief.text)
+        if called != finished:
+            raise StepFailed(
+                f"`bridgectl brief {self.address}` calls the Session {called!r} after a turn "
+                f"that asked nothing, where #188 requires {finished!r}: {brief.text[:300]!r}"
+            )
+        asked = self._brief_a_turn_that_ends_on_a_question()
         return (
             f"exact progress read without a turn, roster summary retained its facts, and "
             f"the Session Brief carried the newest message whole: {newest[:120]!r}; "
-            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}"
+            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}; "
+            f"turn end called {called!r}, and {asked}"
         )
+
+    def _brief_a_turn_that_ends_on_a_question(self) -> str:
+        """Drive a turn that ends on a question, and read what the brief calls it.
+
+        The other half of #188's rule, measured live rather than in the fast
+        suite because what is under test is the whole route: codex marks its own
+        final answer `final_answer`, the tail reader carries that phase through,
+        and Briefing reads the words behind it. Nothing short of a real turn
+        against a real daemon produces the phase, and the fast suite hands it to
+        Briefing already made.
+
+        A lane with one turn ending drives nothing and says so — see
+        `Lane.asking` for why the Claude lane is that lane.
+        """
+        if self.lane.asking is None or self.address is None:
+            return "this lane has one turn ending, so there is nothing else to call"
+        turn = self._drive_turn("ask a question", self.lane.asking)
+        if not turn.ended:
+            raise StepFailed(
+                f"the turn that had to end on a question never ended within "
+                f"{self.far_side.agent_turn_seconds:.0f}s, so there is no turn end to brief"
+            )
+        brief = self.bridgectl("brief", self.address)
+        if not brief.ok:
+            raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
+        decision = STATE_WORDING[BriefState.DECISION]
+        called = self._briefed_state(brief.text)
+        if called != decision:
+            raise StepFailed(
+                f"the Session ended a turn on a question and `bridgectl brief "
+                f"{self.address}` calls it {called!r}, where #188 requires {decision!r}. "
+                f"The brief reads {brief.text[:300]!r}"
+            )
+        return f"a turn ending on a question is called {called!r} ({turn.seconds:.1f}s turn)"
+
+    @staticmethod
+    def _briefed_state(brief: str) -> str:
+        """The state word off a Session Brief, read where Briefing writes it.
+
+        `<name> — <address> — <state>` is the header line
+        (`core/briefing.py::_headline`), so the state is what follows the last
+        separator of the first line. Taken from that one position rather than
+        searched for anywhere in the text, because every state word also appears
+        inside the message a brief carries, and a step that went looking would
+        pass on the Session quoting itself.
+        """
+        lines = brief.splitlines()
+        return lines[0].rsplit(" — ", 1)[-1].strip() if lines else ""
 
     # --- stop notice ------------------------------------------------------
 

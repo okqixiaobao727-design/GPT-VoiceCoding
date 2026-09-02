@@ -26,9 +26,18 @@ MEASURED_SECONDS = 1787712279
 MEASURED = datetime(2026, 8, 26, 2, 44, 39, tzinfo=UTC)
 
 
-def spoke(text: str) -> dict[str, Any]:
-    """An `agentMessage`, as the daemon writes it."""
-    return {"type": "agentMessage", "id": "msg_0e4f", "text": text}
+def spoke(text: str, *, phase: str | None = None) -> dict[str, Any]:
+    """An `agentMessage`, as the daemon writes it.
+
+    `phase` is optional here because it is optional on the wire: the item is
+    `{ id, text, phase: Option<MessagePhase>, ... }`
+    (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`), and a
+    build old enough to omit it is the case #188 briefs as a decision.
+    """
+    item: dict[str, Any] = {"type": "agentMessage", "id": "msg_0e4f", "text": text}
+    if phase is not None:
+        item["phase"] = phase
+    return item
 
 
 def told(text: str) -> dict[str, Any]:
@@ -107,6 +116,46 @@ class TestWhatCountsAsProgress:
     def test_a_turn_still_running_contributes_what_it_has(self) -> None:
         """`turn_status` is dropped, so an in-progress turn is not a special case."""
         assert texts(thread(turn(spoke("halfway"), status="inProgress"))) == ["halfway"]
+
+    def test_which_message_is_the_answer_is_carried_through(self) -> None:
+        """#188: the reader carries `phase`; classifying it is Briefing's job."""
+        document = thread(
+            turn(
+                told("do the thing"),
+                spoke("looking at it now", phase="commentary"),
+                spoke("done", phase="final_answer"),
+            )
+        )
+
+        entries, _ = recent(document, capture=PROGRESS_CAPTURE)
+
+        assert [(entry.text, entry.phase) for entry in entries] == [
+            ("do the thing", None),
+            ("looking at it now", "commentary"),
+            ("done", "final_answer"),
+        ]
+
+    def test_a_build_that_names_no_phase_carries_none(self) -> None:
+        """`phase` is `Option<MessagePhase>` on the wire, and absent is a value."""
+        entries, _ = recent(thread(turn(spoke("done"))), capture=PROGRESS_CAPTURE)
+
+        assert [entry.phase for entry in entries] == [None]
+
+    def test_a_phase_this_build_has_never_seen_is_carried_verbatim(self) -> None:
+        """Not an enum at the seam: an unknown phase reads as "not the answer"."""
+        entries, _ = recent(
+            thread(turn(spoke("done", phase="somethingNewIn0152"))), capture=PROGRESS_CAPTURE
+        )
+
+        assert [entry.phase for entry in entries] == ["somethingNewIn0152"]
+
+    def test_a_phase_that_is_not_a_string_is_no_phase(self) -> None:
+        item = spoke("done")
+        item["phase"] = 7
+
+        entries, _ = recent(thread(turn(item)), capture=PROGRESS_CAPTURE)
+
+        assert [entry.phase for entry in entries] == [None]
 
     def test_the_bound_is_the_shared_one(self) -> None:
         """One bound, one type, whichever lane the row came from."""

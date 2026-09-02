@@ -27,7 +27,11 @@ Claude side (`bridge/transcript.py:1568-1580`), applied to both lanes.
 1516-1520`), because no v1.0 consumer reads them — the Live Call, the Companion
 Channel and the Control Panel ask what a Session last said and what it was last
 told, never which turn that was — and `ProgressEntry` can gain a field later
-without `ProgressObservation` widening twice.
+without `ProgressObservation` widening twice. #188 is that later: an
+`agentMessage`'s `phase` is carried through, because it is the record's own
+answer to *which message was the turn's answer* and nothing else here can
+reconstruct it. It is carried and never read — whether an answer reads as an
+ask is Briefing's reading, not this reader's observation.
 
 **Times are epoch seconds, measured not assumed.** `thread/read` on codex
 0.149.1 answers `updatedAt`, `recencyAt` and `createdAt` as integers —
@@ -61,6 +65,13 @@ USER_ITEM: Final = "userMessage"
 #: Which parts of a user message are words. `image` and `localImage` are the
 #: other two shapes a `userMessage` carries and neither has any to contribute.
 USER_TEXT: Final = "text"
+
+#: Which part of the turn one `agentMessage` was, as codex spells it —
+#: `commentary` or `final_answer`
+#: (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`). Carried
+#: verbatim and never compared here: what a phase means to a reader is
+#: Briefing's (#188), and this module's job is to lose nothing on the way.
+PHASE: Final = "phase"
 
 #: When the thread was last touched, as codex spells it.
 UPDATED_AT: Final = "updatedAt"
@@ -119,7 +130,12 @@ def _entry(item: Any) -> ProgressEntry | None:
     kind = item.get("type")
     if kind == AGENT_ITEM:
         text = item.get("text")
-        return _said(ProgressRole.ASSISTANT, text if isinstance(text, str) else "")
+        phase = item.get(PHASE)
+        return _said(
+            ProgressRole.ASSISTANT,
+            text if isinstance(text, str) else "",
+            phase=phase if isinstance(phase, str) else None,
+        )
     if kind == USER_ITEM:
         return _said(ProgressRole.USER, _user_text(item.get("content")))
     return None
@@ -139,5 +155,5 @@ def _user_text(content: Any) -> str:
     return "".join(part for part in parts if part)
 
 
-def _said(role: ProgressRole, text: str) -> ProgressEntry | None:
-    return ProgressEntry(role=role, text=text) if text.strip() else None
+def _said(role: ProgressRole, text: str, *, phase: str | None = None) -> ProgressEntry | None:
+    return ProgressEntry(role=role, text=text, phase=phase) if text.strip() else None
