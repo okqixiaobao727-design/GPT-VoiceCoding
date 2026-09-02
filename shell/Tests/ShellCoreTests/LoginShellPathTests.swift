@@ -230,16 +230,19 @@ import Testing
         // The `sleep 0.01` in the writer's loop is load-bearing, and removing it
         // to make the job "noisier" is the way to break this test without any
         // assertion changing. An unpaced `while :; do printf x; done` fills the
-        // reader's 64 KB `drainCap` (`LoginShellPath.drainCap`, and `keep`
-        // returning false in `drainPending`) in under two seconds, and the reader
-        // then ends *itself* — measured on this machine at 1.571 s with the
-        // stop-check defect reintroduced and 1.898 s with the reader made to wait
-        // for EOF, both comfortably inside any bound that clears this suite's
-        // jitter. Paced at a byte every 10 ms, twelve seconds of writing is a
-        // little over a kilobyte, the cap is unreachable, and the deadline is the
-        // only thing that can end this call — which is what makes the bound below
-        // mean something. The always-ready-poll defect the paragraph above
-        // describes is guarded by `drainCap` rather than by this fixture.
+        // reader's 1 MB `LoginShellPath.collectionCap` — `keep` returning false —
+        // in about a second and a half, and the reader then ends *itself*:
+        // measured on this machine at 1.571 s with the stop-check defect
+        // reintroduced and 1.898 s with the reader made to wait for EOF, both
+        // comfortably inside any bound that clears this suite's jitter. (The
+        // 64 KB `drainCap` is not what ends it — `/bin/sh` writing single bytes
+        // reaches 64 KB in 0.09 s here and 1 MB in 1.42 s, and 1.42 s is the
+        // number that matches.) Paced at a byte every 10 ms, twelve seconds of
+        // writing is a little over a kilobyte, the cap is unreachable, and the
+        // deadline is the only thing that can end this call — which is what makes
+        // the bound below mean something. The always-ready-poll defect the
+        // paragraph above describes is proved by
+        // `aReaderWhosePollIsNeverEmptyStillLeavesWhenAsked`, not by this fixture.
         let noisy = try fakeShell(
             #"(while :; do printf x; sleep 0.01; done) & printf '%s' "$MARK/opt/bin:/usr/bin$MARK""#
         )
@@ -260,6 +263,51 @@ import Testing
         // waited for one spends the whole 12 s and this bound catches it —
         // measured at 12.017 s with the reader temporarily made to wait for EOF.
         #expect(elapsed < 4.0, "took \(elapsed)s of a \(budget)s budget")
+    }
+
+    @Test func aReaderWhosePollIsNeverEmptyStillLeavesWhenAsked() throws {
+        // The stop check sits at the *top* of the reader's loop, and this is the
+        // only test that says so. The version before it checked the flag when the
+        // poll came back empty, which for a job writing without pause is never:
+        // the poll is ready every time round, the read always succeeds, and the
+        // reader stays until something else ends it.
+        //
+        // Asked through the reader rather than through `readFromLoginShell`,
+        // because that path can only be watched with a clock, and a clock here
+        // measures the other seventeen suites. The two assertions below are what
+        // the stop check means, with no elapsed time in either: the reader left,
+        // and it left with a handful of bytes rather than the megabyte the defect
+        // would have taken. Under the defect the first still succeeds — the
+        // reader ends itself once `collectionCap` is reached, in about 1.4 s here
+        // — and the second is what fails, so this cannot pass by hanging either.
+        let pipe = Pipe()
+        let writer = Process()
+        writer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        writer.arguments = ["-c", "while :; do printf x; done"]
+        writer.standardOutput = pipe.fileHandleForWriting
+        try writer.run()
+        defer {
+            // Killed here rather than left to a `SIGPIPE`: this one is a direct
+            // child, so unlike the fixtures above there is a pid to signal, and a
+            // writer spinning a core through the rest of the suite is exactly the
+            // load these timing tests are trying not to have.
+            writer.terminate()
+            writer.waitUntilExit()
+            try? pipe.fileHandleForWriting.close()
+        }
+
+        let reader = PipeReader(duplicating: pipe.fileHandleForReading.fileDescriptor)
+        reader.stop()
+
+        // Five seconds is a liveness window and not a bound: the reader leaves
+        // within one `readerStopCheckInterval` of being asked, and the number is
+        // this large so that a busy machine cannot make a passing run look like a
+        // wedged one.
+        #expect(reader.awaitEnd(5.0))
+        // One pipe buffer of what was already written, plus at most `drainCap`
+        // taken on the way out — a quarter of `collectionCap` is far above both
+        // and far below the megabyte a reader that never saw the stop collects.
+        #expect(reader.data.count < LoginShellPath.collectionCap / 4)
     }
 
     @Test func aReaderThatNeverRanIsReportedRatherThanCalledSilence() {

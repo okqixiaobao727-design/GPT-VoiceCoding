@@ -580,7 +580,11 @@ protocol DrainedPipe {
 /// `read(2)` rather than `FileHandle.availableData` throughout: the latter
 /// answers an unreadable descriptor by raising, and a raised `NSException` here
 /// would take the app down over somebody's `ssh-agent`.
-private final class PipeReader: DrainedPipe, @unchecked Sendable {
+/// Internal rather than private only so `LoginShellPathTests` can construct one
+/// over a pipe it owns: the stop-check at the top of the loop below is what
+/// `aReaderWhosePollIsNeverEmptyStillLeavesWhenAsked` proves, and no public path
+/// can stage an always-ready pipe without measuring a clock instead (#205).
+final class PipeReader: DrainedPipe, @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var collected = Data()
     private var stopping = false
