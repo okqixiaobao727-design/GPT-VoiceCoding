@@ -81,6 +81,7 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     ApprovalListener,
 )
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
+    AddressHeld,
     publish_address,
     withdraw_address,
 )
@@ -260,6 +261,11 @@ class ClaudeAgentAdapter:
         #: Sessions whose hook never ran. This is the two things that command
         #: does not carry — the inbox socket, and the transcript path (#71).
         self._reported: dict[SessionTarget, SessionReport] = {}
+        #: The peer engine holding the published approval address, if `connect`
+        #: found one (#202). `None` is both "this engine holds it" and "connect
+        #: has not run", which is the same thing to every reader: there is no
+        #: peer to name.
+        self._address_held_by: Path | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -287,6 +293,13 @@ class ClaudeAgentAdapter:
         # timeout, which is worse than the silence of publishing nothing.
         try:
             published = publish_address(self.approval_socket_path(), self._settings)
+        except AddressHeld as held:
+            # First live engine wins (#202). The address is one file per user per
+            # machine and the hook can read no other, so displacing a peer that
+            # is still answering would silently move every permission dialog on
+            # this machine onto this engine.
+            self._address_held_by = held.holder
+            _log.warning("no Approval Relay this run: %s", held)
         except OSError as refused:
             _log.warning("the approval address could not be published: %s", refused)
         else:
@@ -323,7 +336,7 @@ class ClaudeAgentAdapter:
         # And the address goes with it. A published address nobody answers is a
         # dial into nothing, paid by every permission dialog in this config
         # directory until something else publishes over it.
-        withdraw_address()
+        withdraw_address(self.approval_socket_path())
         for replies in self._replies.values():
             await replies.aclose()
         self._replies.clear()
@@ -831,6 +844,45 @@ class ClaudeAgentAdapter:
         return None
 
     async def verify(self) -> VerifyResult:
+        """Report what is installed and loaded, and any route a peer engine holds.
+
+        The outcome is the routes' own answer and the refusal never changes it
+        (#202): an engine that stood down from the approval address is loaded,
+        configured and reaching Sessions on its other route, which is degraded
+        rather than the unreachable far side ADR 0003's #159 amendment fails.
+        What the refusal does is get *named*, here as well as in the log, because
+        ADR 0003 makes this report the authority on what the engine actually
+        loaded — and "no Approval Relay, because that engine over there has it"
+        is exactly the kind of thing configuration cannot tell an operator.
+        """
+        result = await self._verify_routes()
+        if self._address_held_by is None:
+            return result
+        held = (
+            f"the Claude approval address is held by another engine listening at "
+            f"{self._address_held_by}, so this engine runs without the Approval Relay"
+        )
+        if result.outcome is VerifyOutcome.PASS and not self._inboxes:
+            # Both Claude routes read the one published address — the
+            # `PermissionRequest` hook (`approval_hook.py`) and the `SessionStart`
+            # registration hook (`registration.py`) — so a refused engine is not
+            # merely missing approvals: no Session can register with it either.
+            # This one branch would otherwise report PASS, "no Claude Session is
+            # registered, so there is no inbox to reach", which is the guard that
+            # says nothing while the route is dead that ADR 0003 exists to
+            # prevent. **Only** this one: every other answer is a reason of its
+            # own — a missing hook block, a registry outside the config directory,
+            # an inbox that stopped answering — and replacing those with the
+            # refusal would hide a real failure behind it.
+            return VerifyResult(
+                outcome=VerifyOutcome.FAIL,
+                loaded=result.loaded,
+                detail=f"{held}, and no Claude Session can register with an engine holding no "
+                f"address, which is why its roster is empty",
+            )
+        return replace(result, detail=f"{held}; {result.detail}" if result.detail else held)
+
+    async def _verify_routes(self) -> VerifyResult:
         """Report what is installed and loaded, then whether an inbox answers.
 
         Ask Installation first, dial second. A missing hook block explains why

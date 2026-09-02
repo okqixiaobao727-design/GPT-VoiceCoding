@@ -40,10 +40,13 @@ one ([#93](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/93)).
 
 from __future__ import annotations
 
+import itertools
 import os
+import shutil
 import socket
 import stat
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import pytest
 
@@ -150,3 +153,20 @@ def mode_at_bind(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, int]]:
 @pytest.fixture
 def launchd() -> FakeLaunchd:
     return FakeLaunchd()
+
+
+_socket_roots = itertools.count()
+
+
+@pytest.fixture
+def socket_root() -> Iterator[Path]:
+    """A short private root for sockets that are really bound and really dialled.
+
+    Darwin caps an ``AF_UNIX`` path at 103 bytes, so these cannot live under
+    pytest's ``tmp_path``. Held here rather than in each module because the limit
+    is a fact about the platform, and two copies of it drift.
+    """
+    root = Path("/tmp") / f"vc-sockets-{os.getpid()}-{next(_socket_roots)}"
+    root.mkdir(mode=0o700)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)

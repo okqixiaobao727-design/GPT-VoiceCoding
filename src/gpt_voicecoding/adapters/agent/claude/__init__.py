@@ -35,6 +35,7 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
 )
 from gpt_voicecoding.adapters.agent.claude.bootstrap import (
     CHANNEL_CONFIG_VARIABLE,
+    AddressHeld,
     BootstrapError,
     publish_address,
     withdraw_address,
@@ -51,6 +52,7 @@ __all__ = [
     "CHANNEL_CONFIG_VARIABLE",
     "PEER_PROTOCOL",
     "PROVEN_AGAINST_VERSION",
+    "AddressHeld",
     "ApprovalError",
     "BootstrapError",
     "ClaudeAgentAdapter",

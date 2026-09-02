@@ -32,6 +32,7 @@ import support
 
 from gpt_voicecoding import config
 from gpt_voicecoding.adapters.companion_channel.telegram.api import refused_by
+from gpt_voicecoding.seams.identity import AgentKind
 
 A_LANE = "claude"
 
@@ -252,11 +253,18 @@ codex = "gpt_voicecoding.adapters.agent.codex:codex_agent"
 [adapters.settings.companion_channel]
 token_env = "GPTVOICECODING_TELEGRAM_TOKEN"
 chat_id = "8675309"
+
+[adapters.settings."agent.claude"]
+request_timeout_seconds = 30.0
 """
 
 
 def _derived(
-    tmp_path: Path, lane: journey.Lane, *, codex_socket_directory: Path | None = None
+    tmp_path: Path,
+    lane: journey.Lane,
+    *,
+    codex_socket_directory: Path | None = None,
+    dropped_agents: tuple[AgentKind, ...] = (),
 ) -> support.DerivedConfig:
     source = tmp_path / "config.toml"
     source.write_text(A_CONFIG)
@@ -269,6 +277,7 @@ def _derived(
         project_name=f"acceptance-{lane.name}",
         token_variable=lane.token_variable(configured),
         codex_socket_directory=codex_socket_directory,
+        dropped_agents=dropped_agents,
     )
 
 
@@ -314,11 +323,20 @@ def test_a_derived_config_is_one_the_engine_would_accept(tmp_path: Path) -> None
     say why (ADR 0004: output before the log is adopted is discarded).
     """
     for lane in journey.LANES:
-        derived = _derived(tmp_path, lane, codex_socket_directory=tmp_path / lane.name)
+        dropped = () if lane.agent == str(AgentKind.CLAUDE) else (AgentKind.CLAUDE,)
+        derived = _derived(
+            tmp_path,
+            lane,
+            codex_socket_directory=tmp_path / lane.name,
+            dropped_agents=dropped,
+        )
         read = config.load(derived.path)
         assert read.adapters.settings[support.CODEX_SETTINGS_KEY]["socket_directory"] == str(
             tmp_path / lane.name
         )
+        # The lane still has the agent it walks, and the engine's own reader is
+        # what says the drop left a config it would start on (#202).
+        assert AgentKind(lane.agent) in read.adapters.agents
 
 
 def test_the_derived_socket_path_stays_inside_the_unix_domain_limit(tmp_path: Path) -> None:
@@ -446,3 +464,37 @@ def test_a_chat_the_account_never_opened_refuses_with_the_start_instruction() ->
     assert "second" in refusal
     assert "/start" in refusal
     assert "chat not found" in refusal
+
+
+def test_the_codex_lane_carries_no_claude_agent_adapter(tmp_path: Path) -> None:
+    """#202: the published approval address is one file per user per machine, and
+    only an engine that loads the Claude adapter ever claims it. The Codex lane's
+    journey never needs that route, so dropping the adapter is what stops the two
+    lanes racing for it — the harness's half of the fix, beside the product's."""
+    import tomllib
+
+    derived = _derived(tmp_path, journey.CODEX, dropped_agents=(AgentKind.CLAUDE,))
+    agents = tomllib.loads(derived.path.read_text())["adapters"]["agents"]
+
+    assert str(AgentKind.CLAUDE) not in agents
+    assert str(AgentKind.CODEX) in agents, "the lane still needs the agent it walks"
+    settings = tomllib.loads(derived.path.read_text())["adapters"]["settings"]
+    assert f"agent.{AgentKind.CLAUDE}" not in settings, (
+        "a settings table for an adapter the engine no longer builds names no seam it fills, "
+        "and the engine refuses the whole config over it"
+    )
+    dropped = json.loads((derived.path.parent / "config-dropped.json").read_text())
+    assert f"adapters.agents.{AgentKind.CLAUDE}" in dropped
+    assert f'adapters.settings."agent.{AgentKind.CLAUDE}"' in dropped
+
+
+def test_the_claude_lane_carries_every_agent_adapter_the_user_configured(tmp_path: Path) -> None:
+    """Unchanged, and that is the asymmetry: the Claude lane is the one engine
+    left claiming the address, so it keeps the config the user actually wrote."""
+    import tomllib
+
+    derived = _derived(tmp_path, journey.CLAUDE)
+    agents = tomllib.loads(derived.path.read_text())["adapters"]["agents"]
+
+    assert str(AgentKind.CLAUDE) in agents
+    assert str(AgentKind.CODEX) in agents

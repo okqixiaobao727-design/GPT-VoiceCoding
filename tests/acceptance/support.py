@@ -383,6 +383,7 @@ def derive_config(
     project_name: str,
     token_variable: str | None = None,
     codex_socket_directory: Path | None = None,
+    dropped_agents: tuple[AgentKind, ...] = (),
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
 
@@ -420,6 +421,18 @@ def derive_config(
     `20260902T012313Z`, where the second lane's engine died at start for exactly
     that reason. Pointing each lane at its own directory is the setting doing
     what it is for; the engines then have an app-server each.
+
+    **And one entry is dropped that the user's real config has**, which is the
+    third deviation from "accept the user's real config" and the one with no
+    setting behind it: `[adapters.agents]` loses every kind in `dropped_agents`,
+    and the caller passes the Claude kind for the Codex lane (#202). The Claude
+    approval address is a fixed file per user per machine (`locations.py:56`),
+    and only an engine that loads the Claude adapter ever claims it — so an
+    engine that will never walk a Claude journey has no business holding the
+    machine's one Claude approval route. The product now refuses the second
+    claimant rather than displacing the first; this is the harness's half, and
+    with one claimant there is no contention to refuse. The Claude lane's table
+    is untouched, because it is the lane that needs the route.
     """
     run_directory.mkdir(parents=True, exist_ok=True)
     document = tomllib.loads(source.read_text())
@@ -441,6 +454,22 @@ def derive_config(
         dropped.append("adapters.settings.session_launcher")
     adapters["settings"] = settings
     document["adapters"] = adapters
+
+    agents = dict(adapters["agents"])
+    for kind in dropped_agents:
+        # Spelled from `AgentKind` for the reason `CODEX_SETTINGS_KEY` is: a name
+        # this file invented is a table the engine refuses outright.
+        if agents.pop(str(kind), None) is not None:
+            dropped.append(f"adapters.agents.{kind}")
+        # And its settings table goes with it. `[adapters.settings]` is checked
+        # against the seams the engine actually built (`config.py:132`), so a
+        # settings table for an adapter that is no longer listed is a key that
+        # "names no seam this engine fills" — the refusal that stopped both
+        # engines on run `20260902T013222Z`. Dropping the adapter and keeping its
+        # settings would hand the Codex lane a config that cannot start.
+        if settings.pop(f"agent.{kind}", None) is not None:
+            dropped.append(f'adapters.settings."agent.{kind}"')
+    adapters["agents"] = agents
 
     channel = dict(settings["companion_channel"])
     if token_variable is not None:
