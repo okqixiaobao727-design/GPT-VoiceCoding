@@ -79,6 +79,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -118,6 +119,42 @@ SCREEN_TAIL_BYTES = 8000
 
 #: Grace between asking a hand-started Session to go and insisting.
 STOP_GRACE_SECONDS = 10.0
+
+#: The one line that stands between a pty and a Session the product can see.
+#:
+#: A pty on fds 0/1/2 is a terminal the child can read and write; it is not the
+#: child's **controlling** terminal, and `ps -o tty=` names only the latter. The
+#: engine's Codex roster is built on that column — `processes._interactive_pids`
+#: skips a `??` row by #144's rule, and ADR 0020 defines the vouching terminal as
+#: "a live interactive `codex` with a controlling terminal" — so a harness that
+#: only opened a pty started a Session the product was right not to list. That is
+#: what run `20260902T041923Z` measured as a red `roster` step (#208), against a
+#: composition rule that was correct.
+#:
+#: `os.login_tty` is the standard spelling of the fix: `setsid()`, then
+#: `TIOCSCTTY` on the pty. `start_new_session=True` stays beside it — not because
+#: `login_tty` needs it, but because `stop()` reads the process group and the
+#: shim runs a whole interpreter start after `Popen` returns. See `start()`.
+#:
+#: **Why a shim process rather than `preexec_fn`.** Both reach `login_tty`, but
+#: `preexec_fn` runs between `fork()` and `exec()` in *this* process, and this
+#: process is threaded by design: two lanes run at once and each keeps a pty
+#: reader thread alive, which is exactly the case Python documents `preexec_fn`
+#: as unsafe for. Its failure is a child that deadlocks before exec — a hung
+#: acceptance run, hours in, with nothing in the transcript to attribute it to.
+#: The shim pays one interpreter start instead, in a process with one thread.
+#:
+#: **What `execv` keeps**, measured on this machine on 2026-09-02: the pid (so
+#: the roster's row and `session.pid` are the TUI's own), the process group (pgid
+#: == pid, which is what `stop()` signals), the cwd, and the environment. What it
+#: replaces is the process image: after the exec, `ps -o args=` shows the
+#: ordinary command, so `Path(argv[0]).name == "codex"` still holds and the shim
+#: is invisible to everything downstream, including this module's own journal.
+#:
+#: A command that cannot be exec'd raises in the shim and its traceback lands in
+#: the pty transcript. `resolve()` has already found the binary on the PATH by
+#: then, so that is a diagnostic rather than a path the run relies on.
+TAKE_THE_TERMINAL = "import os, sys; os.login_tty(0); os.execv(sys.argv[1], sys.argv[1:])"
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b[=>]")
 
@@ -275,14 +312,27 @@ class HandStartedSession:
         command = [str(self.binary), *self.arguments]
         try:
             self._process = subprocess.Popen(
-                command,
+                # The shim, not the command: it takes the pty as its controlling
+                # terminal — and with it a new session and its own process group,
+                # so a stop still reaches the TUI and everything it spawned — and
+                # then *becomes* the command. See TAKE_THE_TERMINAL.
+                [sys.executable, "-c", TAKE_THE_TERMINAL, *command],
                 cwd=str(self.workspace),
                 env=self.environment,
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,
-                # Its own process group, so a stop reaches the TUI and everything
-                # it spawned rather than only the one pid the harness knows.
+                # Kept beside the shim, not replaced by it, and `stop()` is
+                # why. `Popen` returns only once the child has exec'd, so this
+                # line is what makes the Session its own process group *before
+                # any stop can read one*; the shim's `login_tty` would not, an
+                # interpreter start later, and a stop landing in that window
+                # would take `os.getpgid` to be this process's group and
+                # `killpg` the whole run. Measured on 2026-09-02: dropping this
+                # line killed a pytest run outright. `login_tty` then setsids
+                # again, a session leader's kernel refuses that, `login_tty`
+                # ignores the refusal and goes on to `TIOCSCTTY` — so the
+                # controlling terminal is acquired either way.
                 start_new_session=True,
             )
         except OSError as unstartable:
