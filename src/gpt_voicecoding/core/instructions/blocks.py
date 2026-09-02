@@ -11,11 +11,18 @@ Three things are refused at construction rather than left to a test, because
 they are the mistakes that would make the coverage claim meaningless:
 
 - covering an id the catalogue does not have — a typo would otherwise read as
-  a discharged obligation;
+  a discharged obligation, and a retired rule's id is exactly such a typo;
 - covering the same id twice — "appears once" has to mean once;
-- covering an id that belongs to another audience — a Core rule wearing prose
-  is exactly what the split of audiences exists to prevent, and a dropped one
-  reappearing is what the DROPPED rows exist to catch.
+- covering an id that belongs to another audience — a Core rule wearing prose,
+  or a speaking rule handed to the half with the tools, is what the split of
+  audiences exists to prevent.
+
+**A set may be rendered without its headings.** The Voice hears prose and
+nothing else (ADR 0018: 控制 voice 一定要用自然语言而不是代码语言), so its section
+titles stay here as navigation for whoever reads the generator and never reach
+the wire. That is a rendering choice rather than a second kind of set: the
+blocks, the ids and the coverage claim are identical either way, and only the
+`## ` in front of a title is at stake.
 """
 
 from __future__ import annotations
@@ -65,6 +72,9 @@ class InstructionSet:
 
     audience: Audience
     sections: tuple[Section, ...]
+    #: Whether the section titles are rendered. False for a set whose reader is
+    #: told to hear prose — the titles stay for whoever reads the generator.
+    headings: bool = True
     covers: frozenset[str] = field(init=False)
     text: str = field(init=False)
 
@@ -104,7 +114,8 @@ class InstructionSet:
     def _rendered(self) -> str:
         parts: list[str] = []
         for section in self.sections:
-            parts.append(f"## {section.title}")
+            if self.headings:
+                parts.append(f"## {section.title}")
             parts.extend(block.text.strip() for block in section.blocks)
         return "\n\n".join(parts) + "\n"
 

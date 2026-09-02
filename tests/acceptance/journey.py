@@ -98,6 +98,7 @@ from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
 from gpt_voicecoding.core.policy import DEFAULT_SILENCE_END_SECONDS
 from gpt_voicecoding.seams.call import Cue
+from gpt_voicecoding.seams.control_plane import Action
 
 if TYPE_CHECKING:
     # Named for a type and never imported at runtime: telethon lives behind this
@@ -2451,20 +2452,31 @@ class Walk:
           the Call Agent running `bridgectl`, and this line is that observation:
           the `handoff_request` item the ticket names is not one the harness can
           see, because the Call adapter surfaces no such notification
-          (`adapters/call/realtime/adapter.py:563-578`) and nothing under `src/`
-          changes here;
+          (`adapters/call/realtime/adapter.py:563-578`);
         * the call is down when the step is over — `bridgectl status` stops
-          naming one, and the step ends it itself if the Call Agent has not.
+          naming one, and the step ends it itself if the Call Agent has not;
+        * **the verb it ran was `live`, and the call ended because it ran it** —
+          the two facts #193 added, and the only two here that are not lower
+          bounds. See below.
 
-        **Which verb the Call Agent chose is recorded, never graded**, and that
-        is deliberate: the shipped Voice instructions name the CLI invocation
-        (`core/instructions/voice.py:80-88`) and carry no rule that `live` is
-        what ends a call, so the Call Agent guesses. Run `20260902T095448Z` had
-        it guess `live` on one lane and `call end` — not an action this engine
-        serves — on the other, from the same instructions. Grading the guess
-        would make this step a coin toss about a rule no ticket has shipped yet
-        (deferred, #195). The guess stays visible instead: every verb, in order,
-        into `verdict.json`.
+        **Which verb the Call Agent chose is graded now, and #193 is why.**
+        It used to be recorded and no more, because the shipped instructions
+        named the CLI invocation and carried no rule that `live` ends a call, so
+        the Call Agent guessed: run `20260902T095448Z` had it guess `live` on one
+        lane and `call end` — not an action this engine serves — on the other,
+        from the same instructions, and grading a guess would have made this step
+        a coin toss about a rule no ticket had shipped. #193 ships that rule.
+        `core/instructions/agent.py` generates it into the slot that reaches the
+        acting half (ADR 0018), and this is where it is proved on the wire rather
+        than at the generator's interface: `ended_by` has to be `agent`, and
+        `live` has to be among the verbs the wrapper logged. A lower bound of
+        "some `bridgectl` run happened" would pass on `call end`, which is the
+        state the rule exists to end. Every verb still goes into `verdict.json`,
+        in order, so a failure says what it ran instead.
+
+        `live call long` (#184) keeps the older reading and is not touched: its
+        premise is a Voice that holds the call open until the Silence Ceiling
+        closes it, so an agent hang-up there is the thing that would spoil it.
 
         **The two cues, in order** (#186). The user hears the call connect and
         hears it end, and the engine's log is where a step that cannot hear
@@ -2569,6 +2581,24 @@ class Walk:
                 f"({self._call_line()!r}). Verbs the Call Agent ran: {verbs or 'none'}"
             )
         self._graded_the_two_cues(call.mark)
+        # The rule #193 ships, proved on the wire rather than at the generator's
+        # interface. Two facts, graded separately, because they fail differently:
+        # a Call Agent that ran nothing and a Call Agent that ran `call end` both
+        # leave the call for the harness to close, and only the verb list says
+        # which happened.
+        if not self._ran_the_hangup_verb():
+            raise StepFailed(
+                f"the engine heard {spoken[-1]!r} and the Call Agent never ran "
+                f"`{Action.LIVE}`, which is the one verb its generated instructions say "
+                f"ends a call (`core/instructions/agent.py`). What it ran instead: "
+                f"{verbs or 'nothing at all'}; the call was ended by the {ended_by}"
+            )
+        if ended_by != "agent":
+            raise StepFailed(
+                f"the Call Agent ran `{Action.LIVE}` but the call was ended by the "
+                f"{ended_by}: {seen.end_reason or 'no end reason recorded'}. Verbs in "
+                f"order: {verbs}"
+            )
         # The three observations the ticket asks `verdict.json` to carry. Graded
         # rather than merely written down: a run that recorded none of them is a
         # run whose Call adapter never wrote its file, and a green step that says
@@ -2825,6 +2855,16 @@ class Walk:
             if words:
                 spoken.append(" ".join(words))
         return spoken
+
+    def _ran_the_hangup_verb(self) -> bool:
+        """Whether the Call Agent ran the verb #193's rule tells it to run.
+
+        The verb, not a prefix of a line: `_verbs_run` gives the whole argv tail,
+        so `call end` — the invention run `20260902T095448Z` recorded — reads as
+        itself and is not counted. The name comes from the closed action set, so
+        this cannot go on grading a word the control plane has stopped serving.
+        """
+        return any(verb.split()[:1] == [str(Action.LIVE)] for verb in self._verbs_run())
 
     def _log_since(self, mark: int) -> list[str]:
         """The engine's log from a mark on — one call's worth, not the run's."""

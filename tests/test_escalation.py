@@ -49,7 +49,7 @@ class Harness:
         message: bool = True,
         call: FakeCall | None = None,
         channel: FakeCompanionChannel | None = None,
-        voice_instructions: str = HOUSE_RULES,
+        call_agent_instructions: str = HOUSE_RULES,
     ) -> None:
         self.switches = Switchboard()
         self.switches.flip(SwitchName.DUTY, duty)
@@ -63,7 +63,7 @@ class Harness:
             channel=self.channel,
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),
-            voice_instructions=voice_instructions,
+            call_agent_instructions=call_agent_instructions,
         )
 
     def escalate(self, item: Notice, **kwargs: object) -> object:
@@ -165,7 +165,7 @@ class TestWithNoHouseRulesToOpenOn:
         It is not raised out of the pipeline. Current-state reconciliation may
         create another notice when a later outlet transition occurs.
         """
-        harness = Harness(message=False, voice_instructions="")
+        harness = Harness(message=False, call_agent_instructions="")
 
         outcome = harness.escalate(notice())
 
@@ -175,7 +175,7 @@ class TestWithNoHouseRulesToOpenOn:
 
     def test_the_reason_is_the_one_the_interlock_worded(self) -> None:
         """Not this pipeline's own sentence — the same one, from the same door."""
-        harness = Harness(message=False, voice_instructions="")
+        harness = Harness(message=False, call_agent_instructions="")
 
         outcome = harness.escalate(notice())
 

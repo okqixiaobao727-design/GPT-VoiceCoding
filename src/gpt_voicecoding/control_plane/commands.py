@@ -23,20 +23,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from gpt_voicecoding.core.relays import NO_GRADE, receipt_line
-from gpt_voicecoding.seams.control_plane import Action, Reply, Request
+from gpt_voicecoding.seams.control_plane import USAGE, Action, Reply, Request
 from gpt_voicecoding.seams.identity import ADDRESS_SEPARATOR, address_of
-
-#: How each action is written on one line. Also what a refusal quotes back.
-USAGE: dict[Action, str] = {
-    Action.STATUS: "status",
-    Action.SWITCH: "switch <name> on|off",
-    Action.BRIEF: "brief [<agent>:<session id>[:<pid>]]",
-    Action.HISTORY: "history <agent>:<session id>[:<pid>] [--before <ordinal>]",
-    Action.LIVE: "live",
-    Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
-    Action.APPROVE: "approve <approval id> allow|deny|ask",
-    Action.VERIFY: "verify",
-}
 
 #: The word that asks for the page before one already given. Spelled out, and
 #: taking the ordinal beside it, because a bare number after an address would

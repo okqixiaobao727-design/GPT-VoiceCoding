@@ -31,8 +31,8 @@ from gpt_voicecoding.control_plane.client import (
     EngineUnreachable,
     ask,
 )
-from gpt_voicecoding.control_plane.commands import USAGE, CommandError, build_request, render
-from gpt_voicecoding.seams.control_plane import Action
+from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
+from gpt_voicecoding.seams.control_plane import USAGE, Action
 
 EXIT_OK = 0
 EXIT_REFUSED = 1

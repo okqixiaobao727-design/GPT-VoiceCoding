@@ -152,6 +152,25 @@ def test_core_never_imports_an_adapter() -> None:
     assert not offences, "Bridge Core must not reach into an adapter: " + "; ".join(offences)
 
 
+def test_core_never_imports_the_control_plane_mechanism() -> None:
+    """The hub answers the control plane; it does not read the surface that speaks it.
+
+    `gpt_voicecoding.control_plane` is framing, sockets and the command parser,
+    and its own `commands` module imports `core.relays` to render a receipt. So
+    an import the other way is not merely a layering slip — it closes a cycle
+    across ADR 0001's boundary, and one that resolves at runtime and therefore
+    fails no test that is not this one. It was almost made for a real reason:
+    the Call Agent's instructions are generated from the command forms (#193),
+    and those forms are vocabulary, so they live in `seams/control_plane.py`
+    beside `Action` where the hub may read them.
+    """
+    offences = _imports_under(CORE, "gpt_voicecoding.control_plane")
+    assert not offences, (
+        "Bridge Core reaches the control plane through the seam's vocabulary, never "
+        "through the package that frames it: " + "; ".join(offences)
+    )
+
+
 def test_seams_package_exists() -> None:
     assert _sources(SEAMS), f"no Python sources found under {SEAMS}"
 

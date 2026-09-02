@@ -1279,6 +1279,24 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.toggle().state is CallState.DOWN
         assert hub.core.interlock.owns_call() is False
 
+    def test_a_call_opens_on_the_call_agents_rules_not_the_voices(self) -> None:
+        """Today's slot reaches the acting half, so the acting half's set goes in it.
+
+        `realtimeStartInstructions` was proved by slot-swap to reach the Call
+        Agent and never the Voice (ADR 0018, #175 Q4), and this hub sends one
+        string into `ensure_call`. Until the Dial carries all three payloads, the
+        one string is the Agent set — the Voice's prose has no carrier yet, and
+        putting it here would send the half with the tools a set of rules about
+        pacing and put nothing where the tools are named.
+        """
+        hub = Hub()
+        assert hub.core.instructions is not None
+
+        hub.toggle()
+
+        assert hub.call.opened_on == [hub.core.instructions.agent.text]
+        assert hub.core.instructions.voice.text not in hub.call.opened_on
+
     def test_a_hub_that_generated_no_house_rules_opens_no_call(self) -> None:
         """The refusal comes from the interlock, which is the one door.
 

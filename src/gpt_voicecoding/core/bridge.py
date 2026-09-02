@@ -300,10 +300,15 @@ class BridgeCore:
         #: engine it reaches. None until a root supplies them; a hub assembled
         #: for a test has no CLI to name and does not pretend to.
         self._instructions = generate(instruction_context) if instruction_context else None
-        #: The voice thread's house rules, as the one string a call starts with.
+        #: The rules the **acting** half of a call starts with. `ensure_call`
+        #: still takes one string, and the half it reaches is the one with the
+        #: tools (ADR 0018, proved by slot-swap in #175) — so the Agent set is
+        #: what belongs in it, and the Voice set has no carrier until the Dial
+        #: gives that seam a payload per audience. Which field on the wire
+        #: carries which audience is the realtime adapter's alone to know.
         #: Empty when this hub generated none, and the interlock refuses to open
         #: a call on an empty one rather than this being checked at each caller.
-        self._voice_instructions = self._instructions.voice.text if self._instructions else ""
+        self._call_agent_instructions = self._instructions.agent.text if self._instructions else ""
         #: Durations are measured with `clock`; anything read outside this
         #: process is stamped with `stamp`. A Session's `first_seen` travels to
         #: every surface in the `sessions` payload, and a monotonic reading
@@ -319,7 +324,7 @@ class BridgeCore:
             channel=channel,
             interlock=self.interlock,
             adjudicator=self.adjudicator,
-            voice_instructions=self._voice_instructions,
+            call_agent_instructions=self._call_agent_instructions,
         )
         self.relays = RelayPipeline(
             agents=agents,
@@ -332,12 +337,15 @@ class BridgeCore:
 
     @property
     def instructions(self) -> Instructions | None:
-        """The voice and delegated-turn instruction sets, as plain data.
+        """All three instruction sets, as plain data.
 
         Generated once, from the catalogue and this engine's own installation.
-        The Call adapter starts its realtime thread with the voice set and the
-        Codex adapter starts a Delegated Turn with the delegated one; neither
-        rewrites them, and neither reads anything from disk to get them.
+        A Live Call is two audiences (ADR 0018): the Call adapter starts its
+        realtime thread with the **agent** set, which is the half that acts, and
+        the voice set waits for the Dial to give that seam a payload per
+        audience. The Codex adapter starts a Delegated Turn with the delegated
+        one. None of them rewrites a set, and none reads anything from disk to
+        get one.
         """
         return self._instructions
 
@@ -536,7 +544,7 @@ class BridgeCore:
             return await self.interlock.end_call()
         # Ending is always allowed; whether opening is, is the interlock's to
         # say — in both directions, and for both of its reasons.
-        snapshot = await self.interlock.open_call(self._voice_instructions)
+        snapshot = await self.interlock.open_call(self._call_agent_instructions)
         if snapshot.is_up:
             self._owe_reconciliation()
         return snapshot
