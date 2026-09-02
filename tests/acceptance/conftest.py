@@ -28,6 +28,34 @@ Both engines bridge **every** Session on the machine, so each lane's roster show
 the other lane's Session. Nothing special is done about that: the journey's own
 rule — a step only ever attributes what names its own target
 (`journey.py`'s docstring) — is what already covers it.
+
+## Three roots, and the harness derives two of them
+
+"Socket roots are already per lane" was true of one root and not of three, which
+run `20260902T012313Z` found the hard way — the second lane's engine died at
+start. What one engine owns on this machine:
+
+* **the control socket**, `[engine] socket_path`. Per lane, and was already:
+  `/tmp/gvc-acceptance-<uid>-<run>-<lane>/control.sock`.
+* **the Codex app-server socket**,
+  `<socket_directory>/gpt-voicecoding-<uid>/codex-app-server.sock`
+  (`adapters/agent/codex/adapter.py:143`). Per **machine** by default, and the
+  product refuses rather than shadows a live one — so a second engine simply
+  does not start. `[adapters.settings.agent.codex] socket_directory` is a real
+  setting, so this run points each lane at its own lane root, and the engines get
+  an app-server each. Both lanes' engines load both agent adapters, so this is
+  not the Codex lane's problem alone.
+* **the published approval address**, a fixed
+  `~/Library/Application Support/GPT-VoiceCoding/engine/address.json`
+  (`locations.py:56`, written at `adapters/agent/claude/adapter.py:289` with no
+  `base_dir`). Per machine, **and there is no setting for it** — so with two
+  engines up, the last one to publish owns every Claude permission dialog on this
+  machine, and the first to stop withdraws the address the other is relying on.
+  That is [#202](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/202),
+  a product defect this harness cannot arrange around, and it is a **known
+  cross-lane hazard on the approval route**: a `relay` or `approval` red on
+  either lane of a two-lane run may be it rather than the step's own subject.
+  A single-lane run (`--lane`) is the way to tell them apart until it is fixed.
 """
 
 from __future__ import annotations
@@ -721,6 +749,7 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         socket_path=socket_root / "control.sock",
         project_name=f"acceptance-{lane.name}",
         token_variable=run.token_variable,
+        codex_socket_directory=socket_root,
     )
     engine = support.Engine(
         config=config,

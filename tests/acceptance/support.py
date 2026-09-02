@@ -48,6 +48,7 @@ from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
 )
 from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, ask
 from gpt_voicecoding.seams.control_plane import Action, Request
+from gpt_voicecoding.seams.identity import AgentKind
 
 # --- where a run lives ------------------------------------------------------
 
@@ -355,6 +356,12 @@ def _differing(tree: Path, installed: Path) -> Iterator[str]:
 # --- the run's configuration ------------------------------------------------
 
 
+#: How `[adapters.settings]` names the Codex agent's own table. Built the way the
+#: engine builds it (`config.py:132`), so the two cannot drift into a table the
+#: engine will refuse.
+CODEX_SETTINGS_KEY = f"agent.{AgentKind.CODEX}"
+
+
 @dataclass(frozen=True)
 class DerivedConfig:
     path: Path
@@ -375,6 +382,7 @@ def derive_config(
     socket_path: Path,
     project_name: str,
     token_variable: str | None = None,
+    codex_socket_directory: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
 
@@ -400,6 +408,18 @@ def derive_config(
     own bot's token — which is the shipped mechanism doing exactly what it is
     for: `token_env` is how the engine is told which variable holds the token.
     `None` keeps the user's own name, which is what the first lane wants.
+
+    **A second value is rewritten for the same reason**, and it is the one two
+    lanes cannot discover for themselves:
+    `[adapters.settings.agent.codex] socket_directory`. The engine's own Codex
+    app-server listens at `<socket_directory>/gpt-voicecoding-<uid>/
+    codex-app-server.sock` (`adapters/agent/codex/adapter.py:143`), which is
+    per **machine**, not per engine — and the product refuses rather than
+    shadows it: "leaving … in place: something is still listening on it, and the
+    file is what makes the next engine refuse to start". Measured on run
+    `20260902T012313Z`, where the second lane's engine died at start for exactly
+    that reason. Pointing each lane at its own directory is the setting doing
+    what it is for; the engines then have an app-server each.
     """
     run_directory.mkdir(parents=True, exist_ok=True)
     document = tomllib.loads(source.read_text())
@@ -426,6 +446,18 @@ def derive_config(
     if token_variable is not None:
         channel["token_env"] = token_variable
         settings["companion_channel"] = channel
+
+    if codex_socket_directory is not None:
+        # `[adapters.settings]` is keyed **flat**, by the seam names the engine
+        # itself builds — `agent.<kind>`, `call`, `companion_channel`
+        # (`config.py:132`) — not by nested tables. Spelled from `AgentKind`
+        # rather than typed out, because a name this file invented is a table the
+        # engine refuses outright: measured on run `20260902T013222Z`, where a
+        # nested `[adapters.settings.agent.codex]` stopped **both** engines with
+        # "names no seam this engine fills".
+        codex = dict(settings.get(CODEX_SETTINGS_KEY, {}))
+        codex["socket_directory"] = str(codex_socket_directory)
+        settings[CODEX_SETTINGS_KEY] = codex
 
     path = run_directory / "config.toml"
     path.write_text(_as_toml(document))

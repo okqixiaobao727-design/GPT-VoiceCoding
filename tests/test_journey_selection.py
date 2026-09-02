@@ -30,6 +30,7 @@ import journey
 import pytest
 import support
 
+from gpt_voicecoding import config
 from gpt_voicecoding.adapters.companion_channel.telegram.api import refused_by
 
 A_LANE = "claude"
@@ -231,10 +232,22 @@ state_path = "/tmp/never.json"
 
 [log]
 path = "/tmp/never.log"
+max_bytes = 8388608
+retained_files = 3
+level = "INFO"
+stripped_environment_prefixes = ["CLAUDE", "CODEX"]
+
+[delegate]
+model = "a-model"
+cli = "/usr/bin/true"
 
 [adapters]
-call = "gpt_voicecoding.adapters.call.silent:build"
-companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
+call = "gpt_voicecoding.adapters.call.silent:silent_call"
+companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:telegram_channel"
+
+[adapters.agents]
+claude = "gpt_voicecoding.adapters.agent.claude:claude_agent"
+codex = "gpt_voicecoding.adapters.agent.codex:codex_agent"
 
 [adapters.settings.companion_channel]
 token_env = "GPTVOICECODING_TELEGRAM_TOKEN"
@@ -242,7 +255,9 @@ chat_id = "8675309"
 """
 
 
-def _derived(tmp_path: Path, lane: journey.Lane) -> support.DerivedConfig:
+def _derived(
+    tmp_path: Path, lane: journey.Lane, *, codex_socket_directory: Path | None = None
+) -> support.DerivedConfig:
     source = tmp_path / "config.toml"
     source.write_text(A_CONFIG)
     configured = "GPTVOICECODING_TELEGRAM_TOKEN"
@@ -253,6 +268,7 @@ def _derived(tmp_path: Path, lane: journey.Lane) -> support.DerivedConfig:
         socket_path=tmp_path / f"{lane.name}.sock",
         project_name=f"acceptance-{lane.name}",
         token_variable=lane.token_variable(configured),
+        codex_socket_directory=codex_socket_directory,
     )
 
 
@@ -270,6 +286,50 @@ def test_each_lane_binds_its_own_token_variable_in_the_derived_config(tmp_path: 
         variables[lane.name] = channel["token_env"]
 
     assert len(set(variables.values())) == len(journey.LANES), variables
+
+
+def test_each_lane_gets_its_own_codex_app_server_socket_directory(tmp_path: Path) -> None:
+    """Two engines cannot share one app-server socket: the product refuses the second."""
+    import tomllib
+
+    directories = {}
+    for lane in journey.LANES:
+        derived = _derived(tmp_path, lane, codex_socket_directory=tmp_path / lane.name)
+        written = tomllib.loads(derived.path.read_text())
+        table = written["adapters"]["settings"][support.CODEX_SETTINGS_KEY]
+        directories[lane.name] = table["socket_directory"]
+        assert directories[lane.name] == str(tmp_path / lane.name)
+
+    assert len(set(directories.values())) == len(journey.LANES), directories
+
+
+def test_a_derived_config_is_one_the_engine_would_accept(tmp_path: Path) -> None:
+    """Read back with the engine's **own** reader, which is the only opinion that counts.
+
+    A derived config is only ever proved by an engine starting on it, and that
+    costs a real run. This is the same judgement at CI speed — and it is not
+    hypothetical: run `20260902T013222Z` lost both lanes in nine seconds to a
+    settings table spelled as this harness imagined rather than as
+    `config.py:132` builds it, with `verdict.json` REFUSED and no engine log to
+    say why (ADR 0004: output before the log is adopted is discarded).
+    """
+    for lane in journey.LANES:
+        derived = _derived(tmp_path, lane, codex_socket_directory=tmp_path / lane.name)
+        read = config.load(derived.path)
+        assert read.adapters.settings[support.CODEX_SETTINGS_KEY]["socket_directory"] == str(
+            tmp_path / lane.name
+        )
+
+
+def test_the_derived_socket_path_stays_inside_the_unix_domain_limit(tmp_path: Path) -> None:
+    """Darwin caps an AF_UNIX path at 103 bytes, and this one is the longest.
+
+    `<lane root>/gpt-voicecoding-<uid>/codex-app-server.sock` is deeper than the
+    control socket beside it, so it is the one that would overflow first.
+    """
+    root = support.SOCKET_ROOT / f"gvc-acceptance-{99999}-20260902T012313Z-claude"
+    longest = root / "gpt-voicecoding-99999" / "codex-app-server.sock"
+    assert len(str(longest).encode()) < 104, longest
 
 
 def test_a_derived_config_keeps_the_configured_variable_when_no_lane_asks(tmp_path: Path) -> None:
