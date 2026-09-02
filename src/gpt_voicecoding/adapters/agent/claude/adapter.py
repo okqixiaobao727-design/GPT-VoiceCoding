@@ -64,6 +64,7 @@ from pathlib import Path
 from gpt_voicecoding.adapters.agent._progress import source_degradation
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude import (
+    bootstrap,
     children,
     inbox,
     stop_analysis,
@@ -131,6 +132,27 @@ SUPPLEMENT_UNAVAILABLE = (
     "the Claude inbox route has no mid-turn verb: a Session that is mid-turn queues a peer "
     "message until its turn ends, so nothing this adapter can send reaches the turn in flight"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class UnpublishedAddress:
+    """Why this engine published no Claude approval address (#204).
+
+    One record for all three causes `connect` can end on — the approval socket
+    would not bind, a peer engine holds the address (#202), or the address file
+    could not be written — because every reader asks the same question of them:
+    can a Session reach this engine at all? Both Claude routes read the one
+    published address (ADR 0019), so the answer is no, whichever cause it was,
+    and the roster is empty *because* of it.
+
+    Kept as one field rather than one per cause: the absence of this record is
+    "published", its presence is "not published, because …", and a reader that
+    had to check two fields would have two ways to be told the same thing.
+    """
+
+    #: The because-clause, rendered by the site that caught the failure and
+    #: carrying the path it was about, so the report is actionable without the log.
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,11 +283,11 @@ class ClaudeAgentAdapter:
         #: Sessions whose hook never ran. This is the two things that command
         #: does not carry — the inbox socket, and the transcript path (#71).
         self._reported: dict[SessionTarget, SessionReport] = {}
-        #: The peer engine holding the published approval address, if `connect`
-        #: found one (#202). `None` is both "this engine holds it" and "connect
-        #: has not run", which is the same thing to every reader: there is no
-        #: peer to name.
-        self._address_held_by: Path | None = None
+        #: Why `connect` published no approval address, if it published none
+        #: (#204, generalising #202). `None` is both "this engine published it"
+        #: and "connect has not run", which is the same thing to every reader:
+        #: there is no failure to name.
+        self._unpublished: UnpublishedAddress | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -286,6 +308,13 @@ class ClaudeAgentAdapter:
         try:
             await self._approvals.start()
         except ApprovalError as refused:
+            # Recorded, not merely logged (#204): nothing is published after
+            # this, so no Session can register with this engine either, and
+            # `verify` is where ADR 0003 says an operator finds that out.
+            self._unpublished = UnpublishedAddress(
+                reason=f"the approval socket at {self.approval_socket_path()} would not bind "
+                f"({refused})"
+            )
             _log.warning("no Approval Relay this run: %s", refused)
             return
         # Only now, and only if it bound: a published address nobody is listening
@@ -298,9 +327,15 @@ class ClaudeAgentAdapter:
             # machine and the hook can read no other, so displacing a peer that
             # is still answering would silently move every permission dialog on
             # this machine onto this engine.
-            self._address_held_by = held.holder
+            self._unpublished = UnpublishedAddress(
+                reason=f"another engine is listening at {held.holder}"
+            )
             _log.warning("no Approval Relay this run: %s", held)
         except OSError as refused:
+            self._unpublished = UnpublishedAddress(
+                reason=f"the approval address at {bootstrap.address_path()} could not be written "
+                f"({refused})"
+            )
             _log.warning("the approval address could not be published: %s", refused)
         else:
             _log.info("approval address published at %s", published)
@@ -844,43 +879,49 @@ class ClaudeAgentAdapter:
         return None
 
     async def verify(self) -> VerifyResult:
-        """Report what is installed and loaded, and any route a peer engine holds.
+        """Report what is installed and loaded, and why no address was published.
 
-        The outcome is the routes' own answer and the refusal never changes it
-        (#202): an engine that stood down from the approval address is loaded,
-        configured and reaching Sessions on its other route, which is degraded
-        rather than the unreachable far side ADR 0003's #159 amendment fails.
-        What the refusal does is get *named*, here as well as in the log, because
-        ADR 0003 makes this report the authority on what the engine actually
-        loaded — and "no Approval Relay, because that engine over there has it"
-        is exactly the kind of thing configuration cannot tell an operator.
+        The outcome is the routes' own answer and an unpublished address never
+        changes it (#202, #204): an engine without the approval route is still
+        loaded, configured and reaching Sessions on its other route, which is
+        degraded rather than the unreachable far side ADR 0003's #159 amendment
+        fails. What the failure does is get *named*, here as well as in the log,
+        because ADR 0003 makes this report the authority on what the engine
+        actually loaded — and "no Approval Relay, because the socket would not
+        bind" is exactly the kind of thing configuration cannot tell an operator.
+
+        The one exception is the empty-roster PASS, below, and it keys on "no
+        address published" rather than on any one cause of it: all three read the
+        same to a Session trying to register (#204).
         """
         result = await self._verify_routes()
-        if self._address_held_by is None:
+        if self._unpublished is None:
             return result
-        held = (
-            f"the Claude approval address is held by another engine listening at "
-            f"{self._address_held_by}, so this engine runs without the Approval Relay"
+        unpublished = (
+            f"this engine published no Claude approval address: {self._unpublished.reason}, "
+            f"so it runs without the Approval Relay"
         )
         if result.outcome is VerifyOutcome.PASS and not self._inboxes:
             # Both Claude routes read the one published address — the
             # `PermissionRequest` hook (`approval_hook.py`) and the `SessionStart`
-            # registration hook (`registration.py`) — so a refused engine is not
-            # merely missing approvals: no Session can register with it either.
-            # This one branch would otherwise report PASS, "no Claude Session is
-            # registered, so there is no inbox to reach", which is the guard that
-            # says nothing while the route is dead that ADR 0003 exists to
-            # prevent. **Only** this one: every other answer is a reason of its
-            # own — a missing hook block, a registry outside the config directory,
-            # an inbox that stopped answering — and replacing those with the
-            # refusal would hide a real failure behind it.
+            # registration hook (`registration.py`) — so an engine that published
+            # none is not merely missing approvals: no Session can register with
+            # it either. This one branch would otherwise report PASS, "no Claude
+            # Session is registered, so there is no inbox to reach", which is the
+            # guard that says nothing while the route is dead that ADR 0003
+            # exists to prevent. **Only** this one: every other answer is a
+            # reason of its own — a missing hook block, a registry outside the
+            # config directory, an inbox that stopped answering — and replacing
+            # those would hide a real failure behind this one.
             return VerifyResult(
                 outcome=VerifyOutcome.FAIL,
                 loaded=result.loaded,
-                detail=f"{held}, and no Claude Session can register with an engine holding no "
-                f"address, which is why its roster is empty",
+                detail=f"{unpublished}, and no Claude Session can register with an engine that "
+                f"published no address, which is why its roster is empty",
             )
-        return replace(result, detail=f"{held}; {result.detail}" if result.detail else held)
+        return replace(
+            result, detail=f"{unpublished}; {result.detail}" if result.detail else unpublished
+        )
 
     async def _verify_routes(self) -> VerifyResult:
         """Report what is installed and loaded, then whether an inbox answers.
