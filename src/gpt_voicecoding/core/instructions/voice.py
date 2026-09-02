@@ -175,13 +175,30 @@ def _sections() -> tuple[Section, ...]:
                 # request on, which `scripts/realtime_text_entry_probe.py`'s
                 # `VOICE_PROMPT_DELEGATING` predicted would restore it and which
                 # the earlier text only ever gave for hanging up.
+                #
+                # **And then narrowed again, because "rather than told" was read
+                # as covering questions too.** With that wording the claude lane
+                # failed `live call briefed` three times out of three (#194, runs
+                # `20260902T225654Z`, `20260902T225940Z`, `20260902T230114Z`):
+                # asked what was waiting, the Voice handed the sentence to the
+                # Call Agent, which ran `bridgectl brief` — fetching the roster
+                # the call had been handed ten items of at dial time. The codex
+                # lane passed the same step with one brief in the hand-over
+                # (`20260902T225147Z`), so what the wording could not survive was
+                # a hand-over big enough to look like somebody else's job. So the
+                # rule names *acting* and the same paragraph says where the
+                # answer to "what is waiting" already is.
                 Block(
                     text=(
-                        "When they ask for something to be done rather than told — hang the "
-                        "call up, run something, change something — pass the request to the "
-                        "half behind you rather than answering it yourself. It has the means "
-                        "and you do not. Then let it happen: never announce that the call has "
-                        "ended, and never say goodbye as though you had ended it."
+                        "When they ask you to do something — hang the call up, run "
+                        "something, change something — pass the request to the half behind "
+                        "you rather than doing it yourself. It has the means and you do not. "
+                        "Then let it happen: never announce that the call has ended, and "
+                        "never say goodbye as though you had ended it. Asking what is "
+                        "waiting for them is not asking for something to be done: you were "
+                        "handed the sessions and what each one is waiting on when this call "
+                        "opened, so answer from that, and never pass such a question on to "
+                        "fetch what you are already holding."
                     ),
                 ),
             ),
