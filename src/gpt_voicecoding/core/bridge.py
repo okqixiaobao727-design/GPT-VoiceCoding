@@ -50,7 +50,7 @@ from gpt_voicecoding.core.instructions import InstructionContext, Instructions, 
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
-from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline
+from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, terminal_line
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
 from gpt_voicecoding.core.sessions import Session, spoken_name, spoken_target
 from gpt_voicecoding.core.state import BridgeState
@@ -575,7 +575,7 @@ class BridgeCore:
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
-            await self._announce(outcome.target, outcome.report)
+            await self._announce(outcome.target, terminal_line(outcome))
         for adapter in self._agents.values():
             released = await adapter.sweep_question_budget(self._policy.approval_budget_seconds)
             for target, waiting_for in released:
@@ -652,7 +652,7 @@ class BridgeCore:
         for target in gone:
             _log.info("Session %s is no longer running", target)
             for outcome in self.relays.session_ended(target):
-                await self._announce(outcome.target, outcome.report)
+                await self._announce(outcome.target, terminal_line(outcome))
         if reconcile and self.adjudicator.outlets():
             await self._announce_current_stops(fresh)
         return tuple(gone)
@@ -821,7 +821,7 @@ class BridgeCore:
             _log.info("a Session ended that was never registered: %s", event.target)
         self._state.persist()
         for outcome in self.relays.session_ended(event.target):
-            await self._announce(outcome.target, outcome.report)
+            await self._announce(outcome.target, terminal_line(outcome))
 
     async def _reply_window_changed(self, event: ReplyWindowChanged) -> None:
         """An adapter saw the window move between two discoveries. Land it on the state.
@@ -853,7 +853,7 @@ class BridgeCore:
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""
         try:
-            self._state.relays.classify(event.receipt.request_id, event.receipt.outcome)
+            self._state.relays.classify(event.receipt.request_id, event.receipt)
         except UnknownRelayError:
             _log.info("a receipt arrived for a Relay that is no longer pending")
 
@@ -884,14 +884,21 @@ class BridgeCore:
             _log.info("handled inbound Companion Channel message kind=%s", found.kind)
 
     async def _relay_inbound(self, found: Classification) -> None:
+        """Carry a typed relay in, and answer it with the receipt the CLI prints.
+
+        **Every inbound relay is answered**, and with the same three codes, not
+        only the ones that had to wait. The channel used to hear a sentence when
+        the words queued and silence when they went, which made "it worked" and
+        "nothing was read" the same observation. A receipt is a grade and a
+        reason; how it is said aloud is the Voice's business (#175).
+        """
         assert found.target is not None  # the router sets one for every ANSWER_RELAY
         try:
             outcome = await self.relays.relay(found.target, found.text)
         except BridgeCoreError as refusal:
             await self._reply(str(refusal))
             return
-        if outcome.confirmation:
-            await self._reply(outcome.confirmation)
+        await self._reply(outcome.line)
 
     async def _announce(self, target: SessionTarget, text: str) -> None:
         """Tell the user something the pipelines decided they need to know."""

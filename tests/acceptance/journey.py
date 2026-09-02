@@ -1090,9 +1090,9 @@ class Walk:
         """Words go in through `bridgectl relay`, come out as a receipt and an effect.
 
         **DELIVERED is never inferred from a write** (#71, carried into #77), so
-        this step wants two things the engine cannot fake: a reply that says
-        `delivered` rather than retained or unknown, and the file the words asked
-        for. The permission this turn raises is answered here — through
+        this step wants two things the engine cannot fake: a receipt whose
+        **grade** is `delivered` rather than retained or unproven, and the file
+        the words asked for. The permission this turn raises is answered here — through
         `bridgectl approve`, so the *bridge* answers it — and the evidence is
         handed to `approval`, which is the step that grades it.
 
@@ -1127,21 +1127,24 @@ class Walk:
         )
         resolved = self.approval_resolution.succeeded
         self.turns.append(Turn("relay", time.monotonic() - started, resolved))
-        if "delivered" not in answer.text:
+        # The receipt is a grade and a reason code, and the step reads the
+        # fields rather than looking for a word anywhere in a sentence: `state`
+        # and `grade` both spell `delivered`, so a substring match passed on a
+        # retained relay whose *state* happened to say so.
+        receipt = dict(field.split("=", 1) for field in answer.text.split() if "=" in field)
+        if receipt.get("grade") != "delivered":
             # #68's rule, and the one place it is observable: a route that cannot
-            # be taken surfaces **as a graded delivery failure carrying a
-            # reason**, never as silence and never as a bare refusal.
-            # `seams/delivery.py:47-49` will not let a non-delivered receipt be
-            # built without one, so an answer with no reason is a defect in what
-            # reaches the surface rather than in the delivery itself.
-            reason = answer.text.partition("—")[2].strip()
+            # be taken surfaces **as a graded delivery failure carrying a reason
+            # code**, never as silence and never as a bare refusal.
+            reason = receipt.get("reason")
             raise StepFailed(
-                f"relay answered {answer.text!r}, not `delivered`"
+                f"relay answered {answer.text!r}, whose grade is "
+                f"{receipt.get('grade', '<no grade field>')!r} and not `delivered`"
                 + (
-                    f"; reason given: {reason!r}"
+                    f"; reason code: {reason!r}"
                     if reason
-                    else "; AND no reason travelled with it — #68 requires a delivery failure "
-                    "to carry one, and `seams/delivery.py:47-49` cannot construct one without"
+                    else "; AND no reason code travelled with it — #68 requires a delivery "
+                    "failure to carry one"
                 )
                 + f". {target} is {relayed.effect_in(self.config.workspace)!r}"
             )

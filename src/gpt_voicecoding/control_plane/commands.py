@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from gpt_voicecoding.core.relays import NO_GRADE, receipt_line
 from gpt_voicecoding.seams.control_plane import Action, Reply, Request
 from gpt_voicecoding.seams.identity import ADDRESS_SEPARATOR, address_of
 
@@ -263,12 +264,15 @@ def _degraded_lane_lines(lanes: object) -> list[str]:
 
 
 def _relay_line(data: dict[str, object]) -> str:
-    """Queued is not delivered, and the line says which it was."""
-    line = f"{data['state']} via {data['route']} ({data['outcome']})"
-    for extra in (data["confirmation"], data["report"]):
-        if extra:
-            line += f" — {extra}"
-    return line
+    """The receipt's three codes, in the one format every surface prints.
+
+    No sentence: a relay's receipt is a grade and a reason, and the words the
+    user hears are the Voice's to compose from them (#175). The attempt's own
+    evidence stays on the wire and in the log rather than being read out.
+    """
+    receipt = data["receipt"]
+    grade = receipt["outcome"] if isinstance(receipt, dict) else NO_GRADE
+    return receipt_line(state=str(data["state"]), grade=str(grade), reason=str(data["reason"]))
 
 
 def _verify_lines(seams: object) -> list[str]:

@@ -30,6 +30,7 @@ from gpt_voicecoding.core.bridge import (
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.lifecycle import Lifecycle
+from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.core.router import Classification
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.switches import SwitchName
@@ -335,7 +336,7 @@ class TestTheApprovalPipelineEndToEnd:
         outcome = asyncio.run(hub.core.relay(CODEX, "main"))
 
         assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert outcome.report
+        assert outcome.reason is RelayReason.QUESTION_UNANSWERABLE
         assert hub.agent.calls == []
         assert hub.state.relays.pending() == ()
 
@@ -596,7 +597,8 @@ class TestTheRelayPipelineEndToEnd:
 
         outcome = asyncio.run(hub.core.relay(CODEX, "main"))
 
-        assert outcome.outcome is Delivery.DELIVERED
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.DELIVERED
         assert [call.text for call in hub.agent.calls] == ["main"]
         assert hub.core.status().reply_windows[CODEX] is ReplyWindow.OPEN
         assert hub.state.sessions.resolve(CODEX).state is SessionState.WAITING
@@ -639,23 +641,25 @@ class TestTheRelayPipelineEndToEnd:
         assert [call.text for call in hub.agent.calls] == ["main"]
         assert hub.state.sessions.resolve(CODEX).state is SessionState.RUNNING
 
-    def test_words_for_a_busy_session_wait_and_are_confirmed_once(self) -> None:
+    def test_words_for_a_busy_session_wait_and_the_channel_gets_the_receipt(self) -> None:
+        """The inbound path answers with the same structured receipt the CLI prints."""
         hub = Hub()
 
         hub.emit(InboundText(text="ship it"))
 
         assert hub.agent.calls == []
-        assert hub.channel.sent == ["got it, it'll go when this turn ends"]
+        assert hub.channel.sent == ["state=retained grade=none reason=awaiting_reply_window"]
 
-    def test_the_open_window_delivers_them_without_announcing_again(self) -> None:
+    def test_the_open_window_delivers_them_without_answering_again(self) -> None:
+        """The receipt answers the words the user sent. The flush is not an answer."""
         hub = Hub()
         hub.emit(InboundText(text="ship it"))
-        confirmations = len(hub.channel.sent)
+        receipts = len(hub.channel.sent)
 
         hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
 
         assert [call.text for call in hub.agent.calls] == ["ship it"]
-        assert len(hub.channel.sent) == confirmations
+        assert len(hub.channel.sent) == receipts
 
     def test_ten_minutes_of_waiting_becomes_one_reported_failure(self) -> None:
         hub = Hub()
@@ -665,7 +669,28 @@ class TestTheRelayPipelineEndToEnd:
         hub.tick()
 
         assert hub.state.relays.pending() == ()
-        assert any("never reached the session" in spoken for spoken in hub.call.spoken)
+        assert hub.call.spoken == ["state=reported_failed grade=none reason=ceiling_passed"]
+
+    def test_an_expired_relay_that_was_attempted_does_not_read_like_one_that_was_not(
+        self,
+    ) -> None:
+        """The grade travels with the terminal news, so `UNKNOWN` is not read as `FAILED`.
+
+        This is what the four deleted ceiling reports came in proven/unproven
+        pairs for: "it never reached the session" is true of words that never
+        went and a guess about an attempt that proved nothing. The code says
+        what happened here; the grade says what was proved.
+        """
+        hub = Hub()
+        hub.agent.outcome = Delivery.UNKNOWN
+        hub.agent.reason = "no readback"
+        hub.emit(InboundText(text="ship it"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+
+        assert hub.call.spoken[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
 
     def test_a_session_that_ends_reports_the_words_still_waiting_for_it(self) -> None:
         hub = Hub()

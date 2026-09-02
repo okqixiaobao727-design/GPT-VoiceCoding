@@ -9,12 +9,18 @@ inside an adapter would be a second ledger and a second policy.
 
 Three rules hang off that, all of them here:
 
-- **One confirmation, on receipt**, and then silence: delivery announces nothing
-  a second time. Structural rather than remembered — only `relay` can produce a
-  confirmation, and the flush path that delivers a waiting entry has no way to
-  set one. *Which* confirmation depends on what the attempt proved, because the
-  wording is a promise about what happens next and the three cases promise
-  different things (`confirmation_for`).
+- **The receipt is a grade and a reason, never a sentence.** The verb answers
+  with `RelayOutcome`: where the words are, what the last attempt proved as the
+  seam's own `DeliveryReceipt` — or nothing, when none was made — and one
+  `RelayReason` code. Seven English sentences used to live here and be rendered
+  verbatim by whatever surface asked, which made Bridge Core the author of words
+  the user hears. The Voice re-renders whatever it is handed (#175), so those
+  sentences were a second renderer for words the model rewrites anyway; they are
+  the Voice's rule now, in the generated instructions. Legacy had no scripted
+  acknowledgement to port (`legacy@1d32845:skill/SKILL.md:63-68` covers failure
+  only) — **dropped**; its synchronous relay reply
+  (`legacy@1d32845:bridge/__main__.py:656-661,683-780`) is **adapted** into this
+  structured answer.
 - **A ten-minute ceiling, then a reported failure.** The number is
   `CorePolicy`'s, not this module's, and expiry takes the entry *out* of the
   ledger, so REPORTED_FAILED means what it says: nothing retries it.
@@ -62,6 +68,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 
 from gpt_voicecoding.core.clock import Clock, default_clock
 from gpt_voicecoding.core.lifecycle import Lifecycle
@@ -76,93 +83,161 @@ from gpt_voicecoding.seams.agent import (
     WaitingKind,
     derive_reply_window,
 )
-from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget, new_request_id
 
 _log = logging.getLogger(__name__)
 
-#: What the user hears back the moment words are taken but not yet delivered.
-#: One place, so the promise and the behaviour cannot drift apart — and this one
-#: promises another attempt, so only the two grades that get one may use it.
-QUEUED_CONFIRMATION = "got it, it'll go when this turn ends"
 
-#: What the user hears when an attempt proved nothing either way (P9). It says
-#: the two things that are true and that they cannot infer: the words may
-#: already be in the Session, and nothing here will send them again by itself.
-DUPLICATE_RISK_CONFIRMATION = (
-    "that may already have reached the session — I'm not sending it again on my own, "
-    "because it could arrive twice; say it again if you want another attempt"
-)
+class RelayReason(StrEnum):
+    """Why a Relay stands where it does. Closed, and the only thing said about it.
 
-#: What the user hears when the far side parked the words in front of a person.
-#: Distinct from the above because the right thing to do differs: this one
-#: settles on its own, and saying it again only queues a second copy for the
-#: same human to approve.
-HELD_CONFIRMATION = (
-    "that is parked waiting for approval on the session's side — I'm not sending it again"
-)
+    This replaces seven English sentences and one inline apology. They were
+    written here because a surface rendered them verbatim, which made Bridge
+    Core the author of words the user hears — a second renderer beside the
+    Voice, which re-renders whatever it is handed anyway (#175). A code says the
+    fact; composing the sentence is the Voice's rule, in the instructions.
 
-#: What is reported when a queued Relay passes its ceiling. This is the moment
-#: the Relay becomes terminal, so the wording says so plainly.
-CEILING_REPORT = "that never reached the session — it waited past the limit and was dropped"
+    **The proven/unproven pairs collapsed.** Two of these used to be four,
+    because a sentence about a ceiling may not claim non-delivery of an
+    `UNKNOWN` — the grade that means the far side may well have the words.
+    A code claims nothing about arrival: `ceiling_passed` is a fact about this
+    system's own limit, and the attempt's grade travels beside it.
+    """
 
-#: The same moment for a Relay nothing ever proved either way. Surfaces render
-#: these verbatim, so this one may not say "never reached the session": that is
-#: exactly the claim an UNKNOWN grade refuses to make.
-CEILING_UNPROVEN_REPORT = (
-    "that was never confirmed either way, and I've stopped holding it — it may or may "
-    "not have reached the session"
-)
-
-#: What is reported when the Session those words were for is gone.
-SESSION_GONE_REPORT = "that never reached the session — it ended while the words were waiting"
-
-#: The same, for a Relay that was attempted and proved nothing. The Session's
-#: ending is certain; whether the words got there first is not.
-SESSION_GONE_UNPROVEN_REPORT = (
-    "that session ended, and whether the words reached it first was never confirmed"
-)
+    #: The attempt proved the words reached the model. Nothing else does.
+    DELIVERED = "delivered"
+    #: The words wait, and may go again when the Session next takes a turn.
+    #: Both grades that earn another attempt live here: nothing was sent, or an
+    #: attempt **proved** nothing arrived.
+    AWAITING_REPLY_WINDOW = "awaiting_reply_window"
+    #: An attempt proved nothing either way, so the words are kept and never
+    #: sent again on this system's own authority (P9). Saying them again is the
+    #: user's to authorise.
+    DUPLICATE_RISK = "duplicate_risk"
+    #: The far side parked the words in front of a person. It settles on its
+    #: own; a second copy is a second decision for the same human.
+    HELD_FAR_SIDE = "held_far_side"
+    #: Terminal: the words waited past `relay_ceiling_seconds` and left the
+    #: ledger, so nothing retries them.
+    CEILING_PASSED = "ceiling_passed"
+    #: Terminal: the Session those words were for ended while they waited.
+    SESSION_ENDED = "session_ended"
+    #: Terminal, and refused before the wire: the question is no longer
+    #: answerable from here, so the words were never queued for an inbox that
+    #: cannot take them (#68).
+    QUESTION_UNANSWERABLE = "question_unanswerable"
 
 
-def may_be_retried(outcome: Delivery | None) -> bool:
+#: Which code each grade earns while a Relay is still in play. Total over the
+#: four grades and the absent attempt, and a function: one grade never produces
+#: two codes. The terminal codes are not in here because they are facts about
+#: what happened *here*, not about what an attempt proved.
+_REASON_BY_GRADE: Mapping[Delivery | None, RelayReason] = {
+    None: RelayReason.AWAITING_REPLY_WINDOW,
+    Delivery.FAILED: RelayReason.AWAITING_REPLY_WINDOW,
+    Delivery.UNKNOWN: RelayReason.DUPLICATE_RISK,
+    Delivery.HELD: RelayReason.HELD_FAR_SIDE,
+    Delivery.DELIVERED: RelayReason.DELIVERED,
+}
+
+#: What the grade field says when there is no attempt to grade. Not `unknown`:
+#: that is a positive observation, and this is the absence of one.
+NO_GRADE = "none"
+
+
+def reason_for(receipt: DeliveryReceipt | None) -> RelayReason:
+    """The code an attempt earns, or the one that says nothing was attempted."""
+    return _REASON_BY_GRADE[None if receipt is None else receipt.outcome]
+
+
+def receipt_line(*, state: str, grade: str, reason: str) -> str:
+    """The receipt as one line of codes — the one format every surface prints.
+
+    Three facts and no sentence. One place, so the CLI and the Companion Channel
+    cannot drift into two ways of saying the same receipt, and so a field a
+    harness parses is named the same on both.
+
+    The attempt's own evidence (`DeliveryReceipt.reason`) is deliberately absent:
+    it travels on the wire and into the log, where a defect is diagnosed, and it
+    is the adapter's words rather than anything the user asked for.
+    """
+    return f"state={state} grade={grade} reason={reason}"
+
+
+def may_be_retried(receipt: DeliveryReceipt | None) -> bool:
     """Whether a waiting Relay may go again on this system's own authority (P9).
 
     Two cases and no others: nothing was attempted, so nothing can arrive twice;
     or an attempt **proved** it did not arrive. `UNKNOWN` and `HELD` are both
     "it may have", and this system does not gamble the user's own words on a may.
     """
-    return outcome is None or outcome is Delivery.FAILED
-
-
-def confirmation_for(outcome: Delivery | None) -> str:
-    """What the user is told when their words had to wait, per what was proved."""
-    if outcome is Delivery.UNKNOWN:
-        return DUPLICATE_RISK_CONFIRMATION
-    if outcome is Delivery.HELD:
-        return HELD_CONFIRMATION
-    return QUEUED_CONFIRMATION
-
-
-def _report_for(outcome: Delivery | None, *, proven: str, unproven: str) -> str:
-    """One of two reports, chosen by whether non-delivery was actually established."""
-    return proven if may_be_retried(outcome) else unproven
+    return receipt is None or receipt.outcome is Delivery.FAILED
 
 
 @dataclass(frozen=True, slots=True)
 class RelayOutcome:
-    """Where one Relay stands, and the one thing the user may be told about it."""
+    """Where one Relay stands: the receipt, and the whole of it.
+
+    Three facts and no sentence. `state` is where the words are, `receipt` is
+    what the last attempt proved — the seam's own value, evidence included, or
+    `None` when nothing has been attempted — and `reason` is the one code that
+    says why it stands there.
+
+    **"Not attempted" is the absent attempt, never `UNKNOWN`.** The two are the
+    difference between "it may already have arrived" and "it never left this
+    process", which is the whole of P9's settlement rule; a `None` grade spelt
+    `UNKNOWN` would bring back the duplicates that rule exists to prevent.
+    """
 
     request_id: RequestId
     target: SessionTarget
     state: Lifecycle
     route: RelayRoute
-    #: Spoken or sent back **once**, on receipt, and only when the words had to
-    #: wait. Empty on every other path, including the delivery that follows.
-    confirmation: str = ""
-    #: Said to the user only when the Relay became terminal without arriving.
-    report: str = ""
-    #: The last attempt's honest grade, or `None` when nothing was attempted.
-    outcome: Delivery | None = None
+    #: Why the Relay stands where it does. One code, always present.
+    reason: RelayReason
+    #: The last attempt, whole, or `None` when nothing was attempted.
+    receipt: DeliveryReceipt | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state is Lifecycle.DELIVERED) is not (
+            self.receipt is not None and self.receipt.is_delivered
+        ):
+            raise ValueError(
+                "a Relay is DELIVERED exactly when an attempt proved it: "
+                f"{self.state} beside {self.receipt}"
+            )
+
+    @property
+    def grade(self) -> str:
+        """The attempt's grade as a surface prints it, or `none` when there was none."""
+        return NO_GRADE if self.receipt is None else str(self.receipt.outcome)
+
+    @property
+    def line(self) -> str:
+        """This receipt in the one format every surface prints."""
+        return receipt_line(state=str(self.state), grade=self.grade, reason=str(self.reason))
+
+
+def terminal_line(outcome: RelayOutcome) -> str:
+    """A relay that finally failed, as a bare code line pushed at the user.
+
+    **The grade travels with it**, so an expired `UNKNOWN` and an expired
+    `FAILED` do not read alike. That distinction is the entire reason the
+    deleted reports came in proven and unproven pairs: "it never reached the
+    session" is true of one and a guess about the other. The code says what
+    happened here, the grade says what was proved, and neither has to hedge on
+    the other's behalf — which is why one line of codes can replace four
+    sentences without claiming more than the receipt does.
+
+    **Temporary, and deliberately the narrowest thing that keeps the news
+    flowing.** A terminal failure has to reach the user, and until #197 lands the
+    only route it has is the escalation pipeline, which carries text. So it
+    carries codes, and no sentence. #197 folds the reason onto the Session's row
+    and wakes the Keeper instead, and deletes this function whole with the three
+    calls that use it.
+    """
+    return outcome.line
 
 
 class RelayPipeline:
@@ -218,50 +293,53 @@ class RelayPipeline:
             and session.waiting_for.kind is WaitingKind.QUESTION
             and not question_answerable
         ):
+            # Terminal before the wire, and therefore **ungraded**: nothing was
+            # attempted, so there is no attempt to classify. The code is the
+            # whole answer — where the question can still be answered is the
+            # Voice's sentence to compose, not this module's (#175).
+            _log.info("relay %s refused: %s is no longer answerable from here", rid, target)
             return RelayOutcome(
                 request_id=rid,
                 target=target,
                 state=Lifecycle.REPORTED_FAILED,
                 route=chosen,
-                report=(
-                    "that question is no longer answerable from here; answer it in the terminal"
-                ),
-                outcome=Delivery.FAILED,
+                reason=RelayReason.QUESTION_UNANSWERABLE,
             )
         may_go_now = chosen is RelayRoute.SUPPLEMENT or window is ReplyWindow.OPEN
         if may_go_now:
-            receipt = await adapter.answer_relay(target, text, request_id=rid, route=chosen)
-            if receipt.is_delivered:
+            attempt = await adapter.answer_relay(target, text, request_id=rid, route=chosen)
+            if attempt.is_delivered:
                 return RelayOutcome(
                     request_id=rid,
                     target=target,
                     state=Lifecycle.DELIVERED,
                     route=chosen,
-                    outcome=receipt.outcome,
+                    reason=RelayReason.DELIVERED,
+                    receipt=attempt,
                 )
             _log.info(
                 "relay %s not proven delivered (%s: %s); it waits",
                 rid,
-                receipt.outcome,
-                receipt.reason,
+                attempt.outcome,
+                attempt.reason,
             )
-            outcome = receipt.outcome
+            receipt: DeliveryReceipt | None = attempt
         else:
-            # Nothing went on the wire, so there is no grade to record and no
+            # Nothing went on the wire, so there is no attempt to grade and no
             # duplicate to risk. `None` is that fact, and it is what makes this
             # entry retriable where an attempted-but-unproven one is not.
-            outcome = None
+            receipt = None
 
         # Anything that did not prove delivery waits for the next window, and a
         # SUPPLEMENT that could not go mid-turn waits as an ordinary DELIVER.
-        self._enqueue(rid, target, text, outcome=outcome)
+        self._enqueue(rid, target, text, receipt=receipt)
         return RelayOutcome(
             request_id=rid,
             target=target,
             state=Lifecycle.RETAINED,
             route=RelayRoute.DELIVER,
-            confirmation=confirmation_for(outcome),
-            outcome=outcome,
+            reason=reason_for(receipt),
+            receipt=receipt,
         )
 
     async def reply_window_opened(self, target: SessionTarget) -> tuple[RelayOutcome, ...]:
@@ -283,12 +361,12 @@ class RelayPipeline:
 
         flushed: list[RelayOutcome] = []
         for waiting in self._waiting_answers(target):
-            if not may_be_retried(waiting.outcome):
+            if not may_be_retried(waiting.receipt):
                 _log.info(
                     "relay %s is held rather than retried: an attempt graded %s may already "
                     "have arrived, and a second one would duplicate the user's words",
                     waiting.request_id,
-                    waiting.outcome,
+                    None if waiting.receipt is None else waiting.receipt.outcome,
                 )
                 continue
             receipt = await adapter.answer_relay(
@@ -301,14 +379,15 @@ class RelayPipeline:
                     receipt.outcome,
                     receipt.reason,
                 )
-            self._relays.classify(waiting.request_id, receipt.outcome)
+            self._relays.classify(waiting.request_id, receipt)
             flushed.append(
                 RelayOutcome(
                     request_id=waiting.request_id,
                     target=target,
                     state=(Lifecycle.DELIVERED if receipt.is_delivered else Lifecycle.RETAINED),
                     route=waiting.route,
-                    outcome=receipt.outcome,
+                    reason=reason_for(receipt),
+                    receipt=receipt,
                 )
             )
         return tuple(flushed)
@@ -324,13 +403,7 @@ class RelayPipeline:
             waiting for waiting in self._relays.expired(now=now) if waiting.kind is RelayKind.ANSWER
         ]
         return tuple(
-            self._report_failed(
-                waiting,
-                _report_for(
-                    waiting.outcome, proven=CEILING_REPORT, unproven=CEILING_UNPROVEN_REPORT
-                ),
-            )
-            for waiting in expired
+            self._report_failed(waiting, RelayReason.CEILING_PASSED) for waiting in expired
         )
 
     def session_ended(self, target: SessionTarget) -> tuple[RelayOutcome, ...]:
@@ -340,17 +413,7 @@ class RelayPipeline:
             for waiting in self._relays.pending_for(target)
             if waiting.kind is RelayKind.ANSWER
         ]
-        return tuple(
-            self._report_failed(
-                waiting,
-                _report_for(
-                    waiting.outcome,
-                    proven=SESSION_GONE_REPORT,
-                    unproven=SESSION_GONE_UNPROVEN_REPORT,
-                ),
-            )
-            for waiting in dropped
-        )
+        return tuple(self._report_failed(waiting, RelayReason.SESSION_ENDED) for waiting in dropped)
 
     def waiting_for(self, target: SessionTarget) -> tuple[PendingRelay, ...]:
         """The user's words still queued for one Session, oldest first."""
@@ -377,7 +440,12 @@ class RelayPipeline:
         )
 
     def _enqueue(
-        self, request_id: RequestId, target: SessionTarget, text: str, *, outcome: Delivery | None
+        self,
+        request_id: RequestId,
+        target: SessionTarget,
+        text: str,
+        *,
+        receipt: DeliveryReceipt | None,
     ) -> PendingRelay:
         queued_at = self._clock()
         return self._relays.enqueue(
@@ -389,33 +457,42 @@ class RelayPipeline:
                 queued_at=queued_at,
                 expires_at=queued_at + self._policy.relay_ceiling_seconds,
                 route=RelayRoute.DELIVER,
-                outcome=outcome,
+                receipt=receipt,
             )
         )
 
-    def _report_failed(self, waiting: PendingRelay, report: str) -> RelayOutcome:
+    def _report_failed(self, waiting: PendingRelay, reason: RelayReason) -> RelayOutcome:
+        """Take the entry out and say why, in the code and the last attempt's grade.
+
+        The two used to be one sentence in two spellings, because a rendered
+        sentence may not claim non-delivery of an attempt that proved nothing.
+        The code says what happened here and the receipt says what was proved,
+        so neither has to hedge on the other's behalf.
+        """
         released = self._relays.release(waiting.request_id)
-        _log.info("relay %s reported to the user as failed: %s", released.request_id, report)
+        _log.info(
+            "relay %s is terminal: reason=%s grade=%s",
+            released.request_id,
+            reason,
+            None if released.receipt is None else released.receipt.outcome,
+        )
         return RelayOutcome(
             request_id=released.request_id,
             target=released.target,
             state=Lifecycle.REPORTED_FAILED,
             route=released.route,
-            report=report,
-            outcome=released.outcome,
+            reason=reason,
+            receipt=released.receipt,
         )
 
 
 __all__ = [
-    "CEILING_REPORT",
-    "CEILING_UNPROVEN_REPORT",
-    "DUPLICATE_RISK_CONFIRMATION",
-    "HELD_CONFIRMATION",
-    "QUEUED_CONFIRMATION",
-    "SESSION_GONE_REPORT",
-    "SESSION_GONE_UNPROVEN_REPORT",
+    "NO_GRADE",
     "RelayOutcome",
     "RelayPipeline",
-    "confirmation_for",
+    "RelayReason",
     "may_be_retried",
+    "reason_for",
+    "receipt_line",
+    "terminal_line",
 ]

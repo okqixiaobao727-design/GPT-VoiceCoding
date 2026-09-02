@@ -114,7 +114,7 @@ Payload: none. Data:
   "call_id": null,
   "pending_relays": [{"request_id": "…", "target": {…}, "kind": "answer", "text": "…",
                       "route": "deliver", "queued_at": 0.0, "expires_at": 600.0,
-                      "outcome": "unknown"}],
+                      "outcome": "unknown" /* or null: nothing has been attempted */}],
   "pending_approvals": [{"approval_id": "…", "target": {…}, "tool_name": "Bash",
                          "detail": "", "options": [], "opened_at": 0.0, "expires_at": 600.0}]
 }
@@ -265,9 +265,48 @@ Data:
 
 ```json
 {"request_id": "…", "target": {…}, "state": "pending" | "retained" | "delivered" | "reported_failed",
- "route": "deliver", "outcome": "delivered" | "failed" | "held" | "unknown",
- "confirmation": "", "report": ""}
+ "route": "deliver",
+ "receipt": {"outcome": "delivered" | "failed" | "held" | "unknown", "reason": "…"} | null,
+ "reason": "delivered" | "awaiting_reply_window" | "duplicate_risk" | "held_far_side"
+         | "ceiling_passed" | "session_ended" | "question_unanswerable"}
 ```
+
+**The receipt is a grade and a reason, never a sentence.** Three facts and no
+prose: `state` is where the words are, `receipt` is what the last attempt proved
+— the delivery seam's own value, with the adapter's evidence in `reason` — and
+the top-level `reason` is one code from the closed `RelayReason` set
+(`core/relays.py`), which says why the Relay stands where it does:
+
+| code | what it says |
+| --- | --- |
+| `delivered` | the attempt proved the words reached the model |
+| `awaiting_reply_window` | they wait, and may go again when the Session next takes a turn |
+| `duplicate_risk` | an attempt proved nothing either way, so they are kept and never re-sent on this system's authority (P9) |
+| `held_far_side` | the far side parked them in front of a person |
+| `ceiling_passed` | terminal: they waited past `relay_ceiling_seconds` |
+| `session_ended` | terminal: the Session ended while they waited |
+| `question_unanswerable` | terminal, before the wire: that question is no longer answerable from here (#68) |
+
+`receipt` is `null` when nothing was attempted — **never** a grade of
+`unknown`, which is a positive observation about an attempt that was made. The
+two are the difference between "it may already have arrived" and "it never left
+this process", which is the whole of the duplicate-safety rule.
+
+Surfaces print the three codes and compose no sentence: `state=<state>
+grade=<grade|none> reason=<code>` is the one format (`core/relays.py`,
+`receipt_line`), and `bridgectl relay` and the Companion Channel's inbound relay
+path both answer with exactly it. The words the user *hears* are the Voice's,
+re-rendered from these facts.
+
+`state` is `Lifecycle` (`core/lifecycle.py`), which is where the words stand
+across every attempt they will get — deliberately not the per-attempt `Delivery`
+grade, because reading one attempt's grade as the item's fate is the reference
+implementation's worst delivery bug. Its literals are the four states this verb
+can answer with: **queued** is `retained`, **delivered** is `delivered`, and
+**terminal** is `reported_failed`. There is no `held` *state*: held is a grade
+the far side returned, and it reaches a surface as `receipt.outcome = "held"`
+with `reason = "held_far_side"`, still `retained` because the words are still
+waiting.
 
 Queued is not delivered, and `state` says which it was.
 
