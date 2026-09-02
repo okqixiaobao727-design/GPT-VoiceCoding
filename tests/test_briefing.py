@@ -29,6 +29,14 @@ from gpt_voicecoding.seams.agent import (
     WaitingFor,
     WaitingKind,
 )
+from gpt_voicecoding.seams.call import (
+    HANDOVER_BUDGET_BYTES,
+    MAX_HANDOVER_ITEMS,
+    Dial,
+    DialReason,
+    SpokenBrief,
+    SpokenRosterBrief,
+)
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -481,3 +489,288 @@ class TestText:
         assert "codex:def" in rendered
         assert "requesting permission" in rendered
         assert "finished" in rendered
+
+
+class TestTheSpokenBrief:
+    """One Session Brief as the Call seam carries it — this module's words, as data.
+
+    A Core type may not cross a seam (ADR 0001), so what crosses is the seam's
+    own carrier. What it must *not* become is a second vocabulary: the adapter on
+    the far side assembles these strings and chooses none of them, so every one
+    of them is filled from the same tables `text` prints from.
+    """
+
+    def test_every_field_is_a_word_this_module_chose(self) -> None:
+        brief = briefing.session(
+            row(state=SessionState.WAITING, waiting_for=QUESTION, progress=said("I got this far")),
+            question_answerable=True,
+        )
+
+        spoken = briefing.spoken(brief)
+
+        assert spoken.name == "gpt-voicecoding · a task"
+        assert spoken.agent == "claude"
+        assert spoken.state == "waiting for your decision"
+        assert spoken.newest == "I got this far"
+        assert spoken.decision == (
+            "asked: Which base?",
+            "option: main — the default branch (recommended)",
+            "option: develop",
+            "recommends: main",
+        )
+        assert spoken.answerable_here == "from here"
+        assert spoken.last_activity_at == READ_AT.isoformat()
+
+    def test_a_session_with_no_name_is_carried_by_its_address(self) -> None:
+        """The rule `_headline` follows: the address only where there is no name."""
+        spoken = briefing.spoken(briefing.session(replace(row(), name=None)))
+
+        assert spoken.name == str(CLAUDE)
+
+    def test_an_omitted_newest_carries_the_reason_and_not_a_blank(self) -> None:
+        brief = briefing.omitting_newest(briefing.session(row(progress=said("a long answer"))))
+
+        assert briefing.spoken(brief).newest == "the newest entry is too large to carry"
+
+    def test_a_running_session_carries_no_decision_lines(self) -> None:
+        assert briefing.spoken(briefing.session(row(state=SessionState.RUNNING))).decision == ()
+
+
+class TestTheHandover:
+    """What a system-dialled call comes up already holding (#194, ADR 0018).
+
+    Three kinds of item in one order: why the call was dialled, the roster, then
+    the Sessions that need the user. The wire refuses an over-budget or
+    over-count request outright rather than truncating it, so what is asserted
+    here is that this function gives things back in the right order and never
+    hands `Dial` something it would refuse.
+    """
+
+    def test_the_first_item_says_why_the_call_was_dialled(self) -> None:
+        items = briefing.handover((row(),), focus=None, reason="Sessions need you")
+
+        assert items[0] == DialReason(text="Sessions need you")
+        assert isinstance(items[1], SpokenRosterBrief)
+
+    def test_a_running_session_gets_a_header_row_and_no_brief(self) -> None:
+        items = briefing.handover(
+            (row(CODEX, state=SessionState.RUNNING),), focus=None, reason="dialled"
+        )
+
+        summary = items[1]
+        assert isinstance(summary, SpokenRosterBrief)
+        assert summary.rows == ("gpt-voicecoding · a task — codex:def — running",)
+        assert [item for item in items if isinstance(item, SpokenBrief)] == []
+
+    def test_the_focus_session_is_briefed_first(self) -> None:
+        focus = row(CODEX, state=SessionState.WAITING, waiting_for=QUESTION)
+        other = row(CLAUDE, state=SessionState.WAITING, waiting_for=PERMISSION)
+
+        items = briefing.handover((other, focus), focus=CODEX, reason="dialled")
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert [item.state for item in briefs] == [
+            "waiting for your decision",
+            "requesting permission",
+        ]
+
+    def test_which_sessions_are_briefed_is_the_rosters_answer_alone(self) -> None:
+        """No caller may name one *into the list*, whatever it thinks it knows.
+
+        An earlier draft took the Session the call was dialled about and briefed
+        it ahead of the Focus Session whatever the row said. That put a `running`
+        brief inside the list of Sessions needing the user, because
+        `sessions.set_stop_reading` leaves a row `RUNNING` unless the wait needs
+        the user — a third module's staleness papered over here, at the cost of
+        two of this function's own rules.
+
+        `stopped` is the narrow way back in, and it breaks neither rule: it
+        carries a brief the caller has already read for itself, it goes last, and
+        it goes only where the roster briefed nothing. The tests below it are
+        what say so.
+        """
+        running = row(CODEX, state=SessionState.RUNNING, progress=said("it stopped here"))
+
+        items = briefing.handover((running,), focus=None, reason="dialled")
+
+        assert [item for item in items if isinstance(item, SpokenBrief)] == []
+
+    def test_a_question_is_answerable_here_only_when_the_lane_says_so(self) -> None:
+        waiting = row(CODEX, state=SessionState.WAITING, waiting_for=QUESTION)
+
+        without = briefing.handover((waiting,), focus=None, reason="dialled")
+        with_route = briefing.handover(
+            (waiting,), focus=None, reason="dialled", answerable=(CODEX,)
+        )
+
+        assert _only_brief(without).answerable_here == "at the terminal"
+        assert _only_brief(with_route).answerable_here == "from here"
+
+    def test_a_decision_is_never_given_up_to_keep_a_header_row(self) -> None:
+        """The ladder's own order, on the case that exposed the wrong one.
+
+        Two hundred waiting Sessions: the roster's rows alone are over budget, so
+        something has to go. Giving up briefs first produced one hundred and
+        fifty-four names and not one decision — a hand-over that told the user
+        which Sessions exist and nothing about what any of them is asking.
+        """
+        sessions = tuple(
+            row(
+                SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=said("y" * 400),
+            )
+            for index in range(200)
+        )
+
+        items = briefing.handover(sessions, focus=None, reason="dialled")
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert briefs, "every decision was given up to keep a list of names"
+        assert all(item.decision for item in briefs)
+        assert _fits(items)
+
+    def test_over_budget_the_newest_bodies_go_from_the_back_and_are_named(self) -> None:
+        """Named as omitted and never sliced (ADR 0016), and from the back (#166)."""
+        sessions = tuple(
+            row(
+                SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=said("x" * 900),
+            )
+            for index in range(12)
+        )
+
+        items = briefing.handover(sessions, focus=None, reason="dialled")
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert len(briefs) == 12
+        carried = [item.newest for item in briefs if item.newest.startswith("x")]
+        omitted = [
+            item.newest
+            for item in briefs
+            if item.newest == "the newest entry is too large to carry"
+        ]
+        assert carried and omitted
+        # The ones that kept their body are the ones the roster ordered first.
+        assert [item.newest for item in briefs] == carried + omitted
+        # Everything else stays: the header and the whole decision are what the
+        # user acts on, and they are small.
+        assert all(item.decision for item in briefs)
+        assert _fits(items)
+
+    def test_a_hand_over_never_exceeds_either_ceiling(self) -> None:
+        """Both are hard refusals on the wire, so `Dial` accepts what this returns."""
+        sessions = tuple(
+            row(
+                SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=said("y" * 400),
+            )
+            for index in range(200)
+        )
+
+        items = briefing.handover(sessions, focus=None, reason="dialled")
+
+        assert len(items) <= MAX_HANDOVER_ITEMS
+        assert _fits(items)
+        Dial(voice="prose", agent="rules", hand_over=items)
+
+    def test_the_counts_survive_any_scale_and_the_focus_is_still_briefed_first(self) -> None:
+        """The one thing that never goes, and the one order that never changes.
+
+        Two hundred waiting Sessions fit under neither ceiling, so most of this
+        roster is given back — and what is left still says how many there were.
+        The counts are the summary ADR 0016 asks for: they are what tells the
+        Voice that the call could not carry them all, and they say it without a
+        fourth kind of item on the seam #195 and #196 build on. The Focus Session
+        is still the first brief, because trimming takes from the back and the
+        order the roster chose is the order that survives.
+        """
+        focus = row(
+            CODEX,
+            state=SessionState.WAITING,
+            waiting_for=PERMISSION,
+            progress=said("z" * 400),
+        )
+        others = tuple(
+            row(
+                SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=said("y" * 400),
+            )
+            for index in range(200)
+        )
+
+        items = briefing.handover((*others, focus), focus=CODEX, reason="dialled")
+
+        summary = items[1]
+        assert isinstance(summary, SpokenRosterBrief)
+        assert summary.counts == "the others: 200 waiting for your decision"
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert briefs[0].state == "requesting permission"
+        assert len(items) <= MAX_HANDOVER_ITEMS
+        assert _fits(items)
+        Dial(voice="prose", agent="rules", hand_over=items)
+
+    def test_a_stopped_session_the_roster_did_not_brief_is_carried_last(self) -> None:
+        """The one row the roster is knowingly stale about (#209).
+
+        A Stop that merely ended a turn leaves its row `RUNNING`, and a running
+        Session is briefed by nothing here — so the caller passes the reading it
+        took at the Stop, and it goes after every Session the roster did brief.
+        """
+        stale = row(CODEX, state=SessionState.RUNNING, progress=said("it stopped here"))
+        waiting = row(CLAUDE, state=SessionState.WAITING, waiting_for=PERMISSION)
+        stopped = SpokenBrief(
+            name="gpt-voicecoding · a task",
+            agent="codex",
+            state="finished",
+            newest="it stopped here",
+            decision=("nothing is waiting on you",),
+            answerable_here="at the terminal",
+            last_activity_at="not read",
+        )
+
+        items = briefing.handover(
+            (stale, waiting), focus=None, reason="dialled", stopped=(CODEX, stopped)
+        )
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert [item.state for item in briefs] == ["requesting permission", "finished"]
+        assert briefs[-1] is stopped
+
+    def test_a_stopped_session_the_roster_did_brief_is_not_carried_twice(self) -> None:
+        """One Session, one brief. The roster's reading is the one that travels."""
+        waiting = row(CODEX, state=SessionState.WAITING, waiting_for=QUESTION)
+        stopped = SpokenBrief(
+            name="gpt-voicecoding · a task",
+            agent="codex",
+            state="finished",
+            newest="it stopped here",
+            decision=("nothing is waiting on you",),
+            answerable_here="at the terminal",
+            last_activity_at="not read",
+        )
+
+        items = briefing.handover(
+            (waiting,), focus=None, reason="dialled", stopped=(CODEX, stopped)
+        )
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert len(briefs) == 1
+        assert briefs[0].state == "waiting for your decision"
+
+
+def _only_brief(items: tuple[object, ...]) -> SpokenBrief:
+    briefs = [item for item in items if isinstance(item, SpokenBrief)]
+    assert len(briefs) == 1
+    return briefs[0]
+
+
+def _fits(items: tuple[object, ...]) -> bool:
+    return sum(item.size_in_bytes for item in items) <= HANDOVER_BUDGET_BYTES  # type: ignore[attr-defined]

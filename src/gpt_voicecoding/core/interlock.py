@@ -40,8 +40,8 @@ from __future__ import annotations
 import asyncio
 
 from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
-from gpt_voicecoding.seams.call import CallAdapter, CallSnapshot
+from gpt_voicecoding.core.errors import SecondCallRefused
+from gpt_voicecoding.seams.call import CallAdapter, CallSnapshot, Dial, SpokenBrief
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.identity import RequestId
 
@@ -66,24 +66,24 @@ class CallInterlock:
         """The call the system owns, or None. Opaque; only compared for identity."""
         return self._call_id
 
-    async def open_call(self, instructions: str) -> CallSnapshot:
-        """Bring a Live Call up on those house rules. Refuses when one is owned.
+    async def open_call(self, dial: Dial) -> CallSnapshot:
+        """Bring a Live Call up on that dial. Refuses when one is already owned.
 
         A snapshot that is not UP — CONNECTING, or down — is deliberately *not*
         claimed. Claiming a call that never arrived would bar the retry that
         fixes it, which is the no-loss invariant inverted.
 
-        The instructions are Bridge Core's and are passed straight through: this
-        object decides *whether* a call may open, never what it is told — except
-        for the one case where there is nothing to tell. Both refusals live here
-        because this is the only door, and a rule enforced at each caller
-        instead is a rule that grows a second, divergent copy.
+        The dial is Bridge Core's and is passed straight through: this object
+        decides *whether* a call may open, never what it is opened on. **One
+        refusal now, not two.** The blank check used to live here as well,
+        because this was the only door and a rule enforced at each caller grows a
+        second, divergent copy; a `Dial` refuses its own empty halves at
+        construction (ADR 0018), which is one place and an earlier one — a caller
+        cannot even build the argument that would have been refused here.
         """
         if self._call_id is not None:
             raise SecondCallRefused(self._call_id)
-        if not instructions.strip():
-            raise VoiceInstructionsMissing()
-        snapshot = await self._call.ensure_call(instructions)
+        snapshot = await self._call.ensure_call(dial)
         if snapshot.is_up and snapshot.call_id is not None:
             self._call_id = snapshot.call_id
         return snapshot
@@ -128,8 +128,8 @@ class CallInterlock:
         self._voice_speaking = speaking
         self.note_activity()
 
-    async def speak(self, text: str, *, request_id: RequestId) -> DeliveryReceipt:
-        """Speak through the owned call, serialised with ending it.
+    async def speak(self, brief: SpokenBrief, *, request_id: RequestId) -> DeliveryReceipt:
+        """Hand one Session Brief to the owned call, serialised with ending it.
 
         The receipt is **not** activity. It says the words were handed to the
         adapter, which is a text hand-over and not a voice; what keeps the call
@@ -138,7 +138,7 @@ class CallInterlock:
         window from before the answer instead of from the end of it.
         """
         async with self._operation_lock:
-            return await self._call.speak(text, request_id=request_id)
+            return await self._call.speak(brief, request_id=request_id)
 
     async def end_call(self) -> CallSnapshot:
         """End the call the system owns. Idempotent when none is up."""

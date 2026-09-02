@@ -42,6 +42,7 @@ from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
+    CallInstructionsMissing,
     ChildSessionError,
     LaneUnreadable,
     ProgressUnavailable,
@@ -97,6 +98,9 @@ from gpt_voicecoding.seams.call import (
     CallSnapshot,
     CallStarted,
     Cue,
+    Dial,
+    DialReason,
+    HandoverItem,
     UserSpeech,
     VoiceSpeech,
 )
@@ -123,6 +127,20 @@ NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wi
 #: (#184). One per edge, never per delta — a long answer is hundreds of those.
 VOICE_SPEAKING_LINE = "the call's own Voice started speaking"
 VOICE_QUIET_LINE = "the call's own Voice stopped speaking"
+
+#: Why a call the user opened exists, and the *whole* hand-over it gets (#167
+#: Q6). A user who pressed the toggle is about to say what they want; briefing
+#: them on the roster they were looking at when they pressed it would be the
+#: system talking first, on a call the user opened to talk.
+USER_OPENED = "The user opened this call. Wait to be spoken to, then act on what they ask for."
+
+#: Why a call the *system* dialled exists. The items after it are the roster and
+#: the Sessions waiting, so this says what they are for and nothing they say.
+SYSTEM_DIALLED = (
+    "This call was dialled because Sessions need the user. "
+    "What follows is the roster and each Session that is waiting; "
+    "speak from it, and do not invent anything it does not say."
+)
 
 
 def stop_brief(
@@ -300,15 +318,6 @@ class BridgeCore:
         #: engine it reaches. None until a root supplies them; a hub assembled
         #: for a test has no CLI to name and does not pretend to.
         self._instructions = generate(instruction_context) if instruction_context else None
-        #: The rules the **acting** half of a call starts with. `ensure_call`
-        #: still takes one string, and the half it reaches is the one with the
-        #: tools (ADR 0018, proved by slot-swap in #175) — so the Agent set is
-        #: what belongs in it, and the Voice set has no carrier until the Dial
-        #: gives that seam a payload per audience. Which field on the wire
-        #: carries which audience is the realtime adapter's alone to know.
-        #: Empty when this hub generated none, and the interlock refuses to open
-        #: a call on an empty one rather than this being checked at each caller.
-        self._call_agent_instructions = self._instructions.agent.text if self._instructions else ""
         #: Durations are measured with `clock`; anything read outside this
         #: process is stamped with `stamp`. A Session's `first_seen` travels to
         #: every surface in the `sessions` payload, and a monotonic reading
@@ -324,7 +333,7 @@ class BridgeCore:
             channel=channel,
             interlock=self.interlock,
             adjudicator=self.adjudicator,
-            call_agent_instructions=self._call_agent_instructions,
+            system_dial=self._system_dial,
         )
         self.relays = RelayPipeline(
             agents=agents,
@@ -544,10 +553,68 @@ class BridgeCore:
             return await self.interlock.end_call()
         # Ending is always allowed; whether opening is, is the interlock's to
         # say — in both directions, and for both of its reasons.
-        snapshot = await self.interlock.open_call(self._call_agent_instructions)
+        snapshot = await self.interlock.open_call(self._dial((DialReason(text=USER_OPENED),)))
         if snapshot.is_up:
             self._owe_reconciliation()
         return snapshot
+
+    def _dial(self, hand_over: tuple[HandoverItem, ...]) -> Dial:
+        """What a call this hub opens is opened on: two audiences and a hand-over.
+
+        The one place a `Dial` is built, and therefore the one place that can say
+        which half is missing when this engine generated nothing. The refusal is
+        here rather than in the interlock because that is a door and this is a
+        source: the interlock decides *whether* a call may open, and only the hub
+        knows what it would be opened on (ADR 0018; #193's deferred note on the
+        error's old name).
+        """
+        instructions = self._instructions
+        if instructions is None:
+            raise CallInstructionsMissing("prose for the Voice or rules for the Call Agent")
+        if not instructions.voice.text.strip():
+            raise CallInstructionsMissing("prose for the Voice")
+        if not instructions.agent.text.strip():
+            raise CallInstructionsMissing("rules for the Call Agent")
+        return Dial(
+            voice=instructions.voice.text, agent=instructions.agent.text, hand_over=hand_over
+        )
+
+    def _system_dial(self, notice: Notice) -> Dial:
+        """What a call the *system* dials for one notice is opened on.
+
+        The hand-over is read from the roster **now**, not assembled from the
+        notice that provoked it: ADR 0017's rule is that a missed call is briefed
+        from a fresh reading and never from replayed events, and by the time the
+        matrix reaches this route the wait that started it may have been answered
+        at the terminal. So the notice names the moment and the roster supplies
+        the content.
+
+        **Except for the one row the roster is knowingly stale about.** A Stop
+        that merely ended a turn leaves its row in `RUNNING`
+        (`core/sessions.py::set_stop_reading`, deliberately, #209), and a hand-over
+        briefs no running Session — so a call dialled by that Stop would come up
+        saying a Session needs the user and never mention which. The notice
+        already carries the reading that is *not* stale: `stop_brief` derives the
+        state from the wait for exactly this reason, and `briefing.spoken` worded
+        it. So it is passed alongside, and `handover` places it last and only if
+        the roster did not brief that target itself — never ahead of the Focus
+        Session, and never twice.
+        """
+        sessions = self._state.sessions.live()
+        return self._dial(
+            briefing.handover(
+                sessions,
+                self._state.sessions.focus,
+                reason=SYSTEM_DIALLED,
+                answerable=tuple(
+                    session.target
+                    for session in sessions
+                    if session.waiting_for.kind is WaitingKind.QUESTION
+                    and self._question_answerable(session.target)
+                ),
+                stopped=((notice.target, notice.spoken) if notice.spoken is not None else None),
+            )
+        )
 
     async def outlets_changed(self) -> None:
         """An outlet the switches already allow became reachable again.
@@ -930,6 +997,11 @@ class BridgeCore:
                 request_id=new_request_id(),
                 target=target,
                 text=briefing.text(brief),
+                # The same brief, twice, for the two kinds of surface: the
+                # Companion Channel and the log render words, and the Live Call
+                # is handed the brief itself and speaks from it (`CONTEXT.md`,
+                # *Stop Notice*). One reading, so the two can never disagree.
+                spoken=briefing.spoken(brief),
             )
         )
         return outcome

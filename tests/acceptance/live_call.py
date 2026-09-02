@@ -101,6 +101,23 @@ REQUEST = "那个你把电话挂了吧,我想让你结束通话"
 #: graded hand-off, and this one is only ever about the ceiling.
 LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,不要跳过也不要加快"
 
+#: What the *third* variant asks, and it asks for nothing to be done. #194 dials
+#: the call from the system side and puts the whole briefing in `initialItems`,
+#: which the Voice holds silently — so the question that proves the hand-over
+#: arrived is one whose answer can only have come out of it. "什么需要我" is that
+#: question: the Voice either reads the Sessions it was handed at dial time or it
+#: has nothing, and a Voice with nothing invents (ADR 0018, on the probe's
+#: invented clock). **No verb in it**, deliberately: the Call Agent is the half
+#: with the tools, and a hand-off here would mean the Voice went looking for an
+#: answer it was already holding. The wrapper log staying empty for this question
+#: is what says it did not.
+#:
+#: Longer than the four words it could have been, for `WAV_MINIMUM_SECONDS`'
+#: sake: "什么需要我?" synthesises to 1.04 s against a 1.0 s floor, which is a
+#: run away from being read as the stub `say` writes for a voice that was never
+#: installed. This one is 2 s and change, and asks the same thing.
+NEEDS_REQUEST = "现在有哪些需要我的事情?"
+
 #: The voice `say` synthesises with. `Flo` and `Eddy` are premium zh_CN voices
 #: that have never been downloaded on this machine, and `say` does not say so —
 #: it exits 0 and writes 0.41 s of something that is not the sentence, where
@@ -122,6 +139,7 @@ WAV_MINIMUM_SECONDS = 1.0
 #: against the probe's record; `long` is #184's.
 PLAIN = "plain"
 LONG = "long"
+NEEDS = "needs"
 
 #: Which variant the *next* call plays, as a file in `wav_directory` holding one
 #: variant name. Two things force a per-call channel rather than a settings key:
@@ -166,6 +184,7 @@ class HarnessSettings:
     wav_directory: Path
     request: str = REQUEST
     long_request: str = LONG_REQUEST
+    needs_request: str = NEEDS_REQUEST
     voice: str = WAV_VOICE
     wav_sample_rate: int = WAV_SAMPLE_RATE
     settle_seconds: float = SETTLE_SECONDS
@@ -173,7 +192,7 @@ class HarnessSettings:
     @property
     def requests(self) -> dict[str, str]:
         """Every utterance this run can put on a track, by its variant name."""
-        return {PLAIN: self.request, LONG: self.long_request}
+        return {PLAIN: self.request, LONG: self.long_request, NEEDS: self.needs_request}
 
     @property
     def next_variant_path(self) -> Path:

@@ -249,7 +249,7 @@ def test_the_live_call_steps_are_last_so_a_full_run_dials_after_it_has_walked(
 ) -> None:
     """A call holds the interlock, so on a whole-lane run they come after the
     steps that drive turns rather than in the middle of them."""
-    assert journey.STEPS[-2:] == journey.LIVE_CALL_STEPS
+    assert journey.STEPS[-len(journey.LIVE_CALL_STEPS) :] == journey.LIVE_CALL_STEPS
 
 
 def test_the_step_is_bound_to_a_method_like_every_other_name(tmp_path: Path) -> None:  # noqa: ARG001
@@ -713,6 +713,6 @@ def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
     settings = live_call.HarnessSettings(
         observations=Path("/tmp/o.jsonl"), wav_directory=Path("/tmp/wav")
     )
-    assert set(settings.requests) == {live_call.PLAIN, live_call.LONG}
+    assert set(settings.requests) == {live_call.PLAIN, live_call.LONG, live_call.NEEDS}
     assert settings.requests[live_call.PLAIN] == live_call.REQUEST
     assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST

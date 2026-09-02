@@ -35,7 +35,11 @@ import pytest
 from codex_fake import FakeAppServer, FakeRemoteError
 from gpt_voicecoding.adapters.call.realtime import (
     APPROVAL_POLICY,
+    CODEX_RESPONSE_ITEM_PREFIX,
+    CODEX_RESPONSES_AS_ITEMS,
     DEFAULT_REALTIME_MODEL,
+    DELEGATION_ACK_FILLER,
+    INCLUDE_STARTUP_CONTEXT,
     SANDBOX,
     DelegatedTurnError,
     RealtimeCallAdapter,
@@ -45,6 +49,7 @@ from gpt_voicecoding.adapters.call.realtime import (
     realtime_call,
     webrtc,
 )
+from gpt_voicecoding.adapters.call.realtime.adapter import _item_text
 from gpt_voicecoding.adapters.codex_app_server.process import AppServerError, attach
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
 from gpt_voicecoding.seams.call import (
@@ -53,6 +58,10 @@ from gpt_voicecoding.seams.call import (
     CallStarted,
     CallState,
     Cue,
+    Dial,
+    DialReason,
+    SpokenBrief,
+    SpokenRosterBrief,
     UserSpeech,
     VoiceSpeech,
 )
@@ -71,7 +80,27 @@ from realtime_fake import (
 
 THREAD = "01a02110-d18f-74a0-916d-de1208e9977a"
 CALL_AGENT_INSTRUCTIONS = "speak the Session Name; never invent a detail"
+CALL_VOICE_PROSE = "Speak in short sentences. Wait to be asked before giving detail."
 DELEGATED_RULES = "act only through the control-plane CLI"
+
+
+def dial(*hand_over: object) -> Dial:
+    """What Bridge Core hands this adapter: two audiences and a hand-over."""
+    return Dial(voice=CALL_VOICE_PROSE, agent=CALL_AGENT_INSTRUCTIONS, hand_over=tuple(hand_over))
+
+
+def brief(newest: str) -> SpokenBrief:
+    """One Session Brief in Briefing's own words, as the seam carries it."""
+    return SpokenBrief(
+        name="voicecoding · the dial",
+        agent="codex",
+        state="waiting for your decision",
+        newest=newest,
+        decision=("asked: ship it?", "option: yes", "option: no"),
+        answerable_here="from here",
+        last_activity_at="not read",
+    )
+
 
 _names = iter(range(10_000))
 
@@ -201,7 +230,7 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
 
-                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                snapshot = await adapter.ensure_call(dial())
 
                 assert snapshot.state is CallState.UP
                 assert snapshot.call_id == THREAD
@@ -210,6 +239,133 @@ class TestBringingACallUp:
                 assert start["transport"] == {"type": "webrtc", "sdp": OFFER_SDP}
                 assert start["realtimeStartInstructions"] == CALL_AGENT_INSTRUCTIONS
                 assert audio.answers == [ANSWER_SDP]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_dial_reaches_two_audiences_through_three_slots(self, socket_path: Path) -> None:
+        """ADR 0018's mapping, pinned: `prompt`, `realtimeStartInstructions`, `initialItems`.
+
+        The slot-swap proved which half each reaches — `realtimeStartInstructions`
+        0/6 on the Voice, `prompt` 6/6, `initialItems` 5/6 and silent (#175 Q4,
+        #179). This is the only place in the system that knows any of these three
+        names, and each hand-over item becomes exactly one entry under
+        `role: developer`.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(server, Sink())
+
+                await adapter.ensure_call(
+                    dial(
+                        DialReason(text="dialled because Sessions need you"),
+                        SpokenRosterBrief(
+                            counts="the others: 1 running",
+                            rows=("build — codex:abc — running",),
+                            focus="voicecoding · the dial — codex:def — finished",
+                        ),
+                        brief("it finished"),
+                    )
+                )
+
+                start = server.calls_to("thread/realtime/start")[0]
+                assert start["prompt"] == CALL_VOICE_PROSE
+                assert start["realtimeStartInstructions"] == CALL_AGENT_INSTRUCTIONS
+                assert [item["role"] for item in start["initialItems"]] == [
+                    "developer",
+                    "developer",
+                    "developer",
+                ]
+                assert start["initialItems"][0]["text"] == "dialled because Sessions need you"
+                assert start["initialItems"][1]["text"] == (
+                    "focus: voicecoding · the dial — codex:def — finished\n"
+                    "the others: 1 running\n"
+                    "  build — codex:abc — running"
+                )
+                assert start["initialItems"][2]["text"].endswith("  last activity: not read")
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_three_dial_time_switches_are_this_adapters_constants(
+        self, socket_path: Path
+    ) -> None:
+        """No caller varies them, so they are pinned here rather than on the `Dial`.
+
+        `delegationAckFiller` off is Round 1 Q9's wordiness removed;
+        `includeStartupContext` off keeps a 5,300-token scan of the user's recent
+        threads out of the Voice's prompt (ADR 0018 as amended by #179);
+        `codexResponsesAsItems` on with a prefix is the recorded decision and
+        **buys no observability** — two live spoken calls produced no item
+        carrying an agent answer, so nothing here is built on it.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(server, Sink())
+
+                await adapter.ensure_call(dial())
+
+                start = server.calls_to("thread/realtime/start")[0]
+                assert start["delegationAckFiller"] is DELEGATION_ACK_FILLER is False
+                assert start["includeStartupContext"] is INCLUDE_STARTUP_CONTEXT is False
+                assert start["codexResponsesAsItems"] is CODEX_RESPONSES_AS_ITEMS is True
+                assert start["codexResponseItemPrefix"] == CODEX_RESPONSE_ITEM_PREFIX
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_no_item_reaches_the_wire_larger_than_it_was_budgeted_at(self) -> None:
+        """The invariant `HANDOVER_BUDGET_BYTES` is a promise about, checked here.
+
+        The seam counts a hand-over before this module assembles it, so the count
+        has to be an upper bound on what assembly produces — otherwise a `Dial`
+        the seam accepted is a request the wire refuses, which is an error and
+        not a truncation. It was not one: counting the words without the labels
+        around them let 8,192 budgeted bytes reach the wire as 8,242 (#194
+        review). Asserted against the real assembly rather than against a
+        restatement of it, so a longer label fails here rather than on a call.
+        """
+        items = (
+            DialReason(text="dialled because Sessions need the user"),
+            SpokenRosterBrief(
+                counts="the others: 2 running, 1 finished",
+                rows=("build — codex:abc — running", "docs — claude:def:12 — finished"),
+                focus="voicecoding · the dial — codex:ghi — waiting for your decision",
+            ),
+            brief("it stopped on a question"),
+            SpokenBrief(
+                name="a",
+                agent="codex",
+                state="running",
+                newest="nothing said yet",
+                decision=(),
+                answerable_here="at the terminal",
+                last_activity_at="not read",
+            ),
+        )
+
+        for item in items:
+            assembled = len(_item_text(item).encode("utf-8"))
+            assert assembled <= item.size_in_bytes, f"{type(item).__name__} overflows its budget"
+
+    def test_a_user_opened_dial_carries_exactly_one_item(self, socket_path: Path) -> None:
+        """#167 Q6: a call the user opened gets no hand-over, only why it exists."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(server, Sink())
+
+                await adapter.ensure_call(dial(DialReason(text="The user opened this call.")))
+
+                start = server.calls_to("thread/realtime/start")[0]
+                assert start["initialItems"] == [
+                    {"role": "developer", "text": "The user opened this call."}
+                ]
                 await adapter.aclose()
 
         asyncio.run(scenario())
@@ -229,7 +385,7 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
 
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 started = server.calls_to("thread/start")[0]
                 assert started["approvalPolicy"] == APPROVAL_POLICY == "never"
@@ -260,7 +416,7 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
 
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 start = server.calls_to("thread/realtime/start")[0]
                 assert start["model"] == DEFAULT_REALTIME_MODEL == "gpt-live-1-codex"
@@ -279,7 +435,7 @@ class TestBringingACallUp:
                     server, Sink(), settings=quick(realtime_model="gpt-live-2-later")
                 )
 
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 start = server.calls_to("thread/realtime/start")[0]
                 assert start["model"] == "gpt-live-2-later"
@@ -313,7 +469,7 @@ class TestBringingACallUp:
                 server.answers("thread/realtime/start", refuse)
                 adapter, _ = await riding(server, Sink())
 
-                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                snapshot = await adapter.ensure_call(dial())
 
                 assert snapshot.state is CallState.DOWN
                 logged = " ".join(record.getMessage() for record in caplog.records)
@@ -332,8 +488,8 @@ class TestBringingACallUp:
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
 
-                first = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
-                second = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                first = await adapter.ensure_call(dial())
+                second = await adapter.ensure_call(dial())
 
                 assert first == second
                 assert len(server.calls_to("thread/start")) == 1
@@ -351,7 +507,7 @@ class TestBringingACallUp:
                 sink = Sink()
                 adapter, audio = await riding(server, sink, transport=FakeTransport(connects=False))
 
-                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                snapshot = await adapter.ensure_call(dial())
 
                 assert snapshot.state is CallState.DOWN
                 assert audio.closed
@@ -362,21 +518,18 @@ class TestBringingACallUp:
 
         asyncio.run(scenario())
 
-    def test_a_call_is_never_opened_on_no_instructions(self, socket_path: Path) -> None:
-        """Nothing here invents house rules when the hub generated none."""
+    def test_a_call_is_never_opened_on_no_instructions(self) -> None:
+        """Nothing here invents house rules when the hub generated none.
 
-        async def scenario() -> None:
-            async with FakeAppServer(socket_path) as server:
-                realtime_script(server, thread_id=THREAD)
-                adapter, _ = await riding(server, Sink())
-
-                snapshot = await adapter.ensure_call("   ")
-
-                assert snapshot.state is CallState.DOWN
-                assert server.calls_to("thread/start") == []
-                await adapter.aclose()
-
-        asyncio.run(scenario())
+        The check left this adapter with #194: a `Dial` refuses its own empty
+        halves at construction (`seams/call.py`), so an argument this method
+        could refuse cannot be built. One rule, one place, and an earlier one
+        than the wire.
+        """
+        with pytest.raises(ValueError):
+            Dial(voice="", agent=CALL_AGENT_INSTRUCTIONS)
+        with pytest.raises(ValueError):
+            Dial(voice=CALL_VOICE_PROSE, agent="   ")
 
     def test_hanging_up_during_the_handshake_abandons_it(self, socket_path: Path) -> None:
         """`end_call` while connecting: the attempt stops, and nothing is reported up."""
@@ -388,7 +541,7 @@ class TestBringingACallUp:
                 audio = FakeTransport(connects=False)
                 adapter, _ = await riding(server, sink, transport=audio)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
+                opening = asyncio.ensure_future(adapter.ensure_call(dial()))
                 await asyncio.sleep(0.05)
                 ended = await adapter.end_call()
                 snapshot = await opening
@@ -432,7 +585,7 @@ class TestHangingUpMidHandshake:
 
                 server.answers("thread/start", dawdle)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
+                opening = asyncio.ensure_future(adapter.ensure_call(dial()))
                 await asyncio.sleep(0.05)
                 ended = await adapter.end_call()
                 slow.set()
@@ -460,7 +613,7 @@ class TestHangingUpMidHandshake:
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
+                opening = asyncio.ensure_future(adapter.ensure_call(dial()))
                 await asyncio.sleep(0.05)
                 await adapter.end_call()
                 snapshot = await opening
@@ -475,17 +628,36 @@ class TestHangingUpMidHandshake:
 
 class TestSpeaking:
     def test_speaking_into_a_live_call_is_delivered(self, socket_path: Path) -> None:
+        """The brief goes out assembled, and every word in it is Briefing's (#194).
+
+        What this adapter adds is the labels and the order — `newest:`, the
+        decision lines under the header, `answer:` last. The five state words,
+        the omission wording and the decision's own sentences all arrive already
+        chosen, so nothing here can describe a Session a second way.
+        """
+
         async def scenario() -> None:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
-                receipt = await adapter.speak("that session stopped", request_id=rid())
+                receipt = await adapter.speak(brief("that session stopped"), request_id=rid())
 
                 assert receipt.outcome is Delivery.DELIVERED
                 assert server.calls_to("thread/realtime/appendSpeech") == [
-                    {"threadId": THREAD, "text": "that session stopped"}
+                    {
+                        "threadId": THREAD,
+                        "text": (
+                            "voicecoding · the dial — codex — waiting for your decision\n"
+                            "  newest: that session stopped\n"
+                            "  asked: ship it?\n"
+                            "  option: yes\n"
+                            "  option: no\n"
+                            "  answer: from here\n"
+                            "  last activity: not read"
+                        ),
+                    }
                 ]
                 await adapter.aclose()
 
@@ -497,7 +669,7 @@ class TestSpeaking:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
 
-                receipt = await adapter.speak("anyone there", request_id=rid())
+                receipt = await adapter.speak(brief("anyone there"), request_id=rid())
 
                 assert receipt.outcome is Delivery.FAILED
                 assert "no call is up" in receipt.reason
@@ -511,13 +683,13 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 def refuse(_params: dict) -> dict:
                     raise FakeRemoteError("no realtime session on that thread")
 
                 server.answers("thread/realtime/appendSpeech", refuse)
-                receipt = await adapter.speak("hello", request_id=rid())
+                receipt = await adapter.speak(brief("hello"), request_id=rid())
 
                 assert receipt.outcome is Delivery.FAILED
                 assert "no realtime session on that thread" in receipt.reason
@@ -537,14 +709,14 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 def go_quiet_then_accept(_params: dict) -> dict:
                     audio.go_quiet()
                     return {}
 
                 server.answers("thread/realtime/appendSpeech", go_quiet_then_accept)
-                receipt = await adapter.speak("you are needed", request_id=rid())
+                receipt = await adapter.speak(brief("you are needed"), request_id=rid())
 
                 assert receipt.outcome is Delivery.UNKNOWN
                 assert "already gone" in receipt.reason
@@ -559,14 +731,14 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 async def die(_params: dict) -> dict:
                     await server.drop_everyone()
                     return {}
 
                 server.answers("thread/realtime/appendSpeech", die)
-                receipt = await adapter.speak("you are needed", request_id=rid())
+                receipt = await adapter.speak(brief("you are needed"), request_id=rid())
 
                 assert receipt.outcome is Delivery.UNKNOWN
                 await adapter.aclose()
@@ -581,7 +753,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 first = await adapter.end_call()
                 second = await adapter.end_call()
@@ -602,7 +774,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 def refuse(_params: dict) -> dict:
                     raise FakeRemoteError("no realtime session on that thread")
@@ -622,7 +794,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 await server.notify_all(
                     "thread/realtime/closed",
@@ -646,11 +818,11 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 audio.lose("the peer connection failed")
                 await asyncio.sleep(0.05)
-                receipt = await adapter.speak("you are needed", request_id=rid())
+                receipt = await adapter.speak(brief("you are needed"), request_id=rid())
 
                 assert len(sink.of(CallDropped)) == 1
                 assert receipt.outcome is Delivery.FAILED
@@ -666,7 +838,7 @@ class TestHowACallStops:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 audio.go_quiet()
 
@@ -683,7 +855,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 await server.notify_all(
                     "thread/realtime/transcript/done",
@@ -696,13 +868,212 @@ class TestWhatTheCallRaisesUpward:
 
         asyncio.run(scenario())
 
+    def test_a_hand_off_is_written_down_and_raises_no_event_of_its_own(
+        self, socket_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """ADR 0018: no `HandoffRequested` event. The closed event set stays closed.
+
+        A `handoff_request` is the one observable proof the acting half was
+        reached — the model's own claim to have acted is trusted by nothing
+        (8/8 false hang-up claims, #179). So it is logged, and the engine still
+        acts only on the Call Agent's own `bridgectl` run. What it *does* raise
+        is the user's own sentence, which the item carries and which the seam
+        has always published; there is still no event for the hand-off itself.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                with caplog.at_level(logging.INFO):
+                    await server.notify_all(
+                        "thread/realtime/itemAdded",
+                        {
+                            "threadId": THREAD,
+                            "item": {
+                                "type": "handoff_request",
+                                "handoff_id": "item_EJELbGbAr6yo",
+                                "input_transcript": "hang up",
+                            },
+                        },
+                    )
+                    await asyncio.sleep(0.05)
+
+                assert "item_EJELbGbAr6yo" in caplog.text
+                assert "hang up" in caplog.text
+                assert sink.events == [CallStarted(call_id=THREAD), UserSpeech(text="hang up")]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_sentence_a_hand_off_routed_is_what_the_user_said(self, socket_path: Path) -> None:
+        """The carrier that arrives in time, on the call this engine actually makes.
+
+        Measured on this machine: with `delegationAckFiller` off, a request that
+        routed produced ten user deltas, a `handoff_request`, `bridgectl live`
+        and a closed call in eleven seconds, and **no `transcript/done` at any
+        point**. Waiting for `done` loses the user's words outright — and with
+        them the Silence Ceiling's only reason to hold the call open.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                for delta in ("那个你", "把", "电话挂", "了吧"):
+                    await server.notify_all(
+                        "thread/realtime/transcript/delta",
+                        {"threadId": THREAD, "role": "user", "delta": delta},
+                    )
+                await server.notify_all(
+                    "thread/realtime/itemAdded",
+                    {
+                        "threadId": THREAD,
+                        "item": {
+                            "type": "handoff_request",
+                            "handoff_id": "item_1",
+                            "input_transcript": "那个你把电话挂了吧",
+                        },
+                    },
+                )
+                await asyncio.sleep(0.05)
+
+                assert sink.of(UserSpeech) == [UserSpeech(text="那个你把电话挂了吧")]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_done_that_follows_the_same_utterance_does_not_say_it_twice(
+        self, socket_path: Path
+    ) -> None:
+        """One utterance, one event, whichever carrier got there first.
+
+        The two carriers spell the same audio differently — run
+        `20260902T093755Z` had two lanes write `结束通话` and `结束通 话` from one
+        four-second recording — so they are compared with the spaces taken out.
+        A notice heard twice is worse than one heard once, and this seam's whole
+        grading discipline exists to stop it.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/itemAdded",
+                    {
+                        "threadId": THREAD,
+                        "item": {
+                            "type": "handoff_request",
+                            "handoff_id": "item_1",
+                            "input_transcript": "我想让你结束通话",
+                        },
+                    },
+                )
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "user", "text": "我想让你结束通 话"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert sink.of(UserSpeech) == [UserSpeech(text="我想让你结束通话")]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_what_the_deltas_spelled_goes_up_when_the_call_ends_on_them(
+        self, socket_path: Path
+    ) -> None:
+        """Nothing claimed the utterance, and the call is over: raise it anyway.
+
+        The third carrier, and the last moment the words are this side's to
+        report. Without it a call the Call Agent ends four seconds after routing
+        takes the user's sentence with it.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                for delta in ("现在有哪些", "需要我的", "事情"):
+                    await server.notify_all(
+                        "thread/realtime/transcript/delta",
+                        {"threadId": THREAD, "role": "user", "delta": delta},
+                    )
+                await asyncio.sleep(0.05)
+                assert sink.of(UserSpeech) == []
+
+                await adapter.end_call()
+
+                assert sink.of(UserSpeech) == [UserSpeech(text="现在有哪些需要我的事情")]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_voices_own_deltas_are_never_the_users_words(self, socket_path: Path) -> None:
+        """This system does not read its own speech back to itself."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "assistant", "delta": "that session"},
+                )
+                await asyncio.sleep(0.05)
+                await adapter.end_call()
+
+                assert sink.of(UserSpeech) == []
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_an_item_that_is_not_a_hand_off_is_not_written_down(
+        self, socket_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The arm reads one item type. Everything else on that method is noise."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                adapter, _ = await riding(server, Sink())
+                await adapter.ensure_call(dial())
+
+                with caplog.at_level(logging.INFO):
+                    await server.notify_all(
+                        "thread/realtime/itemAdded",
+                        {"threadId": THREAD, "item": {"type": "input_audio_buffer.speech_started"}},
+                    )
+                    await asyncio.sleep(0.05)
+
+                assert "handed work to the Call Agent" not in caplog.text
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
     def test_this_systems_own_voice_is_not_raised_as_the_users(self, socket_path: Path) -> None:
         async def scenario() -> None:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 await server.notify_all(
                     "thread/realtime/transcript/done",
@@ -731,7 +1102,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 for delta in ("that ", "session ", "stopped"):
                     await server.notify_all(
@@ -757,7 +1128,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 for _ in range(2):
                     await server.notify_all(
@@ -788,7 +1159,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
 
                 await server.notify_all(
                     "thread/realtime/transcript/delta",
@@ -1176,7 +1547,7 @@ class TestTheCuesItPlays:
                 realtime_script(server, thread_id=THREAD)
                 player = FakeCueOutput()
                 adapter, audio = await riding(server, Sink(), cue_player=player)
-                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                await adapter.ensure_call(dial())
                 await adapter.end_call()
                 assert audio.closed
                 await adapter.play_cue(Cue.ENDED)

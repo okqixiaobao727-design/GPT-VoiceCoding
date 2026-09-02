@@ -22,16 +22,17 @@ import journey
 import pytest
 
 from claude_adapter_fake import ParkedApproval, claude_waiting_roster
-from fakes import PROGRESS_CAPTURE, FakeCall, UnreachableFarSide
+from fakes import PROGRESS_CAPTURE, FakeCall, UnreachableFarSide, handed_over, spoken_words
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
+    USER_OPENED,
     VOICE_QUIET_LINE,
     VOICE_SPEAKING_LINE,
 )
-from gpt_voicecoding.core.errors import ChildSessionError, VoiceInstructionsMissing
+from gpt_voicecoding.core.errors import CallInstructionsMissing, ChildSessionError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.core.router import Classification
@@ -64,6 +65,9 @@ from gpt_voicecoding.seams.call import (
     CallStarted,
     CallState,
     Cue,
+    DialReason,
+    SpokenBrief,
+    SpokenRosterBrief,
     UserSpeech,
     VoiceSpeech,
 )
@@ -108,7 +112,12 @@ class TestTheStopNoticePipelineEndToEnd:
 
         hub.emit(SessionStopped(target=CODEX, progress=observed))
 
-        assert "The registry status is the root cause." in hub.call.spoken[0]
+        # The words go out on the notice's own text — the log line and, where
+        # Message is on, the Companion Channel. What the *call* is handed comes
+        # off the roster, which still reads this Session as running, so it is a
+        # header row there (`test_a_session_the_roster_reads_as_running_…`).
+        assert hub.call.calls_started == 1
+        assert "port the log" in handed_over(hub.call)
         assert hub.core.status().sessions[0].progress == observed
 
     def test_a_stop_that_read_a_question_puts_it_on_the_roster_row(self) -> None:
@@ -368,7 +377,7 @@ class TestTheStopNoticePipelineEndToEnd:
 
         hub.emit(SessionStopped(target=CODEX))
 
-        assert "port the log" in hub.call.spoken[0]
+        assert "port the log" in handed_over(hub.call)
 
     def test_a_stop_while_the_system_owns_a_call_opens_no_second_call(self) -> None:
         """The reference implementation's loop, made unreachable."""
@@ -425,11 +434,11 @@ class TestTheStopNoticePipelineEndToEnd:
         hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
-        assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
 
     def test_the_auto_hangup_switch_is_no_outlet_transition(self) -> None:
@@ -447,12 +456,14 @@ class TestTheStopNoticePipelineEndToEnd:
             )
         )
         hub.call.spoken.clear()
+        hub.call.opened_on.clear()
         hub.channel.sent.clear()
 
         hub.flip(SwitchName.AUTO_HANGUP, True)
         asyncio.run(hub.core.discover())
 
         assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
         assert hub.channel.sent == []
 
     def test_message_off_and_voice_on_never_pushes_text(self) -> None:
@@ -953,7 +964,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=CODEX))
 
-        assert "port the log" in hub.call.spoken[0]
+        assert "port the log" in handed_over(hub.call)
 
     def test_a_stop_on_a_session_the_roster_has_not_seen_is_still_announced(self) -> None:
         """Unknown is not child, and the asymmetry is the point.
@@ -967,7 +978,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=SessionTarget(agent=AgentKind.CODEX, session_id="new")))
 
-        assert hub.call.spoken
+        assert hub.call.calls_started == 1
 
     def test_a_permission_a_child_raises_is_not_announced(self) -> None:
         """A Codex subagent thread can raise a real `requestApproval`.
@@ -991,7 +1002,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission()))
 
-        assert hub.call.spoken
+        assert "requesting permission" in handed_over(hub.call)
 
 
 class TestTheRelayPipelineEndToEnd:
@@ -1090,7 +1101,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.tick()
 
         assert hub.state.relays.pending() == ()
-        assert hub.call.spoken == ["state=reported_failed grade=none reason=ceiling_passed"]
+        assert hub.channel.sent[-1] == "state=reported_failed grade=none reason=ceiling_passed"
 
     def test_an_expired_relay_that_was_attempted_does_not_read_like_one_that_was_not(
         self,
@@ -1111,7 +1122,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.now += TEN_MINUTES
         hub.tick()
 
-        assert hub.call.spoken[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
+        assert hub.channel.sent[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
 
     def test_a_session_that_ends_reports_the_words_still_waiting_for_it(self) -> None:
         hub = Hub()
@@ -1241,11 +1252,11 @@ class TestTheOneCallInvariantEndToEnd:
 
         assert snapshot.is_up
         assert hub.agent.inspections == []
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice] == []
+        assert "Which base?" not in spoken_words(hub.call)
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in spoken_words(hub.call)
 
     def test_a_call_started_event_reconciles_current_stops(self) -> None:
         hub = Hub(voice=False)
@@ -1279,23 +1290,114 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.toggle().state is CallState.DOWN
         assert hub.core.interlock.owns_call() is False
 
-    def test_a_call_opens_on_the_call_agents_rules_not_the_voices(self) -> None:
-        """Today's slot reaches the acting half, so the acting half's set goes in it.
+    def test_a_call_opens_addressing_both_audiences_by_name(self) -> None:
+        """Each half gets its own set, and the hub names the audience, not the slot.
 
         `realtimeStartInstructions` was proved by slot-swap to reach the Call
-        Agent and never the Voice (ADR 0018, #175 Q4), and this hub sends one
-        string into `ensure_call`. Until the Dial carries all three payloads, the
-        one string is the Agent set — the Voice's prose has no carrier yet, and
-        putting it here would send the half with the tools a set of rules about
-        pacing and put nothing where the tools are named.
+        Agent and never the Voice, and `prompt` to reach the Voice (ADR 0018,
+        #175 Q4). The hub knows none of that: it hands over a `Dial` whose fields
+        are *voice* and *agent*, and which wire slot each lands in is the realtime
+        adapter's alone (#194). Before the Dial, one string carried the Agent set
+        and the Voice's prose had no carrier at all.
         """
         hub = Hub()
         assert hub.core.instructions is not None
 
         hub.toggle()
 
-        assert hub.call.opened_on == [hub.core.instructions.agent.text]
-        assert hub.core.instructions.voice.text not in hub.call.opened_on
+        dialled = hub.call.opened_on[0]
+        assert dialled.voice == hub.core.instructions.voice.text
+        assert dialled.agent == hub.core.instructions.agent.text
+
+    def test_a_call_the_user_opened_carries_one_item_and_no_hand_over(self) -> None:
+        """#167 Q6. They pressed the toggle to talk; the system does not talk first.
+
+        Briefing them on the roster they were looking at when they pressed it
+        would be the system opening the conversation on a call the user opened to
+        open it themselves.
+        """
+        hub = Hub()
+
+        hub.toggle()
+
+        assert hub.call.opened_on[0].hand_over == (DialReason(text=USER_OPENED),)
+        assert "wait to be spoken to" in USER_OPENED.lower()
+
+    def test_a_system_dialled_call_comes_up_holding_the_roster_and_the_waiting(
+        self,
+    ) -> None:
+        """The hand-over is the briefing, and it is read now rather than replayed.
+
+        ADR 0017: a missed call is briefed from a fresh reading. The notice names
+        which Session and the moment; every word about state comes off the roster
+        as it stands when the dial is built (#194).
+        """
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        kinds = [type(item) for item in hub.call.opened_on[0].hand_over]
+        assert kinds[0] is DialReason
+        assert kinds[1] is SpokenRosterBrief
+        assert SpokenBrief in kinds
+        assert hub.call.spoken == []
+        assert "Which base?" in handed_over(hub.call)
+
+    def test_the_session_a_stop_dialled_about_is_briefed_though_its_row_reads_running(
+        self,
+    ) -> None:
+        """The one row the roster is knowingly stale about is briefed from the Stop.
+
+        `sessions.set_stop_reading` leaves a Stop that merely ended a turn in
+        `RUNNING` (#209), and a hand-over briefs no running Session — so without
+        this the call would come up saying a Session needs the user and never say
+        which. What travels is the notice's own brief, whose state `stop_brief`
+        derived from the wait, so it reads `finished` and never `running`: this
+        is not the removed `about` parameter, which briefed whatever the stale
+        row said and put it ahead of the Focus Session.
+        """
+        hub = Hub()
+
+        hub.emit(SessionStopped(target=CODEX))
+
+        assert [type(item) for item in hub.call.opened_on[0].hand_over] == [
+            DialReason,
+            SpokenRosterBrief,
+            SpokenBrief,
+        ]
+        briefed = hub.call.opened_on[0].hand_over[-1]
+        assert isinstance(briefed, SpokenBrief)
+        # What the row still says, and what the Stop's own reading says instead.
+        # The codex lane reads a turn that ended without a final answer as a
+        # decision (#166 B2); what matters here is that it is not `running`.
+        assert briefed.state == "waiting for your decision"
+        assert "port the log" in briefed.name
+
+    def test_the_session_a_stop_dialled_about_is_briefed_exactly_once(self) -> None:
+        """Whether or not the roster briefed it itself, it appears once.
+
+        The roster's reading is the one that travels when there is one — this
+        wait needs the user, so the row moved to `WAITING` and `handover` briefed
+        it from there. The notice's copy is added only in the other case, so a
+        Session is never announced twice on the same call.
+        """
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        briefs = [item for item in hub.call.opened_on[0].hand_over if isinstance(item, SpokenBrief)]
+        assert len(briefs) == 1
+        assert briefs[0].state == "waiting for your decision"
 
     def test_a_hub_that_generated_no_house_rules_opens_no_call(self) -> None:
         """The refusal comes from the interlock, which is the one door.
@@ -1305,7 +1407,7 @@ class TestTheOneCallInvariantEndToEnd:
         """
         hub = Hub(instructions=False)
 
-        with pytest.raises(VoiceInstructionsMissing):
+        with pytest.raises(CallInstructionsMissing):
             hub.toggle()
 
         assert hub.call.calls_started == 0
@@ -1443,11 +1545,11 @@ class TestTheOneCallInvariantEndToEnd:
         hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
-        assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
 
 
