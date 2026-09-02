@@ -6,11 +6,11 @@ user's authority intact. Delivering mid-turn without asking gets the words
 framed as untrusted and refused — verified live. So the hub queues, and the
 adapters only ever deliver.
 
-The three numbers and rules that hang off that: one confirmation on receipt and
-never a second announcement on delivery; a ten-minute ceiling and then a
-reported failure; and route choice — deliver between turns versus supplement
-mid-turn — that follows the user's explicit intent and is never read off what
-the Session happens to be doing.
+The three numbers and rules that hang off that: a receipt that is a grade and a
+reason code and never a sentence; a ten-minute ceiling and then a reported
+failure; and route choice — deliver between turns versus supplement mid-turn —
+that follows the user's explicit intent and is never read off what the Session
+happens to be doing.
 """
 
 from __future__ import annotations
@@ -25,16 +25,7 @@ from gpt_voicecoding.core.errors import StaleSessionError, UnknownSessionError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import RelayKind, RelayQueue
-from gpt_voicecoding.core.relays import (
-    CEILING_REPORT,
-    CEILING_UNPROVEN_REPORT,
-    DUPLICATE_RISK_CONFIRMATION,
-    HELD_CONFIRMATION,
-    QUEUED_CONFIRMATION,
-    SESSION_GONE_REPORT,
-    SESSION_GONE_UNPROVEN_REPORT,
-    RelayPipeline,
-)
+from gpt_voicecoding.core.relays import RelayPipeline, RelayReason, reason_for
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.seams.agent import (
     RelayRoute,
@@ -44,8 +35,8 @@ from gpt_voicecoding.seams.agent import (
     WaitingFor,
     WaitingKind,
 )
-from gpt_voicecoding.seams.delivery import Delivery
-from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
+from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionName, SessionTarget
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -109,10 +100,14 @@ class TestDeliveringIntoAnOpenReplyWindow:
         assert [call.text for call in harness.agent.calls] == ["ship it"]
         assert harness.relays.pending() == ()
 
-    def test_a_delivered_relay_is_never_confirmed_because_it_did_not_wait(self) -> None:
+    def test_a_delivered_relay_carries_the_attempt_that_proved_it(self) -> None:
         harness = Harness(window=ReplyWindow.OPEN)
 
-        assert harness.relay().confirmation == ""
+        outcome = harness.relay()
+
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.DELIVERED
+        assert outcome.reason is RelayReason.DELIVERED
 
     def test_the_users_own_words_go_by_the_answer_verb(self) -> None:
         """Which verb Bridge Core calls is how the adapter knows whose words these are."""
@@ -167,7 +162,10 @@ class TestQueueingAgainstAClosedWindow:
         outcome = asyncio.run(harness.pipeline.relay(CLAUDE, "main"))
 
         assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert outcome.report
+        assert outcome.reason is RelayReason.QUESTION_UNANSWERABLE
+        # Nothing went on the wire, so there is no attempt to grade. A receipt
+        # here would claim an attempt that never happened.
+        assert outcome.receipt is None
         assert harness.agent.calls == []
         assert harness.relays.pending() == ()
 
@@ -215,22 +213,58 @@ class TestQueueingAgainstAClosedWindow:
         assert len(harness.relays.pending()) == 1
 
 
-class TestConfirmingExactlyOnce:
-    def test_a_queued_relay_is_confirmed_on_receipt(self) -> None:
+class TestTheReceiptIsAGradeAndAReason:
+    """The receipt is `RelayOutcome` itself: a state, a graded attempt, a code.
+
+    No sentence anywhere in it. The words the user hears are the Voice's to
+    compose from these facts (#175), and a sentence composed here would be a
+    second renderer for words the model rewrites anyway.
+    """
+
+    def test_a_queued_relay_says_what_it_is_waiting_for(self) -> None:
         harness = Harness()
 
         outcome = harness.relay()
 
-        assert outcome.confirmation
+        assert outcome.state is Lifecycle.RETAINED
+        assert outcome.reason is RelayReason.AWAITING_REPLY_WINDOW
 
-    def test_delivery_announces_nothing_a_second_time(self) -> None:
-        """ "Got it, it'll go when this turn ends" — and then silence."""
+    def test_words_that_never_went_carry_no_grade_at_all(self) -> None:
+        """ "Not attempted" is the absent attempt, never `UNKNOWN`."""
+        harness = Harness()
+
+        assert harness.relay().receipt is None
+
+    def test_every_grade_maps_to_exactly_one_reason_code(self) -> None:
+        """Total, and a function: one grade never produces two codes."""
+        grades: list[Delivery | None] = [None, *Delivery]
+
+        codes = {
+            grade: reason_for(
+                None
+                if grade is None
+                else DeliveryReceipt(request_id=RequestId("r"), outcome=grade, reason="because")
+            )
+            for grade in grades
+        }
+
+        assert codes == {
+            None: RelayReason.AWAITING_REPLY_WINDOW,
+            Delivery.FAILED: RelayReason.AWAITING_REPLY_WINDOW,
+            Delivery.UNKNOWN: RelayReason.DUPLICATE_RISK,
+            Delivery.HELD: RelayReason.HELD_FAR_SIDE,
+            Delivery.DELIVERED: RelayReason.DELIVERED,
+        }
+
+    def test_the_delivery_that_follows_is_graded_rather_than_announced(self) -> None:
+        """The flush says what the attempt proved, and says nothing to the user."""
         harness = Harness()
         harness.relay()
 
         outcomes = harness.window_opened()
 
-        assert [one.confirmation for one in outcomes] == [""]
+        assert [one.state for one in outcomes] == [Lifecycle.DELIVERED]
+        assert [one.reason for one in outcomes] == [RelayReason.DELIVERED]
 
 
 class TestTheRouteFollowsTheUsersIntent:
@@ -350,7 +384,7 @@ class TestTheTenMinuteCeiling:
         (outcome,) = harness.sweep()
 
         assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert outcome.report
+        assert outcome.reason is RelayReason.CEILING_PASSED
 
     def test_an_expired_relay_leaves_the_ledger_so_nothing_can_retry_it(self) -> None:
         harness = Harness()
@@ -477,28 +511,33 @@ class TestDuplicateSafety:
 
         assert [waiting.text for waiting in harness.relays.pending()] == ["ship it"]
 
-    def test_the_user_is_warned_rather_than_promised_a_delivery(self) -> None:
+    def test_an_unproven_attempt_is_graded_and_coded_as_a_duplicate_risk(self) -> None:
         harness = self.unknown()
 
         outcome = harness.relay("ship it")
 
-        assert outcome.confirmation == DUPLICATE_RISK_CONFIRMATION
-        assert outcome.confirmation != QUEUED_CONFIRMATION
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.UNKNOWN
+        assert outcome.reason is RelayReason.DUPLICATE_RISK
 
-    def test_a_held_relay_says_it_is_parked_rather_than_waiting_for_a_turn(self) -> None:
+    def test_a_held_relay_is_coded_as_parked_rather_than_waiting_for_a_turn(self) -> None:
         harness = self.held()
 
         outcome = harness.relay("ship it")
 
-        assert outcome.confirmation == HELD_CONFIRMATION
+        assert outcome.reason is RelayReason.HELD_FAR_SIDE
 
-    def test_a_proven_failure_still_promises_the_next_turn(self) -> None:
+    def test_a_proven_failure_is_coded_as_waiting_for_the_next_window(self) -> None:
         harness = Harness(
             window=ReplyWindow.OPEN,
             agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
         )
 
-        assert harness.relay("ship it").confirmation == QUEUED_CONFIRMATION
+        outcome = harness.relay("ship it")
+
+        assert outcome.reason is RelayReason.AWAITING_REPLY_WINDOW
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.FAILED
 
     def test_the_user_may_authorise_another_attempt_by_saying_it_again(self) -> None:
         """The explicit authority P9 asks for is the user relaying the words again."""
@@ -514,42 +553,56 @@ class TestDuplicateSafety:
         harness = self.unknown()
         outcome = harness.relay("ship it")
 
-        harness.relays.classify(outcome.request_id, Delivery.DELIVERED)
+        harness.relays.classify(
+            outcome.request_id,
+            DeliveryReceipt(request_id=outcome.request_id, outcome=Delivery.DELIVERED),
+        )
 
         assert harness.relays.pending() == ()
 
 
-class TestWhatTheCeilingSaysAboutAnUnprovenRelay:
-    """A ceiling report is rendered verbatim, so it may not claim non-delivery.
+class TestWhatATerminalRelaySaysAboutAnUnprovenAttempt:
+    """The reason code says what happened here; the grade says what was proved.
 
-    "It never reached the session" is true of words that were never attempted and
-    of a proven failure. It is a **guess** about an `UNKNOWN`, which is precisely
-    the grade that means the far side may well have them.
+    The two used to be one sentence, in two spellings each, because a rendered
+    sentence may not claim non-delivery of an `UNKNOWN` — the grade that means
+    the far side may well have the words. Splitting them makes the pair
+    unnecessary: `ceiling_passed` is a fact about this system's ceiling and
+    claims nothing about arrival, and the attempt's grade travels beside it.
     """
 
-    def test_an_unproven_relay_is_reported_without_claiming_it_never_arrived(self) -> None:
-        harness = Harness(
+    def unproven(self) -> Harness:
+        return Harness(
             window=ReplyWindow.OPEN,
             agent=FakeAgent(outcome=Delivery.UNKNOWN, reason="no readback"),
         )
+
+    def test_a_terminal_relay_keeps_the_grade_of_the_attempt_it_made(self) -> None:
+        harness = self.unproven()
         harness.relay("ship it")
 
         harness.now += TEN_MINUTES
         (outcome,) = harness.sweep()
 
-        assert outcome.report == CEILING_UNPROVEN_REPORT
         assert outcome.state is Lifecycle.REPORTED_FAILED
+        assert outcome.reason is RelayReason.CEILING_PASSED
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.UNKNOWN
+        # The adapter's own evidence survives the ceiling rather than being
+        # rewritten into a sentence about it.
+        assert outcome.receipt.reason == "no readback"
 
-    def test_words_that_never_went_are_reported_as_never_having_gone(self) -> None:
+    def test_words_that_never_went_reach_the_ceiling_with_no_grade(self) -> None:
         harness = Harness()
         harness.relay("ship it")
 
         harness.now += TEN_MINUTES
         (outcome,) = harness.sweep()
 
-        assert outcome.report == CEILING_REPORT
+        assert outcome.reason is RelayReason.CEILING_PASSED
+        assert outcome.receipt is None
 
-    def test_a_proven_failure_is_reported_as_never_having_gone_too(self) -> None:
+    def test_a_proven_failure_reaches_the_ceiling_under_the_same_code(self) -> None:
         harness = Harness(
             window=ReplyWindow.OPEN,
             agent=FakeAgent(outcome=Delivery.FAILED, reason="the far side is gone"),
@@ -559,23 +612,25 @@ class TestWhatTheCeilingSaysAboutAnUnprovenRelay:
         harness.now += TEN_MINUTES
         (outcome,) = harness.sweep()
 
-        assert outcome.report == CEILING_REPORT
+        assert outcome.reason is RelayReason.CEILING_PASSED
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.FAILED
 
-    def test_a_session_that_ends_under_an_unproven_relay_says_so_honestly(self) -> None:
-        harness = Harness(
-            window=ReplyWindow.OPEN,
-            agent=FakeAgent(outcome=Delivery.UNKNOWN, reason="no readback"),
-        )
+    def test_a_session_that_ends_under_an_unproven_relay_keeps_that_grade(self) -> None:
+        harness = self.unproven()
         harness.relay("ship it")
 
         (outcome,) = harness.pipeline.session_ended(CODEX)
 
-        assert outcome.report == SESSION_GONE_UNPROVEN_REPORT
+        assert outcome.reason is RelayReason.SESSION_ENDED
+        assert outcome.receipt is not None
+        assert outcome.receipt.outcome is Delivery.UNKNOWN
 
-    def test_a_session_that_ends_under_words_that_never_went_says_that(self) -> None:
+    def test_a_session_that_ends_under_words_that_never_went_carries_no_grade(self) -> None:
         harness = Harness()
         harness.relay("ship it")
 
         (outcome,) = harness.pipeline.session_ended(CODEX)
 
-        assert outcome.report == SESSION_GONE_REPORT
+        assert outcome.reason is RelayReason.SESSION_ENDED
+        assert outcome.receipt is None

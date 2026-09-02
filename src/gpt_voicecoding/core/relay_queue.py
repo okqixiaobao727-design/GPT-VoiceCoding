@@ -26,7 +26,7 @@ from enum import StrEnum
 
 from gpt_voicecoding.core.errors import DuplicateRelayError, UnknownRelayError
 from gpt_voicecoding.seams.agent import RelayRoute
-from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
 
 
@@ -56,8 +56,8 @@ class PendingRelay:
     queued_at: float
     expires_at: float
     route: RelayRoute = RelayRoute.DELIVER
-    #: What the last attempt proved, or `None` for an entry nothing has been
-    #: attempted for yet.
+    #: The last attempt, whole — its grade and the evidence behind it — or
+    #: `None` for an entry nothing has been attempted for yet.
     #:
     #: **`None` rather than `UNKNOWN`, and the difference is P9's whole rule.**
     #: `UNKNOWN` is a positive observation — something went on the wire and
@@ -66,7 +66,14 @@ class PendingRelay:
     #: such risk. Spelling both `UNKNOWN` made one value mean two things and
     #: made the settlement policy unable to tell "may already have arrived" from
     #: "never left this process".
-    outcome: Delivery | None = None
+    #:
+    #: **The whole receipt rather than the grade alone**, because an entry can
+    #: end minutes after its attempt — at the ceiling, or when the Session goes
+    #: — and what the surface owes the user then is that attempt's grade with
+    #: the evidence the seam requires beside it (`seams/delivery.py`). A queue
+    #: that kept only the grade left the pipeline writing a sentence about the
+    #: attempt instead of carrying it.
+    receipt: DeliveryReceipt | None = None
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -86,7 +93,7 @@ class RelayQueue:
 
     def enqueue(self, pending: PendingRelay) -> PendingRelay:
         """Hold a Relay until something proves it delivered or releases it."""
-        if pending.outcome is not None and pending.outcome.is_delivered:
+        if pending.receipt is not None and pending.receipt.is_delivered:
             raise ValueError(
                 "this queue holds undelivered Relays; something already delivered cannot wait in it"
             )
@@ -103,11 +110,11 @@ class RelayQueue:
         """Everything waiting for one exact Session. A fork is a different Session."""
         return tuple(waiting for waiting in self._pending.values() if waiting.target == target)
 
-    def classify(self, request_id: RequestId, outcome: Delivery) -> PendingRelay:
+    def classify(self, request_id: RequestId, receipt: DeliveryReceipt) -> PendingRelay:
         """Record what an attempt proved. Proving delivery takes the entry out."""
         waiting = self._waiting(request_id)
-        classified = replace(waiting, outcome=outcome)
-        if outcome.is_delivered:
+        classified = replace(waiting, receipt=receipt)
+        if receipt.is_delivered:
             del self._pending[request_id]
         else:
             self._pending[request_id] = classified

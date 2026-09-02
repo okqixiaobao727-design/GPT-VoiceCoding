@@ -1205,4 +1205,4 @@ class TestDeathReachesBridgeCoreEndToEnd:
         assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
         assert hub.state.relays.pending() == ()
         assert hub.agent.calls == []
-        assert any("never reached the session" in spoken for spoken in hub.call.spoken)
+        assert hub.call.spoken == ["state=reported_failed grade=none reason=session_ended"]

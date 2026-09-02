@@ -228,6 +228,57 @@ class TestSayingNoOutLoud:
         assert "switch <name> on|off" in capsys.readouterr().err
 
 
+class TestRenderingARelayReceipt:
+    """The surface prints the receipt's three codes, and composes no sentence.
+
+    A relay receipt is a grade and a reason. The words the user hears are the
+    Voice's, re-rendered from these facts (#175); a sentence built here would be
+    a second renderer for words the model rewrites anyway.
+    """
+
+    def reply(self, **data: object) -> Reply:
+        return Reply.answered(
+            Action.RELAY,
+            {
+                "request_id": "r-1",
+                "target": {"agent": "codex", "session_id": "abc", "pid": None},
+                "state": "delivered",
+                "route": "deliver",
+                "receipt": {"outcome": "delivered", "reason": ""},
+                "reason": "delivered",
+                **data,
+            },
+        )
+
+    def test_a_delivered_relay_prints_its_state_grade_and_reason(self) -> None:
+        rendered = render(self.reply())
+
+        assert rendered == "state=delivered grade=delivered reason=delivered"
+
+    def test_words_still_waiting_print_no_grade_rather_than_a_guess(self) -> None:
+        """Nothing was attempted, so there is no grade — and it is never `unknown`."""
+        rendered = render(
+            self.reply(state="retained", receipt=None, reason="awaiting_reply_window")
+        )
+
+        assert rendered == "state=retained grade=none reason=awaiting_reply_window"
+        assert "unknown" not in rendered
+
+    def test_an_unproven_attempt_prints_the_grade_beside_its_code(self) -> None:
+        rendered = render(
+            self.reply(
+                state="retained",
+                receipt={"outcome": "unknown", "reason": "no readback"},
+                reason="duplicate_risk",
+            )
+        )
+
+        assert rendered == "state=retained grade=unknown reason=duplicate_risk"
+        # The adapter's evidence travels on the wire and into the log. It is not
+        # printed at the user, who is owed a code and not a diagnostic.
+        assert "no readback" not in rendered
+
+
 class TestRenderingLaneDegradation:
     def test_status_says_when_progress_was_unreadable(self) -> None:
         """Where degradation is said, now that the roster verb is a Briefing.

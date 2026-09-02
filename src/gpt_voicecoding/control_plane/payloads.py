@@ -226,7 +226,10 @@ def pending_relay_document(pending: PendingRelay) -> dict[str, Any]:
         "route": str(pending.route),
         "queued_at": pending.queued_at,
         "expires_at": pending.expires_at,
-        "outcome": str(pending.outcome),
+        # The grade of the last attempt, or nothing at all when none was made.
+        # `null` rather than `unknown`: the absence of an attempt is not an
+        # attempt that proved nothing.
+        "outcome": None if pending.receipt is None else str(pending.receipt.outcome),
     }
 
 
@@ -338,15 +341,24 @@ def call_document(snapshot: CallSnapshot) -> dict[str, Any]:
 
 
 def relay_document(outcome: RelayOutcome) -> dict[str, Any]:
-    """Queued is not delivered, and this says which it was."""
+    """The receipt: where the words are, what was proved, and why.
+
+    `receipt` is `null` when nothing was attempted — never a grade of `unknown`,
+    which is a positive observation this document must not invent. The attempt's
+    own evidence rides inside it, for the log and for a surface that is
+    diagnosing rather than telling the user something.
+    """
     return {
         "request_id": str(outcome.request_id),
         "target": target_document(outcome.target),
         "state": str(outcome.state),
         "route": str(outcome.route),
-        "outcome": str(outcome.outcome),
-        "confirmation": outcome.confirmation,
-        "report": outcome.report,
+        "receipt": (
+            None
+            if outcome.receipt is None
+            else {"outcome": str(outcome.receipt.outcome), "reason": outcome.receipt.reason}
+        ),
+        "reason": str(outcome.reason),
     }
 
 

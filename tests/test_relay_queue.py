@@ -15,7 +15,7 @@ import pytest
 from gpt_voicecoding.core.errors import DuplicateRelayError, UnknownRelayError
 from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.seams.agent import RelayRoute
-from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget, new_request_id
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
@@ -40,6 +40,15 @@ def answer(
         queued_at=queued_at,
         expires_at=queued_at + TEN_MINUTES,
         route=route,
+    )
+
+
+def graded(request_id: RequestId, outcome: Delivery) -> DeliveryReceipt:
+    """What an attempt proved, with the evidence a non-delivered grade owes."""
+    return DeliveryReceipt(
+        request_id=request_id,
+        outcome=outcome,
+        reason="" if outcome.is_delivered else "the fake adapter said so",
     )
 
 
@@ -73,7 +82,7 @@ class TestEnqueueing:
         """
         queue = RelayQueue()
         queued = queue.enqueue(answer())
-        assert queued.outcome is None
+        assert queued.receipt is None
 
     def test_something_already_delivered_cannot_wait_in_the_undelivered_queue(self) -> None:
         queue = RelayQueue()
@@ -84,7 +93,7 @@ class TestEnqueueing:
             text="yes, go ahead",
             queued_at=1_000.0,
             expires_at=1_600.0,
-            outcome=Delivery.DELIVERED,
+            receipt=graded(RequestId("r-1"), Delivery.DELIVERED),
         )
         with pytest.raises(ValueError):
             queue.enqueue(already)
@@ -115,33 +124,38 @@ class TestClassifying:
         queue = RelayQueue()
         queued = queue.enqueue(answer())
 
-        released = queue.classify(queued.request_id, Delivery.DELIVERED)
+        released = queue.classify(queued.request_id, graded(queued.request_id, Delivery.DELIVERED))
 
-        assert released.outcome is Delivery.DELIVERED
+        assert released.receipt is not None
+        assert released.receipt.outcome is Delivery.DELIVERED
         assert queue.pending() == ()
         with pytest.raises(UnknownRelayError):
-            queue.classify(queued.request_id, Delivery.FAILED)
+            queue.classify(queued.request_id, graded(queued.request_id, Delivery.FAILED))
 
     def test_a_held_entry_stays_pending_and_is_never_delivered(self) -> None:
         queue = RelayQueue()
         queued = queue.enqueue(answer())
-        held = queue.classify(queued.request_id, Delivery.HELD)
+        held = queue.classify(queued.request_id, graded(queued.request_id, Delivery.HELD))
 
-        assert held.outcome is Delivery.HELD
-        assert held.outcome.is_delivered is False
+        assert held.receipt is not None
+        assert held.receipt.outcome is Delivery.HELD
+        assert held.receipt.is_delivered is False
+        # The attempt's own evidence is kept, so a terminal outcome can carry it
+        # rather than have a sentence written about it later.
+        assert held.receipt.reason == "the fake adapter said so"
         assert queue.pending() == (held,)
 
     def test_a_failed_entry_stays_until_something_releases_it(self) -> None:
         """Whether a failure is terminal is the pipelines issue's call, not the queue's."""
         queue = RelayQueue()
         queued = queue.enqueue(answer())
-        failed = queue.classify(queued.request_id, Delivery.FAILED)
+        failed = queue.classify(queued.request_id, graded(queued.request_id, Delivery.FAILED))
         assert queue.pending() == (failed,)
 
     def test_classifying_something_never_queued_fails_closed(self) -> None:
         queue = RelayQueue()
         with pytest.raises(UnknownRelayError):
-            queue.classify(new_request_id(), Delivery.DELIVERED)
+            queue.classify(new_request_id(), graded(RequestId("r-1"), Delivery.DELIVERED))
 
 
 class TestReleasing:
