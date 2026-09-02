@@ -1407,6 +1407,11 @@ class Walk:
     def switches(self) -> str:
         """Duty off pushes nothing; Duty on reports only what is still actionable (#80).
 
+        The Auto Hang-up Switch is exercised here too (#185), as a wire claim
+        only: flipped off and on through `bridgectl switch`, each position read
+        back from `status`. The behaviour it governs — a silent call outliving
+        the ceiling — needs a call, and this run is text-only.
+
         The turn here ends **waiting on the user** rather than done, because that
         is what makes a Session still actionable when Duty comes back on. Two
         observations: silence over a derived window with Duty off, and — with
@@ -1432,6 +1437,44 @@ class Walk:
         """
         if self.address is None:
             raise LaneBlocked("no Session to watch the switches over")
+
+        def position(name: str) -> str | None:
+            """One switch's position, as `status` renders it for a person."""
+            reading = self.bridgectl("status")
+            if not reading.ok:
+                raise StepFailed(f"reading back {name}, `status` refused: {reading.text}")
+            for line in reading.text.splitlines():
+                if not line.startswith("switches:"):
+                    continue
+                for entry in line.removeprefix("switches:").split(","):
+                    switch, _, state = entry.strip().partition(" ")
+                    if switch == name:
+                        return state
+            return None
+
+        # The Auto Hang-up Switch (#185), flipped where the other switches are.
+        # What it governs is the Silence Ceiling, and this run is text-only — no
+        # call is opened here to be ended. What the step claims is the wire: the
+        # fourth switch is settable from `bridgectl` and readable in `status`,
+        # on the same surface and under the same name as the other three.
+        auto_off = self.bridgectl("switch", "auto_hangup", "off")
+        if not auto_off.ok:
+            raise StepFailed(f"`switch auto_hangup off` refused: {auto_off.text}")
+        read_off = position("auto_hangup")
+        if read_off != "off":
+            self.bridgectl("switch", "auto_hangup", "on")
+            raise StepFailed(
+                f"`switch auto_hangup off` was accepted, but `status` reads {read_off!r}"
+            )
+        auto_on = self.bridgectl("switch", "auto_hangup", "on")
+        if not auto_on.ok:
+            raise StepFailed(f"`switch auto_hangup on` refused: {auto_on.text}")
+        read_on = position("auto_hangup")
+        if read_on != "on":
+            raise StepFailed(
+                f"`switch auto_hangup on` was accepted, but `status` reads {read_on!r}"
+            )
+
         off = self.bridgectl("switch", "duty", "off")
         if not off.ok:
             raise StepFailed(f"`switch duty off` refused: {off.text}")
@@ -1507,6 +1550,7 @@ class Walk:
             )
         question_evidence = self._accept_question()
         return (
+            "auto_hangup off then on, each position read back from `status`; "
             f"Duty off: nothing pushed in {self.far_side.absence_window_seconds:.0f}s, `status` "
             f"still answered ({status.text.splitlines()[0]!r}); Duty on: "
             f"{resolution.authority_evidence}; effect resolved in "

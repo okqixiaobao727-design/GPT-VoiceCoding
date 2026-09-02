@@ -109,7 +109,7 @@ Payload: none. Data:
 
 ```json
 {
-  "switches": {"duty": false, "voice": false, "message": false},
+  "switches": {"duty": false, "voice": false, "message": false, "auto_hangup": true},
   "sessions": [ /* see below */ ],
   "call_id": null,
   "pending_relays": [{"request_id": "…", "target": {…}, "kind": "answer", "text": "…",
@@ -243,6 +243,23 @@ the same question with worse evidence.
 Payload: `{"name": "duty", "on": true}`. `on` must be a JSON boolean; a string is
 refused, because `"false"` is truthy and the switch it would turn on is the
 master. Data: `{"name": …, "on": …, "previous": …}`.
+
+Four names are registered — `duty`, `voice`, `message`, `auto_hangup` — plus
+whatever Feature Switches configuration declares. Any other name is
+`unknown_switch`. Every position is persisted, and a surface reads them back from
+`status` under the same keys.
+
+`auto_hangup` is the Auto Hang-up Switch, and it is the odd one: it starts **on**,
+where the other three start off, and it hangs from nothing. The Silence Ceiling
+is the call's own limit rather than an act toward the user, so it ends a silent
+call with Duty off and on calls the user opened; only this switch stops it. How
+long that silence runs is configuration, not a switch — `[policy]
+silence_end_seconds`. Bridge Core asks `SwitchAdjudicator.may_auto_hangup()`,
+the same way it asks `may_touch_call()` before it speaks.
+
+Growing the set is additive on the wire and not a protocol change: the grammar
+above is unchanged, and a surface renders `status`'s switches over its own known
+order, so a key it has no row for is ignored rather than guessed at.
 
 Turning an outlet on marks current-state reconciliation as owed. The next
 ordinary discovery pass uses its fresh lane rows and announces each live main

@@ -1,9 +1,10 @@
 """Switch state — one of Bridge Core's three pieces of truth.
 
 The hierarchy is `CONTEXT.md`'s, not this module's invention: the Duty Switch is
-master, the Voice and Message Switches sit beneath it, and Feature Switches are
-flat booleans under a parent. Every switch has exactly two states, so every
-switch here is a `bool` and nothing else.
+master, the Voice and Message Switches sit beneath it, the Auto Hang-up Switch
+stands beside Duty rather than under it, and Feature Switches are flat booleans
+under a parent. Every switch has exactly two states, so every switch here is a
+`bool` and nothing else.
 
 Two words are deliberately different:
 
@@ -14,7 +15,7 @@ Two words are deliberately different:
   is the only question business behaviour may ask.
 
 Which Feature Switches exist is configuration, passed in at construction. This
-module knows the three named switches because `CONTEXT.md` names them; it knows
+module knows the four named switches because `CONTEXT.md` names them; it knows
 no feature by name.
 
 ADR 0002 is *not* implemented here and must not be: the rule that the control
@@ -32,18 +33,31 @@ from gpt_voicecoding.core.errors import UnknownSwitchError
 
 
 class SwitchName(StrEnum):
-    """The three switches `CONTEXT.md` names. Feature Switches are not members."""
+    """The four switches `CONTEXT.md` names. Feature Switches are not members."""
 
     DUTY = "duty"
     VOICE = "voice"
     MESSAGE = "message"
+    AUTO_HANGUP = "auto_hangup"
 
 
-#: Every named switch's parent. Duty has none — it is the master.
-_NAMED_PARENTS: dict[SwitchName, SwitchName | None] = {
-    SwitchName.DUTY: None,
-    SwitchName.VOICE: SwitchName.DUTY,
-    SwitchName.MESSAGE: SwitchName.DUTY,
+@dataclass(frozen=True, slots=True)
+class _NamedSwitch:
+    """What `CONTEXT.md` fixes about one named switch: where it hangs, how it starts."""
+
+    parent: SwitchName | None
+    default: bool = False
+
+
+#: Every named switch, as the Language describes it. Two of them are parentless:
+#: Duty because it is the master, and Auto Hang-up because the Silence Ceiling is
+#: the call's own limit rather than an act toward the user — so it holds with
+#: Duty off, and it is the one named switch that starts on.
+_NAMED_SWITCHES: dict[SwitchName, _NamedSwitch] = {
+    SwitchName.DUTY: _NamedSwitch(parent=None),
+    SwitchName.VOICE: _NamedSwitch(parent=SwitchName.DUTY),
+    SwitchName.MESSAGE: _NamedSwitch(parent=SwitchName.DUTY),
+    SwitchName.AUTO_HANGUP: _NamedSwitch(parent=None, default=True),
 }
 
 
@@ -86,10 +100,12 @@ class Switchboard:
 
     def __init__(self, features: Iterable[FeatureSwitch] = ()) -> None:
         parents: dict[str, str | None] = {
-            str(name): (str(parent) if parent is not None else None)
-            for name, parent in _NAMED_PARENTS.items()
+            str(name): (str(named.parent) if named.parent is not None else None)
+            for name, named in _NAMED_SWITCHES.items()
         }
-        states: dict[str, bool] = dict.fromkeys(parents, False)
+        states: dict[str, bool] = {
+            str(name): named.default for name, named in _NAMED_SWITCHES.items()
+        }
 
         for feature in features:
             if feature.name in parents:

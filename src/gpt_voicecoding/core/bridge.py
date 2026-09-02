@@ -445,10 +445,17 @@ class BridgeCore:
         The flip itself is never gated. What follows it is: turning an outlet on
         is an outlet transition, and a transition is the *only* thing that asks
         the next discovery pass to reconcile still-actionable waits.
+
+        Which flips are transitions is read off the outlets themselves rather
+        than from the flip's direction, because not every switch is an outlet.
+        The Auto Hang-up Switch is the plain case: it opens no way to reach the
+        user, so turning it on owes nobody a re-announcement of what they are
+        already waiting on.
         """
+        opened_before = set(self.adjudicator.outlets())
         previous = self._state.switches.flip(name, on)
         self._state.persist()
-        if on and not previous:
+        if set(self.adjudicator.outlets()) - opened_before:
             self._owe_reconciliation()
         return previous
 
@@ -592,20 +599,25 @@ class BridgeCore:
                     )
                 )
         approvals = await self.approvals.sweep_expired()
-        try:
-            ended_silent_call = await self.interlock.end_silent_call(
-                self._policy.silence_end_seconds
-            )
-        except Exception:  # noqa: BLE001 - the interlock spends one attempt per call
-            _log.exception(
-                "could not end the silent Live Call; not trying again until the call changes"
-            )
-        else:
-            if ended_silent_call:
-                _log.info(
-                    "ended the Live Call after %g seconds without call activity",
-                    self._policy.silence_end_seconds,
+        # Asked before the Call Keeper is, and not inside it: with the Auto
+        # Hang-up Switch off the ceiling is never measured, so the Keeper's one
+        # ending attempt per call stays unspent and turning the switch back on
+        # ends a call that has been silent all along.
+        if self.adjudicator.may_auto_hangup():
+            try:
+                ended_silent_call = await self.interlock.end_silent_call(
+                    self._policy.silence_end_seconds
                 )
+            except Exception:  # noqa: BLE001 - the Call Keeper spends one attempt per call
+                _log.exception(
+                    "could not end the silent Live Call; not trying again until the call changes"
+                )
+            else:
+                if ended_silent_call:
+                    _log.info(
+                        "ended the Live Call after %g seconds without call activity",
+                        self._policy.silence_end_seconds,
+                    )
         return expired, approvals
 
     async def discover(self) -> tuple[SessionTarget, ...]:

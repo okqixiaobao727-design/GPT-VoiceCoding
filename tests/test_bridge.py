@@ -285,6 +285,29 @@ class TestTheStopNoticePipelineEndToEnd:
         assert [notice for notice in hub.call.spoken if "Which base?" in notice]
         assert hub.state.relays.pending() == ()
 
+    def test_the_auto_hangup_switch_is_no_outlet_transition(self) -> None:
+        """It opens no way to reach the user, so turning it on re-announces nothing."""
+        hub = Hub(auto_hangup=False)
+        hub.emit(SessionStopped(target=CODEX))
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+                ),
+            )
+        )
+        hub.call.spoken.clear()
+        hub.channel.sent.clear()
+
+        hub.flip(SwitchName.AUTO_HANGUP, True)
+        asyncio.run(hub.core.discover())
+
+        assert hub.call.spoken == []
+        assert hub.channel.sent == []
+
     def test_message_off_and_voice_on_never_pushes_text(self) -> None:
         hub = Hub(message=False)
 
@@ -418,7 +441,8 @@ class TestTheLiveCallSilenceCeiling:
         assert hub.call.spoken
         assert hub.call.calls_ended == 0
 
-    def test_the_silence_ceiling_is_not_gated_by_any_switch(self) -> None:
+    def test_the_ceiling_holds_with_duty_off_on_a_call_the_user_opened(self) -> None:
+        """Only the Auto Hang-up Switch governs it; Duty and Voice do not reach it."""
         hub = Hub(
             duty=False,
             voice=False,
@@ -430,6 +454,35 @@ class TestTheLiveCallSilenceCeiling:
         hub.emit(CallStarted(call_id=started.call_id))
 
         hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_the_auto_hangup_switch_off_leaves_a_silent_call_up(self) -> None:
+        hub = Hub(auto_hangup=False, silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 600.0
+        hub.tick()
+        hub.tick()
+
+        assert hub.call.calls_ended == 0
+        assert hub.core.interlock.owns_call() is True
+
+    def test_turning_the_switch_back_on_ends_a_call_already_past_the_ceiling(self) -> None:
+        """The one ending attempt per call is not spent while the switch is off."""
+        hub = Hub(auto_hangup=False, silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 600.0
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.flip("auto_hangup", True)
         hub.tick()
 
         assert hub.call.calls_ended == 1
