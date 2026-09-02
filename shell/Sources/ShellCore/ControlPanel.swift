@@ -146,9 +146,25 @@ public struct SessionRow: Equatable, Identifiable, Sendable {
 }
 
 public struct SwitchReading: Equatable, Sendable, Identifiable {
-    /// The three the engine registers, in the order the Language lists them:
-    /// Duty is the master, and the other two are effective only while it is on.
-    public static let canonicalOrder = ["duty", "voice", "message"]
+    /// Every switch this shell has a row for: the engine's wire key, and the
+    /// Language's own words for it. One table, so a switch cannot be half-known
+    /// — ordered here and untitled, or titled here and never rendered.
+    ///
+    /// The order is the Language's: Duty is the master, the next two are
+    /// effective only while it is on, and Auto Hang-up stands beside Duty rather
+    /// than under it — the Silence Ceiling is the call's own limit, so it holds
+    /// with Duty off.
+    private static let known: [(name: String, title: String)] = [
+        ("duty", "Duty Switch"),
+        ("voice", "Voice Switch"),
+        ("message", "Message Switch"),
+        ("auto_hangup", "Auto Hang-up Switch"),
+    ]
+
+    /// The rendering order, and the panel maps `status` over it rather than over
+    /// the reply's own keys: a switch the engine grows and this shell has no row
+    /// for is ignored, not guessed at.
+    public static let canonicalOrder = known.map(\.name)
 
     public var name: String
     public var on: Bool
@@ -157,12 +173,7 @@ public struct SwitchReading: Equatable, Sendable, Identifiable {
     /// The Language's own words, so the dropdown never invents a second name for
     /// a switch that already has one.
     public var title: String {
-        switch name {
-        case "duty": return "Duty Switch"
-        case "voice": return "Voice Switch"
-        case "message": return "Message Switch"
-        default: return name
-        }
+        Self.known.first { $0.name == name }?.title ?? name
     }
 }
 

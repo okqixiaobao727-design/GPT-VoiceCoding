@@ -40,6 +40,7 @@ class Hub:
         duty: bool = True,
         voice: bool = True,
         message: bool = True,
+        auto_hangup: bool = True,
         sessions: tuple[tuple[SessionTarget, str], ...] = ((CODEX, "port the log"),),
         window: ReplyWindow = ReplyWindow.CLOSED,
         control: object = None,
@@ -56,6 +57,7 @@ class Hub:
         switches.flip(SwitchName.DUTY, duty)
         switches.flip(SwitchName.VOICE, voice)
         switches.flip(SwitchName.MESSAGE, message)
+        switches.flip(SwitchName.AUTO_HANGUP, auto_hangup)
 
         registry = SessionRegistry()
         # The Reply Window is derived, so a test that wants one open says what

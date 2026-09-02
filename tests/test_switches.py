@@ -1,10 +1,11 @@
 """Switch state: the hierarchy, and what "effective" means under it.
 
 `CONTEXT.md` fixes the shape — Duty is master, Voice and Message sit beneath it,
-Feature Switches are flat booleans under a parent, every switch has exactly two
-states, and every other switch is effective only while Duty is on. These tests
-pin that hierarchy; ADR 0002's "the control plane is never gated" is a policy
-test and belongs to the pipelines issue, not here.
+Auto Hang-up stands beside it, Feature Switches are flat booleans under a
+parent, every switch has exactly two states, and every switch under Duty is
+effective only while Duty is on. These tests pin that hierarchy; ADR 0002's "the
+control plane is never gated" is a policy test and belongs to the pipelines
+issue, not here.
 """
 
 from __future__ import annotations
@@ -22,8 +23,23 @@ from gpt_voicecoding.core.switches import (
 
 def test_duty_voice_and_message_exist_and_start_off() -> None:
     board = Switchboard()
-    for name in SwitchName:
+    for name in (SwitchName.DUTY, SwitchName.VOICE, SwitchName.MESSAGE):
         assert board.is_set(name) is False
+
+
+def test_auto_hangup_starts_on() -> None:
+    """The Silence Ceiling is on unless the user turns it off (`CONTEXT.md`)."""
+    assert Switchboard().is_set(SwitchName.AUTO_HANGUP) is True
+
+
+def test_auto_hangup_stands_beside_duty_rather_than_under_it() -> None:
+    """The ceiling is the call's own limit, so Duty does not reach it (`CONTEXT.md`)."""
+    board = Switchboard()
+    assert board.is_set(SwitchName.DUTY) is False
+    assert board.is_effective(SwitchName.AUTO_HANGUP) is True
+
+    board.flip(SwitchName.AUTO_HANGUP, False)
+    assert board.is_effective(SwitchName.AUTO_HANGUP) is False
 
 
 def test_flipping_a_switch_reports_the_previous_state() -> None:
@@ -159,6 +175,28 @@ def test_a_snapshot_round_trips_every_switch() -> None:
     assert restored.snapshot() == board.snapshot()
     assert restored.is_set(SwitchName.DUTY) is True
     assert restored.is_set("stop_notice") is False
+
+
+def test_a_snapshot_round_trips_the_auto_hangup_position() -> None:
+    board = Switchboard()
+    board.flip(SwitchName.AUTO_HANGUP, False)
+
+    restored = Switchboard()
+    restored.restore(board.snapshot())
+
+    assert restored.is_set(SwitchName.AUTO_HANGUP) is False
+
+
+def test_a_snapshot_written_before_auto_hangup_existed_leaves_it_on() -> None:
+    """An engine that predates the switch wrote three keys; the fourth keeps its default.
+
+    Restoring one must not read the absent key as off — that would turn the
+    Silence Ceiling off on the first restart after an upgrade.
+    """
+    board = Switchboard()
+    board.restore(SwitchSnapshot.of({"duty": True, "voice": True, "message": False}))
+
+    assert board.is_set(SwitchName.AUTO_HANGUP) is True
 
 
 def test_restoring_a_snapshot_naming_an_unregistered_feature_fails_closed() -> None:

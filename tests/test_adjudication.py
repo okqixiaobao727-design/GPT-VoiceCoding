@@ -88,6 +88,30 @@ class TestTheTwoOutwardQuestions:
         assert adjudicator.may_push() is True
 
 
+class TestTheAutoHangupQuestion:
+    def test_the_ceiling_holds_with_duty_and_voice_off(self) -> None:
+        """The ceiling is the call's own limit, not an act toward the user (`CONTEXT.md`)."""
+        switches = board()
+        adjudicator = SwitchAdjudicator(switches)
+
+        assert switches.is_set(SwitchName.DUTY) is False
+        assert switches.is_set(SwitchName.VOICE) is False
+        assert adjudicator.may_auto_hangup() is True
+
+    def test_the_switch_alone_answers_it(self) -> None:
+        switches = board(duty=True, voice=True)
+        adjudicator = SwitchAdjudicator(switches)
+        switches.flip(SwitchName.AUTO_HANGUP, False)
+
+        assert adjudicator.may_auto_hangup() is False
+
+    def test_it_is_no_outlet_of_its_own(self) -> None:
+        """Ending a silent call reaches nobody, so it never joins the outlets."""
+        adjudicator = SwitchAdjudicator(board())
+
+        assert adjudicator.outlets() == ()
+
+
 class TestFeatureSwitches:
     def test_a_feature_is_effective_only_under_its_parent(self) -> None:
         switches = board(duty=True)
@@ -108,7 +132,17 @@ class TestAdr0002:
 
         Adding a status or flip verb here is the exact first step toward gating
         the one surface that must answer with every switch off.
+
+        The pin forbids control-plane verbs, not reach verbs: `may_auto_hangup`
+        is one of the latter — the system acting on the call unbidden — so it
+        belongs here beside `may_touch_call`.
         """
         verbs = {name for name in dir(SwitchAdjudicator) if not name.startswith("_")}
 
-        assert verbs == {"may_touch_call", "may_push", "may_use", "outlets"}
+        assert verbs == {
+            "may_touch_call",
+            "may_push",
+            "may_use",
+            "may_auto_hangup",
+            "outlets",
+        }

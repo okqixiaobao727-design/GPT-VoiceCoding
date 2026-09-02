@@ -29,7 +29,7 @@ final class ScriptedControlPlane: ControlPlaneDialing, @unchecked Sendable {
 
 private let allSwitchesOff = """
     {"ok": true, "action": "status", "protocol": 3, "data": {
-      "switches": {"duty": false, "voice": false, "message": false},
+      "switches": {"duty": false, "voice": false, "message": false, "auto_hangup": false},
       "sessions": [], "call_id": null, "pending_relays": [], "pending_approvals": []}}
     """
 
@@ -43,9 +43,52 @@ private let allSwitchesOff = """
             Issue.record("expected a reading")
             return
         }
-        #expect(status.switches.map(\.name) == ["duty", "voice", "message"])
+        #expect(status.switches.map(\.name) == ["duty", "voice", "message", "auto_hangup"])
+        #expect(
+            status.switches.map(\.title) == [
+                "Duty Switch", "Voice Switch", "Message Switch", "Auto Hang-up Switch",
+            ])
         #expect(status.switches.allSatisfy { !$0.on })
         #expect(!status.callIsUp)
+    }
+
+    @Test func theAutoHangupSwitchIsFlippedLikeTheOthers() async {
+        // Its own row, sent under its own name — the panel holds no second path
+        // for a switch that is not under Duty.
+        let engine = ScriptedControlPlane([
+            .status: .success(allSwitchesOff),
+            .switch: .success(
+                #"{"ok": true, "action": "switch", "protocol": 3, "data": {"name": "auto_hangup", "on": false, "previous": true}}"#
+            ),
+        ])
+        let panel = ControlPanel(client: engine)
+        await panel.flip("auto_hangup", on: false)
+
+        #expect(engine.requests() == ["switch", "status"])
+        #expect(panel.lastFailure == nil)
+    }
+
+    @Test func aSwitchTheShellDoesNotKnowIsNotRendered() async {
+        // Additive on the wire: the panel maps `status` over its own canonical
+        // order, so a key it has no row for is ignored rather than guessed at.
+        let engine = ScriptedControlPlane([
+            .status: .success(
+                """
+                {"ok": true, "action": "status", "protocol": 3, "data": {
+                  "switches": {"duty": true, "voice": false, "message": false,
+                               "auto_hangup": true, "sound": true},
+                  "sessions": [], "call_id": null, "pending_relays": [],
+                  "pending_approvals": []}}
+                """)
+        ])
+        let panel = ControlPanel(client: engine)
+        await panel.refresh()
+
+        guard case .read(let status) = panel.reading else {
+            Issue.record("expected a reading")
+            return
+        }
+        #expect(status.switches.map(\.name) == ["duty", "voice", "message", "auto_hangup"])
     }
 
     @Test func aChildProcessFollowsItsParentAndAnUnknownChildIsLast() async {

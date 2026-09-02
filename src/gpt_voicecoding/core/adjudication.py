@@ -6,6 +6,10 @@ pipeline asks here rather than reading the board itself, so "Duty off means the
 system does not speak, does not push, and does not touch the Live Call" is one
 implementation instead of one per pipeline.
 
+Three of the four questions here are about reaching the user. The fourth — may
+the Silence Ceiling end a silent call — is about the call's own limit, and its
+switch answers it alone; nothing above it may veto it.
+
 The Voice and Message answers are computed independently, all the way down. The
 Voice Switch is the whole Live Call — speaking into it, opening it, ending it —
 because `CONTEXT.md` defines it that way, and the Message Switch is text reach.
@@ -63,6 +67,18 @@ class SwitchAdjudicator:
     def may_push(self) -> bool:
         """Whether the system may push text through the Companion Channel."""
         return self._switches.is_effective(SwitchName.MESSAGE)
+
+    def may_auto_hangup(self) -> bool:
+        """Whether the Silence Ceiling may end the call it is measuring.
+
+        The Auto Hang-up Switch answers this alone. It stands beside Duty rather
+        than under it (`CONTEXT.md`), because the ceiling is the call's own limit
+        and not an act toward the user — so the answer holds with Duty and Voice
+        off, and on a call the user opened. `is_effective` is asked rather than
+        `is_set` for the same reason every other verb here does: the ancestry
+        question is the board's to answer, not this module's to assume away.
+        """
+        return self._switches.is_effective(SwitchName.AUTO_HANGUP)
 
     def may_use(self, feature: str) -> bool:
         """Whether one Feature Switch is on *and* everything above it is.
