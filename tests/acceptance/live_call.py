@@ -67,6 +67,7 @@ from gpt_voicecoding.adapters.call.realtime import realtime_call
 from gpt_voicecoding.adapters.call.realtime.transport import CallTransport, LostHandler
 from gpt_voicecoding.adapters.call.realtime.webrtc import (
     FRAME_SAMPLES,
+    SAMPLE_BYTES,
     SAMPLE_RATE,
     webrtc_transport,
 )
@@ -350,26 +351,26 @@ def pcm_at_48k(path: Path) -> bytes:
     import av
 
     resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-    frame = av.AudioFrame(format="s16", layout="mono", samples=len(payload) // 2)
+    frame = av.AudioFrame(format="s16", layout="mono", samples=len(payload) // SAMPLE_BYTES)
     frame.planes[0].update(payload)
     frame.sample_rate = rate
     frame.pts = 0
     frame.time_base = fractions.Fraction(1, rate)
     resampled = bytearray()
     for out in [*resampler.resample(frame), *resampler.resample(None)]:
-        # Only the first `samples * 2` bytes are audio; the rest of the plane is
-        # padding, and `_Speaker` learned the hard way that padding is audible.
-        resampled += bytes(out.planes[0])[: out.samples * 2]
+        # Only the first `samples * SAMPLE_BYTES` bytes are audio; the rest of
+        # the plane is padding, and `_Speaker` learned the hard way it is audible.
+        resampled += bytes(out.planes[0])[: out.samples * SAMPLE_BYTES]
     return bytes(resampled)
 
 
 def framed(pcm: bytes) -> list[bytes]:
     """PCM cut into the exact 20 ms payloads `_Track.recv` hands to `av`.
 
-    Every frame is `FRAME_SAMPLES * 2` bytes and the last one is padded with
+    Every frame is `FRAME_SAMPLES * SAMPLE_BYTES` bytes and the last is padded with
     silence, because `plane.update` wants the plane's whole buffer.
     """
-    width = FRAME_SAMPLES * 2
+    width = FRAME_SAMPLES * SAMPLE_BYTES
     return [pcm[at : at + width].ljust(width, b"\x00") for at in range(0, len(pcm), width)]
 
 

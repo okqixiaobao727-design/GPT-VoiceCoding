@@ -17,14 +17,18 @@ this module imports no audio library at all, which
 
 ## The table is the specification; the reference WAVs are not
 
-The shapes were chosen by ear on this machine (#174: three candidates a moment,
-played on the very path this module feeds) and the reference renderings sit on
-the local branch `prototype/174-tone-cues`. Those WAVs were written with a naive
-gain — the prototype multiplied a unit waveform by the target peak — which
-lands the ENDED cue about 1.2 dB *under* its stated peak, because summing a
-second harmonic onto a sine does not produce a unit peak. #174's table states
-peaks, so a cue here is **normalised** to reach the one it was given, and that
-is the number a listener heard.
+**#174's resolution comment is the specification**, and it carries the table
+whole: three candidates a moment, played by ear on the very path this module
+feeds, and the chosen shapes written down with their peaks. The prototype that
+played them and the reference WAVs it exported are on the branch
+`prototype/174-tone-cues` — cited second, and deliberately: a branch is a thing
+one machine can lose, and the ticket is what holds the decision.
+
+Those WAVs were written with a naive gain — the prototype multiplied a unit
+waveform by the target peak — which lands the ENDED cue about 1.2 dB *under* its
+stated peak, because summing a second harmonic onto a sine does not produce a
+unit peak. #174's table states peaks, so a cue here is **normalised** to reach
+the one it was given, and that is the number a listener heard.
 
 ## The design rule, not just the picked sounds
 

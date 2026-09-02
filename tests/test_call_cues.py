@@ -6,11 +6,13 @@ installs the voice extra. Everything except the one thing that matters most:
 whether a cue is *audible* is #174's ear test, which a harness cannot run and is
 never asked to (#181).
 
-**The table is the spec, and the prototype is not.** `prototype/174-tone-cues`
-chose these shapes by ear and rendered reference WAVs from a naive gain, which
-leaves a cue carrying a second harmonic over a decibel under the peak it was
-supposed to have. The peaks below are the ones #186 states, and a cue is
-normalised to reach them.
+**The table is the spec, and the prototype is not.** #174's resolution comment
+is where these shapes were chosen by ear and written down; the branch
+`prototype/174-tone-cues` holds the prototype that played them and the reference
+WAVs it exported, and is named second because a branch is a thing one machine can
+lose. Those WAVs came from a naive gain, which leaves a cue carrying a second
+harmonic over a decibel under the peak it was supposed to have. The peaks below
+are the ones #174 and #186 state, and a cue is normalised to reach them.
 """
 
 from __future__ import annotations
@@ -44,11 +46,11 @@ def samples(pcm: bytes) -> array.array[int]:
 def peak_dbfs(pcm: bytes) -> float:
     """How loud the loudest sample in one cue is, relative to full scale."""
     loudest = max(abs(sample) for sample in samples(pcm))
-    return 20 * math.log10(loudest / 32767)
+    return 20 * math.log10(loudest / cues.FULL_SCALE)
 
 
 def duration_ms(pcm: bytes) -> float:
-    return len(pcm) / 2 / cues.SAMPLE_RATE * 1000
+    return cues.frames_in(pcm) / cues.SAMPLE_RATE * 1000
 
 
 class TestTheTable:
