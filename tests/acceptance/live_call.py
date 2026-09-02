@@ -1,0 +1,524 @@
+"""The acceptance harness's own Call adapter: a Live Call with nobody at the mic.
+
+## What this is, and where it runs
+
+This module is named by the **run config**, not imported by the harness:
+`[adapters] call = live_call:harness_call` (`support.derive_config`). So it is
+constructed inside the *engine* process, by the bundle's own interpreter, and
+`support.Engine.environment` puts `tests/acceptance` on that process's
+`PYTHONPATH` so the name resolves. Nothing under `src/` changes — the seam the
+composition root already has (`config.py:70` `REQUIRED_SEAMS`, ADR 0001) is what
+this fills, and `realtime_call`'s `transport_factory` parameter
+(`adapters/call/realtime/__init__.py`) is the hole it fills it through.
+
+## Ported, not invented (ADR 0010, #183)
+
+Every audio decision here is **ported** from the local probe
+`scripts/realtime_text_entry_probe.py` (untracked, main checkout), which is the
+reference implementation: #181 ran it and found synthesised speech on the media
+track reaching the Call Agent 3/3 with no device opened.
+
+| Here | Probe |
+|---|---|
+| `say` | `:794` `_say` — measures the WAV, because `say` exits 0 for a voice it cannot speak |
+| `pcm_at_48k` | `:829` — `av`, not `MediaPlayer`, which ends the track at EOF |
+| `framed` | `:860` — whole planes, last one padded |
+| `WavTrackSource` | `:887` — queued frames falling back to paced silence |
+| the `_next` injection | `:979` — the one line that reaches past the transport's surface |
+
+Legacy has no counterpart: its acceptance followed the host app's log
+(`legacy@1d32845:bridge/livecall.py:77-109`) with no synthesised speech at all —
+**dropped, because** this product owns the peer connection and feeds its own
+track (#180 §1).
+
+## What is *not* ported, and why
+
+The probe drives its own handshake and decides mid-call which WAV variant to
+play next off what the backend has been heard to do (`:1000-1021`). This is
+v0 — "the route through the product, nothing more" — so it plays the plain
+utterance once, the moment the peer connection has been up for `settle_seconds`,
+and records which variant that was. The variant is written down rather than
+assumed because the step reports it as an observation and a later ticket
+(the Call Keeper's v1) is the one that gets to vary it.
+
+## How the step on the other side of the process boundary reads this
+
+Through `observations`: one JSON object a line, appended as things happen, read
+back by `observed`. The step runs in pytest and the transport runs in the
+engine, and this file is the only thing that crosses between them.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fractions
+import json
+import subprocess
+import time
+import wave
+from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, fields
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from gpt_voicecoding.adapters.call.realtime import realtime_call
+from gpt_voicecoding.adapters.call.realtime.transport import CallTransport, LostHandler
+from gpt_voicecoding.adapters.call.realtime.webrtc import (
+    FRAME_SAMPLES,
+    SAMPLE_RATE,
+    webrtc_transport,
+)
+
+#: The reference this module is named by, so `derive_config` and the verdict
+#: spell it once. `module:attribute`, the form `[adapters]` takes.
+REFERENCE = "live_call:harness_call"
+
+#: One 20 ms frame of nothing — the payload `_Microphone._next` returns in a
+#: silent run (`webrtc.py:276`), restated here because the WAV source returns it
+#: between utterances and the track must never be starved.
+SILENT_FRAME = b"\x00\x00" * FRAME_SAMPLES
+
+#: What the call is asked. #175 run 3's exact phrasing, which #179 and #181
+#: proved produces a `handoff_request`, and which the Call Agent answers by
+#: running `bridgectl live` — so the request is also what ends the call.
+REQUEST = "那个你把电话挂了吧,我想让你结束通话"
+
+#: The voice `say` synthesises with. `Flo` and `Eddy` are premium zh_CN voices
+#: that have never been downloaded on this machine, and `say` does not say so —
+#: it exits 0 and writes 0.41 s of something that is not the sentence, where
+#: `Tingting` writes 3.95 s that is (probe `:335-341`).
+WAV_VOICE = "Tingting"
+
+#: The rate the request is synthesised at: the backend's own
+#: `REALTIME_AUDIO_SAMPLE_RATE`, and the rate a WebRTC track must be resampled
+#: up from.
+WAV_SAMPLE_RATE = 24_000
+
+#: The shortest a synthesised request may plausibly be. Under this, the voice
+#: was not installed and `say` emitted a stub.
+WAV_MINIMUM_SECONDS = 1.0
+
+#: The variant this version plays. The probe's name for the unpadded utterance,
+#: kept because the observation is compared against the probe's record.
+PLAIN = "plain"
+
+#: How long the call is left alone after the peer connection comes up, before
+#: the utterance goes out. The probe's `--settle` default, and the figure every
+#: #179/#181 run used.
+SETTLE_SECONDS = 10.0
+
+
+class HarnessSettingsError(Exception):
+    """`[adapters.settings.call]` does not say enough for the harness to run."""
+
+
+@dataclass(frozen=True)
+class HarnessSettings:
+    """What the harness tells its own Call adapter, out of the shared table.
+
+    The composition root forwards `[adapters.settings.call]` opaquely
+    (`composition.py:412`), and `RealtimeCallSettings.of` refuses every key it
+    does not recognise. So the two halves of the table are separated here, on
+    the way in, and the adapter is handed only its own.
+
+    The two paths have **no defaults**: they are how the step on the other side
+    of the process boundary finds this run, and a default would put them
+    somewhere no lane is looking. Everything else defaults to the probe's own
+    proven value.
+    """
+
+    #: Where the JSONL this run writes goes. Per lane — two lanes run at once.
+    observations: Path
+    #: Where the synthesised WAVs are kept, so a person can listen to them after.
+    wav_directory: Path
+    request: str = REQUEST
+    voice: str = WAV_VOICE
+    wav_sample_rate: int = WAV_SAMPLE_RATE
+    settle_seconds: float = SETTLE_SECONDS
+
+    @classmethod
+    def split(cls, table: dict[str, Any] | None) -> tuple[HarnessSettings, dict[str, Any]]:
+        """This module's keys, and everything else, which is the adapter's."""
+        given = dict(table or {})
+        mine = {field.name: given.pop(field.name) for field in fields(cls) if field.name in given}
+        for name in ("observations", "wav_directory"):
+            if not str(mine.get(name, "")).strip():
+                raise HarnessSettingsError(
+                    f"[adapters.settings.call] must name {name}: the acceptance step reads "
+                    f"this run out of that path, and it is not this module's to default"
+                )
+            mine[name] = Path(str(mine[name])).expanduser()
+        if "wav_sample_rate" in mine:
+            mine["wav_sample_rate"] = int(mine["wav_sample_rate"])
+        if "settle_seconds" in mine:
+            mine["settle_seconds"] = float(mine["settle_seconds"])
+        return cls(**mine), given
+
+
+# --- what crosses the process boundary --------------------------------------
+
+
+class Observations:
+    """One JSON object a line, appended and flushed as each thing happens.
+
+    A line at a time rather than one document at the end, because the reader is
+    another process and the writer is a call that may be cut off mid-way: a
+    half-written run still parses, and what it got as far as saying is still
+    readable.
+    """
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+
+    def note(self, what: str, **fields: Any) -> None:
+        entry = {"at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "what": what, **fields}
+        with self.path.open("a", encoding="utf-8") as sink:
+            sink.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+@dataclass(frozen=True)
+class Observed:
+    """What the engine-side run wrote down, as the step reads it.
+
+    Every field is optional: a call that never came up wrote nothing, and the
+    step says "not observed" rather than failing to parse.
+    """
+
+    entries: tuple[dict[str, Any], ...] = ()
+    variant: str | None = None
+    end_reason: str | None = None
+    transport_factory: str | None = None
+
+
+def observed(path: Path) -> Observed:
+    """Read one run's observation file. A missing file is nothing observed."""
+    if not path.exists():
+        return Observed()
+    entries: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            # A line cut off mid-write is the last one; everything before it
+            # still happened, and dropping the whole file would lose it.
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return Observed(
+        entries=tuple(entries),
+        variant=_last(entries, "variant"),
+        end_reason=_last(entries, "reason"),
+        transport_factory=_last(entries, "transport_factory"),
+    )
+
+
+def _last(entries: list[dict[str, Any]], field: str) -> Any:
+    """The newest value written for one field, or None if none ever was."""
+    for entry in reversed(entries):
+        if entry.get(field) is not None:
+            return entry[field]
+    return None
+
+
+# --- the audio, ported from the probe ---------------------------------------
+
+
+def say(text: str, path: Path, *, voice: str = WAV_VOICE, rate: int = WAV_SAMPLE_RATE) -> Path:
+    """Synthesise one utterance to a mono 16-bit WAV, and prove it is really one.
+
+    `say` exits 0 for a voice it cannot actually speak with, writing a short stub
+    instead of the sentence, so the exit code says nothing. What says something
+    is the duration: a stub is under half a second and the request is about four.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "say",
+            "-v",
+            voice,
+            "-o",
+            str(path),
+            f"--data-format=LEI16@{rate}",
+            "--file-format=WAVE",
+            text,
+        ],
+        check=True,
+    )
+    with wave.open(str(path), "rb") as synthesised:
+        seconds = synthesised.getnframes() / synthesised.getframerate()
+        channels, width = synthesised.getnchannels(), synthesised.getsampwidth()
+    if channels != 1 or width != 2:
+        raise RuntimeError(f"{path} is not mono 16-bit: channels={channels} width={width}")
+    if seconds < WAV_MINIMUM_SECONDS:
+        raise RuntimeError(
+            f"voice {voice!r} produced {seconds:.2f}s for {text!r}, under the "
+            f"{WAV_MINIMUM_SECONDS}s floor — it is almost certainly not installed. "
+            "`say -v '?'` lists the names; a premium voice must be downloaded first."
+        )
+    return path
+
+
+def pcm_at_48k(path: Path) -> bytes:
+    """One WAV as 48 kHz mono s16 bytes, resampled by `av` if it is not already.
+
+    48 kHz is what the track carries (`webrtc.py`'s `SAMPLE_RATE`), and `av` is
+    the resampler already in the process — the same one `_Speaker` uses on the
+    way back. `MediaPlayer` would have done all this and is still the wrong
+    tool: it ends the track at EOF (`aiortc/contrib/media.py:121-127`), which
+    would stop RTP in the middle of the call.
+
+    Imported inside the body, the way `webrtc.py` does it: `av` is the voice
+    extra, CI installs `.[dev]` only, and everything else in this module is
+    ordinary code the fast suite runs. Imported **after** the pass-through
+    return rather than before it, so a WAV already at the track's rate needs no
+    resampler to be installed — which the probe's version did not distinguish
+    (`:840`) because a probe only ever runs where the extra is.
+    """
+    with wave.open(str(path), "rb") as source:
+        rate = source.getframerate()
+        payload = source.readframes(source.getnframes())
+    if rate == SAMPLE_RATE:
+        return payload
+
+    import av
+
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    frame = av.AudioFrame(format="s16", layout="mono", samples=len(payload) // 2)
+    frame.planes[0].update(payload)
+    frame.sample_rate = rate
+    frame.pts = 0
+    frame.time_base = fractions.Fraction(1, rate)
+    resampled = bytearray()
+    for out in [*resampler.resample(frame), *resampler.resample(None)]:
+        # Only the first `samples * 2` bytes are audio; the rest of the plane is
+        # padding, and `_Speaker` learned the hard way that padding is audible.
+        resampled += bytes(out.planes[0])[: out.samples * 2]
+    return bytes(resampled)
+
+
+def framed(pcm: bytes) -> list[bytes]:
+    """PCM cut into the exact 20 ms payloads `_Track.recv` hands to `av`.
+
+    Every frame is `FRAME_SAMPLES * 2` bytes and the last one is padded with
+    silence, because `plane.update` wants the plane's whole buffer.
+    """
+    width = FRAME_SAMPLES * 2
+    return [pcm[at : at + width].ljust(width, b"\x00") for at in range(0, len(pcm), width)]
+
+
+class WavTrackSource:
+    """The frame source that stands in for the microphone's.
+
+    It is the third implementation of the same one-method hole `_Microphone`
+    already has two of (`webrtc.py:262-276`): captured frames, paced silence,
+    and now queued WAV frames falling back to paced silence. The pacing is
+    copied exactly, because it is load-bearing — frames handed over as fast as
+    the encoder asks would run the media clock ahead of the wall clock, and the
+    far side would be listening to a call that had already ended.
+
+    The clock and the sleep are parameters so the pacing can be tested without
+    spending the time it paces (`tests/test_live_call_harness.py`). Production
+    passes neither and gets the real ones.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        observations: Observations | None = None,
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+        self._observations = observations
+        self._pending: deque[bytes] = deque()
+
+    def enqueue(self, frames: list[bytes], *, variant: str = PLAIN) -> float:
+        """Queue one utterance. Returns how long it will take to go out."""
+        self._pending.extend(frames)
+        seconds = len(frames) * FRAME_SAMPLES / SAMPLE_RATE
+        if self._observations is not None:
+            self._observations.note(
+                "wav utterance on the track",
+                variant=variant,
+                frames=len(frames),
+                seconds=round(seconds, 2),
+            )
+        return seconds
+
+    async def next(self, track: Any) -> bytes:
+        """One 20 ms payload: the next WAV frame, or silence, paced in real time."""
+        if track._started is None:
+            track._started = self._clock()
+        delay = track._started + track._pts / SAMPLE_RATE - self._clock()
+        if delay > 0:
+            await self._sleep(delay)
+        if not self._pending:
+            return SILENT_FRAME
+        payload = self._pending.popleft()
+        if not self._pending and self._observations is not None:
+            self._observations.note("wav utterance finished")
+        return payload
+
+
+# --- the transport, and the adapter the run config names --------------------
+
+
+class HarnessCallTransport:
+    """The production transport, with its microphone fed from a WAV.
+
+    Everything about the call is the real one out of `webrtc.py`: the peer
+    connection, the track, the Opus encoder and the real-time pacing. Two things
+    are added, and they are the whole of what this class is:
+
+    * the frame source is replaced, which `_Microphone` exposes exactly one
+      method for — `recv` looks `_next` up on the instance (`webrtc.py:248`), so
+      a function set there shadows the class's own. The same seam `silent=True`
+      fills, filled a third way (probe `:966-979`);
+    * the ending is written down. `CallEnded` is an event with no log line of
+      its own (`core/bridge.py:780-785` notes only the interlock), so what the
+      audio path saw — this side closing, or the connection going away by
+      itself — is recorded here, and the step reads it back.
+
+    No device is opened: the microphone grant is triggered by opening the
+    device, and `silent=True` never does.
+    """
+
+    def __init__(
+        self, *, settings: HarnessSettings, observations: Observations, utterance: list[bytes]
+    ) -> None:
+        self._settings = settings
+        self._observations = observations
+        #: Already synthesised, resampled and framed — by `harness_call`, while
+        #: the engine was being assembled. Not here, and that is the point: this
+        #: runs inside the event loop, one step before the handshake, and `say`
+        #: is a subprocess and the resampler is CPU. A second of blocking there
+        #: is a second the peer connection is not being set up in.
+        self._utterance = utterance
+        self._real = webrtc_transport(silent=True)
+        self._source = WavTrackSource(observations=observations)
+        self._spoke = False
+        self._connected_at: float | None = None
+        self._ended: str | None = None
+        # Reaching past the transport's own surface, deliberately and only here.
+        self._real._microphone._next = self._next  # type: ignore[attr-defined]
+        observations.note(
+            "wav source installed",
+            transport_factory=REFERENCE,
+            variant=PLAIN,
+            voice=settings.voice,
+            request=settings.request,
+            frames=len(self._utterance),
+            rate=settings.wav_sample_rate,
+            settle_seconds=settings.settle_seconds,
+        )
+
+    async def _next(self, track: Any) -> bytes:
+        """Every 20 ms, and the only clock this side has once the call is up.
+
+        The utterance is put on the track from here rather than by anything
+        outside the process, because there is nothing outside the process: the
+        step that asked for the call is in pytest, and this is the engine. What
+        it waits for is the peer connection being up and then staying up for
+        `settle_seconds` — the probe's own dial-time silence window, which every
+        run that was heard used (`--settle`, default 10 s).
+        """
+        if not self._spoke and self._real.is_connected:
+            now = time.monotonic()
+            if self._connected_at is None:
+                self._connected_at = now
+                self._observations.note(
+                    "peer connection up", settle_seconds=self._settings.settle_seconds
+                )
+            elif now - self._connected_at >= self._settings.settle_seconds:
+                self._spoke = True
+                self._source.enqueue(self._utterance, variant=PLAIN)
+        return await self._source.next(track)
+
+    # -- the `CallTransport` protocol, delegated ----------------------------
+
+    async def offer(self) -> str:
+        return await self._real.offer()
+
+    async def accept_answer(self, sdp: str) -> None:
+        await self._real.accept_answer(sdp)
+
+    async def wait_connected(self, timeout_seconds: float) -> None:
+        await self._real.wait_connected(timeout_seconds)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._real.is_connected
+
+    def on_lost(self, handler: LostHandler) -> None:
+        def lost(reason: str) -> None:
+            self._note_end(f"the connection went away by itself: {reason}")
+            handler(reason)
+
+        self._real.on_lost(lost)
+
+    async def aclose(self) -> None:
+        # `aclose` is idempotent and the adapter calls it on every path, so the
+        # first reason recorded is the one that says what really ended the call.
+        self._note_end("this side closed the audio path")
+        await self._real.aclose()
+
+    def _note_end(self, reason: str) -> None:
+        if self._ended is not None:
+            return
+        self._ended = reason
+        self._observations.note("call ended", reason=reason, spoke=self._spoke)
+
+
+def harness_call(*, sink: Any = None, settings: dict[str, Any] | None = None) -> Any:
+    """`[adapters] call` — the shipped adapter, with a transport that speaks.
+
+    The adapter is the production `RealtimeCallAdapter`: the signalling
+    conversation, the Delegated Turn and the classification rules are all the
+    ones being accepted. Only the audio path is the harness's, and it is handed
+    over through the parameter the shipped factory already has for it.
+
+    **The utterance is synthesised here**, while the engine is still being
+    assembled, and the same frames are reused by every call this engine holds.
+    Two reasons, and both are the shipped factory's own reasoning applied one
+    seam over (`realtime/__init__.py`: the voice extra is proved present *here*
+    so a misconfiguration is a refusal to start rather than an outage
+    mid-call):
+
+    * a voice that is not installed, or a `say` that writes a stub, is then a
+      run that never starts rather than a call that comes up mute and fails
+      twenty minutes later for a reason nothing names;
+    * `say` is a subprocess and the resampler is CPU, and doing either inside
+      the event loop is a second stolen from the handshake.
+    """
+    mine, theirs = HarnessSettings.split(settings)
+    observations = Observations(mine.observations)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    utterance = framed(
+        pcm_at_48k(
+            say(
+                mine.request,
+                mine.wav_directory / f"{stamp}-request-{mine.wav_sample_rate}.wav",
+                voice=mine.voice,
+                rate=mine.wav_sample_rate,
+            )
+        )
+    )
+    observations.note(
+        "utterance synthesised",
+        transport_factory=REFERENCE,
+        voice=mine.voice,
+        rate=mine.wav_sample_rate,
+        frames=len(utterance),
+        seconds=round(len(utterance) * FRAME_SAMPLES / SAMPLE_RATE, 2),
+    )
+
+    def build() -> CallTransport:
+        return HarnessCallTransport(settings=mine, observations=observations, utterance=utterance)
+
+    return realtime_call(sink=sink, settings=theirs, transport_factory=build)

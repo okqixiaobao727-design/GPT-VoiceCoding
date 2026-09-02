@@ -206,7 +206,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     `test_lanes.py`'s docstring). A build ticket runs one step of one lane;
     the pre-merge run passes neither option and walks everything.
 
-    A step is not a test — nine of them share one engine, one Session and one
+    A step is not a test — they share one engine, one Session and one
     chat — so `-k` cannot address one, and the prerequisite closure means asking
     for a step is asking for the steps beneath it too. A lane *is* a parametrised
     test, but the parameters are now chosen rather than fixed: the lanes run
@@ -535,7 +535,7 @@ def preflight(
     """Step 0. Everything here is a refusal, never a failure.
 
     **What it refuses about is what this run selected.** Every check below was
-    written when a run was always both lanes and always nine steps, and each one
+    written when a run was always both lanes and always every step, and each one
     was therefore about the run. With `--lane` and `--step` they are not: a Codex
     binary this run will never execute, or a Codex permission ground no selected
     step stands on, is a refusal about work nobody asked for — and a refusal that
@@ -796,6 +796,12 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         # Codex lane's journey never walks that route. Dropping the adapter is
         # what leaves exactly one claimant when both lanes are up.
         dropped_agents=() if lane.agent == str(AgentKind.CLAUDE) else (AgentKind.CLAUDE,),
+        # #183: only a run that walks `live call` gets the harness's own Call
+        # adapter and the `bridgectl` wrapper. Conditional rather than always,
+        # because every other step is accepting the Call adapter the *user*
+        # configured, and swapping it on a run that never dials would mean those
+        # steps were graded against an engine nobody runs.
+        harness_live_call="live call" in arrangement.selection.steps,
     )
     engine = support.Engine(
         config=config,
@@ -862,7 +868,7 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         finally:
             # #44: the engine unlinked its socket but left its approval directory
             # behind. Recorded rather than graded — a real open bug and a real
-            # detector, but not one of the nine names the build tickets cite.
+            # detector, but not one of the step names the build tickets cite.
             # Checked after the engine is down, because that is when the listener
             # stops, and before the Session, which is the order the sequential
             # harness observed it in.
