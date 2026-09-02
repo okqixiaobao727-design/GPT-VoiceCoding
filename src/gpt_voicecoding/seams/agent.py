@@ -251,6 +251,28 @@ class ProgressRole(StrEnum):
     ASSISTANT = "assistant"
 
 
+class ProgressPhase(StrEnum):
+    """Which part of a turn one thing that was said belonged to.
+
+    This seam's vocabulary, not the source's: the values below are the words
+    Bridge Core reads, and the Codex spellings they are mapped from live in one
+    table in that lane's reader (`adapters/agent/codex/thread_tail.py`), which
+    is the only place a build's own name for a phase is written (ADR 0001 —
+    Bridge Core speaks seam verbs, protocol mechanics stay in the adapter).
+    Renaming a value back to a source string would put that mechanic here.
+
+    `UNKNOWN` is a member rather than an error (#210). A phase a future build
+    invents must cost the reading nothing and read as *not the answer*, because
+    the reading rides on a roster row the user is looking at and raising there
+    would blank it — so an adapter maps everything it does not recognise here,
+    and a lane that marks nothing at all leaves the field `None` instead.
+    """
+
+    COMMENTARY = "commentary"
+    FINAL_ANSWER = "answer"
+    UNKNOWN = "unknown"
+
+
 class ProgressAvailability(StrEnum):
     """Whether an authoritative progress source was read, and whether it answered."""
 
@@ -282,22 +304,29 @@ class ProgressEntry:
     """One thing that was said in a Session, and by which side.
 
     Legacy carried `turn_id` and `turn_status` beside them on the Codex lane
-    (`legacy@1d32845:bridge/codex.py:1484-1492, 1516-1520`); **dropped, because**
-    no v1.0 consumer reads them — the Live Call, the Companion Channel and the
+    (`legacy@1d32845:bridge/codex.py:1405, 1484-1492, 1516-1520`). `turn_id` is
+    **ported** (#210): which turn an entry belongs to is the only boundary that
+    survives a turn opened by a message with no words in it — a `userMessage`
+    carrying only an image leaves no entry at all, and a reader that finds the
+    newest turn by looking for the newest thing the user said reads straight
+    past it into the turn before. `turn_status` stays **dropped, because** no
+    v1.0 consumer reads it — the Live Call, the Companion Channel and the
     Control Panel ask what a Session last said and what it was last told, never
-    which turn that was or how the turn ended — and adding a field here is
-    additive rather than a second widening of `ProgressObservation`.
+    how the turn ended — and a running turn is not a special case to the reader
+    that carries what it has said so far.
 
-    `phase` is that additive field (#188), and it is the source's own word
-    rather than a vocabulary of this seam's: Codex marks each `agentMessage`
-    `commentary` or `final_answer`
+    `phase` is the other field beside them (#188), and it is a `ProgressPhase` —
+    this seam's vocabulary rather than the source's. Codex marks each
+    `agentMessage` with a word of its own
     (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`, serialised
-    `Option<MessagePhase>`), and a lane that marks nothing leaves it `None`. Not
-    an enum, deliberately: a phase a future build invents must read as *not the
-    answer* and cost the reading nothing, where an enum would raise on a roster
-    row the user is looking at. Who compares it to what is the reader's — the
-    tail readers carry it and never look at it, and Briefing is the one place
-    that asks whether a turn ended on its answer (`core/briefing.py`).
+    `Option<MessagePhase>`); that lane's reader maps it, anything it does not
+    recognise becomes `UNKNOWN`, and a lane that marks nothing leaves this
+    `None`. An earlier draft carried the source string raw and argued an enum
+    would raise on a roster row (#188); `UNKNOWN` is what answers that instead,
+    so nothing is lost and Bridge Core no longer compares a protocol word
+    (ADR 0001). Who compares it to what is still the reader's — the tail readers
+    set it and never look at it, and Briefing is the one place that asks whether
+    a turn ended on its answer (`core/briefing.py`).
     """
 
     #: Where this entry sits in the Session's visible record, counted **from
@@ -312,9 +341,18 @@ class ProgressEntry:
     ordinal: int
     role: ProgressRole
     text: str
-    #: Which part of the turn this was, in the source's own word, or `None`
-    #: when the source did not say.
-    phase: str | None = None
+    #: Which part of the turn this was, in this seam's vocabulary, or `None`
+    #: when the source did not mark it at all.
+    phase: ProgressPhase | None = None
+    #: Which turn this entry belongs to, named by the source and assigned by the
+    #: lane at read time (#210), or `None` when the source has no turn to name.
+    #: Opaque here: it is compared to another entry's and never parsed, so it
+    #: groups entries without this seam knowing how either source spells one. A
+    #: lane whose record has no turn concept — a Claude transcript file is one
+    #: long append — leaves it `None`, and so does a Codex turn whose document
+    #: named no `id`; a reader that finds no turns falls back to the boundary it
+    #: had before (`core/briefing.py::_final_answer`).
+    turn_id: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int):
@@ -325,8 +363,12 @@ class ProgressEntry:
             raise ValueError("a progress entry role must use the Agent seam vocabulary")
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("an entry with nothing said in it is not progress")
-        if self.phase is not None and not isinstance(self.phase, str):
-            raise ValueError("a progress entry phase is the source's own word, or nothing")
+        if self.phase is not None and not isinstance(self.phase, ProgressPhase):
+            raise ValueError("a progress entry phase must use the Agent seam vocabulary")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str) or not self.turn_id.strip()
+        ):
+            raise ValueError("a progress entry turn is named by the source, or not named")
 
 
 class ProgressCapture(Protocol):

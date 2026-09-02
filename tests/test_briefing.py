@@ -23,6 +23,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressEntry,
     ProgressObservation,
     ProgressOmission,
+    ProgressPhase,
     ProgressRole,
     SessionLifecycle,
     SessionState,
@@ -147,11 +148,11 @@ class TestTheFiveStates:
         assert sum(brief.counts.values()) == 0
 
 
-FINAL_ANSWER = "final_answer"
-COMMENTARY = "commentary"
+FINAL_ANSWER = ProgressPhase.FINAL_ANSWER
+COMMENTARY = ProgressPhase.COMMENTARY
 
 
-def codex_said(*said: tuple[str, str | None]) -> ProgressObservation:
+def codex_said(*said: tuple[str, ProgressPhase | None]) -> ProgressObservation:
     """A Codex reading: what the agent said, each with the `phase` it carried."""
     return ProgressObservation.readable(
         has_history=True,
@@ -163,9 +164,9 @@ def codex_said(*said: tuple[str, str | None]) -> ProgressObservation:
     )
 
 
-def told(text: str) -> ProgressEntry:
+def told(text: str, *, turn_id: str | None = None) -> ProgressEntry:
     """What the Session was told — and, in a tail, where a turn begins."""
-    return ProgressEntry(ordinal=0, role=ProgressRole.USER, text=text)
+    return ProgressEntry(ordinal=0, role=ProgressRole.USER, text=text, turn_id=turn_id)
 
 
 def codex_tail(*entries: ProgressEntry) -> ProgressObservation:
@@ -173,11 +174,15 @@ def codex_tail(*entries: ProgressEntry) -> ProgressObservation:
     return ProgressObservation.readable(has_history=True, read_at=READ_AT, recent=entries)
 
 
-def answer(text: str, phase: str | None = FINAL_ANSWER) -> ProgressEntry:
-    return ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text=text, phase=phase)
+def answer(
+    text: str, phase: ProgressPhase | None = FINAL_ANSWER, *, turn_id: str | None = None
+) -> ProgressEntry:
+    return ProgressEntry(
+        ordinal=0, role=ProgressRole.ASSISTANT, text=text, phase=phase, turn_id=turn_id
+    )
 
 
-def codex_state(*said: tuple[str, str | None]) -> BriefState:
+def codex_state(*said: tuple[str, ProgressPhase | None]) -> BriefState:
     return briefing.session(row(CODEX, progress=codex_said(*said))).state
 
 
@@ -256,6 +261,11 @@ class TestACodexTurnThatAskedNothing:
         Without the boundary a turn still working — or one that produced only
         commentary — would be briefed FINISHED on the *previous* turn's answer,
         which is the ticket's "no final answer → DECISION" turned inside out.
+
+        These three name no turn, which is the **fallback** rule (#210): a
+        Claude reading, or a Codex build whose turns carried no `id`, still
+        stops at the newest thing the user said. The three below them are the
+        same three boundaries when the source did name its turns.
         """
         working = codex_tail(
             told("do the first thing"),
@@ -279,6 +289,30 @@ class TestACodexTurnThatAskedNothing:
         )
         assert briefing.session(row(CODEX, progress=done)).state is BriefState.FINISHED
 
+    def test_a_turn_opened_by_an_image_alone_is_not_the_turn_before_it(self) -> None:
+        """#210: a `userMessage` carrying only an image leaves no entry, so the
+        boundary the search stops at is the turn each entry names, not the
+        newest thing the user said. Without it this reads the previous turn's
+        answer and briefs FINISHED where the turn has produced only commentary.
+        """
+        wordless = codex_tail(
+            told("do the first thing", turn_id="turn_one"),
+            answer("Done. All tests pass.", turn_id="turn_one"),
+            answer("先看一下目录。", COMMENTARY, turn_id="turn_two"),
+        )
+        assert briefing.session(row(CODEX, progress=wordless)).state is BriefState.DECISION
+
+    def test_a_turn_named_by_the_source_bounds_the_search_at_both_ends(self) -> None:
+        """The named boundary stops the search; it does not stop this turn being
+        read, and an entry the user put mid-turn does not end it either."""
+        done = codex_tail(
+            told("do the first thing", turn_id="turn_one"),
+            answer("同意吗？", turn_id="turn_one"),
+            told("now do the second", turn_id="turn_two"),
+            answer("已完成第二件事。", turn_id="turn_two"),
+        )
+        assert briefing.session(row(CODEX, progress=done)).state is BriefState.FINISHED
+
     def test_a_link_target_that_holds_brackets_is_still_a_target(self) -> None:
         """A URL may carry balanced parentheses, and cutting at the first one
         leaves the query string in the prose (`?run=7` reads as an ask)."""
@@ -286,7 +320,9 @@ class TestACodexTurnThatAskedNothing:
         assert answered(said) is BriefState.FINISHED
 
     def test_a_phase_this_build_cannot_read_is_not_an_answer(self) -> None:
-        assert codex_state(("已完成。", "somethingNewIn0152")) is BriefState.DECISION
+        """The adapter maps an unrecognised codex word to `UNKNOWN`, and this is
+        what that member means here: the turn did not end on its answer."""
+        assert codex_state(("已完成。", ProgressPhase.UNKNOWN)) is BriefState.DECISION
 
     def test_a_session_nobody_read_stays_a_decision(self) -> None:
         assert (

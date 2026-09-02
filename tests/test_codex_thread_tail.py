@@ -19,7 +19,12 @@ from typing import Any
 
 from fakes import PROGRESS_CAPTURE, capture_for
 from gpt_voicecoding.adapters.agent.codex.thread_tail import last_activity, moment, recent
-from gpt_voicecoding.seams.agent import ProgressOmission, ProgressRole
+from gpt_voicecoding.seams.agent import (
+    ProgressEntry,
+    ProgressOmission,
+    ProgressPhase,
+    ProgressRole,
+)
 
 #: The moment the live probe read, and the integer the daemon spelled it as.
 MEASURED_SECONDS = 1787712279
@@ -50,8 +55,13 @@ def told(text: str) -> dict[str, Any]:
     }
 
 
-def turn(*items: dict[str, Any], status: str = "completed") -> dict[str, Any]:
-    return {"id": "01a03bf0", "status": status, "items": list(items)}
+def turn(
+    *items: dict[str, Any], status: str = "completed", turn_id: Any = "01a03bf0"
+) -> dict[str, Any]:
+    document: dict[str, Any] = {"status": status, "items": list(items)}
+    if turn_id is not None:
+        document["id"] = turn_id
+    return document
 
 
 def thread(*turns: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -61,6 +71,11 @@ def thread(*turns: dict[str, Any], **extra: Any) -> dict[str, Any]:
 def texts(document: dict[str, Any]) -> list[str]:
     entries, _ = recent(document, capture=PROGRESS_CAPTURE)
     return [entry.text for entry in entries]
+
+
+def _entries(*turns: dict[str, Any]) -> tuple[ProgressEntry, ...]:
+    entries, _ = recent(thread(*turns), capture=PROGRESS_CAPTURE)
+    return entries
 
 
 class TestWhatCountsAsProgress:
@@ -131,8 +146,8 @@ class TestWhatCountsAsProgress:
 
         assert [(entry.text, entry.phase) for entry in entries] == [
             ("do the thing", None),
-            ("looking at it now", "commentary"),
-            ("done", "final_answer"),
+            ("looking at it now", ProgressPhase.COMMENTARY),
+            ("done", ProgressPhase.FINAL_ANSWER),
         ]
 
     def test_a_build_that_names_no_phase_carries_none(self) -> None:
@@ -141,21 +156,50 @@ class TestWhatCountsAsProgress:
 
         assert [entry.phase for entry in entries] == [None]
 
-    def test_a_phase_this_build_has_never_seen_is_carried_verbatim(self) -> None:
-        """Not an enum at the seam: an unknown phase reads as "not the answer"."""
+    def test_a_phase_this_build_has_never_seen_is_unknown(self) -> None:
+        """#210: an unrecognised phase costs the reading nothing and is not the
+        answer — `UNKNOWN` is what a seam enum uses instead of raising here."""
         entries, _ = recent(
             thread(turn(spoke("done", phase="somethingNewIn0152"))), capture=PROGRESS_CAPTURE
         )
 
-        assert [entry.phase for entry in entries] == ["somethingNewIn0152"]
+        assert [entry.phase for entry in entries] == [ProgressPhase.UNKNOWN]
 
-    def test_a_phase_that_is_not_a_string_is_no_phase(self) -> None:
+    def test_a_phase_that_is_not_a_string_is_unknown_rather_than_no_phase(self) -> None:
+        """The source said *something*, which is a different fact from saying
+        nothing — and only a build that marks no phase at all leaves `None`."""
         item = spoke("done")
         item["phase"] = 7
 
         entries, _ = recent(thread(turn(item)), capture=PROGRESS_CAPTURE)
 
-        assert [entry.phase for entry in entries] == [None]
+        assert [entry.phase for entry in entries] == [ProgressPhase.UNKNOWN]
+
+    def test_every_entry_names_the_turn_it_came_from(self) -> None:
+        """**Ported** from `legacy@1d32845:bridge/codex.py:1405,1484-1492`: the
+        turn document's `id`, attached to every message that turn held — and to
+        an `agentMessage` in a turn whose opening message left no entry."""
+        picture = told("")
+        picture["content"] = [{"type": "image", "imageUrl": "data:..."}]
+        document = thread(
+            turn(told("do the thing"), spoke("done"), turn_id="turn_one"),
+            turn(picture, spoke("looking at it now"), turn_id="turn_two"),
+        )
+
+        entries, _ = recent(document, capture=PROGRESS_CAPTURE)
+
+        assert [(entry.text, entry.turn_id) for entry in entries] == [
+            ("do the thing", "turn_one"),
+            ("done", "turn_one"),
+            ("looking at it now", "turn_two"),
+        ]
+
+    def test_a_turn_that_names_no_id_names_no_turn(self) -> None:
+        """**Adapted** from legacy, which raised (`:1405-1411`): one malformed
+        turn must not blank the roster row this reading is on."""
+        assert [entry.turn_id for entry in _entries(turn(spoke("done"), turn_id=None))] == [None]
+        assert [entry.turn_id for entry in _entries(turn(spoke("done"), turn_id=7))] == [None]
+        assert [entry.turn_id for entry in _entries(turn(spoke("done"), turn_id="  "))] == [None]
 
     def test_the_bound_is_the_shared_one(self) -> None:
         """One bound, one type, whichever lane the row came from."""

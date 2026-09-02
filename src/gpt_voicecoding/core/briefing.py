@@ -60,6 +60,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressAvailability,
     ProgressObservation,
     ProgressOmission,
+    ProgressPhase,
     ProgressRole,
     ReplyWindow,
     SessionState,
@@ -472,14 +473,6 @@ def _turn_ended(session: Session) -> BriefState:
 # Did the Codex turn end on a question? (#188, on the evidence in #176.)
 # ----------------------------------------------------------------------
 
-#: Codex's own word for the message that ends a turn. `MessagePhase::FinalAnswer`
-#: is documented as "the assistant's terminal answer text for the current turn"
-#: (`codex-rs/protocol/src/models.rs:909-917`) and was byte-identical to
-#: `task_complete.last_agent_message` in 562 of 562 comparisons (#176 §2.1).
-#: Compared here and nowhere else: the tail readers carry the word, this module
-#: is what it means anything to.
-FINAL_ANSWER: Final = "final_answer"
-
 #: What the user was shown, once what they were not is taken out: a fenced code
 #: block, an inline code span, and the target half of a markdown link (the label
 #: is kept, because the label is words they read). Measured: stripping code
@@ -516,23 +509,24 @@ def _final_answer(progress: ProgressObservation) -> str | None:
     """The newest message the source marked as this turn's answer, if it did.
 
     **The search stops at the turn it is about.** A progress tail holds several
-    turns, and the newest thing the user said is where the newest one began — so
-    an answer found behind that is the *previous* turn's, and reading it would
-    brief a turn that is still working, or one that has produced only
-    commentary, on words it never said. `ProgressEntry` carries no `turn_id`
-    (legacy's, dropped), and the boundary is in the tail already, as the entry
-    the user put there.
+    turns, and an answer found behind the newest one is the *previous* turn's:
+    reading it would brief a turn that is still working, or one that has
+    produced only commentary, on words it never said. The newest turn is the
+    turn of the newest entry, by the `turn_id` the lane put on it (#210), and
+    only entries naming that turn are searched. That boundary is the source's
+    own and survives a turn opened by a message with no words in it — a
+    `userMessage` carrying only an image leaves no entry at all
+    (`adapters/agent/codex/thread_tail.py::_entry`, and the seam refuses an
+    entry with nothing said in it), so a turn opened by one that has produced
+    only commentary is a DECISION rather than the previous turn's FINISHED.
 
-    **One turn opener leaves no entry, and this reads past it.** A `userMessage`
-    carrying only an image says nothing, so the Codex tail reader yields nothing
-    for it (`adapters/agent/codex/thread_tail.py::_entry`, and the seam refuses
-    an entry with no words in it) — a turn opened by an image alone that has
-    produced only commentary therefore reaches the *previous* turn's answer and
-    is briefed FINISHED. Carrying the boundary regardless of what the message
-    held needs a turn field on `ProgressEntry`, which is a widening #188 may not
-    make — `phase` is its one structural adapter change — and inventing words
-    for a wordless message is not the alternative. Left as it stands, and
-    opened as #210.
+    **A reading that names no turn keeps the rule it had before.** The Claude
+    lane has no turn in a transcript file, and a Codex build may name none, so
+    when the newest entry carries no `turn_id` the search stops at the newest
+    `USER` entry instead — the boundary that is in the tail already, as the
+    entry the user put there. Nothing regresses on a reading without turns; it
+    is only the wordless opener that reads past it, which is the case the
+    `turn_id` closes.
 
     Nothing is classified without an answer, and every way of not having one
     stays DECISION: a build old enough to mark no `phase`, a turn that has said
@@ -542,10 +536,14 @@ def _final_answer(progress: ProgressObservation) -> str | None:
     the commentary instead would manufacture a decision out of the mid-turn
     question Codex's own prompt permits there.
     """
+    newest_turn = progress.recent[-1].turn_id if progress.recent else None
     for entry in reversed(progress.recent):
-        if entry.role is ProgressRole.USER:
+        if newest_turn is None:
+            if entry.role is ProgressRole.USER:
+                return None
+        elif entry.turn_id != newest_turn:
             return None
-        if entry.phase == FINAL_ANSWER:
+        if entry.phase is ProgressPhase.FINAL_ANSWER:
             return entry.text
     return None
 

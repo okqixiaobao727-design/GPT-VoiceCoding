@@ -23,15 +23,24 @@ and is wrong here, because the same reading now rides on a roster row and one
 unknown item would blank a row the user is looking at. So an unreadable item
 costs itself and nothing else — which is the rule legacy already used on its
 Claude side (`bridge/transcript.py:1568-1580`), applied to both lanes.
-**Dropped**: `turn_id` and `turn_status` beside each entry (`:1484-1492,
-1516-1520`), because no v1.0 consumer reads them — the Live Call, the Companion
+**Ported**: `turn_id` beside each entry (`:1405, 1484-1492, 1516-1520`), which
+legacy read off the turn document and attached to every message that turn held.
+**Adapted** the same way the item types were: legacy *raised* when a turn named
+no `id` or named a non-string one (`:1405-1411`), and here such a turn simply
+yields entries that name no turn, because a roster row must not blank over one
+malformed turn. It is the only boundary that survives a turn opened by a message
+with no words in it (#210): a `userMessage` carrying only an image leaves no
+entry, so the turn a reader could otherwise find by looking for the newest thing
+the user said is not there to find. **Dropped**: `turn_status` (`:1484-1492,
+1516-1520`), because no v1.0 consumer reads it — the Live Call, the Companion
 Channel and the Control Panel ask what a Session last said and what it was last
-told, never which turn that was — and `ProgressEntry` can gain a field later
-without `ProgressObservation` widening twice. #188 is that later: an
-`agentMessage`'s `phase` is carried through, because it is the record's own
-answer to *which message was the turn's answer* and nothing else here can
-reconstruct it. It is carried and never read — whether an answer reads as an
-ask is Briefing's reading, not this reader's observation.
+told, never how the turn ended.
+
+#188 added the other field: an `agentMessage`'s `phase`, because it is the
+record's own answer to *which message was the turn's answer* and nothing else
+here can reconstruct it. It is normalised into the seam's `ProgressPhase` here
+and never read here — whether an answer reads as an ask is Briefing's reading,
+not this reader's observation.
 
 **Times are epoch seconds, measured not assumed.** `thread/read` on codex
 0.149.1 answers `updatedAt`, `recencyAt` and `createdAt` as integers —
@@ -51,6 +60,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressCapture,
     ProgressEntry,
     ProgressOmission,
+    ProgressPhase,
     ProgressRole,
 )
 
@@ -66,12 +76,26 @@ USER_ITEM: Final = "userMessage"
 #: other two shapes a `userMessage` carries and neither has any to contribute.
 USER_TEXT: Final = "text"
 
-#: Which part of the turn one `agentMessage` was, as codex spells it —
-#: `commentary` or `final_answer`
-#: (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`). Carried
-#: verbatim and never compared here: what a phase means to a reader is
-#: Briefing's (#188), and this module's job is to lose nothing on the way.
+#: Which part of the turn one `agentMessage` was, as codex spells it
+#: (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`).
 PHASE: Final = "phase"
+
+#: Codex's own words for a phase, and the seam facts they are. **This table is
+#: the only place either string is written** (ADR 0001): the phase reaches
+#: Briefing as a `ProgressPhase`, so Bridge Core never compares a codex word.
+#: Anything absent from it — a phase a later build invents, or a value that is
+#: not a string at all — reads as `UNKNOWN` rather than raising, for the same
+#: reason an unknown item type costs only itself: this reading rides on a roster
+#: row. `UNKNOWN` is not `None`, deliberately (#210): the source said something,
+#: and "said something this build cannot read" is a different fact from "said
+#: nothing", even though both read as *not the answer*.
+PHASES: Final[Mapping[str, ProgressPhase]] = {
+    "commentary": ProgressPhase.COMMENTARY,
+    "final_answer": ProgressPhase.FINAL_ANSWER,
+}
+
+#: Which turn a thread document says one of its turns is, as codex spells it.
+TURN_ID: Final = "id"
 
 #: When the thread was last touched, as codex spells it.
 UPDATED_AT: Final = "updatedAt"
@@ -109,8 +133,9 @@ def visible(thread: Mapping[str, Any]) -> tuple[ProgressEntry, ...]:
         items = turn.get("items")
         if not isinstance(items, list):
             continue
+        turn_id = _turn_id(turn.get(TURN_ID))
         for item in items:
-            entry = _entry(item, ordinal=len(entries))
+            entry = _entry(item, ordinal=len(entries), turn_id=turn_id)
             if entry is not None:
                 entries.append(entry)
     return tuple(entries)
@@ -137,28 +162,54 @@ def last_activity(thread: Mapping[str, Any]) -> datetime | None:
     return moment(thread.get(UPDATED_AT))
 
 
-def _entry(item: Any, *, ordinal: int) -> ProgressEntry | None:
+def _entry(item: Any, *, ordinal: int, turn_id: str | None) -> ProgressEntry | None:
     """One turn item as something that was said, or `None` if it was not.
 
     The ordinal is the count of entries already kept, so it numbers the visible
     conversation from its oldest entry across every turn, and an item that is
-    not something said costs no number (#171).
+    not something said costs no number (#171). The turn is the enclosing turn's,
+    whatever the item is: an entry names the turn it came from even when the
+    turn's own opening message left no entry beside it (#210).
     """
     if not isinstance(item, Mapping):
         return None
     kind = item.get("type")
     if kind == AGENT_ITEM:
         text = item.get("text")
-        phase = item.get(PHASE)
         return _said(
             ordinal,
             ProgressRole.ASSISTANT,
             text if isinstance(text, str) else "",
-            phase=phase if isinstance(phase, str) else None,
+            phase=_phase(item.get(PHASE)),
+            turn_id=turn_id,
         )
     if kind == USER_ITEM:
-        return _said(ordinal, ProgressRole.USER, _user_text(item.get("content")))
+        return _said(ordinal, ProgressRole.USER, _user_text(item.get("content")), turn_id=turn_id)
     return None
+
+
+def _phase(value: Any) -> ProgressPhase | None:
+    """Which part of the turn one `agentMessage` was, as this seam says it.
+
+    A build old enough to omit the field said nothing, which is `None`; a build
+    that said a word this one does not know said *something*, which is
+    `UNKNOWN`. Both read as not the answer, and neither raises.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return ProgressPhase.UNKNOWN
+    return PHASES.get(value, ProgressPhase.UNKNOWN)
+
+
+def _turn_id(value: Any) -> str | None:
+    """Which turn this is, by its own account, or nothing this reader can group by.
+
+    **Adapted** from `legacy@1d32845:bridge/codex.py:1405-1411`, which raised on
+    a turn that named no `id`: here the turn keeps its entries and they name no
+    turn, so one malformed turn cannot blank the roster row this reading is on.
+    """
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _user_text(content: Any) -> str:
@@ -176,8 +227,13 @@ def _user_text(content: Any) -> str:
 
 
 def _said(
-    ordinal: int, role: ProgressRole, text: str, *, phase: str | None = None
+    ordinal: int,
+    role: ProgressRole,
+    text: str,
+    *,
+    phase: ProgressPhase | None = None,
+    turn_id: str | None = None,
 ) -> ProgressEntry | None:
-    return (
-        ProgressEntry(ordinal=ordinal, role=role, text=text, phase=phase) if text.strip() else None
-    )
+    if not text.strip():
+        return None
+    return ProgressEntry(ordinal=ordinal, role=role, text=text, phase=phase, turn_id=turn_id)
