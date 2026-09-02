@@ -31,8 +31,6 @@ from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
 from gpt_voicecoding.core.verification import SeamLoad
 from gpt_voicecoding.seams.agent import (
-    ApprovalRequest,
-    AwaitingApproval,
     ChildClassification,
     ChildKind,
     LaneDiscovery,
@@ -128,6 +126,26 @@ class Surface:
         """The Session says it will take a user turn now."""
         asyncio.run(self.core.dispatch(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN)))
 
+    def dialog_on_screen(self, target: SessionTarget = CODEX, approval_id: str = "a1") -> None:
+        """One Session stopped on a permission its lane is still holding.
+
+        The product's only path to that state since #191: the Stop carries the
+        dialog's handle in its `WaitingFor`, and the roster row is where the
+        Approval Relay finds it.
+        """
+        asyncio.run(
+            self.core.dispatch(
+                SessionStopped(
+                    target=target,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.PERMISSION,
+                        tool_name="Bash",
+                        approval_id=approval_id,
+                    ),
+                )
+            )
+        )
+
 
 class TestWithEverySwitchOff:
     """ADR 0002, absolute: every action answers with Duty off. All of them."""
@@ -152,11 +170,7 @@ class TestWithEverySwitchOff:
                 ),
             )
         )
-        asyncio.run(
-            surface.core.approvals.opened(
-                ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
-            )
-        )
+        surface.dialog_on_screen()
 
         replies = {
             Action.STATUS: surface.ask(Action.STATUS),
@@ -242,7 +256,9 @@ class TestStatus:
         assert data["sessions"][0]["lifecycle"] == "live"
         assert data["sessions"][0]["state"] == "running"
         assert data["pending_relays"] == []
-        assert data["pending_approvals"] == []
+        # Protocol 8: no second list beside the rows. A pending permission is
+        # the row's own `waiting_for`, and the panel counts those (#191).
+        assert "pending_approvals" not in data
 
     def test_the_roster_is_answerable_on_its_own(self) -> None:
         """The Roster Brief names the same Sessions `status` holds rows for."""
@@ -453,22 +469,48 @@ class TestRelayingAndApproving:
 
         assert data["route"] == "deliver"
 
-    def test_a_verdict_is_carried_and_the_loop_closed(self) -> None:
+    def test_a_verdict_is_carried_and_answered_with_its_receipt(self) -> None:
+        """The receipt is the Relay's: a state, a grade and a reason (#192)."""
         surface = Surface()
         surface.register()
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
-                )
-            )
-        )
+        surface.dialog_on_screen()
 
         data = surface.ask(Action.APPROVE, approval_id="a1", verdict="allow").data
 
         assert data["verdict"] == "allow"
-        assert data["closing_notice"]
+        assert data["approval_id"] == "a1"
+        assert data["state"] == "delivered"
+        assert data["receipt"]["outcome"] == "delivered"
+        assert data["reason"] == "delivered"
+        assert "closing_notice" not in data
         assert [call.verdict for call in surface.agent.calls if call.verb == "approval_relay"]
+
+    def test_a_verdict_for_a_spawned_target_is_refused_in_its_own_words(self) -> None:
+        """ "Never spoken to" includes never answered, and it reads differently."""
+        child = SessionTarget(agent=AgentKind.CODEX, session_id="child-1", pid=77)
+        surface = Surface()
+        surface.register()
+        surface.state.sessions.register(
+            Session(
+                target=child,
+                name=NAME,
+                workspace=WORKSPACE,
+                first_seen=0.0,
+                child=ChildClassification(kind=ChildKind.CHILD, parent=CODEX),
+            )
+        )
+        surface.state.sessions.set_stop_reading(
+            child,
+            waiting_for=WaitingFor(kind=WaitingKind.PERMISSION, tool_name="Bash", approval_id="c1"),
+            progress=ProgressObservation(),
+        )
+
+        reply = surface.ask(Action.APPROVE, approval_id="c1", verdict="allow")
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "Child Process" in reply.error.message
+        assert surface.agent.calls == []
 
 
 class TestVerify:
@@ -1048,13 +1090,7 @@ class TestTheFocusSession:
     def test_answering_a_permission_makes_it_the_focus(self) -> None:
         surface = Surface()
         surface.register()
-        asyncio.run(
-            surface.core.dispatch(
-                AwaitingApproval(
-                    request=ApprovalRequest(approval_id="a1", target=CODEX, tool_name="Bash")
-                )
-            )
-        )
+        surface.dialog_on_screen()
 
         surface.ask(Action.APPROVE, approval_id="a1", verdict="allow")
 

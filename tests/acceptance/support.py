@@ -959,13 +959,14 @@ ENGINE_RELAY_PROOF_SECONDS = DEFAULT_ACK_TIMEOUT_SECONDS
 def control_plane_status(socket_path: Path, journal: Journal) -> dict[str, Any]:
     """Read `status`'s **payload**, not `bridgectl`'s rendering of it.
 
-    This exists for exactly one value: `approval_id`. It is in the control-plane
-    reply (`control_plane/payloads.py:180`) and it reaches **no human surface** —
-    `bridgectl status` prints only a count of pending approvals
-    (`control_plane/commands.py:209`), the escalated announcement does not carry
-    it (`core/approvals.py:43`), the Swift shell never mentions it, and
-    `engine.log` records it only for a verdict that arrives too late. So
-    `bridgectl approve <id>` cannot be driven by anyone.
+    This exists for exactly one value: `approval_id`. It rides the roster row's
+    `waiting_for` in the control-plane reply
+    (`control_plane/payloads.py::waiting_for_document`) and it reaches **no human
+    surface** — `bridgectl status` prints a row's name and state and not its
+    dialog handle, the Stop Notice a permission produces does not carry it
+    (`core/briefing.py::_decision_lines`), and the Swift shell counts those rows
+    without naming one. So `bridgectl approve <id>` cannot be driven by anyone
+    reading a surface.
 
     Legacy has **no** counterpart behaviour to cite: its permission handling
     pushed "Claude needs your permission to use X" as a *notice*

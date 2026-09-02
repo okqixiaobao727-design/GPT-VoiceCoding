@@ -30,7 +30,7 @@ final class ScriptedControlPlane: ControlPlaneDialing, @unchecked Sendable {
 private let allSwitchesOff = """
     {"ok": true, "action": "status", "protocol": 3, "data": {
       "switches": {"duty": false, "voice": false, "message": false, "auto_hangup": false},
-      "sessions": [], "call_id": null, "pending_relays": [], "pending_approvals": []}}
+      "sessions": [], "call_id": null, "pending_relays": []}}
     """
 
 @MainActor
@@ -77,8 +77,7 @@ private let allSwitchesOff = """
                 {"ok": true, "action": "status", "protocol": 3, "data": {
                   "switches": {"duty": true, "voice": false, "message": false,
                                "auto_hangup": true, "sound": true},
-                  "sessions": [], "call_id": null, "pending_relays": [],
-                  "pending_approvals": []}}
+                  "sessions": [], "call_id": null, "pending_relays": []}}
                 """)
         ])
         let panel = ControlPanel(client: engine)
@@ -138,7 +137,7 @@ private let allSwitchesOff = """
                   "child": {"kind": "main", "parent": null}
                 }
               ],
-              "call_id": null, "pending_relays": [], "pending_approvals": []}}
+              "call_id": null, "pending_relays": []}}
             """
         let panel = ControlPanel(client: ScriptedControlPlane([.status: .success(status)]))
 
@@ -203,7 +202,7 @@ private let allSwitchesOff = """
                   "child": {"kind": "main", "parent": null}
                 }
               ],
-              "call_id": null, "pending_relays": [], "pending_approvals": []}}
+              "call_id": null, "pending_relays": []}}
             """
         let panel = ControlPanel(client: ScriptedControlPlane([.status: .success(status)]))
 
@@ -219,6 +218,10 @@ private let allSwitchesOff = """
         #expect(reading.sessionRows[1].waitingKind == "permission")
         #expect(reading.sessionRows[1].waitingMessage == "Waiting for permission")
         #expect(reading.sessionRows[1].lastActivity == Date(timeIntervalSince1970: 123.5))
+        // Protocol 8 retired `pending_approvals` from `status` (#191), and the
+        // reply above carries no such field: the permission row *is* what is
+        // pending, so the line counts these rows rather than a second list.
+        #expect(reading.pendingApprovals == 1)
     }
 
     @Test func anEmptyRosterSaysSoInWords() async {
@@ -231,6 +234,7 @@ private let allSwitchesOff = """
             return
         }
         #expect(reading.emptyRosterMessage == "No live Sessions")
+        #expect(reading.pendingApprovals == 0)
     }
 
     @Test func theRosterScrollsWithinItsSingleHeightBound() throws {

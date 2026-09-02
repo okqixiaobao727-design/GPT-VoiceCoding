@@ -279,6 +279,47 @@ class TestRenderingARelayReceipt:
         assert "no readback" not in rendered
 
 
+class TestRenderingAVerdict:
+    """`approve` prints the verdict and the same three codes a relay does (#191).
+
+    An Approval Relay is a Relay, so its receipt is the Relay's receipt, and the
+    closing sentence this line used to print retired with the loop it closed.
+    """
+
+    def reply(self, **data: object) -> Reply:
+        return Reply.answered(
+            Action.APPROVE,
+            {
+                "approval_id": "a1",
+                "verdict": "allow",
+                "request_id": "r-1",
+                "target": {"agent": "codex", "session_id": "abc", "pid": None},
+                "state": "delivered",
+                "route": "deliver",
+                "receipt": {"outcome": "delivered", "reason": ""},
+                "reason": "delivered",
+                **data,
+            },
+        )
+
+    def test_a_carried_verdict_prints_its_verdict_state_grade_and_reason(self) -> None:
+        rendered = render(self.reply())
+
+        assert rendered == "verdict=allow state=delivered grade=delivered reason=delivered"
+
+    def test_an_unproven_verdict_prints_the_grade_it_earned_and_no_sentence(self) -> None:
+        rendered = render(
+            self.reply(
+                state="reported_failed",
+                receipt={"outcome": "held", "reason": "the dialog kept it"},
+                reason="held_far_side",
+            )
+        )
+
+        assert rendered == "verdict=allow state=reported_failed grade=held reason=held_far_side"
+        assert "the dialog kept it" not in rendered
+
+
 class TestRenderingLaneDegradation:
     def test_status_says_when_progress_was_unreadable(self) -> None:
         """Where degradation is said, now that the roster verb is a Briefing.
@@ -296,7 +337,6 @@ class TestRenderingLaneDegradation:
                     "sessions": [],
                     "call_id": None,
                     "pending_relays": [],
-                    "pending_approvals": [],
                     "degraded_lanes": {"codex": "the daemon dropped the progress read"},
                 },
             )

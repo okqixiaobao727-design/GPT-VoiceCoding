@@ -261,14 +261,19 @@ class TestTheAgentContract:
         )
         assert agent.calls[0].verdict is ApprovalVerdict.ALLOW
 
-    def test_a_budget_expiry_has_a_verdict_that_is_not_deny(self) -> None:
+    def test_handing_a_dialog_back_has_a_verdict_that_is_not_deny(self) -> None:
+        """`ask` is the one verdict said by saying nothing, and it stays."""
         assert ApprovalVerdict.ASK in set(ApprovalVerdict)
 
     def test_a_fake_holds_no_question_hook_unless_a_test_explicitly_scripts_one(self) -> None:
         agent = FakeAgent()
 
         assert agent.question_answerable(CLAUDE) is False
-        assert asyncio.run(agent.sweep_question_budget(600.0)) == ()
+
+    def test_the_seam_asks_no_adapter_to_keep_a_clock(self) -> None:
+        """The wire bounds a held hook, so no verb hands an adapter a budget (#191)."""
+        assert not hasattr(FakeAgent(), "sweep_question_budget")
+        assert not hasattr(AgentAdapter, "sweep_question_budget")
 
 
 class TestTheCallContract:

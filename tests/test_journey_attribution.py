@@ -29,15 +29,14 @@ import support
 
 from gpt_voicecoding.control_plane.payloads import session_document
 from gpt_voicecoding.core import briefing
-from gpt_voicecoding.core.approvals import announcement_for
 from gpt_voicecoding.core.bridge import stop_brief
 from gpt_voicecoding.core.sessions import Session, session_from
 from gpt_voicecoding.seams.agent import (
-    ApprovalRequest,
     ChildClassification,
     ChildKind,
     SessionInspection,
     WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -455,7 +454,7 @@ class TestTheCodexPermissionPolicyReadbackRemainsExact:
 
 
 class TestTheProductsOwnNoticesAreAttributable:
-    """Both notices Bridge Core composes, matched by the forms the harness derives."""
+    """The one notice Bridge Core composes, matched by the forms the harness derives."""
 
     def test_a_stop_notice_names_the_session_it_is_about(self) -> None:
         mine = session()
@@ -464,16 +463,31 @@ class TestTheProductsOwnNoticesAreAttributable:
 
         assert journey._named_in(notice, journey._naming_forms(row(mine)))
 
-    def test_an_approval_announcement_names_the_session_it_is_about(self) -> None:
-        """#109's product half: until it, this sentence named only the tool."""
+    def test_a_permission_notice_names_the_session_it_is_about(self) -> None:
+        """#109's product half, now carried by the Stop Notice alone (#191).
+
+        Until #109 the permission sentence named only the tool, and it was its
+        own renderer. It is the same brief as every other wait now, so the rule
+        holds wherever the brief does — this case proves the permission shape of
+        it, which is the one that cost the run.
+        """
         mine = session()
 
-        announcement = announcement_for(
-            ApprovalRequest("a1", mine.target, "Write", detail="relay.txt"),
-            spoken_as="workspace-claude · port the log",
+        notice = briefing.text(
+            stop_brief(
+                mine,
+                mine.target,
+                WaitingFor(
+                    kind=WaitingKind.PERMISSION,
+                    tool_name="Write",
+                    detail="relay.txt",
+                    approval_id="a1",
+                ),
+            )
         )
 
-        assert journey._named_in(announcement, journey._naming_forms(row(mine)))
+        assert "  permission: Write — relay.txt" in notice
+        assert journey._named_in(notice, journey._naming_forms(row(mine)))
 
     def test_an_unnamed_session_is_still_attributable_by_its_address(self) -> None:
         anonymous = session(task=None)

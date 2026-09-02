@@ -381,7 +381,6 @@ def _policy(section: dict[str, Any], where: str) -> CorePolicy:
     dials: dict[str, float | int] = {}
     for key in (
         "relay_ceiling_seconds",
-        "approval_budget_seconds",
         "silence_end_seconds",
     ):
         value = section.get(key)

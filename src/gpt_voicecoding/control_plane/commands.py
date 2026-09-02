@@ -228,7 +228,10 @@ def render(reply: Reply) -> str:
         case Action.RELAY:
             return _relay_line(data)
         case Action.APPROVE:
-            return data["closing_notice"] or f"{data['verdict']} carried ({data['state']})"
+            # The verdict, then the same three codes a Relay prints. An Approval
+            # Relay is a Relay, and it closes no loop with a sentence: what the
+            # user hears is the Voice's to compose from these facts (#175, #192).
+            return f"verdict={data['verdict']} " + _relay_line(data)
         case Action.VERIFY:
             return "\n".join(_verify_lines(data["seams"]))
     return ""
@@ -246,9 +249,8 @@ def _status_lines(data: dict[str, object]) -> list[str]:
     lines.extend(_lane_lines(data.get("lanes")))
     lines.extend(_degraded_lane_lines(data.get("degraded_lanes")))
     pending_relays = data["pending_relays"]
-    pending_approvals = data["pending_approvals"]
-    assert isinstance(pending_relays, list) and isinstance(pending_approvals, list)
-    lines.append(f"waiting: {len(pending_relays)} relays, {len(pending_approvals)} approvals")
+    assert isinstance(pending_relays, list)
+    lines.append(f"waiting: {len(pending_relays)} relays")
     return lines
 
 

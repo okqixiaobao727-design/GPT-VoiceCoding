@@ -37,9 +37,17 @@ public struct EngineStatus: Equatable, Sendable {
     /// Sessions a person can see running now.
     public var sessionRows: [SessionRow]
     public var pendingRelays: Int
-    public var pendingApprovals: Int
 
     public var callIsUp: Bool { callID != nil }
+    /// Dialogs waiting on a person, counted off the roster rows themselves.
+    ///
+    /// Protocol 8 retired `pending_approvals`: a pending permission is one of
+    /// the three Session states, so the rows already say it and a second list
+    /// beside them was a second answer to one question. Counted here rather
+    /// than read, for the same reason ``sessions`` and ``childProcesses`` are.
+    public var pendingApprovals: Int {
+        sessionRows.count { $0.state == "waiting" && $0.waitingKind == "permission" }
+    }
     /// Logical live main Sessions, not every visible roster row.
     public var sessions: Int { sessionRows.count { !$0.isChild } }
     /// Visible subordinate rows, kept apart from the Session count.
@@ -58,7 +66,6 @@ public struct EngineStatus: Equatable, Sendable {
         }
         sessionRows = Self.parentsBeforeChildren(rows)
         pendingRelays = document["pending_relays"]?.array?.count ?? 0
-        pendingApprovals = document["pending_approvals"]?.array?.count ?? 0
     }
 
     /// A stable hierarchy projection over the wire's order.

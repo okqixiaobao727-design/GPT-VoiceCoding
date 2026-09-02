@@ -30,6 +30,7 @@ from gpt_voicecoding.adapters.agent.codex import codex_agent
 from gpt_voicecoding.adapters.agent.codex.adapter import (
     PRE_WIRE_UNREACHABLE,
     CodexAgentAdapter,
+    _dialog_waiting,
 )
 from gpt_voicecoding.adapters.agent.codex.approvals import (
     COMMAND_EXECUTION,
@@ -47,7 +48,6 @@ from gpt_voicecoding.installation import codex_launch_agent
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
     ChildKind,
     RelayRoute,
     ReplyWindow,
@@ -231,13 +231,39 @@ def rid(text: str = "r-1") -> RequestId:
     return RequestId(text)
 
 
-def test_codex_exposes_no_question_hook_or_question_budget() -> None:
+async def parked_dialog(adapter, *, session_id: str = THREAD) -> ApprovalRequest:
+    """The dialog this lane is holding, read the way the product reads it (#191).
+
+    Through `_dialog_waiting` and `as_approval_request` — the same two steps the
+    roster row and the `SessionStopped` both go through — because since #191 that
+    projection is the only way a Codex dialog travels, and a test that read
+    `watched.pending` directly would be reading a source the product does not.
+    """
+    for _ in range(400):
+        for target, watched in tuple(adapter._threads.items()):  # noqa: SLF001 - the held dialog
+            if target.session_id != session_id:
+                continue
+            waiting = _dialog_waiting(watched)
+            request = None if waiting is None else waiting.as_approval_request(target)
+            if request is not None:
+                return request
+        await asyncio.sleep(0.01)
+    raise AssertionError("no dialog this lane holds ever reached the roster projection")
+
+
+async def _until_row_has_a_dialog(adapter, *, session_id: str = THREAD) -> None:
+    """Wait until the lane's own roster row carries a parked dialog's handle."""
+    await parked_dialog(adapter, session_id=session_id)
+
+
+def test_codex_exposes_no_question_hook_and_no_hold_ceiling() -> None:
+    """A Codex dialog stays answerable from the TUI, so it never needed one."""
     adapter = CodexAgentAdapter(
         progress_capture=PROGRESS_CAPTURE, sink=Sink(), settings=quick(), daemon=no_daemon()
     )
 
     assert adapter.question_answerable(TARGET) is False
-    assert asyncio.run(adapter.sweep_question_budget(600.0)) == ()
+    assert not hasattr(adapter, "sweep_question_budget")
 
 
 class TestRegisteringSessions:
@@ -537,7 +563,7 @@ class TestSupplement:
 
 
 class TestApprovals:
-    def test_a_permission_prompt_is_raised_upward_with_its_voice_menu(
+    def test_a_permission_prompt_reaches_the_roster_with_its_voice_menu(
         self, socket_path: Path
     ) -> None:
         sink = Sink()
@@ -563,16 +589,17 @@ class TestApprovals:
                         },
                     )
                     await _settled()
+                    return await parked_dialog(adapter), sink.events
                 finally:
                     await adapter.aclose()
 
-        asyncio.run(scenario())
-        raised = sink.of(AwaitingApproval)
-        assert len(raised) == 1
-        request = raised[0].request
+        request, raised = asyncio.run(scenario())
         assert request.target == TARGET
         assert request.detail == "Do you want to allow me to run this command?"
         assert request.options == ("accept", "acceptForSession", "decline")
+        # And no event of its own: the dialog travels on the Session's Stop and
+        # on the roster row, which is the same reading (#191).
+        assert [event for event in raised if isinstance(event, SessionStopped)] == []
 
     def test_the_shell_text_is_never_what_the_user_is_told(self) -> None:
         """#109. One rule for both lanes: description-class text, never the arguments.
@@ -650,7 +677,7 @@ class TestApprovals:
                         APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
                     )
                     await _settled()
-                    request = sink.of(AwaitingApproval)[0].request
+                    request = await parked_dialog(adapter)
                     verdict = asyncio.ensure_future(
                         adapter.approval_relay(
                             request, ApprovalVerdict.ALLOW, request_id=rid("v-1")
@@ -679,7 +706,7 @@ class TestApprovals:
                         APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
                     )
                     await _settled()
-                    request = sink.of(AwaitingApproval)[0].request
+                    request = await parked_dialog(adapter)
                     receipt = await adapter.approval_relay(
                         request, ApprovalVerdict.ASK, request_id=rid("v-1")
                     )
@@ -706,7 +733,7 @@ class TestApprovals:
                         APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
                     )
                     await _settled()
-                    request = sink.of(AwaitingApproval)[0].request
+                    request = await parked_dialog(adapter)
                     await server.notify_all(
                         "serverRequest/resolved", {"threadId": THREAD, "requestId": wire_id}
                     )
@@ -783,7 +810,7 @@ class TestApprovalRouting:
                         APPROVAL, {"threadId": THREAD, "turnId": TURN, "itemId": "call_1"}
                     )
                     await _settled()
-                    request = sink.of(AwaitingApproval)[0].request
+                    request = await parked_dialog(adapter)
                     await adapter.answer_relay(TARGET, "one", request_id=rid("r-1"))
                     await server.notify_all(
                         "thread/settings/updated",
@@ -1533,12 +1560,11 @@ class TestNotSubscribingToAChildProcess:
     **This is where the Child Process rule has to bite, not only in Bridge
     Core.** `discover` adopts every row it comes back with, and adopting is
     `thread/resume` — the call that subscribes this adapter to a thread's
-    permission prompts. A child adopted here raises `AwaitingApproval` and
-    `SessionStopped` like anything else, and Bridge Core's guard reads a target
-    the roster has not observed yet as *unknown* rather than as a child, so a
-    prompt raised in the window between the first sighting and the registry
-    holding the row would be announced — and answering it would carry the user's
-    verdict to `approval_relay`, which consults no registry at all.
+    permission prompts. A child adopted here raises `SessionStopped` like
+    anything else and its dialog lands on the roster row, and Bridge Core's guard
+    reads a target the roster has not observed yet as *unknown* rather than as a
+    child, so a prompt raised in the window between the first sighting and the
+    registry holding the row would be announced.
 
     Not subscribing closes the window at its source, and the evidence is already
     here: `SessionInspection.child` is on the row this method is handed. It also
@@ -1680,8 +1706,7 @@ class TestReachingASessionThroughTheSharedDaemon:
                     wire_id = await server.ask_all(
                         APPROVAL, {"threadId": THREAD, "command": "rm -rf build"}
                     )
-                    await _until(lambda: bool(sink.of(AwaitingApproval)))
-                    request = sink.of(AwaitingApproval)[0].request
+                    request = await parked_dialog(adapter)
                     verdict = asyncio.ensure_future(
                         adapter.approval_relay(request, ApprovalVerdict.ALLOW, request_id=rid())
                     )
@@ -1844,13 +1869,12 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
 
                     await adapter.answer_relay(TARGET, "still the same thread", request_id=rid())
                     await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
-                    await _until(lambda: bool(sink.of(AwaitingApproval)))
-                    return current_target
+                    return current_target, await parked_dialog(adapter)
                 finally:
                     await adapter.aclose()
 
-        current_target = asyncio.run(scenario())
-        assert [event.request.target for event in sink.of(AwaitingApproval)] == [current_target]
+        current_target, request = asyncio.run(scenario())
+        assert request.target == current_target
 
     def test_a_prompt_raised_by_the_users_own_turn_reaches_the_user(
         self, socket_path: Path
@@ -1864,8 +1888,7 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
                 try:
                     await adapter.discover()
                     await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
-                    await _until(lambda: bool(sink.of(AwaitingApproval)))
-                    return sink.of(AwaitingApproval)[0].request
+                    return await parked_dialog(adapter)
                 finally:
                     await adapter.aclose()
 
@@ -1883,17 +1906,21 @@ class TestWhatADiscoveredThreadGetsSubscribedTo:
 class TestWhatACodexRowSaysItStoppedOn:
     """The projection the Codex lane never had (#77, from #75's review).
 
-    `_asked` raised `AwaitingApproval` and stopped, so a Codex roster row could
-    not say what its Session had stopped on while a Claude row could. This is the
+    `_asked` raised a second event and stopped, so a Codex roster row could not
+    say what its Session had stopped on while a Claude row could. This is the
     same request in the seam's one inspection vocabulary — **not** a second
     reader: no transcript parser for Codex, ever, because the rollout on disk is
     worse evidence for a question the app-server already answered (P6, P13).
+
+    Since #191 it is also the *only* reading there is: the row and the Stop are
+    how a dialog reaches the user and how a verdict finds its way back.
     """
 
     async def row_with_a_dialog(self, server: Codex, sink: Sink, adapter):
+        del sink
         await adapter.discover()
         await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
-        await _until(lambda: bool(sink.of(AwaitingApproval)))
+        await _until_row_has_a_dialog(adapter)
         lane = await adapter.discover()
         return next(row for row in lane.rows if row.target.session_id == THREAD)
 
@@ -1925,7 +1952,7 @@ class TestWhatACodexRowSaysItStoppedOn:
                 adapter = await joined(server, sink)
                 try:
                     row = await self.row_with_a_dialog(server, sink, adapter)
-                    return row, sink.of(AwaitingApproval)[0].request
+                    return row, await parked_dialog(adapter)
                 finally:
                     await adapter.aclose()
 
@@ -1936,10 +1963,10 @@ class TestWhatACodexRowSaysItStoppedOn:
     def test_the_stop_says_what_it_stopped_on_too(self, socket_path: Path) -> None:
         """The row and the Stop are one reading, not two that agree most of the time.
 
-        It matters more here than on the roster: a Codex permission already
-        reaches the user through `AwaitingApproval`, so a `SessionStopped` with
-        no `approval_id` is one Bridge Core cannot recognise as the same dialog —
-        it announces that too, and the user is asked twice for one decision.
+        It matters more here than on the roster: this Stop is the only event a
+        Codex permission travels on (#191), so one with no `approval_id` is a
+        dialog nothing carries the handle for — the brief sends the user to the
+        keyboard and `answer_approval` has nothing to find.
         """
         sink = Sink()
 
@@ -1960,7 +1987,7 @@ class TestWhatACodexRowSaysItStoppedOn:
                     )
                     await _settled()
                     await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
-                    await _until(lambda: bool(sink.of(AwaitingApproval)))
+                    await _until_row_has_a_dialog(adapter)
                     await server.notify_all(
                         "thread/status/changed",
                         {"threadId": THREAD, "status": {"type": "idle"}},
@@ -1973,7 +2000,7 @@ class TestWhatACodexRowSaysItStoppedOn:
         (stopped,) = sink.of(SessionStopped)
         assert stopped.waiting_for.kind is WaitingKind.PERMISSION
         assert stopped.waiting_for.tool_name == "a shell command"
-        assert stopped.waiting_for.approval_id == sink.of(AwaitingApproval)[0].request.approval_id
+        assert stopped.waiting_for.approval_id
         assert stopped.waiting_for.as_approval_request(stopped.target) is not None
         assert stopped.progress.recent[-1].text == (
             "The command is ready; I need permission to run it."

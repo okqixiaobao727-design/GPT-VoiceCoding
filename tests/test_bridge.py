@@ -29,7 +29,7 @@ from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
 )
-from gpt_voicecoding.core.errors import VoiceInstructionsMissing
+from gpt_voicecoding.core.errors import ChildSessionError, VoiceInstructionsMissing
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.core.router import Classification
@@ -38,7 +38,6 @@ from gpt_voicecoding.core.switches import SwitchName
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
     ChildClassification,
     ChildKind,
     LaneDiscovery,
@@ -442,81 +441,140 @@ class TestTheStopNoticePipelineEndToEnd:
         assert hub.channel.sent == []
 
 
-class TestTheApprovalPipelineEndToEnd:
-    def test_tick_sweeps_question_holds_with_the_configured_budget_and_closes_once(
-        self,
-    ) -> None:
-        hub = Hub(voice=False, approval_budget_seconds=17.0)
-        question = WaitingFor(
-            kind=WaitingKind.QUESTION,
-            prompt="Which base?",
-            approval_id="p-1",
+class TestTheApprovalRelayCarriesAndNothingMore:
+    """The verb, and the four ways it can end (#191).
+
+    No pipeline, no budget, no announcement of its own: a permission is one of
+    the three Session states, so it is announced as a Stop Notice like every
+    other wait and this verb only carries the verdict back.
+    """
+
+    def waiting_row(self, target: SessionTarget = CODEX, approval_id: str | None = "a1") -> None:
+        return SessionInspection(
+            target=target,
+            workspace=Path("/tmp/workspace"),
+            state=SessionState.WAITING,
+            waiting_for=WaitingFor(
+                kind=WaitingKind.PERMISSION,
+                tool_name="Bash",
+                detail="push the branch",
+                approval_id=approval_id,
+            ),
         )
-        hub.agent.question_releases.append((CODEX, question))
 
-        hub.tick()
-        first = tuple(hub.channel.sent)
-        hub.tick()
+    def hub_with_dialog(self, **kwargs: object) -> Hub:
+        hub = Hub(**kwargs)  # type: ignore[arg-type]
+        hub.agent.discovery = LaneDiscovery(rows=(self.waiting_row(),))
+        asyncio.run(hub.core.discover())
+        return hub
 
-        assert hub.agent.question_budgets == [17.0, 17.0, 17.0, 17.0]
-        assert len(first) == 1
-        assert hub.channel.sent == list(first)
-        # The hook that held the question is gone, and Briefing is where that
-        # reads as "at the terminal" — Bridge Core no longer has a sentence.
-        assert "  answer: at the terminal" in first[0]
+    def answer(self, hub: Hub, approval_id: str = "a1", verdict=ApprovalVerdict.ALLOW):
+        return asyncio.run(hub.core.answer_approval(approval_id, verdict))
 
-    def test_an_answer_after_budget_release_is_refused_at_the_public_relay(self) -> None:
-        hub = Hub(voice=False, approval_budget_seconds=17.0)
-        question = WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?")
+    def test_a_verdict_for_a_handle_the_roster_carries_reaches_the_lane(self) -> None:
+        hub = self.hub_with_dialog(voice=False)
+
+        outcome = self.answer(hub)
+
+        assert [(call.verb, call.verdict) for call in hub.agent.calls] == [
+            ("approval_relay", ApprovalVerdict.ALLOW)
+        ]
+        assert outcome is not None
+        assert outcome.target == CODEX
+        assert outcome.state is Lifecycle.DELIVERED
+        assert outcome.reason is RelayReason.DELIVERED
+        assert outcome.receipt is not None and outcome.receipt.request_id == outcome.request_id
+
+    def test_answering_a_permission_takes_the_focus_as_an_answer_relay_does(self) -> None:
+        hub = self.hub_with_dialog(voice=False)
+
+        self.answer(hub)
+
+        assert hub.state.sessions.focus == CODEX
+
+    def test_a_verdict_for_a_handle_no_row_carries_is_refused_and_sends_nothing(self) -> None:
+        hub = self.hub_with_dialog(voice=False)
+        hub.channel.sent.clear()
+
+        assert self.answer(hub, "a-gone") is None
+        assert hub.agent.calls == []
+        assert hub.channel.sent == []
+
+    def test_a_verdict_for_a_row_whose_hook_ended_is_refused(self) -> None:
+        """The hook released the dialog, so the row carries no handle any more."""
+        hub = Hub(voice=False)
+        hub.agent.discovery = LaneDiscovery(rows=(self.waiting_row(approval_id=None),))
+        asyncio.run(hub.core.discover())
+
+        assert self.answer(hub) is None
+        assert hub.agent.calls == []
+
+    def test_a_verdict_for_a_spawned_target_is_refused_in_its_own_words(self) -> None:
+        """ "Never spoken to" includes never answered (advisor, 2026-08-27)."""
+        hub = Hub(voice=False)
+        child = SessionTarget(agent=AgentKind.CODEX, session_id="child-1", pid=99)
         hub.agent.discovery = LaneDiscovery(
             rows=(
+                self.waiting_row(),
                 SessionInspection(
-                    target=CODEX,
+                    target=child,
                     workspace=Path("/tmp/workspace"),
                     state=SessionState.WAITING,
-                    waiting_for=question,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.PERMISSION,
+                        tool_name="Bash",
+                        approval_id="c1",
+                    ),
+                    child=ChildClassification(kind=ChildKind.CHILD, parent=CODEX),
                 ),
             )
         )
-        hub.agent.answerable_questions.add(CODEX)
         asyncio.run(hub.core.discover())
-        hub.agent.question_releases.append((CODEX, question))
 
-        hub.tick()
-        outcome = asyncio.run(hub.core.relay(CODEX, "main"))
-
-        assert outcome.state is Lifecycle.REPORTED_FAILED
-        assert outcome.reason is RelayReason.QUESTION_UNANSWERABLE
+        with pytest.raises(ChildSessionError):
+            self.answer(hub, "c1")
         assert hub.agent.calls == []
-        assert hub.state.relays.pending() == ()
 
-    def test_an_awaiting_approval_event_announces_on_every_outlet(self) -> None:
-        hub = Hub()
+    def test_an_unproven_receipt_returns_its_grade_and_announces_nothing(self) -> None:
+        """`HELD`, `FAILED` and `UNKNOWN` are the verb's answer, not a notice."""
+        for grade, reason in (
+            (Delivery.HELD, RelayReason.HELD_FAR_SIDE),
+            (Delivery.FAILED, RelayReason.AWAITING_REPLY_WINDOW),
+            (Delivery.UNKNOWN, RelayReason.DUPLICATE_RISK),
+        ):
+            hub = self.hub_with_dialog(voice=False)
+            hub.agent.outcome = grade
+            hub.channel.sent.clear()
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+            outcome = self.answer(hub)
 
-        assert hub.call.spoken
-        assert hub.channel.sent
+            assert outcome is not None
+            assert outcome.state is Lifecycle.REPORTED_FAILED
+            assert outcome.reason is reason
+            assert outcome.grade == str(grade)
+            assert hub.channel.sent == []
 
-    def test_an_unanswered_approval_expires_to_ask_and_never_to_deny(self) -> None:
-        hub = Hub()
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+    def test_the_engine_keeps_no_clock_on_a_held_dialog(self) -> None:
+        """No budget, no sweep: the wire ends the hook, not `tick` (ADR 0015).
+
+        Voice is on and a call is up, because the release this test proves does
+        not happen is the one that used to fire mid-sentence: an engine-timed
+        expiry spoke into whatever call was live and pushed a closing notice
+        beside it. Nothing is pushed and nothing rings.
+        """
+        hub = self.hub_with_dialog()
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.call.spoken.clear()
+        hub.channel.sent.clear()
 
         hub.now += TEN_MINUTES
         hub.tick()
-
-        assert [call.verdict for call in hub.agent.calls] == [ApprovalVerdict.ASK]
-
-    def test_a_verdict_after_expiry_is_discarded_safely(self) -> None:
-        hub = Hub()
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
-        hub.now += TEN_MINUTES
         hub.tick()
 
-        late = asyncio.run(hub.core.approvals.answer("a1", ApprovalVerdict.ALLOW))
-
-        assert late is None
-        assert [call.verdict for call in hub.agent.calls] == [ApprovalVerdict.ASK]
+        assert hub.agent.calls == []
+        assert hub.channel.sent == []
+        assert hub.call.spoken == []
 
 
 class TestTheLiveCallSilenceCeiling:
@@ -688,6 +746,10 @@ class TestAChildProcessIsNeverAnnounced:
         )
         return child
 
+    def permission(self) -> WaitingFor:
+        """A wait carrying a live dialog handle — the answerable kind."""
+        return WaitingFor(kind=WaitingKind.PERMISSION, tool_name="Bash", approval_id="a1")
+
     def test_a_stop_on_a_child_reaches_no_outlet(self) -> None:
         hub = Hub()
 
@@ -727,30 +789,29 @@ class TestAChildProcessIsNeverAnnounced:
 
         assert hub.call.spoken
 
-    def test_a_permission_a_child_raises_is_not_escalated(self) -> None:
+    def test_a_permission_a_child_raises_is_not_announced(self) -> None:
         """A Codex subagent thread can raise a real `requestApproval`.
 
         Accepted for v1.0 (advisor, 2026-08-27): "never spoken to" includes
         never answered, so that dialog is the keyboard's. The alternative is an
         Approval Relay carrying the user's authority into a Session `resolve`
-        refuses to address.
+        refuses to address — which is why the same rule is said again where the
+        verdict would be carried (`answer_approval`).
         """
         hub = Hub()
         child = self.spawned(hub)
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", child, "Bash")))
+        hub.emit(SessionStopped(target=child, waiting_for=self.permission()))
 
         assert hub.channel.sent == []
-        assert hub.core.approvals.pending() == ()
 
-    def test_its_parents_permission_is_escalated_as_it_always_was(self) -> None:
+    def test_its_parents_permission_is_announced_as_it_always_was(self) -> None:
         hub = Hub()
         self.spawned(hub)
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission()))
 
-        assert hub.channel.sent
-        assert len(hub.core.approvals.pending()) == 1
+        assert hub.call.spoken
 
 
 class TestTheRelayPipelineEndToEnd:
@@ -1247,10 +1308,7 @@ class TestSwitchAdjudicationEndToEnd:
         assert waiting.approval_id == "a1"
         hub.core._agents[AgentKind.CLAUDE] = adapter  # noqa: SLF001 - real lane under test
 
-        hub.emit(
-            AwaitingApproval(request=request),
-            SessionStopped(target=CLAUDE, waiting_for=waiting),
-        )
+        hub.emit(SessionStopped(target=CLAUDE, waiting_for=waiting))
         assert hub.channel.sent == []
         hub.state.switches.flip(SwitchName.DUTY, True)
 
@@ -1258,7 +1316,8 @@ class TestSwitchAdjudicationEndToEnd:
         asyncio.run(hub.core.discover())
 
         assert len(hub.channel.sent) == 1
-        assert "waiting for your permission to use Bash" in hub.channel.sent[0]
+        assert "  permission: Bash" in hub.channel.sent[0]
+        assert "  answer: from here" in hub.channel.sent[0]
 
     def test_duty_turning_on_announces_a_question_the_session_is_still_waiting_on(
         self,
@@ -1386,19 +1445,8 @@ class TestSwitchAdjudicationEndToEnd:
         assert hub.agent.inspections == []
         assert hub.channel.sent == []
 
-    def test_duty_turning_on_reoffers_the_same_pending_permission(self) -> None:
+    def test_duty_turning_on_re_announces_the_same_pending_permission(self) -> None:
         hub = Hub(duty=False, voice=False)
-        hub.emit(
-            AwaitingApproval(
-                request=ApprovalRequest(
-                    approval_id="a1",
-                    target=CODEX,
-                    tool_name="Bash",
-                    detail="push the branch",
-                )
-            )
-        )
-        (opened,) = hub.core.approvals.pending()
         pending = SessionInspection(
             target=CODEX,
             workspace=Path("/tmp/workspace"),
@@ -1418,16 +1466,16 @@ class TestSwitchAdjudicationEndToEnd:
 
         asyncio.run(hub.core.discover())
 
-        assert hub.channel.sent == [
-            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash "
-            "— push the branch"
-        ]
-        assert hub.core.approvals.pending() == (opened,)
+        (announced,) = hub.channel.sent
+        assert announced.startswith("GPT-VoiceCoding · port the log")
+        assert "  permission: Bash — push the branch" in announced
+        assert "  answer: from here" in announced
 
-        # The second outlet transition re-offers the same still-held permission.
-        # Bridge Core keeps no memory of the first announcement, so the user picking
-        # the phone up again is told what is still waiting for them (#161).
-        hub.flip(SwitchName.VOICE, True)
+        # The second outlet transition re-announces the same still-held
+        # permission. Bridge Core keeps no memory of the first announcement, so
+        # the user coming back is told what is still waiting for them (#161).
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
         asyncio.run(hub.core.discover())
 
         assert len(hub.channel.sent) == 2
@@ -1452,22 +1500,11 @@ class TestSwitchAdjudicationEndToEnd:
         assert len(hub.channel.sent) == 3
         assert hub.channel.sent[2] == hub.channel.sent[0]
 
-    def test_an_expired_permission_is_reconciled_as_answerable_only_in_the_terminal(
+    def test_a_released_permission_is_reconciled_as_answerable_only_in_the_terminal(
         self,
     ) -> None:
+        """The hook ended, so the fresh reading carries no handle (ADR 0015)."""
         hub = Hub(duty=False, voice=False)
-        hub.emit(
-            AwaitingApproval(
-                request=ApprovalRequest(
-                    approval_id="a1",
-                    target=CODEX,
-                    tool_name="Bash",
-                    detail="push the branch",
-                )
-            )
-        )
-        hub.now += TEN_MINUTES
-        hub.tick()
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -1478,7 +1515,6 @@ class TestSwitchAdjudicationEndToEnd:
                         kind=WaitingKind.PERMISSION,
                         tool_name="Bash",
                         detail="push the branch",
-                        approval_id="a1",
                     ),
                 ),
             )
@@ -1490,7 +1526,6 @@ class TestSwitchAdjudicationEndToEnd:
 
         asyncio.run(hub.core.discover())
 
-        assert hub.core.approvals.pending() == ()
         assert len(hub.channel.sent) == 1
         assert "terminal" in hub.channel.sent[0]
 
@@ -1702,34 +1737,6 @@ class TestSwitchAdjudicationEndToEnd:
         assert hub.state.relays.pending() == ()
         assert hub.core.status().sessions
 
-    def test_a_pending_approval_pushes_without_waiting_on_the_voice_attempt(self) -> None:
-        """ "In parallel" is literal: a stalled call must not hold the text back."""
-        released = asyncio.Event()
-        hub = Hub()
-        original = hub.call.speak
-
-        async def speak_slowly(text: str, **kwargs: object) -> object:
-            await released.wait()
-            return await original(text, **kwargs)  # type: ignore[arg-type]
-
-        hub.call.speak = speak_slowly  # type: ignore[method-assign]
-
-        async def watch() -> list[str]:
-            escalating = asyncio.ensure_future(
-                hub.core.dispatch(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
-            )
-            # Let the fan-out start both attempts before the call is unblocked.
-            for _ in range(4):
-                await asyncio.sleep(0)
-            pushed = list(hub.channel.sent)
-            released.set()
-            await escalating
-            return pushed
-
-        assert asyncio.run(watch()) == [
-            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash"
-        ]
-
 
 class TestEventsThatDecideNothing:
     def test_the_in_call_transcript_is_recorded_and_never_relayed(self) -> None:
@@ -1880,18 +1887,13 @@ class TestWhatBecomesOfACompanionReplyThatDidNotLand:
         ]
 
 
-class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
-    """One dialog, two events, one announcement (#77, from #75's review).
+class TestHowAPermissionIsAnnounced:
+    """One dialog, one event, one announcement (#191).
 
-    A Session entering `waiting` raises `SessionStopped`; `AskUserQuestion` also
-    raises the `PermissionRequest` hook that produces `AwaitingApproval`. That
-    pair opens a policy Bridge Core owns and the adapter does not: one question
-    or permission would otherwise announce twice, once through each event.
-
-    The `AwaitingApproval` notice wins wherever it exists, because it is the one
-    with a budget, a fallback and a closing notice — it can actually be answered
-    — and it already asks for `EVERY_OUTLET`, which is the wider reach. Where it
-    does *not* exist, the Stop Notice is all there is, and it says so.
+    A Session entering `waiting` on a permission raises `SessionStopped` and
+    nothing else — both adapters fold the dialog handle into that Stop's wait —
+    so the permission is briefed exactly as every other wait is, with no second
+    event, no parallel announcement and no reach of its own.
 
     Voice is off throughout, so every announcement lands on one surface and can
     simply be counted.
@@ -1905,37 +1907,23 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
             approval_id=approval_id,
         )
 
-    def dialog(self) -> AwaitingApproval:
-        return AwaitingApproval(
-            request=ApprovalRequest(
-                approval_id="a1",
-                target=CODEX,
-                tool_name="Bash",
-                detail="push the branch",
-            )
-        )
-
-    def test_a_dialog_the_approval_pipeline_holds_announces_once(self) -> None:
-        hub = Hub(voice=False)
-
-        hub.emit(
-            self.dialog(),
-            SessionStopped(target=CODEX, waiting_for=self.permission("a1")),
-        )
-
-        assert hub.channel.sent == [
-            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash "
-            "— push the branch"
-        ]
-
-    def test_the_suppressed_stop_is_written_down_rather_than_dropped_silently(self, caplog) -> None:
-        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+    def test_a_dialog_the_lane_still_holds_announces_once_as_a_stop_notice(self) -> None:
         hub = Hub(voice=False)
 
         hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission("a1")))
 
-        assert any("a1" in one.getMessage() for one in caplog.records)
-        assert hub.channel.sent == []
+        (announced,) = hub.channel.sent
+        assert announced.startswith("GPT-VoiceCoding · port the log")
+        assert "  permission: Bash — push the branch" in announced
+
+    def test_a_dialog_the_lane_still_holds_is_answerable_from_here(self) -> None:
+        """The handle on the row is what `answer_approval` needs, and Briefing says so."""
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission("a1")))
+
+        (announced,) = hub.channel.sent
+        assert "  answer: from here" in announced
 
     def test_a_permission_nothing_is_holding_is_announced_after_all(self) -> None:
         """The roster saw `waiting`; no hook is parked. Nothing else will say it."""
@@ -1997,35 +1985,43 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
 class TestEveryNoticeNamesTheSessionItIsAbout:
     """#109: on a machine bridging every Session, an unnamed notice is unanswerable.
 
-    The Stop Notice always named its Session; the Approval Relay's announcement
-    opened "a session is waiting…" and named only the tool. That is the notice
-    carrying a budget and a `bridgectl approve` — the *most* answerable thing the
-    product says, and the only one that did not say which Session it was about.
-    It cost an acceptance run (`20260826T213402Z`), where a stranger's permission
-    prompt was indistinguishable from the lane's own.
+    The Stop Notice always named its Session; the retired approval announcement
+    opened "a session is waiting…" and named only the tool. It cost an acceptance
+    run (`20260826T213402Z`), where a stranger's permission prompt was
+    indistinguishable from the lane's own. Since #191 there is one notice for a
+    permission — the Stop Notice — and Briefing's own header is what names it, so
+    the rule holds by construction rather than by a second renderer remembering it.
 
     Legacy: **ported** from `legacy@1d32845:bridge/host.py:213-235`, which
     rendered `Session: {session_label}` above "This session is waiting for
     permission."
     """
 
-    #: The one target the Hub does not register, so `_known` answers None and the
-    #: address floor is what the notice has to fall back on.
+    #: The one target the Hub does not register, so the brief has no name to use
+    #: and the address floor is what the notice has to fall back on.
     STRANGER = SessionTarget(agent=AgentKind.CODEX, session_id="not-in-the-roster")
 
-    def test_the_announcement_names_the_session_the_way_the_user_does(self) -> None:
+    def permission(self, detail: str = "") -> WaitingFor:
+        return WaitingFor(
+            kind=WaitingKind.PERMISSION,
+            tool_name="Bash",
+            detail=detail,
+            approval_id="a1",
+        )
+
+    def test_the_permission_notice_names_the_session_the_way_the_user_does(self) -> None:
         hub = Hub(voice=False)
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission()))
 
         (announcement,) = hub.channel.sent
-        assert announcement.startswith("GPT-VoiceCoding · port the log is waiting")
+        assert announcement.startswith("GPT-VoiceCoding · port the log")
 
     def test_both_notices_call_one_session_the_same_thing(self) -> None:
         """One answer to "what is this called", or the user hears two Sessions."""
         hub = Hub(voice=False)
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash")))
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission()))
         hub.emit(SessionStopped(target=CODEX))
 
         announcement, stop_notice = hub.channel.sent
@@ -2033,20 +2029,18 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
         assert announcement.startswith(called) and stop_notice.startswith(called)
 
     def test_a_session_the_roster_does_not_hold_is_named_by_its_address(self) -> None:
-        """The floor `spoken_name` itself falls back to — never "a session"."""
+        """The floor a brief's header falls back to — never "a session"."""
         hub = Hub(voice=False)
 
-        hub.emit(AwaitingApproval(request=ApprovalRequest("a1", self.STRANGER, "Bash")))
+        hub.emit(SessionStopped(target=self.STRANGER, waiting_for=self.permission()))
 
         (announcement,) = hub.channel.sent
-        assert announcement.startswith("codex not-in-the-roster is waiting")
+        assert announcement.startswith("codex:not-in-the-roster")
 
-    def test_the_detail_still_travels_after_the_name(self) -> None:
+    def test_the_detail_still_travels_beside_the_tool(self) -> None:
         hub = Hub(voice=False)
 
-        hub.emit(
-            AwaitingApproval(request=ApprovalRequest("a1", CODEX, "Bash", detail="push the branch"))
-        )
+        hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission("push the branch")))
 
         (announcement,) = hub.channel.sent
-        assert announcement.endswith("your permission to use Bash — push the branch")
+        assert "  permission: Bash — push the branch" in announcement

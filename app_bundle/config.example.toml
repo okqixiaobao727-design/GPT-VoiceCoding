@@ -73,7 +73,6 @@ executable = "/opt/homebrew/bin/codex"
 [policy]
 # Optional; these are the locked defaults.
 # relay_ceiling_seconds   = 600
-# approval_budget_seconds = 600
 # silence_end_seconds     = 60
 # history_page_entries    = 5
 

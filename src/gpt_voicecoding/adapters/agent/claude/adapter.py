@@ -508,12 +508,6 @@ class ClaudeAgentAdapter:
         """Whether the exact question hook for this Session is still parked."""
         return self._approvals.question_answerable(target)
 
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        """Release Claude questions past Core's configured budget."""
-        return await self._approvals.sweep_question_budget(budget_seconds)
-
     # -- the seam ---------------------------------------------------------
 
     async def discover(self) -> LaneDiscovery:

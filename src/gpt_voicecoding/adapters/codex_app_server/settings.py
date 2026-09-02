@@ -14,8 +14,8 @@ recognised or named in a refusal.
 `config.py`'s own rule, applied one level down. Where the codex executable is,
 where a socket directory goes, how long a wire waits for a frame — those are
 locations and protocol mechanics, and an in-code default for them is honest. The
-Relay ceiling and the approval budget are *policy*, they belong to Bridge Core's
-own configuration, and nothing here may restate them.
+Relay ceiling is *policy*, it belongs to Bridge Core's own configuration, and
+nothing here may restate it.
 """
 
 from __future__ import annotations

@@ -55,7 +55,8 @@ notice land where `stop notice` is looking. Learned on run `20260826T213402Z`, w
 `stop notice` passed on a permission prompt belonging to a stale `/tmp/vcprobe`
 thread, and on a quieter machine would have failed for a reason equally
 unrelated to the lane (#109). The sibling lesson had already been learned once,
-one module over, for `pending_approvals` (`approval_effect.resolve`).
+one module over, for the pending dialogs `approval_effect.resolve` correlates —
+read off the roster's own PERMISSION rows since #191.
 
 ## The turns, and why there are five
 
@@ -251,12 +252,16 @@ BOOT_TURN_ALLOWANCE = 2.0
 #: greps line by line, so this still matches once per Stop — the header line.
 ENGINE_STOP_LINE = r"(?i)Session stopped:"
 
-#: What the escalated permission announcement says (`core/approvals.py:52-76`).
+#: What a Stop Notice about a permission says (`core/briefing.py::_decision_lines`).
+#: **There is one notice for a permission now** (#191): the dialog rides the
+#: Session's Stop like every other wait, so what this matches is the brief's own
+#: decision line rather than a retired announcement of its own.
+#:
 #: Matched rather than quoted whole: the tool name and the detail are the agent's,
 #: and this run does not get to predict them. **Which Session it is about is not
-#: this pattern's business either** — the sentence opens with the Session's name
-#: since #109, and the attribution rule is what reads it.
-APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
+#: this pattern's business either** — the brief's header names it, and the
+#: attribution rule is what reads that.
+APPROVAL_ANNOUNCEMENT = re.compile(r"^\s*permission:", re.IGNORECASE | re.MULTILINE)
 
 #: The engine's own line for what the user said (`core/bridge.py:796`). It is the
 #: only line either call event has: `CallStarted` and `CallEnded` are noted into
@@ -1752,10 +1757,12 @@ class Walk:
 
         The interval before release is derived from `agent_turn_seconds` +
         `absence_window_seconds` + `DISCOVERY_SECONDS` +
-        `telegram_round_trip_seconds`; the acceptance configuration keeps that
-        sum below the Approval Relay budget. #146's required resolution grades
-        the announcement, Approval Relay answer and file effect together before
-        the Session proceeds to the question proof and `child`.
+        `telegram_round_trip_seconds`. Nothing on the engine side expires the
+        dialog while that runs — the wire alone bounds a held hook (#191, ADR
+        0015) — so the sum has only Claude Code's own hook timeout above it.
+        #146's required resolution grades the Stop Notice, Approval Relay answer
+        and file effect together before the Session proceeds to the question
+        proof and `child`.
 
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
@@ -1874,7 +1881,7 @@ class Walk:
         ]
         if len(announcements) != 1:
             raise StepFailed(
-                f"Duty on produced {len(announcements)} permission announcements for "
+                f"Duty on produced {len(announcements)} permission Stop Notices for "
                 f"{approval_id}, not exactly one: {[message.text for message in announcements]!r}"
             )
         question_evidence = self._accept_question()
@@ -1935,12 +1942,6 @@ class Walk:
                 f"turn ended={turn.ended}, waiting_for={waiting!r}, options={options!r}, "
                 f"reply_window={self._roster_field('reply_window')!r}"
             )
-        question_status = support.control_plane_status(self.config.socket_path, self.journal)
-        if any(
-            isinstance(waiting, dict) and _address_of(waiting) == self.address
-            for waiting in question_status.get("pending_approvals", [])
-        ):
-            raise StepFailed("the question leaked into `pending_approvals`")
 
         def is_question_notice(seen) -> bool:
             return (
@@ -2765,17 +2766,31 @@ class Walk:
         )
 
     def _pending_approvals(self) -> tuple[approval_effect.PendingApproval, ...]:
-        """Every pending dialog, with enough identity for the module to correlate it."""
+        """Every pending dialog, read off the roster rows that carry one (#191).
+
+        `status` retired its `pending_approvals` list at protocol 8, because a
+        pending permission *is* one of the three Session states: the row says
+        `waiting` on a `permission`, and its `approval_id` is the handle
+        `bridgectl approve` answers with. A row in that state whose handle is
+        gone is a dialog that went back to the keyboard, and it is deliberately
+        not offered here — correlating one would send the walk to answer
+        something no verdict can reach.
+        """
         data = support.control_plane_status(self.config.socket_path, self.journal)
         pending: list[approval_effect.PendingApproval] = []
-        for waiting in data.get("pending_approvals", []):
-            if not isinstance(waiting, dict):
+        for row in data.get("sessions", []):
+            if not isinstance(row, dict) or row.get("state") != "waiting":
+                continue
+            waiting = row.get("waiting_for")
+            if not isinstance(waiting, dict) or waiting.get("kind") != "permission":
                 continue
             approval_id = waiting.get("approval_id")
+            if approval_id is None:
+                continue
             pending.append(
                 approval_effect.PendingApproval(
-                    approval_id=str(approval_id) if approval_id is not None else "",
-                    session_address=_address_of(waiting),
+                    approval_id=str(approval_id),
+                    session_address=_address_of(row),
                 )
             )
         return tuple(pending)
@@ -2878,9 +2893,9 @@ def _naming_forms(row: dict) -> tuple[str, ...]:
 def _named_in(text: str, forms: Sequence[str]) -> bool:
     """Does this message name one of these Sessions? The attribution rule's whole test.
 
-    Substring, not equality: the product's own words wrap the name in a sentence
-    it composes (`core/bridge.py:107-120`, `core/approvals.py:52-76`), and which
-    sentence is the product's business rather than this harness's.
+    Substring, not equality: the product's own words wrap the name in a brief it
+    composes (`core/briefing.py::_headline`), and what that brief says is the
+    product's business rather than this harness's.
     """
     return any(form in text for form in forms)
 

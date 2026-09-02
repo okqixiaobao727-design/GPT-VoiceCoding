@@ -56,7 +56,14 @@ from typing import Any
 #: time with an ordinal cursor — so a version-6 surface would send an action this
 #: engine no longer has, and would have no way to ask for a second page of
 #: anything.
-PROTOCOL_VERSION = 7
+#:
+#: 8 retires `pending_approvals` from `status` (#191). A pending permission is
+#: one of the three Session states, so the roster row in `permission` is the
+#: whole of what is waiting, and a second list beside it was a second answer to
+#: the same question. A version-7 surface would count an absent field as zero
+#: and show "0 pending approvals" over a dialog that is on screen — a silent
+#: wrong number, which is exactly what this gate exists to prevent.
+PROTOCOL_VERSION = 8
 
 #: The longest line either side will read. Generous for a roster, small enough
 #: that a peer cannot make the engine hold an unbounded buffer.

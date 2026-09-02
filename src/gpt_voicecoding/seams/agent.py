@@ -10,8 +10,14 @@ transition after that. The split is not redundancy — an event cannot bootstrap
 level, because registration happens before Bridge Core holds the Session and a
 report raised there is dropped as belonging to a Session nobody knows (#27).
 
-Events raised upward: Session stopped, Session ended, Session awaiting approval,
-Reply Window changed, and delivery receipts that arrive asynchronously.
+Events raised upward: Session stopped, Session ended, Reply Window changed, and
+delivery receipts that arrive asynchronously.
+
+**A pending permission is not an event of its own.** Both adapters fold the
+dialog's handle into the Stop's `WaitingFor`, so the Session's PERMISSION state
+is what travels and `as_approval_request` is how the Approval Relay addresses it
+(#191). A second event for the same dialog only ever asked Bridge Core to
+recognise two things as one.
 
 Reply-Window queueing is Bridge Core policy. Adapters deliver; they never queue.
 
@@ -720,13 +726,6 @@ class SessionEnded(Event):
 
 
 @dataclass(frozen=True, slots=True)
-class AwaitingApproval(Event):
-    """A permission dialog is on screen. It blocks every other Relay until answered."""
-
-    request: ApprovalRequest
-
-
-@dataclass(frozen=True, slots=True)
 class ReplyWindowChanged(Event):
     """The Session's willingness to accept an inbound Relay as a user turn changed."""
 
@@ -743,7 +742,7 @@ class RelayReceipt(Event):
 
 
 #: The closed set of events this seam raises. Nothing else may appear.
-AgentEvent = SessionStopped | SessionEnded | AwaitingApproval | ReplyWindowChanged | RelayReceipt
+AgentEvent = SessionStopped | SessionEnded | ReplyWindowChanged | RelayReceipt
 
 
 @runtime_checkable
@@ -871,19 +870,8 @@ class AgentAdapter(Protocol):
         This is the live half of the Reply Window rule. A roster can say that a
         Session is waiting on a question, but only the adapter knows whether the
         exact hook is still parked. False is the fail-closed answer for an
-        unknown target, a permission, an expired question, or a lane without
-        this route.
-        """
-        ...
-
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        """Release questions this lane held past the configured Core budget.
-
-        The budget value is supplied by Bridge Core, so adapters hold mechanism
-        and timestamps without importing policy. Each returned pair was popped
-        before release and therefore can be announced exactly once by Core.
+        unknown target, a permission, a question whose hook has ended, or a lane
+        without this route.
         """
         ...
 

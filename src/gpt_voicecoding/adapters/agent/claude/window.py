@@ -77,9 +77,9 @@ dialog is on screen and the Session is stalled on the person. Announcing only
 the first left a *question* with no route to any outlet: by the time the Session
 reached `idle` the user had answered it at the keyboard, the transcript carried
 the `tool_result`, and the reader correctly reported that it was waiting on
-nothing. Which of the two announcements a permission actually produces — this,
-or the `AwaitingApproval` its hook raises — is Bridge Core's policy and not this
-module's.
+nothing. What a permission's Stop produces is Bridge Core's policy and not this
+module's: since #191 this is the only event a dialog travels on, and the parked
+hook's handle rides on it.
 
 **But not every `waiting` is that stop** (#150). Reading the bare status as one
 called the user about a slash-command picker they were looking at, and said only
@@ -450,9 +450,9 @@ class ReplyWindowWatcher:
         unreadable record is the registry being rewritten, not a dialog closing
         and reopening.
 
-        Which of the two announcements the user actually hears when a permission
-        raises both this and `AwaitingApproval` is Bridge Core's policy
-        (`core/bridge.py`), not this adapter's.
+        What the user hears about a permission is Bridge Core's policy
+        (`core/bridge.py`), not this adapter's; this module supplies the wait,
+        handle included.
         """
         for target in tuple(self._reported):
             record, alive = self._observe(target)

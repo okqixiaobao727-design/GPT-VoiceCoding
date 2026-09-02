@@ -2,8 +2,10 @@
 
 Bridge Core decides; the modules around it do. Policy that lives here and nowhere
 else: the Stop Notice escalation pipeline, Relay queueing against the Reply
-Window, the Approval Relay budget and its fallback, the one-call-at-a-time
-invariant, and switch adjudication.
+Window, the one-call-at-a-time invariant, and switch adjudication. **The Approval
+Relay is not on that list** (#191): it carries a verdict to the dialog the roster
+says is open and decides nothing about how long that dialog lives, because the
+wire that holds the hook is what bounds it (ADR 0015, amended).
 
 State held here and nowhere else: switch state, the Session registry, the
 undelivered Relay queue. Modules keep no copies; every surface queries the hub.
@@ -11,8 +13,8 @@ The durable subset is persisted by an internal storage component only Bridge Cor
 touches — nothing else may read those files, or the disk becomes a second truth.
 
 Bridge Core may grow internal components (escalation pipeline, relay queue,
-approval budget, persistence), separately testable but *not* new external seams:
-outsiders see one Bridge Core.
+persistence), separately testable but *not* new external seams: outsiders see one
+Bridge Core.
 
 The ones that hold state:
 
@@ -34,8 +36,6 @@ The ones that decide — the policy, all of it:
 - ``escalation`` — the Stop Notice route matrix for one delivery attempt.
 - ``relays`` — queueing the user's own words against the Reply Window, and the
   ceiling on how long they may wait.
-- ``approvals`` — the Approval Relay budget, its never-deny fallback, and the
-  notice that closes the loop.
 - ``router`` — what inbound text means. Unknown or ambiguous fails closed.
 - ``verification`` — what configuration named against what the engine loaded
   (ADR 0003); only the hub knows the configured side.
