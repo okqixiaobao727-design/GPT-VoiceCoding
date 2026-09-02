@@ -85,6 +85,21 @@ SILENT_FRAME = b"\x00\x00" * FRAME_SAMPLES
 #: running `bridgectl live` — so the request is also what ends the call.
 REQUEST = "那个你把电话挂了吧,我想让你结束通话"
 
+#: What the *other* variant asks. #184 needs a call to outlive the Silence
+#: Ceiling while its own Voice is still speaking, and four seconds of answer
+#: cannot show that. Counting is asked for rather than an explanation because
+#: its length is the Voice's own arithmetic and not a judgement about how much
+#: to say: two hundred numbers took 220s on run `20260902T162146Z`, against a
+#: 60s ceiling, where "talk for two minutes" is a duration models do not hit.
+#:
+#: **No hang-up ask in it.** That run had the Voice count for 220s and then hand
+#: nothing off at all, which is the honest answer: a request that is not a
+#: hang-up ask gives the Call Agent nothing to do, and no shipped rule says it
+#: should end a call by itself (#195, deferred). So the two asks are two
+#: utterances rather than one sentence carrying both — `REQUEST` keeps #183's
+#: graded hand-off, and this one is only ever about the ceiling.
+LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,不要跳过也不要加快"
+
 #: The voice `say` synthesises with. `Flo` and `Eddy` are premium zh_CN voices
 #: that have never been downloaded on this machine, and `say` does not say so —
 #: it exits 0 and writes 0.41 s of something that is not the sentence, where
@@ -100,9 +115,24 @@ WAV_SAMPLE_RATE = 24_000
 #: was not installed and `say` emitted a stub.
 WAV_MINIMUM_SECONDS = 1.0
 
-#: The variant this version plays. The probe's name for the unpadded utterance,
-#: kept because the observation is compared against the probe's record.
+#: The variants this version can play, by the names the step selects them with
+#: and the observation records them under. `plain` is the probe's own name for
+#: the unpadded hang-up utterance, kept because the observation is compared
+#: against the probe's record; `long` is #184's.
 PLAIN = "plain"
+LONG = "long"
+
+#: Which variant the *next* call plays, as a file in `wav_directory` holding one
+#: variant name. Two things force a per-call channel rather than a settings key:
+#: one engine walks every step of a lane, and both call steps run on it — so a
+#: sentence fixed at engine start would be one step's sentence spoken into the
+#: other step's call. It is derived from `wav_directory` rather than configured
+#: because both sides already agree on that path, and one more key would be one
+#: more thing `derive_config` and `HarnessSettings` had to keep in step.
+#:
+#: Absent, empty or unknown reads as `PLAIN`: the step that does not care about
+#: the variant gets the one #183 accepted.
+NEXT_VARIANT_FILE = "next-variant"
 
 #: How long the call is left alone after the peer connection comes up, before
 #: the utterance goes out. The probe's `--settle` default, and the figure every
@@ -134,9 +164,20 @@ class HarnessSettings:
     #: Where the synthesised WAVs are kept, so a person can listen to them after.
     wav_directory: Path
     request: str = REQUEST
+    long_request: str = LONG_REQUEST
     voice: str = WAV_VOICE
     wav_sample_rate: int = WAV_SAMPLE_RATE
     settle_seconds: float = SETTLE_SECONDS
+
+    @property
+    def requests(self) -> dict[str, str]:
+        """Every utterance this run can put on a track, by its variant name."""
+        return {PLAIN: self.request, LONG: self.long_request}
+
+    @property
+    def next_variant_path(self) -> Path:
+        """Where the step says which variant the next call plays."""
+        return self.wav_directory / NEXT_VARIANT_FILE
 
     @classmethod
     def split(cls, table: dict[str, Any] | None) -> tuple[HarnessSettings, dict[str, Any]]:
@@ -155,6 +196,27 @@ class HarnessSettings:
         if "settle_seconds" in mine:
             mine["settle_seconds"] = float(mine["settle_seconds"])
         return cls(**mine), given
+
+
+def ask_for(wav_directory: Path, variant: str) -> None:
+    """Say which variant the next call plays. Written by the step, read at dial.
+
+    Every step that dials states its variant, including the one that wants the
+    default: a file left behind by the call before it is otherwise the thing
+    that decides, and "whatever the last step wanted" is not a request anybody
+    made.
+    """
+    wav_directory.mkdir(parents=True, exist_ok=True)
+    (wav_directory / NEXT_VARIANT_FILE).write_text(variant + "\n", encoding="utf-8")
+
+
+def variant_asked_for(wav_directory: Path, known: tuple[str, ...]) -> str:
+    """Which variant to play now. Anything the harness cannot play reads as `PLAIN`."""
+    path = wav_directory / NEXT_VARIANT_FILE
+    if not path.exists():
+        return PLAIN
+    asked = path.read_text(encoding="utf-8").strip()
+    return asked if asked in known else PLAIN
 
 
 # --- what crosses the process boundary --------------------------------------
@@ -390,10 +452,19 @@ class HarnessCallTransport:
     """
 
     def __init__(
-        self, *, settings: HarnessSettings, observations: Observations, utterance: list[bytes]
+        self,
+        *,
+        settings: HarnessSettings,
+        observations: Observations,
+        utterance: list[bytes],
+        variant: str = PLAIN,
     ) -> None:
         self._settings = settings
         self._observations = observations
+        #: Which of the run's utterances this call plays. Chosen per call, by
+        #: the step that dialled, because one engine holds every call a lane's
+        #: walk makes and two of those steps want different sentences.
+        self._variant = variant
         #: Already synthesised, resampled and framed — by `harness_call`, while
         #: the engine was being assembled. Not here, and that is the point: this
         #: runs inside the event loop, one step before the handshake, and `say`
@@ -410,9 +481,9 @@ class HarnessCallTransport:
         observations.note(
             "wav source installed",
             transport_factory=REFERENCE,
-            variant=PLAIN,
+            variant=variant,
             voice=settings.voice,
-            request=settings.request,
+            request=settings.requests[variant],
             frames=len(self._utterance),
             rate=settings.wav_sample_rate,
             settle_seconds=settings.settle_seconds,
@@ -437,7 +508,7 @@ class HarnessCallTransport:
                 )
             elif now - self._connected_at >= self._settings.settle_seconds:
                 self._spoke = True
-                self._source.enqueue(self._utterance, variant=PLAIN)
+                self._source.enqueue(self._utterance, variant=self._variant)
         return await self._source.next(track)
 
     # -- the `CallTransport` protocol, delegated ----------------------------
@@ -483,7 +554,7 @@ def harness_call(*, sink: Any = None, settings: dict[str, Any] | None = None) ->
     ones being accepted. Only the audio path is the harness's, and it is handed
     over through the parameter the shipped factory already has for it.
 
-    **The utterance is synthesised here**, while the engine is still being
+    **Every utterance is synthesised here**, while the engine is still being
     assembled, and the same frames are reused by every call this engine holds.
     Two reasons, and both are the shipped factory's own reasoning applied one
     seam over (`realtime/__init__.py`: the voice extra is proved present *here*
@@ -495,30 +566,45 @@ def harness_call(*, sink: Any = None, settings: dict[str, Any] | None = None) ->
       twenty minutes later for a reason nothing names;
     * `say` is a subprocess and the resampler is CPU, and doing either inside
       the event loop is a second stolen from the handshake.
+
+    **All of them, not the one this run will use**, for the first reason above:
+    one engine holds every call a lane's walk makes, and a variant first
+    synthesised at dial time would move a broken voice from "the run never
+    started" to "the last step failed for a reason nothing names". Which one
+    goes on the track is decided per call, by the step that dialled.
     """
     mine, theirs = HarnessSettings.split(settings)
     observations = Observations(mine.observations)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    utterance = framed(
-        pcm_at_48k(
-            say(
-                mine.request,
-                mine.wav_directory / f"{stamp}-request-{mine.wav_sample_rate}.wav",
-                voice=mine.voice,
-                rate=mine.wav_sample_rate,
+    utterances: dict[str, list[bytes]] = {}
+    for variant, sentence in mine.requests.items():
+        utterances[variant] = framed(
+            pcm_at_48k(
+                say(
+                    sentence,
+                    mine.wav_directory / f"{stamp}-{variant}-{mine.wav_sample_rate}.wav",
+                    voice=mine.voice,
+                    rate=mine.wav_sample_rate,
+                )
             )
         )
-    )
-    observations.note(
-        "utterance synthesised",
-        transport_factory=REFERENCE,
-        voice=mine.voice,
-        rate=mine.wav_sample_rate,
-        frames=len(utterance),
-        seconds=round(len(utterance) * FRAME_SAMPLES / SAMPLE_RATE, 2),
-    )
+        observations.note(
+            "utterance synthesised",
+            transport_factory=REFERENCE,
+            voice=mine.voice,
+            rate=mine.wav_sample_rate,
+            frames=len(utterances[variant]),
+            seconds=round(len(utterances[variant]) * FRAME_SAMPLES / SAMPLE_RATE, 2),
+            synthesised=variant,
+        )
 
     def build() -> CallTransport:
-        return HarnessCallTransport(settings=mine, observations=observations, utterance=utterance)
+        variant = variant_asked_for(mine.wav_directory, tuple(utterances))
+        return HarnessCallTransport(
+            settings=mine,
+            observations=observations,
+            utterance=utterances[variant],
+            variant=variant,
+        )
 
     return realtime_call(sink=sink, settings=theirs, transport_factory=build)

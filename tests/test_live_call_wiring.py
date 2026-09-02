@@ -16,6 +16,7 @@ in. That is what these are for.
 
 from __future__ import annotations
 
+import inspect
 import os
 import stat
 import subprocess
@@ -243,17 +244,27 @@ def test_the_live_call_step_runs_alone(tmp_path: Path) -> None:  # noqa: ARG001
     assert not chosen.whole_lane
 
 
-def test_the_live_call_step_is_last_so_a_full_run_dials_after_it_has_walked(
+def test_the_live_call_steps_are_last_so_a_full_run_dials_after_it_has_walked(
     tmp_path: Path,  # noqa: ARG001
 ) -> None:
-    """A call holds the interlock, so on a whole-lane run it comes after the
+    """A call holds the interlock, so on a whole-lane run they come after the
     steps that drive turns rather than in the middle of them."""
-    assert journey.STEPS[-1] == "live call"
+    assert journey.STEPS[-2:] == journey.LIVE_CALL_STEPS
 
 
 def test_the_step_is_bound_to_a_method_like_every_other_name(tmp_path: Path) -> None:  # noqa: ARG001
-    assert "live call" in journey.PREREQUISITES
+    for step in journey.LIVE_CALL_STEPS:
+        assert step in journey.PREREQUISITES
+        assert step in journey.STEPS
     assert hasattr(journey.Walk, "live_call")
+    assert hasattr(journey.Walk, "live_call_long")
+
+
+def test_the_long_step_runs_alone_too(tmp_path: Path) -> None:  # noqa: ARG001
+    """#184's Red is one call's own clock; a turn-driving step before it is minutes."""
+    chosen = journey.select(["live call long"])
+    assert chosen.selected == ("live call long",)
+    assert chosen.setup == ()
 
 
 def test_only_a_run_that_walks_the_step_swaps_the_users_call_adapter(tmp_path: Path) -> None:
@@ -285,6 +296,18 @@ def test_a_recogniser_that_splits_a_word_still_counts_as_having_heard_it() -> No
 def test_the_substring_is_really_part_of_the_request_the_harness_speaks() -> None:
     """A fragment nothing puts on the track would never be heard at all."""
     assert journey.LIVE_CALL_HEARD_SUBSTRING in live_call.REQUEST
+    assert journey.LIVE_CALL_LONG_HEARD_SUBSTRING in live_call.LONG_REQUEST
+
+
+def test_the_long_request_asks_for_no_hang_up() -> None:
+    """Run `20260902T162146Z`: one sentence asking for both got neither graded.
+
+    The Voice counted for 220s and the Call Agent then ran nothing at all, so
+    #183's hand-off assertion went red for a reason that was not #184's. The two
+    asks are two utterances now, and this is the half that must not carry one.
+    """
+    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.LONG_REQUEST
+    assert live_call.REQUEST != live_call.LONG_REQUEST
 
 
 def test_the_wrapper_records_under_a_path_with_a_space_in_it(tmp_path: Path) -> None:
@@ -376,21 +399,320 @@ def test_a_call_that_went_down_on_its_own_is_not_credited_to_the_agent() -> None
     the Call Agent ended it. The audio path is the one that knows.
     """
     lost = "the connection went away by itself: ICE failed"
-    assert journey._ended_by(True, lost) == "lost"
-    assert journey._ended_by(False, lost) == "lost"
+    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=True) == "lost"
+    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=False) == "lost"
 
 
 def test_an_ending_the_agent_asked_for_is_the_agents() -> None:
     closed = "this side closed the audio path"
-    assert journey._ended_by(True, closed) == "agent"
+    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=True) == "agent"
+
+
+def test_a_call_the_engines_own_ceiling_ended_is_not_the_agents() -> None:
+    """Run `20260902T162146Z` recorded `agent` for a call nobody asked to end.
+
+    The ceiling closes the audio path from this side, exactly as a `bridgectl
+    live` the Call Agent ran does, so the end reason cannot tell them apart. The
+    engine's own log line is the only thing that can (#184).
+    """
+    closed = "this side closed the audio path"
+    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=True) == "ceiling"
+    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=False) == "ceiling"
+
+
+def test_a_connection_that_went_away_is_a_loss_before_it_is_a_ceiling() -> None:
+    """The audio path is asked first, as it already was for the agent."""
+    lost = "the connection went away by itself: ICE failed"
+    assert journey._ended_by(end_reason=lost, by_ceiling=True, by_agent=True) == "lost"
 
 
 def test_an_ending_the_step_had_to_make_itself_is_the_harnesss() -> None:
     """Green does not depend on the verb guess, and the guess stays visible."""
     closed = "this side closed the audio path"
-    assert journey._ended_by(False, closed) == "harness"
+    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=False) == "harness"
 
 
 def test_no_end_reason_at_all_still_says_who_was_waited_on() -> None:
-    assert journey._ended_by(True, None) == "agent"
-    assert journey._ended_by(False, None) == "harness"
+    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=True) == "agent"
+    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=False) == "harness"
+
+
+def test_every_answer_is_its_own_argument_rather_than_one_that_is_inferred() -> None:
+    """The bug the shape had: `by_agent` was read off "the call was down".
+
+    That is true of a call the ceiling ended, a call that dropped and a call the
+    step ended itself, so a caller with no reason to believe the Call Agent
+    ended anything could not say so. Every answer is now keyword-only and
+    stated (#184).
+    """
+    parameters = inspect.signature(journey._ended_by).parameters
+    assert [name for name in parameters] == ["end_reason", "by_ceiling", "by_agent"]
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters.values()
+    )
+    assert all(parameter.default is inspect.Parameter.empty for parameter in parameters.values())
+
+
+# --- the ceiling the Voice holds open ---------------------------------------
+
+
+class _Engine:
+    """Only the half of the engine handle these readings touch: its log."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+
+    def log_lines(self) -> list[str]:
+        return self._lines
+
+
+def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> journey.Walk:
+    walk = object.__new__(journey.Walk)
+    walk.engine = _Engine(lines or [])
+    walk.config = support.DerivedConfig(
+        path=tmp_path / "config.toml",
+        socket_path=tmp_path / "s.sock",
+        state_path=tmp_path / "state.json",
+        log_path=tmp_path / "engine.log",
+        project_name="acceptance",
+        workspace=tmp_path,
+        token_variable="T",
+        chat_id="1",
+    )
+    return walk
+
+
+def _said(message: str) -> str:
+    """One engine log line, in the shape `engine/logfile.py` writes."""
+    return f"2026-09-03 10:00:00,000 INFO gpt_voicecoding.core.bridge: {message}"
+
+
+def test_both_edges_of_the_voice_are_counted_off_the_engine_log(tmp_path: Path) -> None:
+    """A finished answer: the span opened once and closed once (#184)."""
+    walk = _walk(
+        tmp_path,
+        lines=[
+            _said(journey.VOICE_SPEAKING_LINE),
+            _said(journey.VOICE_QUIET_LINE),
+        ],
+    )
+    assert walk._voice_speech_edges() == {True: 1, False: 1}
+
+
+def test_an_answer_cut_in_half_leaves_a_start_edge_with_no_stop(tmp_path: Path) -> None:
+    """The bug's own shape: the ceiling fired mid-answer, so no `done` ever came.
+
+    This is what the long step grades on, and it is why the assertion counts
+    edges rather than measuring a duration — no pace the Voice counts at can
+    produce a stop edge from a call that was already hung up.
+    """
+    walk = _walk(tmp_path, lines=[_said(journey.VOICE_SPEAKING_LINE)])
+    assert walk._voice_speech_edges() == {True: 1, False: 0}
+
+
+def test_a_call_cut_after_an_earlier_answer_finished_still_reads_as_cut(
+    tmp_path: Path,
+) -> None:
+    """Why the rule is "no more starts than stops" and not "at least one of each".
+
+    The Voice may answer before the request lands — it did on run
+    `20260902T162146Z`, where the start edge preceded the user transcript.
+    Counting only presence would then let an earlier closed span stand in for
+    the answer's open one, and a run hung up mid-count would read green.
+    """
+    walk = _walk(
+        tmp_path,
+        lines=[
+            _said(journey.VOICE_SPEAKING_LINE),
+            _said(journey.VOICE_QUIET_LINE),
+            _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
+            _said(journey.VOICE_SPEAKING_LINE),
+        ],
+    )
+    edges = walk._voice_speech_edges()
+    assert edges[True] and edges[False]
+    assert edges[False] < edges[True]
+
+
+def test_an_utterance_that_ended_without_a_delta_is_not_a_span_left_open(
+    tmp_path: Path,
+) -> None:
+    """A `done` with no delta before it makes stops outnumber starts, honestly."""
+    walk = _walk(
+        tmp_path,
+        lines=[
+            _said(journey.VOICE_SPEAKING_LINE),
+            _said(journey.VOICE_QUIET_LINE),
+            _said(journey.VOICE_QUIET_LINE),
+        ],
+    )
+    edges = walk._voice_speech_edges()
+    assert edges[False] >= edges[True] >= 1
+
+
+def test_a_step_reads_only_the_lines_its_own_call_produced(tmp_path: Path) -> None:
+    """Two steps dial on one engine, so the log carries the call before this one.
+
+    Counting the whole log would let `live call`'s own answer stand in for the
+    long one's, and its ending stand in for the long one's ending — a green
+    step resting on evidence from a different call (#184).
+    """
+    before = [
+        _said(journey.VOICE_SPEAKING_LINE),
+        _said(journey.VOICE_QUIET_LINE),
+        _said("ended the Live Call after 60 seconds without call activity"),
+    ]
+    walk = _walk(tmp_path, lines=[*before, _said(journey.VOICE_SPEAKING_LINE)])
+
+    assert walk._voice_speech_edges() == {True: 2, False: 1}
+    assert walk._voice_speech_edges(since=len(before)) == {True: 1, False: 0}
+    assert walk._ceiling_ended_the_call() is True
+    assert walk._ceiling_ended_the_call(since=len(before)) is False
+
+
+class _Talking(_Engine):
+    """An engine whose log grows a little on every read, like a call in progress."""
+
+    def __init__(self, lines: list[str], *, per_read: int = 1) -> None:
+        super().__init__([])
+        self._pending = list(lines)
+        self._per_read = per_read
+        self._given: list[str] = []
+
+    def log_lines(self) -> list[str]:
+        for _ in range(self._per_read):
+            if self._pending:
+                self._given.append(self._pending.pop(0))
+        return list(self._given)
+
+
+def test_the_watch_measures_first_edge_to_last_across_a_broken_up_answer(
+    tmp_path: Path,
+) -> None:
+    """Run `20260902T170324Z`: two hundred numbers arrived as twenty-three turns.
+
+    Waiting for the first moment the spans balanced called the gap after the
+    first turn the end of the answer, and the step then failed a green engine
+    for answering "only" fifty-two seconds. The watch measures the whole
+    stretch instead, from the first edge to the last one it ever sees.
+    """
+    turns = []
+    for _ in range(3):
+        turns += [_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)]
+    walk = _walk(tmp_path)
+    walk.engine = _Talking(turns)
+    walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
+    downs = iter([False] * 6 + [True] * 4)
+    walk._call_is_down = lambda: next(downs, True)  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01)
+
+    assert watch.went_down is True
+    assert watch.edges == {True: 3, False: 3}
+    assert watch.first_voice_at is not None and watch.last_voice_at is not None
+    # Every turn after the first moved the mark, so the stretch spans them all.
+    assert watch.last_voice_at > watch.first_voice_at
+    assert watch.down_at >= watch.last_voice_at
+
+
+def test_a_call_whose_voice_never_speaks_is_watched_without_a_stretch(
+    tmp_path: Path,
+) -> None:
+    """No edge, no answer: the step says so rather than dividing by nothing."""
+    walk = _walk(tmp_path, lines=[_said("nothing about the Voice at all")])
+    walk._call_is_down = lambda: True  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=5.0, poll_seconds=0.01)
+
+    assert watch.edges == {True: 0, False: 0}
+    assert watch.first_voice_at is None
+    assert watch.last_voice_at is None
+
+
+def test_the_engines_own_line_is_what_names_the_ceiling_as_the_ender(tmp_path: Path) -> None:
+    """The number in it is configuration, so the sentence around it is matched."""
+    walk = _walk(tmp_path, lines=[_said("ended the Live Call after 12.5 seconds")])
+    assert walk._ceiling_ended_the_call() is False
+
+    ended = _walk(
+        tmp_path,
+        lines=[_said("ended the Live Call after 12.5 seconds without call activity")],
+    )
+    assert ended._ceiling_ended_the_call() is True
+
+
+def test_the_ceiling_is_read_out_of_the_lane_that_is_running(tmp_path: Path) -> None:
+    walk = _walk(tmp_path)
+    walk.config.path.write_text(A_CONFIG + "\n[policy]\nsilence_end_seconds = 12.5\n")
+    assert walk._silence_ceiling_seconds() == 12.5
+
+
+def test_a_lane_that_sets_no_ceiling_is_running_the_shipped_one(tmp_path: Path) -> None:
+    """The engine's default, not a copy of it — the step never types the number."""
+    walk = _walk(tmp_path)
+    walk.config.path.write_text(A_CONFIG)
+    assert walk._silence_ceiling_seconds() == journey.DEFAULT_SILENCE_END_SECONDS
+
+
+def test_the_silence_the_ceiling_waits_out_is_graded_to_the_polls_granularity() -> None:
+    """Both ends of that span are polls, so each is up to one interval late.
+
+    A ceiling that waited its full sixty seconds must not read as an early
+    ending because of which poll saw what.
+    """
+    assert journey.LIVE_CALL_POLL_SECONDS > 0
+    assert journey.LIVE_CALL_POLL_SECONDS < journey.DEFAULT_SILENCE_END_SECONDS
+
+
+def test_the_long_step_waits_out_the_answer_and_the_silence_after_it(
+    tmp_path: Path,  # noqa: ARG001
+) -> None:
+    """Nothing may end the call before the ceiling would have.
+
+    The answer is 220s measured; the ceiling then needs its own stretch of
+    silence on top before it fires. A step that gave up sooner would be the
+    thing that decided how long the call lasted.
+    """
+    assert journey.LIVE_CALL_ANSWER_SECONDS > 220.0
+    assert journey.LIVE_CALL_ANSWER_SECONDS > journey.LIVE_CALL_END_SECONDS
+
+
+# --- which utterance goes on the track --------------------------------------
+
+
+def test_a_wav_directory_nobody_wrote_in_plays_the_request_v0_accepted(
+    tmp_path: Path,
+) -> None:
+    """The default is #183's sentence: a step that does not care gets that one."""
+    assert live_call.variant_asked_for(tmp_path, (live_call.PLAIN, live_call.LONG)) == (
+        live_call.PLAIN
+    )
+
+
+def test_the_step_names_the_variant_and_the_harness_reads_it_back(tmp_path: Path) -> None:
+    """The per-call channel, both halves. One engine holds both steps' calls."""
+    live_call.ask_for(tmp_path / "wav", live_call.LONG)
+    known = (live_call.PLAIN, live_call.LONG)
+    assert live_call.variant_asked_for(tmp_path / "wav", known) == live_call.LONG
+
+    live_call.ask_for(tmp_path / "wav", live_call.PLAIN)
+    assert live_call.variant_asked_for(tmp_path / "wav", known) == live_call.PLAIN
+
+
+def test_a_variant_the_harness_cannot_play_is_the_default_rather_than_a_crash(
+    tmp_path: Path,
+) -> None:
+    """A call that comes up mute proves nothing; one that speaks #183's words says so."""
+    (tmp_path / "wav").mkdir()
+    (tmp_path / "wav" / live_call.NEXT_VARIANT_FILE).write_text("whistling\n")
+    assert live_call.variant_asked_for(tmp_path / "wav", (live_call.PLAIN,)) == live_call.PLAIN
+
+
+def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
+    """The two halves of the mapping are the same two names, or one is unreachable."""
+    settings = live_call.HarnessSettings(
+        observations=Path("/tmp/o.jsonl"), wav_directory=Path("/tmp/wav")
+    )
+    assert set(settings.requests) == {live_call.PLAIN, live_call.LONG}
+    assert settings.requests[live_call.PLAIN] == live_call.REQUEST
+    assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST

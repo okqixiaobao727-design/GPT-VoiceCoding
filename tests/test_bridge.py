@@ -28,6 +28,8 @@ from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, Se
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
+    VOICE_QUIET_LINE,
+    VOICE_SPEAKING_LINE,
 )
 from gpt_voicecoding.core.errors import ChildSessionError, VoiceInstructionsMissing
 from gpt_voicecoding.core.lifecycle import Lifecycle
@@ -56,7 +58,13 @@ from gpt_voicecoding.seams.agent import (
     WaitingFor,
     WaitingKind,
 )
-from gpt_voicecoding.seams.call import CallDropped, CallStarted, CallState, UserSpeech
+from gpt_voicecoding.seams.call import (
+    CallDropped,
+    CallStarted,
+    CallState,
+    UserSpeech,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
@@ -637,7 +645,13 @@ class TestTheLiveCallSilenceCeiling:
         hub.tick()
         assert hub.call.calls_ended == 1
 
-    def test_a_notice_spoken_into_the_call_restarts_its_silence_window(self) -> None:
+    def test_a_notice_handed_to_the_call_does_not_by_itself_restart_the_window(self) -> None:
+        """The receipt says the words were handed over, not that anything was said.
+
+        What keeps the call alive is the Voice speaking them, and that arrives
+        on its own as `VoiceSpeech` (#184). The stamp this test used to prove
+        was a text hand-over wearing a voice's clothes.
+        """
         hub = Hub(silence_end_seconds=60.0)
         started = hub.toggle()
         assert started.call_id is not None
@@ -645,11 +659,139 @@ class TestTheLiveCallSilenceCeiling:
 
         hub.now += 50.0
         hub.emit(SessionStopped(target=CODEX))
-        hub.now += 59.9
+        hub.now += 10.0
         hub.tick()
 
         assert hub.call.spoken
+        assert hub.call.calls_ended == 1
+
+    def test_the_voice_speaking_holds_the_ceiling_open(self) -> None:
+        """A 75 s answer generated in 10 s is still a call somebody is talking on."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        # Deltas every 5 s for 75 s: one span, one start edge, no end edge yet.
+        hub.emit(VoiceSpeech(speaking=True))
+        for _ in range(15):
+            hub.now += 5.0
+            hub.tick()
+
         assert hub.call.calls_ended == 0
+
+        hub.emit(VoiceSpeech(speaking=False))
+        hub.now += 59.9
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.now += 0.1
+        hub.tick()
+        assert hub.call.calls_ended == 1
+
+    def test_a_voice_that_stopped_and_then_silence_ends_the_call(self) -> None:
+        """The stop edge is activity too: the window runs from the end of the answer."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 50.0
+        hub.emit(VoiceSpeech(speaking=True), VoiceSpeech(speaking=False))
+        hub.now += 59.9
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.now += 0.1
+        hub.tick()
+        assert hub.call.calls_ended == 1
+
+    def test_a_call_dropped_mid_answer_leaves_the_next_one_unheld(self) -> None:
+        """A start edge with no stop, then the call goes away. No flag outlives it."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+        hub.emit(VoiceSpeech(speaking=True))
+        hub.emit(CallDropped(call_id=started.call_id, detail="the far side left"))
+
+        hub.emit(CallStarted(call_id="call-2"))
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_a_ceiling_is_not_measured_while_news_is_unread(self) -> None:
+        """The two loops are two tasks, so an emitted edge is not a noted one.
+
+        `_ticking` and `_dispatching` are separate (`engine/composition.py`), so
+        a `VoiceSpeech(True)` sitting in the queue has not reached the interlock.
+        A tick that measured silence then would end the call one event before
+        being told the Voice was speaking on it — which is #184's bug arriving by
+        a different door.
+        """
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        # Emitted, deliberately not drained: this is the state the tick loop can
+        # find the hub in.
+        hub.core.events.emit(VoiceSpeech(speaking=True))
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        # Read, and now the flag itself is what holds the ceiling open.
+        hub.emit()
+        hub.now += 600.0
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+    def test_news_about_a_session_does_not_hold_a_silent_call_open(self) -> None:
+        """The ceiling's question is about the call, so only the call can defer it.
+
+        Asking the queue whether it held *anything* was the first shape of the
+        guard above, and it was too wide: a `SessionStopped` waiting to be read
+        is not activity on a call, and a lane that kept producing events could
+        have held a forgotten call open for as long as it kept producing them.
+        """
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.core.events.emit(SessionStopped(target=CODEX))
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_a_call_with_nothing_unread_is_still_ended_when_it_is_silent(self) -> None:
+        """The guard is about unread news, not about being cautious in general."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_both_voice_edges_are_written_down(self, caplog) -> None:
+        """The engine's log is where a run says the Voice held the call open."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(VoiceSpeech(speaking=True), VoiceSpeech(speaking=False))
+
+        said = [record.getMessage() for record in caplog.records]
+        assert VOICE_SPEAKING_LINE in said
+        assert VOICE_QUIET_LINE in said
 
     def test_the_ceiling_holds_with_duty_off_on_a_call_the_user_opened(self) -> None:
         """Only the Auto Hang-up Switch governs it; Duty and Voice do not reach it."""

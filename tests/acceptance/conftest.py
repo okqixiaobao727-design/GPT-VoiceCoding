@@ -796,12 +796,14 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         # Codex lane's journey never walks that route. Dropping the adapter is
         # what leaves exactly one claimant when both lanes are up.
         dropped_agents=() if lane.agent == str(AgentKind.CLAUDE) else (AgentKind.CLAUDE,),
-        # #183: only a run that walks `live call` gets the harness's own Call
-        # adapter and the `bridgectl` wrapper. Conditional rather than always,
-        # because every other step is accepting the Call adapter the *user*
-        # configured, and swapping it on a run that never dials would mean those
-        # steps were graded against an engine nobody runs.
-        harness_live_call="live call" in arrangement.selection.steps,
+        # #183: only a run that walks a step that dials gets the harness's own
+        # Call adapter and the `bridgectl` wrapper. Conditional rather than
+        # always, because every other step is accepting the Call adapter the
+        # *user* configured, and swapping it on a run that never dials would mean
+        # those steps were graded against an engine nobody runs.
+        harness_live_call=any(
+            step in arrangement.selection.steps for step in journey_module.LIVE_CALL_STEPS
+        ),
     )
     engine = support.Engine(
         config=config,

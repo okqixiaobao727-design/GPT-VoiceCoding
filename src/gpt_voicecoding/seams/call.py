@@ -12,8 +12,8 @@ adapter stateless about them: there is no window in which a call could be opened
 with instructions from a generation that is no longer the hub's. An adapter may
 not hold them past the call they were given for.
 
-Events raised upward: the user's speech transcript, and call started / ended /
-dropped.
+Events raised upward: the user's speech transcript, whether the call's own
+Voice is speaking, and call started / ended / dropped.
 
 The one-call-at-a-time invariant lives *above* this seam, in Bridge Core, not in
 any adapter (ADR 0001). An adapter neither knows nor enforces it.
@@ -89,6 +89,30 @@ class UserSpeech(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceSpeech(Event):
+    """Whether the call's own Voice is producing speech right now.
+
+    Named for the glossary's **Voice**, not for the wire: `role: assistant` is
+    the realtime protocol's word, known to the adapter that translates it and
+    to nothing above this seam.
+
+    A state and not a tick, because the two things that need it need different
+    questions answered. The Silence Ceiling asks "was there activity" *and* has
+    to hold while an answer is still being spoken — an answer generated in ten
+    seconds and spoken over seventy-five is seventy-five seconds of call, which
+    no bare edge describes. "Wait for a gap" asks whether it is speaking now.
+
+    `speaking=False` means the Voice stopped **generating**, not that the
+    speaker stopped **playing**: playout trails it by the transport's jitter
+    buffer and this system's own playback buffer. A caller that waits for a gap
+    owes a settle window on top of this edge; the ceiling does not, because
+    trailing audio only makes a call it holds open longer.
+    """
+
+    speaking: bool
+
+
+@dataclass(frozen=True, slots=True)
 class CallStarted(Event):
     call_id: str
 
@@ -110,7 +134,7 @@ class CallDropped(Event):
 
 
 #: The closed set of events this seam raises. Nothing else may appear.
-CallEvent = UserSpeech | CallStarted | CallEnded | CallDropped
+CallEvent = UserSpeech | VoiceSpeech | CallStarted | CallEnded | CallDropped
 
 
 @runtime_checkable

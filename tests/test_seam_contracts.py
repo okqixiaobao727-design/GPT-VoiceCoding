@@ -17,7 +17,7 @@ import asyncio
 import inspect
 from dataclasses import fields
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
@@ -39,7 +39,16 @@ from gpt_voicecoding.seams.agent import (
     ProgressRole,
     RelayRoute,
 )
-from gpt_voicecoding.seams.call import CallAdapter, CallState
+from gpt_voicecoding.seams.call import (
+    CallAdapter,
+    CallDropped,
+    CallEnded,
+    CallEvent,
+    CallStarted,
+    CallState,
+    UserSpeech,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.events import EventSink
@@ -328,6 +337,35 @@ class TestTheCallContract:
         call = FakeCall()
         asyncio.run(call.ensure_call(HOUSE_RULES))
         assert call.opened_on == [HOUSE_RULES]
+
+    def test_the_voice_speaking_state_is_one_of_the_events_the_seam_raises(self) -> None:
+        """Both edges of the call's own voice cross the seam, as one state (#184).
+
+        A state rather than a tick, because the two readers want different
+        questions answered from it: the Silence Ceiling asks "was there
+        activity", and it also has to *hold* while the answer is still being
+        spoken — a span, which no bare edge describes.
+        """
+        assert set(get_args(CallEvent)) == {
+            UserSpeech,
+            VoiceSpeech,
+            CallStarted,
+            CallEnded,
+            CallDropped,
+        }
+        assert {field.name for field in fields(VoiceSpeech)} == {"speaking"}
+        assert VoiceSpeech(speaking=True).speaking is True
+
+    def test_an_adapter_can_raise_both_voice_edges_with_no_audio(self) -> None:
+        """The fake emits it, so every consumer above the seam is testable dry."""
+        sink = RecordingSink()
+        call = FakeCall(sink=sink)
+        asyncio.run(call.ensure_call(HOUSE_RULES))
+
+        call.voice_speech(speaking=True)
+        call.voice_speech(speaking=False)
+
+        assert sink.events == [VoiceSpeech(speaking=True), VoiceSpeech(speaking=False)]
 
 
 class TestTheCompanionChannelContract:

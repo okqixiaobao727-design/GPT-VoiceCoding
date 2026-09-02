@@ -58,6 +58,7 @@ from gpt_voicecoding.seams.call import (
     CallState,
     DelegatedReply,
     UserSpeech,
+    VoiceSpeech,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -79,9 +80,13 @@ REALTIME_VERSION = "v3"
 #: A voice call is audio out. `text` is the same route with the point removed.
 OUTPUT_MODALITY = "audio"
 
-#: Which side of a realtime transcript is the user speaking. The other side is
-#: this system's own speech coming back, which is not news to it.
+#: Which side of a realtime transcript is the user speaking.
 USER_ROLE = "user"
+
+#: The other side: this system's own Voice. The wire's word for it, translated
+#: here into the seam's `VoiceSpeech` and never carried upward as it is — above
+#: this adapter the glossary has no unqualified *assistant* (`CONTEXT.md`).
+ASSISTANT_ROLE = "assistant"
 
 
 class _Abandoned(Exception):
@@ -111,6 +116,11 @@ class _LiveCall:
     #: Set when *this side* asked for the end, so the far side going quiet
     #: afterwards is not reported as a loss.
     ending: bool = False
+    #: Whether the Voice is in the middle of an utterance on *this* call. Per
+    #: attempt rather than per adapter, so a call that drops between the first
+    #: delta and the `done` that would have cleared it cannot leave the latch
+    #: set over the call that follows.
+    speaking: bool = False
 
     def fail(self, reason: str) -> None:
         """Stop anything waiting on this attempt, with a reason rather than a hang."""
@@ -569,17 +579,43 @@ class RealtimeCallAdapter:
             case "thread/realtime/started":
                 if not live.started.done():
                     live.started.set_result(None)
+            case "thread/realtime/transcript/delta":
+                self._voice_started(live, params)
             case "thread/realtime/transcript/done":
-                self._transcribed(params)
+                self._transcribed(live, params)
             case "thread/realtime/error":
                 self._drop(live, f"the realtime session failed: {params.get('message')}")
             case "thread/realtime/closed":
                 reason = params.get("reason") or "no reason given"
                 self._drop(live, f"the realtime session closed: {reason}")
 
-    def _transcribed(self, params: Message) -> None:
-        """Raise what the user said. The other side of the transcript is our own voice."""
-        if params.get("role") != USER_ROLE:
+    def _voice_started(self, live: _LiveCall, params: Message) -> None:
+        """The Voice began an utterance. Only the first delta of one is news.
+
+        A long answer is hundreds of these — 604 in the probe records — and the
+        seam publishes a *span*, so every delta after the first says nothing the
+        span does not already say.
+        """
+        if params.get("role") != ASSISTANT_ROLE or live.speaking:
+            return
+        live.speaking = True
+        self._emit(VoiceSpeech(speaking=True))
+
+    def _transcribed(self, live: _LiveCall, params: Message) -> None:
+        """Raise what was said, from whichever side of the transcript said it.
+
+        The Voice's half is raised as the end of a span rather than as words:
+        this system does not read its own speech back to itself. It is raised on
+        every assistant `done`, latch or no latch, because `done` is emitted
+        once per *turn* — an answer codex splits in two produces two of them,
+        and a `done` with no delta before it is still an utterance that ended.
+        """
+        role = params.get("role")
+        if role == ASSISTANT_ROLE:
+            live.speaking = False
+            self._emit(VoiceSpeech(speaking=False))
+            return
+        if role != USER_ROLE:
             return
         text = params.get("text")
         if isinstance(text, str) and text.strip():
