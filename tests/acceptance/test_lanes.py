@@ -25,13 +25,15 @@ every full run, or it is not in the acceptance.
 ## One run per machine, whatever `--lane` it names
 
 Two lanes run at once **inside one run**. Two *runs* must not: they share things
-no option separates, and nothing in the harness refuses the second one yet, so
-this is a rule a person keeps.
+no option separates, so preflight takes a cross-process lock on the user-account
+session for the length of the run and **refuses** a second run by the holder's
+pid and run directory (`telegram_person.PersonSessionLock`).
 
 * **The Telegram user account is one client.** Its session is an SQLite file
   holding a bearer auth key, and a second process opening it gets `database is
   locked` at best (`telegram_person.PersonConnection`). Two lanes share one
-  connection for exactly this reason; two runs cannot.
+  connection for exactly this reason; two runs cannot — and the lock is taken
+  beside that file, so the refusal arrives before either process opens it.
 * **The trust gate writes the user's own files.** `support.TrustGate`
   read-modify-writes `~/.claude.json` and `~/.codex/config.toml`, and the lock
   that keeps two lanes off each other there is a **thread** lock — it means

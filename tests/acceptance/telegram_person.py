@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
+import fcntl
 import inspect
 import json
 import os
@@ -49,6 +51,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import IO
 
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
@@ -67,6 +70,34 @@ DEFAULT_PERSON_DIRECTORY = (
 #: without one and the file on disk carries it.
 SESSION_STEM = "person"
 CREDENTIALS_FILE = "credentials.json"
+
+#: The one-run-per-machine lock (#203), a sibling of the session rather than a
+#: suffix on it: SQLite keeps its own `-journal` and `-wal` beside the database,
+#: and a `person.session.lock` would read as one more of those.
+LOCK_FILE = f"{SESSION_STEM}.lock"
+
+#: What a refusal calls a holder whose record it could not read. Not "another
+#: acceptance run": an unreadable record is not evidence of what wrote it.
+UNKNOWN_HOLDER = "something on this machine"
+
+#: How the two holders name themselves in the lock file. A run and a one-shot
+#: `status` take the same lock, and only the writer knows which it is.
+ACCEPTANCE_RUN_HOLDER = "another acceptance run"
+STATUS_CHECK_HOLDER = "a `telegram_person.py status` check"
+
+#: The identity is written a few syscalls after the lock is taken, so a refuser
+#: that loses that race reads an empty file. It waits out that window rather than
+#: reporting "unknown" for a holder that is about to name itself. A second is
+#: orders of magnitude more than an `open`, a `write` and a `flush` on a local
+#: file — deliberately, since being generous here costs a run that is refusing
+#: anyway, and being tight costs the refusal its whole reason.
+HOLDER_RECORD_SECONDS = 1.0
+HOLDER_RECORD_POLL_SECONDS = 0.005
+
+#: `flock` says "somebody else has it" with `EWOULDBLOCK`, and `EACCES` is the
+#: same answer on the platforms that use it. Every other errno is a different
+#: problem and is raised as itself.
+CONTENDED_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 #: `my.telegram.org` issues these to a Telegram account, once. They are needed at
 #: every connect and not only at login, so the login writes them down beside the
@@ -148,6 +179,224 @@ def session_path(directory: Path | None = None) -> Path:
 
 def credentials_path(directory: Path | None = None) -> Path:
     return (directory or person_directory()) / CREDENTIALS_FILE
+
+
+def session_lock_path(directory: Path | None = None) -> Path:
+    """The one-run-per-machine lock, beside the session it guards.
+
+    Beside it rather than in a directory of its own so that
+    `GPTVOICECODING_ACCEPTANCE_PERSON_DIR` moves the lock and the session
+    together — a lock that stayed behind would refuse a run that was not sharing
+    anything, which is the false refusal mirroring the false verdict preflight
+    exists to prevent. Its own name rather than the session's with a suffix, so
+    it is never read as the SQLite file or as one of SQLite's own sidecars.
+    """
+    return (directory or person_directory()) / LOCK_FILE
+
+
+@dataclass(frozen=True)
+class LockHolder:
+    """Whoever holds the session lock, as the refusal is allowed to name them.
+
+    Every field is optional, and `held_by` says what kind of process wrote the
+    record rather than letting the reader assume: `status` takes the same lock
+    for the length of one question and has no run directory at all, so a refusal
+    that called every holder "another acceptance run" would name a run that does
+    not exist. `docs/acceptance-design.md` § Preflight refuses rather than runs —
+    a refusal never assumes.
+    """
+
+    pid: int | None
+    run_directory: str | None
+    held_by: str | None = None
+
+    def __str__(self) -> str:
+        return (
+            f"{self.held_by or UNKNOWN_HOLDER} holds the user-account session: "
+            f"pid {self.pid if self.pid is not None else 'unknown'}, "
+            f"run directory {self.run_directory or 'unknown'}"
+        )
+
+
+class SessionInUse(PersonError):
+    """Something on this machine already holds the user account. Named, never guessed."""
+
+    def __init__(self, holder: LockHolder) -> None:
+        super().__init__(str(holder))
+        self.holder = holder
+
+
+def read_lock_holder(directory: Path | None = None) -> LockHolder:
+    """Who the lock file says is holding it — or `unknown`, never a guess.
+
+    **The record is written after the lock is taken**, because the lock belongs to
+    the file and writing an identity before holding it would clobber the record of
+    whoever currently does. Two consequences, and this waits both of them out
+    rather than quoting something it cannot stand behind:
+
+    * a holder that has the lock but has not yet written leaves an empty file;
+    * a holder that has *just* taken the lock leaves the previous holder's record
+      in place for the syscall between `flock` and the truncate.
+
+    Both windows are ended by the same rule: a record naming a process that is no
+    longer alive is a ghost, not a holder, and is waited out like an empty one.
+    The residual is a run killed outright whose pid the kernel then handed to some
+    unrelated process — a pid record cannot tell that apart from the real holder,
+    and no reading of this file can.
+    """
+    deadline = time.monotonic() + HOLDER_RECORD_SECONDS
+    while True:
+        holder = _recorded_holder(directory)
+        if holder is not None:
+            return holder
+        if time.monotonic() >= deadline:
+            return LockHolder(None, None, None)
+        time.sleep(HOLDER_RECORD_POLL_SECONDS)
+
+
+def _recorded_holder(directory: Path | None) -> LockHolder | None:
+    """The record if it names a live process, `None` while it names nobody yet."""
+    try:
+        recorded = json.loads(session_lock_path(directory).read_text())
+        pid = int(recorded["pid"])
+        run_directory = recorded["run_directory"]
+        held_by = recorded.get("held_by")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not _is_alive(pid):
+        return None
+    return LockHolder(
+        pid,
+        None if run_directory is None else str(run_directory),
+        None if held_by is None else str(held_by),
+    )
+
+
+def _is_alive(pid: int) -> bool:
+    """Signal 0: asks the kernel about the process without touching it.
+
+    `PermissionError` is *alive* — a process this user may not signal is still a
+    process — and only `ProcessLookupError` is the answer that means gone.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class PersonSessionLock:
+    """One acceptance run per machine, enforced across processes rather than by a person.
+
+    Two runs share what no `--lane` separates: this session file, which is SQLite
+    backing exactly one client, and `support.TrustGate`'s writes to the user's own
+    `~/.claude.json` and `~/.codex/config.toml`, guarded by a *thread* lock that
+    means nothing to a second pytest process. So the run takes this lock before it
+    opens the session, and holds it until the session-scoped fixtures tear down.
+
+    **Advisory, non-blocking, and released by the kernel.** `flock` is held by the
+    open file description, so a run killed with `SIGKILL` leaves no stale lock to
+    clean up by hand — which is the whole reason the holder is a lock file rather
+    than a pid file somebody has to sweep. The holder writes its pid and run
+    directory into the file *after* acquiring, so the refusal can name what is in
+    the way instead of saying only that something is.
+
+    **Legacy (ADR 0010), adapted:** `legacy@1d32845:bridge/logfile.py:207-229`
+    (`_rotate`; the `fcntl.flock(lock.fileno(), fcntl.LOCK_EX)` at :222) is the
+    same pattern — an advisory lock on a sibling file beside the thing it guards.
+    Adapted rather than ported: blocking `LOCK_EX` serialising one rotation there,
+    non-blocking `LOCK_EX | LOCK_NB` held for a whole run here, with the holder's
+    identity written into the file so the second run's refusal can quote it.
+    """
+
+    def __init__(
+        self,
+        *,
+        held_by: str,
+        directory: Path | None = None,
+        run_directory: Path | str | None = None,
+    ) -> None:
+        self._directory = directory or person_directory()
+        self._run_directory = run_directory
+        # Stated by the caller rather than inferred here: this class cannot know
+        # whether it is being taken for a whole run or for one `status` answer,
+        # and the refusal on the other side quotes whichever it is.
+        self._held_by = held_by
+        self._handle: IO[str] | None = None
+
+    def __enter__(self) -> PersonSessionLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+    @property
+    def path(self) -> Path:
+        return session_lock_path(self._directory)
+
+    def acquire(self) -> None:
+        """Take the lock, or raise `SessionInUse` naming who has it. Never waits."""
+        self._directory.mkdir(parents=True, exist_ok=True)
+        # `a+` rather than `w`: opening for write truncates the holder's record
+        # before this process has learned it cannot have the lock.
+        handle = self.path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            handle.close()
+            # Only contention becomes a refusal. A permission error, a full disk
+            # or a filesystem with no `flock` proves nothing about another run,
+            # and reporting one as "another acceptance run holds the session"
+            # would be exactly the assumption preflight exists to refuse.
+            if error.errno in CONTENDED_ERRNOS:
+                raise SessionInUse(read_lock_holder(self._directory)) from None
+            raise
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "run_directory": None
+                        if self._run_directory is None
+                        else str(self._run_directory),
+                        "held_by": self._held_by,
+                    }
+                )
+            )
+            handle.flush()
+            self.path.chmod(PRIVATE_FILE)
+        except OSError:
+            handle.close()
+            raise
+        self._handle = handle
+
+    def release(self) -> None:
+        """Clear the record, then close the handle — closing is what releases it.
+
+        The record goes first and inside the lock, so a clean handover leaves no
+        identity behind for the next contender to quote. A run that dies instead
+        of releasing leaves its record, and `read_lock_holder` is what disregards
+        it. Safe to repeat.
+        """
+        if self._handle is None:
+            return
+        try:
+            self._handle.seek(0)
+            self._handle.truncate()
+            self._handle.flush()
+        except OSError:
+            # An unwritable record is not worth failing a teardown over: the
+            # reader already refuses to quote a holder that is no longer alive.
+            pass
+        self._handle.close()
+        self._handle = None
 
 
 @dataclass(frozen=True)
@@ -467,6 +716,21 @@ def status(directory: Path | None = None) -> int:
     except PersonError as refusal:
         print(f"NOT AUTHORISED: {refusal}")
         return 1
+    # The lock is taken before the client is built, not after: connecting to a
+    # session another run holds is where `database is locked` comes from, and
+    # that message names SQLite rather than the run in the way. Held for the
+    # length of this answer only — `status` is a question, not a run — and so it
+    # records itself as a `status` check rather than as a run that never existed.
+    try:
+        with PersonSessionLock(directory=directory, held_by=STATUS_CHECK_HOLDER):
+            return _report_authorisation(session, credentials)
+    except SessionInUse as in_use:
+        print(f"IN USE: {in_use}")
+        return 1
+
+
+def _report_authorisation(session: Path, credentials: ApiCredentials) -> int:
+    """The account question itself, once the lock says this process may ask it."""
     loop = asyncio.new_event_loop()
     client = TelegramClient(
         str(session.with_suffix("")), credentials.api_id, credentials.api_hash, loop=loop

@@ -432,7 +432,40 @@ def bots(
 
 
 @pytest.fixture(scope="session")
-def person_connection() -> Iterator[telegram_person.PersonConnection]:
+def person_session_lock(run_directory: Path) -> Iterator[telegram_person.PersonSessionLock]:
+    """One acceptance run per machine, refused rather than kept by a person (#203).
+
+    `docs/acceptance-design.md` § Running it lists what two runs share and no
+    `--lane` separates: the user-account session, which is SQLite backing one
+    client, and `support.TrustGate`'s writes to the user's own `~/.claude.json`
+    and `~/.codex/config.toml`, guarded by a thread lock that means nothing to a
+    second pytest process. The rule was written down and kept by hand; this takes
+    it.
+
+    **It is listed before the bots for a reason.** A second run must refuse
+    before it reads a token, opens the session file or touches the trust gate —
+    a refusal that arrives after any of those has already had the collision it
+    was supposed to prevent. So `preflight` names this fixture ahead of `bots`,
+    and `person_connection` depends on it rather than the other way round.
+
+    Held for the whole session and released here. A run killed outright leaves
+    nothing to sweep: `flock` belongs to the open file description, so the kernel
+    releases it when the process dies.
+    """
+    try:
+        with telegram_person.PersonSessionLock(
+            run_directory=run_directory,
+            held_by=telegram_person.ACCEPTANCE_RUN_HOLDER,
+        ) as lock:
+            yield lock
+    except telegram_person.SessionInUse as in_use:
+        _refuse(str(in_use))
+
+
+@pytest.fixture(scope="session")
+def person_connection(
+    person_session_lock: telegram_person.PersonSessionLock,  # noqa: ARG001 - held, not called
+) -> Iterator[telegram_person.PersonConnection]:
     """The one account, connected once. One session file backs one client.
 
     It journals nothing itself: what a reader needs is *who* connected and to
@@ -489,6 +522,9 @@ def preflight(
     provenance: support.Provenance,
     engine_path: str,
     run_directory: Path,
+    # Ahead of `bots`, `people` and every trust-gate write: a second run on this
+    # machine refuses here, before it has touched anything the first run holds.
+    person_session_lock: telegram_person.PersonSessionLock,
     journal: support.Journal,
     verdict: support.Verdict,
     selection: journey_module.Selection,
