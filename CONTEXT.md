@@ -50,6 +50,10 @@ _Avoid_: announcement (the act, not the thing)
 The minimum interval between two sounds the system makes toward the user on the voice side: after any end of a call — hung up, dropped, or a dial that failed — it does not dial again; during a call it does not ring or speak unbidden again. A Session event inside it only marks that a call, or a word, is owed; when it ends, the system reads the Sessions afresh and dials, speaks, or stays quiet on what it finds — never on replayed events. The user's own Live Toggle is not subject to it.
 _Avoid_: debounce, back-off, grace period, rate limit
 
+**Cue**:
+A short sound played on the user's own speakers to mark a moment of the Live Call rather than to carry words: the call connected, the call ended, or — mid-call — something happened. The term names the moment; which notes are heard for it belong to the Call adapter, and were chosen by ear. Played by the engine on the configured output device, on its own stream, so the sound for a call that has ended does not depend on that call's audio path still being open.
+_Avoid_: tone, beep, chime, earcon, notification sound
+
 **Voice**:
 The Live Call's speaking half — the model the user hears and talks to. It has no tools: it composes speech from what the engine hands it, and hands anything that reads as a job to the Call Agent. It is addressed in plain prose, never in code-like text.
 _Avoid_: voice model, realtime model, assistant (unqualified), voice thread

@@ -2,7 +2,13 @@
 
 Verbs Bridge Core calls: `ensure_call` and `end_call` (the two halves of the Live
 Toggle), `call_state`, `speak(text)`, `delegate(text) -> reply` (the Delegated
-Turn — the cost lever, whose model the caller selects), and `verify`.
+Turn — the cost lever, whose model the caller selects), `play_cue(cue)`, and
+`verify`.
+
+**`play_cue` names a moment, not a sound.** The user hears the call connect and
+hears it end, and what those are heard *as* was chosen by ear on real speakers
+(#174) — a decision with no policy in it, which is why the caller states
+`CONNECTED` or `ENDED` and the adapter owns everything else about it.
 
 **Instructions arrive at the call site, as plain data.** Both verbs that start a
 thread take the instruction set that thread begins with, because Bridge Core
@@ -49,6 +55,27 @@ class CallState(StrEnum):
     DOWN = "down"
     CONNECTING = "connecting"
     UP = "up"
+
+
+class Cue(StrEnum):
+    """A moment in the call the user is owed a sound for — never the sound itself.
+
+    The seam names the moment because the sound is the adapter's: which notes,
+    how loud and how long were chosen by ear (#174) against one machine's
+    speakers, and nothing above this seam has an opinion about any of it. A
+    caller says *the call came up*; what that is heard as belongs behind here.
+
+    `EVENT` is the mid-call one — something happened that is not the call
+    starting or ending — and it has no caller yet: the Call Keeper (#170, #174)
+    is what will ring it. It ships implemented rather than deferred because the
+    three sounds were chosen together, as a set a listener learns at once, and
+    picking the third one later would be picking it against a set that had
+    already gone out.
+    """
+
+    CONNECTED = "connected"
+    ENDED = "ended"
+    EVENT = "event"
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +193,31 @@ class CallAdapter(Protocol):
         self, text: str, *, model: str, instructions: str, request_id: RequestId
     ) -> DelegatedReply:
         """Hand work to a coding model on the user's behalf — the Delegated Turn."""
+        ...
+
+    async def play_cue(self, cue: Cue) -> None:
+        """Mark one moment of the call with a sound, on the user's own speakers.
+
+        **Returns as soon as the cue is on its way, not when it has been heard.**
+        A cue is feedback about something that already happened, and a caller
+        that waited for one would be holding its own dispatch open for a third
+        of a second to play a noise about the thing it has finished doing.
+
+        **Cues are heard in the order they were asked for.** They mark moments,
+        and the moments have an order — a caller that says CONNECTED and then
+        ENDED has described a call, not a set of two things. How an adapter
+        keeps that promise while still returning at once is its own business.
+
+        Nothing is reported back. A cue that could not be played — no output
+        device, no audio library, a device somebody unplugged — is the adapter's
+        to write down and swallow: there is no recovery a caller could attempt,
+        and a raise here would let a missing sound take down the call it was
+        only commenting on.
+
+        Not tied to the call being up. `ENDED` plays *after* the call's own
+        audio stream has closed, which is why the player is the adapter's and
+        not the transport's.
+        """
         ...
 
     async def verify(self) -> VerifyResult:

@@ -81,7 +81,7 @@ import os
 import re
 import time
 import tomllib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Container, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,9 +93,11 @@ import live_call
 import support
 from support import LaneBlocked, StepFailed
 
+from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
 from gpt_voicecoding.core.policy import DEFAULT_SILENCE_END_SECONDS
+from gpt_voicecoding.seams.call import Cue
 
 if TYPE_CHECKING:
     # Named for a type and never imported at runtime: telethon lives behind this
@@ -374,6 +376,97 @@ def _unspaced(text: str) -> str:
 DROPPED_REASON = "went away by itself"
 
 
+def _cue_line_indices(lines: Sequence[str], cue: Cue) -> list[int]:
+    """Where in one reading of the log each `cue` says it was played.
+
+    Offsets rather than the lines, because what is graded here is an *order*.
+    The engine writes no line at all for `CallStarted` or `CallEnded` — the hub
+    notes them into the interlock and moves on — so a cue's own line is both the
+    evidence that it played and the only thing the rest of the call's log can be
+    ordered against (#186). One reading is passed in rather than taken twice:
+    the log grows while a step reads it, and two readings are two numberings.
+    """
+    phrase = cues.cue_phrase(cue)
+    return [index for index, line in enumerate(lines) if phrase in line]
+
+
+def _cue_record(cue: Cue, device: int | None) -> str:
+    """What a played cue's line must actually carry, built the adapter's own way.
+
+    The ticket asks the adapter's log to record "the output device and the span
+    written for each", and matching only `played the … cue` would pass a line
+    carrying neither. Composed with the product's own function rather than a
+    pattern typed here, so the two cannot drift: the frames are what the cue
+    really synthesises to, and the device is the one this lane configured.
+    """
+    return cues.played_line(
+        cues.CueSpan(cue=cue, device=device, started=0.0, frames=cues.frames_in(cues.render(cue)))
+    )
+
+
+def _cue_complaint(lines: Sequence[str], spoken: Container[str], *, device: int | None) -> str:
+    """Why this call's log is not the two cues in the right places, or "" if it is.
+
+    Two claims, each ordered against the only other line this call's own half of
+    the log carries — the user speech line. CONNECTED must be written *before*
+    it: the cue marks the call coming up, and the utterance goes on the track ten
+    seconds after the peer connection settles, so a CONNECTED that arrived after
+    it would be a cue played for the wrong moment. ENDED must be written *after*
+    it, because it marks the other end of the same call.
+
+    Absence is the likelier failure and is why presence is graded at all: a
+    machine with no usable output device logs a refusal instead — the adapter
+    swallows its own playback failures by design, because a missing tone may not
+    take down the call it was only commenting on — and this step would otherwise
+    go green over a silent product.
+
+    Pure, and module-level, so CI runs it: the acceptance walk itself never
+    reaches CI, and a rule with no test at CI speed is what #109 cost.
+    """
+    wanted = (Cue.CONNECTED, Cue.ENDED)
+    named = {cue: _cue_line_indices(lines, cue) for cue in wanted}
+    # **The same line has to carry both**, which is why the order below is read
+    # off `at` and never off `named`. A thin line before the speech and a whole
+    # one after it satisfies "a whole line exists" and "something was logged
+    # early" separately, while describing a call whose connect was never
+    # actually recorded.
+    at = {
+        cue: [index for index in named[cue] if _cue_record(cue, device) in lines[index]]
+        for cue in wanted
+    }
+    spoken_at = [index for index, line in enumerate(lines) if line in spoken]
+
+    missing = [f"no {cue} cue" for cue in wanted if not named[cue]]
+    if missing:
+        return (
+            f"the call came up and went down and the engine logged {', '.join(missing)}. "
+            f"The Call adapter writes one line per cue it played, naming the output device "
+            f"and the span written, and a device it could not open is logged as a refusal "
+            f"instead. Engine log tail: {list(lines[-8:])}"
+        )
+    thin = [f"{cue}: {[lines[index] for index in named[cue]]}" for cue in wanted if not at[cue]]
+    if thin:
+        return (
+            f"a cue was logged without the output device and the span written, which is what "
+            f"this step reads it for. Expected a line carrying "
+            f"{[_cue_record(cue, device) for cue in wanted]}; got {thin}"
+        )
+    if not spoken_at:
+        return "no user speech line to order the cues against"
+    if at[Cue.CONNECTED][0] > spoken_at[0]:
+        return (
+            f"the connected cue was logged at line {at[Cue.CONNECTED][0]}, after the user speech "
+            f"at {spoken_at[0]} — a cue for the call coming up that arrived after the call had "
+            f"already been talked into"
+        )
+    if at[Cue.ENDED][-1] < spoken_at[0]:
+        return (
+            f"the ended cue was logged at line {at[Cue.ENDED][-1]}, before the user speech at "
+            f"{spoken_at[0]} — that is not this call's ending"
+        )
+    return ""
+
+
 def _ended_by(*, end_reason: str | None, by_ceiling: bool, by_agent: bool) -> str:
     """Who ended the call — and `lost` and `ceiling` are answers, not shades of `agent`.
 
@@ -427,6 +520,15 @@ LIVE_CALL_HANDOFF_SECONDS = 120.0
 
 #: And how long the call then gets to actually go down.
 LIVE_CALL_END_SECONDS = 60.0
+
+#: How long the ENDED cue's own log line gets to appear after the call is down.
+#: The cue is played off the dispatch loop, on the adapter's own thread, and the
+#: line is written when the device write has drained — 320-620 ms of wall time
+#: for 60-300 ms of sound on this path (#174). Ten seconds is that with room for
+#: a machine under load, and it is a wait rather than a single read because a
+#: read taken the instant `bridgectl status` says `call: none` would be racing
+#: a thread that had not been scheduled yet.
+LIVE_CALL_CUE_SECONDS = 10.0
 
 #: How long the long variant's answer can itself take. Measured, not guessed:
 #: the Voice counted to two hundred in 220s on run `20260902T162146Z` (its
@@ -2364,6 +2466,18 @@ class Walk:
         (deferred, #195). The guess stays visible instead: every verb, in order,
         into `verdict.json`.
 
+        **The two cues, in order** (#186). The user hears the call connect and
+        hears it end, and the engine's log is where a step that cannot hear
+        reads that: `CallStarted` and `CallEnded` are events the hub notes into
+        the interlock without writing a line, so the Call adapter's own record
+        of the cue it played — naming the output device and the span written —
+        is the only witness there is. CONNECTED is ordered against the user
+        speech line, which is the one engine line this call's other half
+        produces; ENDED is ordered after it, and is waited for, because it is
+        played *after* the call's audio has closed and the log is written from a
+        thread. Whether either was audible is #174's ear test, never this
+        step's (#181: never on audio).
+
         Everything else this step learns is **recorded, never graded**: the
         transport factory, the wav variant, the end reason the audio path saw,
         and whether the agent or the harness ended the call.
@@ -2391,6 +2505,14 @@ class Walk:
             if not by_agent:
                 self._end_any_live_call()
             ended = self._call_is_down()
+            # The cue is played off the dispatch loop, on a thread of the
+            # adapter's own, so the line lands a moment after the call is
+            # already down. Waited for rather than read once.
+            support.wait_for(
+                lambda: bool(self._cue_lines(Cue.ENDED, since=call.mark)),
+                deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
         seen = live_call.observed(self.config.call_observations)
         ended_by = _ended_by(
             end_reason=seen.end_reason,
@@ -2412,6 +2534,17 @@ class Walk:
             "live call bridgectl runs",
             f"{len(runs)} logged in {self.config.cli_wrapper_log}; verbs in order: "
             f"{verbs or 'none'}; the call was ended by the {ended_by}",
+        )
+        cues_played = self._cue_order(since=call.mark)
+        cue_lines = [
+            self._log_since(call.mark)[at]
+            for cue in (Cue.CONNECTED, Cue.ENDED)
+            for at in self._cue_lines(cue, since=call.mark)
+        ]
+        self.journey.observe(
+            "live call cues",
+            f"cues in order: {cues_played or 'none'}; the adapter's own lines, which "
+            f"name the output device and the span written: {cue_lines or 'none'}",
         )
         if not heard:
             raise StepFailed(
@@ -2435,6 +2568,7 @@ class Walk:
                 f"the call was still up after the step asked it to end "
                 f"({self._call_line()!r}). Verbs the Call Agent ran: {verbs or 'none'}"
             )
+        self._graded_the_two_cues(call.mark)
         # The three observations the ticket asks `verdict.json` to carry. Graded
         # rather than merely written down: a run that recorded none of them is a
         # run whose Call adapter never wrote its file, and a green step that says
@@ -2456,8 +2590,8 @@ class Walk:
             )
         return (
             f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; "
-            f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; call down "
-            f"({self._call_line()!r}), ended by the {ended_by}; transport "
+            f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; cues {cues_played}; "
+            f"call down ({self._call_line()!r}), ended by the {ended_by}; transport "
             f"{seen.transport_factory}, wav variant {seen.variant!r}, ended {seen.end_reason!r}"
         )
 
@@ -2716,6 +2850,49 @@ class Walk:
             for line in support.matching_lines(self._log_since(since), USER_SPEECH_LINE)
             if _unspaced(carrying) in _unspaced(line)
         ]
+
+    def _graded_the_two_cues(self, mark: int) -> None:
+        """The user heard the call connect and heard it end, in that order (#186).
+
+        The reading is taken here and judged by `_cue_complaint`, which is a
+        module-level function with no walk behind it so CI grades the rule
+        itself — an acceptance run is an expensive place to discover an ordering
+        written the wrong way round (#109).
+
+        The speech lines are read first and the whole log second, so what is
+        searched is a superset of what is searched for: the log grows while this
+        runs, and the other way round a line could be looked for in a reading
+        taken before it was written.
+        """
+        spoken = set(self._user_speech_lines(since=mark))
+        complaint = _cue_complaint(
+            self._log_since(mark), spoken, device=self._configured_output_device()
+        )
+        if complaint:
+            raise StepFailed(complaint)
+
+    def _configured_output_device(self) -> int | None:
+        """Which output index this lane's engine sends cues to, if it was told one.
+
+        Read out of the lane's own config rather than assumed, the way the
+        Silence Ceiling is: the adapter names whatever it was given in the line
+        this step matches, and a run that pinned a device would otherwise be
+        graded against a line for a device it is not using.
+        """
+        document = tomllib.loads(self.config.path.read_text())
+        table = document.get("adapters", {}).get("settings", {}).get("call", {})
+        given = table.get("output_device")
+        return None if given is None else int(given)
+
+    def _cue_lines(self, cue: Cue, *, since: int = 0) -> list[int]:
+        """Where in this call's log each `cue` was played, as offsets from the mark."""
+        return _cue_line_indices(self._log_since(since), cue)
+
+    def _cue_order(self, *, since: int = 0) -> list[str]:
+        """Every cue this call played, in the order the engine wrote them down."""
+        lines = self._log_since(since)
+        played = [(line_index, cue) for cue in Cue for line_index in _cue_line_indices(lines, cue)]
+        return [str(cue) for _, cue in sorted(played)]
 
     def _voice_speech_edges(self, *, since: int = 0) -> dict[bool, int]:
         """How many times the engine wrote each edge of its own Voice down (#184).
