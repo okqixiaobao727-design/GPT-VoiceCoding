@@ -78,14 +78,20 @@ class ChildSessionError(SessionError):
 
 
 class ProgressUnavailable(SessionError):
-    """Nothing on this machine can say how far that Session has got.
+    """Nothing on this machine can read what that Session said.
 
-    The honest error #76 asks the `progress` verb for, and it is a refusal rather
-    than an answer carrying no progress for the reason the whole ticket turns on:
+    The honest error #76 asks for and #171 keeps on the `history` verb, and it is
+    a refusal rather than an empty page, for the reason both tickets turn on:
     "nobody could read it" and "it has said nothing" are different facts, and a
     surface handed the first as the second reports a working Session as an idle
-    one. A Session that *was* read and had said nothing comes back as an ordinary
-    answer with an empty reading.
+    one. A Session that *was* read and has nothing before the cursor comes back
+    as an ordinary answer with an empty page.
+
+    **Named for the observation, not for the retired verb.** `progress` is still
+    what the Agent seam calls the reading a lane takes of a Session's own record
+    (`ProgressObservation`); what retired is the *action* that published it
+    exactly (#171). This is that reading being unavailable, and it is raised by
+    `history` alone.
 
     Two ways to arrive here, and neither may be papered over: a Codex Session the
     shared daemon does not hold — its rollout is on disk and reading it would be
@@ -99,7 +105,7 @@ class ProgressUnavailable(SessionError):
 
     def __init__(self, target: SessionTarget) -> None:
         super().__init__(
-            f"nothing has read how far {target} has got: this engine reads a Session's "
+            f"nothing has read what {target} said: this engine reads a Session's "
             "own record and never infers one"
         )
         self.target = target

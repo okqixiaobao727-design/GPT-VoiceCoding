@@ -19,14 +19,18 @@ adapter's issue.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._progress import page as history_page
 from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
+    HistoryPage,
     LaneDiscovery,
+    ProgressEntry,
     RelayRoute,
     ReplyWindow,
     SessionInspection,
@@ -117,6 +121,15 @@ class FakeAgent:
         #: one thing on this seam that raises, and a lane that could not look
         #: must not be answerable as a Session that said nothing.
         self.inspect_raises: Exception | None = None
+        #: Every visible entry this fake's lane holds per target, oldest first
+        #: and already numbered — what a real lane builds before anything trims
+        #: it. Absent means this lane holds no record for that target, which is
+        #: `read_at=None` and not an empty page.
+        self.records: dict[SessionTarget, tuple[ProgressEntry, ...]] = {}
+        #: Every `(target, before, count)` this fake was asked for, in order.
+        self.pages: list[tuple[SessionTarget, int | None, int]] = []
+        #: What `history` raises instead of answering.
+        self.history_raises: Exception | None = None
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         return self._routes
@@ -202,6 +215,31 @@ class FakeAgent:
             workspace=Path("/nowhere"),
             lifecycle=SessionLifecycle.ENDED,
             state=SessionState.IDLE,
+        )
+
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page over whatever record a test gave this fake.
+
+        It calls the same shared window both real lanes call, so a test that
+        pages this fake is testing the product's windowing and not a second
+        implementation of it.
+        """
+        self.pages.append((target, before, count))
+        if self.history_raises is not None:
+            raise self.history_raises
+        if target not in self.records:
+            return HistoryPage()
+        return history_page(
+            self.records[target],
+            before=before,
+            count=count,
+            read_at=datetime.now(UTC),
         )
 
     async def verify(self) -> VerifyResult:

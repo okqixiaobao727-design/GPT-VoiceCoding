@@ -39,7 +39,7 @@ The full form of a Session Brief's facts, given when the user asks: the newest m
 _Avoid_: stop detail, expansion
 
 **History**:
-What one Session said and was told before its newest message, read on request in pages of a configured size (default five entries, both sides counted, newest first). A page names each entry's place in the Session's record so the next request can ask for the entries before it; an entry too large to carry is named as omitted, never dropped without a word. The page size is a count; the wire's byte ceiling stays a ceiling.
+What one Session said and was told, read on request in pages of a configured size (default five entries, both sides counted, newest first). Asked without a cursor it is the newest page, and that page includes the newest message: every page is complete on its own. A page names each entry's place in the Session's record so the next request can ask for the entries before it; an entry too large to carry is named as omitted, never dropped without a word. The page size is a count; the wire's byte ceiling stays a ceiling.
 _Avoid_: progress (the retired verb), transcript, log, tail
 
 **Stop Notice**:

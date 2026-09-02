@@ -24,6 +24,7 @@ from fakes import FakeAgent, FakeCall, FakeCompanionChannel, instruction_context
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.bridge import BridgeCore
+from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import RelayQueue
 from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
@@ -37,7 +38,6 @@ from gpt_voicecoding.seams.agent import (
     LaneDiscovery,
     LaneUnavailable,
     Option,
-    ProgressAvailability,
     ProgressEntry,
     ProgressObservation,
     ProgressOmission,
@@ -78,7 +78,13 @@ def wire(reply: Reply) -> bytes:
 class Surface:
     """One assembled engine-side control plane, and the knobs a test needs."""
 
-    def __init__(self, *, duty: bool = True, max_bytes: int = 65_536) -> None:
+    def __init__(
+        self,
+        *,
+        duty: bool = True,
+        max_bytes: int = 65_536,
+        page_entries: int = CorePolicy().history_page_entries,
+    ) -> None:
         self.agent = FakeAgent()
         self.call = FakeCall()
         self.channel = FakeCompanionChannel()
@@ -95,6 +101,7 @@ class Surface:
             agents={AgentKind.CLAUDE: self.agent, AgentKind.CODEX: self.agent},
             inventory=(SeamLoad(seam="call", configured="a.call"),),
             instruction_context=instruction_context(),
+            policy=CorePolicy(history_page_entries=page_entries),
         )
         self.plane = ControlPlane(
             self.core,
@@ -128,9 +135,10 @@ class TestWithEverySwitchOff:
     def test_every_action_succeeds_with_duty_voice_and_message_off(self) -> None:
         surface = Surface(duty=False)
         surface.register()
-        # `progress` needs something to have been read, or it refuses for a real
+        # `history` needs a lane that holds a record, or it refuses for a real
         # reason — which is not this test's subject. The subject is that no
-        # *switch* refuses anything, so the lane is given a reading to answer.
+        # *switch* refuses anything, so the lane is given one to answer from.
+        surface.agent.records[CODEX] = ()
         surface.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -154,7 +162,7 @@ class TestWithEverySwitchOff:
             Action.STATUS: surface.ask(Action.STATUS),
             Action.SWITCH: surface.ask(Action.SWITCH, name="duty", on=False),
             Action.BRIEF: surface.ask(Action.BRIEF),
-            Action.PROGRESS: surface.ask(Action.PROGRESS, target=CODEX_ADDRESS),
+            Action.HISTORY: surface.ask(Action.HISTORY, target=CODEX_ADDRESS),
             Action.LIVE: surface.ask(Action.LIVE),
             Action.RELAY: surface.ask(Action.RELAY, target=CODEX_ADDRESS, text="carry on"),
             Action.APPROVE: surface.ask(Action.APPROVE, approval_id="a1", verdict="allow"),
@@ -302,6 +310,7 @@ class TestStatus:
                         has_history=True,
                         recent=(
                             ProgressEntry(
+                                ordinal=0,
                                 role=ProgressRole.ASSISTANT,
                                 text="x" * 20_000,
                             ),
@@ -489,244 +498,171 @@ def test_every_action_is_dispatchable(action: Action) -> None:
     assert action in ControlPlane(Surface().core).handlers
 
 
-class TestProgress:
-    """#76's verb: one exact Session, read now, and never a turn."""
+class TestHistory:
+    """#171's verb: one page of one Session's own words, older on request."""
 
-    def stopped(self, *, said: str = "done") -> LaneDiscovery:
-        return LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=WORKSPACE,
-                    state=SessionState.IDLE,
-                    progress=ProgressObservation.readable(
-                        has_history=True,
-                        recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text=said),),
-                        omission=ProgressOmission.OLDER,
-                        read_at=READ_AT,
-                    ),
-                    last_activity=READ_AT,
-                ),
+    SAID = (
+        "the first thing",
+        "the second thing",
+        "the third thing",
+        "the fourth thing",
+        "the fifth thing",
+        "the sixth thing",
+        "the seventh thing",
+    )
+
+    def record(self, said: tuple[str, ...] | None = None) -> tuple[ProgressEntry, ...]:
+        """One Session's whole visible record, oldest first and numbered."""
+        return tuple(
+            ProgressEntry(
+                ordinal=index,
+                role=ProgressRole.USER if index % 2 == 0 else ProgressRole.ASSISTANT,
+                text=text,
             )
+            for index, text in enumerate(self.SAID if said is None else said)
         )
 
-    def test_one_session_is_read_now_and_rendered_as_a_roster_row(self) -> None:
-        """The same row shape `status` carries: a surface learns no second one."""
-        surface = Surface()
+    def surface(self, said: tuple[str, ...] | None = None, **kwargs: object) -> Surface:
+        surface = Surface(**kwargs)  # type: ignore[arg-type]
         surface.register()
-        surface.agent.discovery = self.stopped()
+        surface.agent.records[CODEX] = self.record(said)
+        return surface
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+    def test_the_newest_page_includes_the_newest_entry(self) -> None:
+        """Every page is complete on its own; the engine remembers nothing (#171)."""
+        surface = self.surface()
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert reply.ok
-        session = reply.data["session"]
-        assert session["target"] == CODEX_ADDRESS
-        assert session["progress"] == {
-            "availability": "readable",
-            "has_history": True,
-            "omission": "older",
-            "read_at": READ_AT.isoformat(),
-            "recent": [{"role": "assistant", "text": "done"}],
-        }
-        assert session["last_activity"] == READ_AT.isoformat()
+        assert [entry["text"] for entry in reply.data["entries"]] == [
+            "the seventh thing",
+            "the sixth thing",
+            "the fifth thing",
+            "the fourth thing",
+            "the third thing",
+        ]
+        assert [entry["ordinal"] for entry in reply.data["entries"]] == [6, 5, 4, 3, 2]
+        assert reply.data["older"] is True
 
-    def test_progress_renders_the_live_reply_window_for_an_answerable_question(self) -> None:
-        surface = Surface()
-        surface.register()
-        surface.agent.answerable_questions.add(CODEX)
-        surface.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=WORKSPACE,
-                    state=SessionState.WAITING,
-                    waiting_for=WaitingFor(
-                        kind=WaitingKind.QUESTION,
-                        prompt="Which base?",
-                    ),
-                    progress=ProgressObservation.readable(
-                        has_history=False,
-                        read_at=READ_AT,
-                    ),
-                ),
-            )
+    def test_the_page_size_is_the_engines_dial_and_never_the_callers(self) -> None:
+        surface = self.surface(page_entries=2)
+
+        entries = surface.ask(Action.HISTORY, target=CODEX_ADDRESS).data["entries"]
+
+        assert [entry["ordinal"] for entry in entries] == [6, 5]
+
+    def test_the_cursor_asks_for_the_entries_before_it(self) -> None:
+        surface = self.surface()
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before=2)
+
+        assert [entry["ordinal"] for entry in reply.data["entries"]] == [1, 0]
+        assert reply.data["older"] is False
+
+    def test_a_cursor_past_the_oldest_entry_is_an_empty_page_rather_than_a_refusal(
+        self,
+    ) -> None:
+        """An answer, not a refusal: there is simply nothing before the first thing said."""
+        surface = self.surface()
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before=0)
+
+        assert reply.ok
+        assert reply.data["entries"] == []
+        assert reply.data["older"] is False
+        assert reply.data["read_at"] is not None
+
+    def test_a_cursor_above_every_ordinal_is_the_newest_page(self) -> None:
+        surface = self.surface()
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before=9_999)
+
+        assert [entry["ordinal"] for entry in reply.data["entries"]] == [6, 5, 4, 3, 2]
+
+    def test_fewer_entries_than_a_page_is_the_whole_history(self) -> None:
+        surface = self.surface(said=("only this", "and this"))
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
+
+        assert [entry["ordinal"] for entry in reply.data["entries"]] == [1, 0]
+        assert reply.data["older"] is False
+
+    def test_an_ordinal_names_the_same_entry_across_a_read_while_the_session_appends(
+        self,
+    ) -> None:
+        """Both sources are append-only for what this seam keeps, so a cursor holds."""
+        surface = self.surface()
+        first = surface.ask(Action.HISTORY, target=CODEX_ADDRESS).data
+
+        surface.agent.records[CODEX] = self.record((*self.SAID, "and one more"))
+        after = surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before=2).data
+
+        assert [entry["ordinal"] for entry in first["entries"]] == [6, 5, 4, 3, 2]
+        assert [entry["text"] for entry in after["entries"]] == [
+            "the second thing",
+            "the first thing",
+        ]
+
+    def test_an_oversize_entry_keeps_its_slot_and_the_page_advances(self) -> None:
+        """ADR 0016: named as omitted, never cut, and never silently dropped."""
+        surface = self.surface(
+            said=("small one", "x" * 4_000, "another small one"),
+            max_bytes=2_048,
         )
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert reply.ok
-        assert reply.data["session"]["reply_window"] == "open"
+        assert reply.data["entries"] == [
+            {"ordinal": 2, "role": "user", "text": "another small one"},
+            {"ordinal": 1, "role": "assistant", "omission": "oversize"},
+            {"ordinal": 0, "role": "user", "text": "small one"},
+        ]
+        assert len(wire(reply)) <= 2_048
 
-    def test_it_asks_the_lane_rather_than_answering_from_the_roster(self) -> None:
-        """A cached answer would make the verb no fresher than the tick beside it."""
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = self.stopped()
+    def test_a_page_is_never_folded_into_the_roster(self) -> None:
+        """`inspect` is the roster's read; a page is a separate one (ADR 0016)."""
+        surface = self.surface()
 
-        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
-        assert surface.agent.inspections == [CODEX]
+        assert surface.agent.inspections == []
         assert surface.agent.calls == []
-
-    def test_the_reading_becomes_the_rosters_truth(self) -> None:
-        """Asking for progress then asking for status cannot say two things."""
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = self.stopped(said="halfway")
-
-        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-        roster = surface.ask(Action.STATUS).data["sessions"]
-
-        assert roster[0]["progress"] == {
-            "availability": "readable",
-            "has_history": True,
-            "omission": "status_summary",
-            "read_at": READ_AT.isoformat(),
+        assert surface.ask(Action.STATUS).data["sessions"][0]["progress"] == {
+            "availability": "not_read",
+            "has_history": None,
+            "omission": "none",
+            "read_at": None,
             "recent": [],
         }
 
-    def test_it_ends_nothing_it_did_not_look_at(self) -> None:
-        """A verb asked about one Session concludes nothing about the others."""
-        surface = Surface()
-        surface.register()
-        surface.register(SECOND_CODEX)
-        surface.agent.discovery = self.stopped()
+    def test_one_lane_read_per_page(self) -> None:
+        """A second `inspect` for a fresher staleness check would fold it back in."""
+        surface = self.surface()
 
-        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before=4)
 
-        assert len(surface.ask(Action.STATUS).data["sessions"]) == 2
+        assert surface.agent.pages == [(CODEX, 4, 5)]
 
     def test_a_session_nobody_registered_is_refused_by_identity(self) -> None:
         surface = Surface()
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert reply.error is not None
         assert reply.error.code is ErrorCode.UNKNOWN_SESSION
+        assert surface.agent.pages == []
 
-    def test_a_lane_that_could_not_look_refuses_rather_than_saying_nothing_happened(
-        self,
-    ) -> None:
-        """ "I could not look" and "it has said nothing" are different facts."""
-        surface = Surface()
-        surface.register()
-        surface.agent.inspect_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
+    def test_a_session_that_has_ended_is_a_stale_target_not_an_empty_page(self) -> None:
+        surface = self.surface()
+        surface.state.sessions.observe(AgentKind.CODEX, LaneDiscovery(), now=1.0)
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "`codex` is not on PATH" in reply.error.message
-
-    def test_an_unreadable_observation_refuses_with_its_source_reason(self) -> None:
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=WORKSPACE,
-                    state=SessionState.IDLE,
-                    progress=ProgressObservation.unreadable("the rollout could not be decoded"),
-                ),
-            )
-        )
-
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "the rollout could not be decoded" in reply.error.message
-        assert (
-            surface.state.sessions.resolve(CODEX).progress.availability
-            is ProgressAvailability.NOT_READ
-        )
-
-    def test_a_lane_that_could_not_look_leaves_the_row_as_it_was(self) -> None:
-        surface = Surface()
-        surface.register()
-        surface.agent.inspect_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
-
-        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert surface.ask(Action.STATUS).data["sessions"][0]["lifecycle"] == "live"
-
-    def test_a_session_with_no_readable_progress_refuses_rather_than_says_nothing(
-        self,
-    ) -> None:
-        """An unattached Codex row, or one whose first turn wrote no record (#73).
-
-        The refusal is #76's "honest error for an unattached or ended row": a
-        surface handed a successful reply carrying no progress would render a
-        Session nobody could read as one that has said nothing.
-        """
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = LaneDiscovery(
-            rows=(SessionInspection(target=CODEX, workspace=WORKSPACE, state=SessionState.IDLE),)
-        )
-
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert reply.error is not None
-        assert reply.error.code is ErrorCode.REFUSED
-        assert "never infers one" in reply.error.message
-
-    def test_a_session_read_and_found_silent_answers_rather_than_refuses(self) -> None:
-        """The other side of that line, and the whole reason it is drawn."""
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=WORKSPACE,
-                    state=SessionState.IDLE,
-                    progress=ProgressObservation.readable(
-                        has_history=False,
-                        read_at=READ_AT,
-                    ),
-                ),
-            )
-        )
-
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert reply.ok
-        assert reply.data["session"]["progress"] == {
-            "availability": "readable",
-            "has_history": False,
-            "omission": "none",
-            "read_at": READ_AT.isoformat(),
-            "recent": [],
-        }
-
-    def test_a_session_that_has_ended_is_a_stale_target_not_an_empty_answer(self) -> None:
-        """#76's other honest error."""
-        surface = Surface()
-        surface.register()
-        surface.agent.discovery = LaneDiscovery()  # a lane that looked and found nothing
-
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert reply.error is not None
         assert reply.error.code is ErrorCode.STALE_SESSION
-
-    def test_it_does_not_end_the_row_itself(self) -> None:
-        """Ending a row is `observe`'s, and only `observe`'s.
-
-        The value an `inspect` answers for a Session it could not find carries no
-        workspace and no name, so folding it into the roster would strip the very
-        fields a surface needs to say what happened to it. The next discovery
-        ends it properly, within one cadence.
-        """
-        surface = Surface()
-        held = surface.register()
-        surface.agent.discovery = LaneDiscovery()
-
-        surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
-
-        assert surface.state.sessions.all() == (held,)
+        assert surface.agent.pages == []
 
     def test_a_child_process_is_refused_before_any_lane_is_touched(self) -> None:
         """Seen, never spoken to — and never asked on its own behalf either (#68)."""
@@ -740,87 +676,73 @@ class TestProgress:
             )
         )
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert reply.error is not None
-        assert surface.agent.inspections == []
+        assert surface.agent.pages == []
 
-    def test_a_5482_byte_entry_is_returned_whole_when_the_complete_reply_fits(self) -> None:
-        text = "x" * 5_447
+    def test_a_lane_that_could_not_look_refuses_rather_than_saying_nothing_was_said(
+        self,
+    ) -> None:
+        """ "I could not look" and "it has said nothing" are different facts."""
+        surface = self.surface()
+        surface.agent.history_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
+
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
+
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "`codex` is not on PATH" in reply.error.message
+
+    def test_a_lane_holding_no_record_refuses_rather_than_answering_an_empty_page(
+        self,
+    ) -> None:
+        """A Codex thread the daemon does not hold, or a transcript nobody named."""
         surface = Surface()
         surface.register()
-        surface.agent.discovery = self.stopped(said=text)
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
-        assert reply.ok
-        assert reply.data["session"]["progress"]["recent"] == [{"role": "assistant", "text": text}]
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.REFUSED
+        assert "never infers one" in reply.error.message
 
-    def test_a_newest_entry_that_cannot_fit_is_history_not_silence(self) -> None:
-        surface = Surface(max_bytes=1_024)
-        surface.register()
-        surface.agent.discovery = self.stopped(said="x" * 2_000)
+    def test_a_lane_that_could_not_look_leaves_the_row_as_it_was(self) -> None:
+        surface = self.surface()
+        surface.agent.history_raises = LaneUnavailable(AgentKind.CODEX, "`codex` is not on PATH")
 
-        reply = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
-        assert reply.ok
-        assert reply.data["session"]["progress"] == {
-            "availability": "readable",
-            "has_history": True,
-            "omission": "newest_oversize",
-            "read_at": READ_AT.isoformat(),
-            "recent": [],
-        }
+        assert surface.ask(Action.STATUS).data["sessions"][0]["lifecycle"] == "live"
 
-    def test_exact_progress_keeps_the_newest_whole_tail_in_chronological_order(self) -> None:
-        surface = Surface(max_bytes=1_024)
-        surface.register()
-        surface.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=WORKSPACE,
-                    state=SessionState.IDLE,
-                    progress=ProgressObservation.readable(
-                        has_history=True,
-                        recent=(
-                            ProgressEntry(role=ProgressRole.USER, text="x" * 2_000),
-                            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
-                        ),
-                        omission=ProgressOmission.NONE,
-                        read_at=READ_AT,
-                    ),
-                ),
-            )
-        )
+    def test_a_cursor_that_is_not_an_ordinal_is_an_unusable_payload(self) -> None:
+        surface = self.surface()
 
-        progress = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS).data["session"]["progress"]
+        reply = surface.ask(Action.HISTORY, target=CODEX_ADDRESS, before="newest")
 
-        assert progress["recent"] == [{"role": "assistant", "text": "done"}]
-        assert progress["omission"] == "older"
+        assert reply.error is not None
+        assert reply.error.code is ErrorCode.INVALID_PAYLOAD
 
     def test_unicode_and_json_escaping_are_measured_as_actual_wire_bytes(self) -> None:
         text = ('雪"\\\n' * 90) + "done"
-        measuring = Surface()
-        measuring.register()
-        measuring.agent.discovery = self.stopped(said=text)
-        complete = measuring.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        measuring = self.surface(said=("small one", text))
+        complete = measuring.ask(Action.HISTORY, target=CODEX_ADDRESS)
         exact_capacity = len(wire(complete))
 
-        fitting = Surface(max_bytes=exact_capacity)
-        fitting.register()
-        fitting.agent.discovery = self.stopped(said=text)
-        fits = fitting.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        fitting = self.surface(said=("small one", text), max_bytes=exact_capacity)
+        fits = fitting.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
-        too_small = Surface(max_bytes=exact_capacity - 1)
-        too_small.register()
-        too_small.agent.discovery = self.stopped(said=text)
-        omitted = too_small.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        too_small = self.surface(said=("small one", text), max_bytes=exact_capacity - 1)
+        omitted = too_small.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
-        assert fits.data["session"]["progress"]["recent"][0]["text"] == text
+        assert fits.data["entries"][0]["text"] == text
         assert len(wire(fits)) == exact_capacity
-        assert omitted.data["session"]["progress"]["recent"] == []
-        assert omitted.data["session"]["progress"]["omission"] == "newest_oversize"
+        assert omitted.data["entries"][0] == {
+            "ordinal": 1,
+            "role": "assistant",
+            "omission": "oversize",
+        }
+        assert omitted.data["entries"][1]["text"] == "small one"
         assert len(wire(omitted)) <= exact_capacity - 1
 
 
@@ -842,7 +764,11 @@ class TestBrief:
                     ),
                     progress=ProgressObservation.readable(
                         has_history=True,
-                        recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text="I got this far"),),
+                        recent=(
+                            ProgressEntry(
+                                ordinal=0, role=ProgressRole.ASSISTANT, text="I got this far"
+                            ),
+                        ),
                         read_at=READ_AT,
                     ),
                     last_activity=READ_AT,
@@ -1020,7 +946,7 @@ class TestBrief:
     def test_a_session_whose_progress_could_not_be_read_is_briefed_not_refused(self) -> None:
         """Where `brief` and `progress` part, and why.
 
-        `progress` exists to answer with a Session's own words and has nothing
+        `history` exists to answer with a Session's own words and has nothing
         to say without them. A brief still has a state, a wait and a name, so an
         unreadable reading becomes a state the user is told about rather than a
         refusal that tells them nothing.
@@ -1040,11 +966,11 @@ class TestBrief:
         )
 
         brief = surface.ask(Action.BRIEF, target=CODEX_ADDRESS)
-        progress = surface.ask(Action.PROGRESS, target=CODEX_ADDRESS)
+        history = surface.ask(Action.HISTORY, target=CODEX_ADDRESS)
 
         assert brief.ok
         assert brief.data["session"]["state"] == "unreadable"
-        assert progress.error is not None
+        assert history.error is not None
 
     def test_a_newest_message_too_large_for_the_line_is_named_rather_than_sliced(self) -> None:
         """ADR 0016 at the wire: the brief still answers, and says what it dropped.
@@ -1065,7 +991,9 @@ class TestBrief:
                     waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
                     progress=ProgressObservation.readable(
                         has_history=True,
-                        recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text="x" * 4_000),),
+                        recent=(
+                            ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text="x" * 4_000),
+                        ),
                         read_at=READ_AT,
                     ),
                 ),

@@ -42,7 +42,7 @@ def said(text: str) -> ProgressObservation:
     return ProgressObservation.readable(
         has_history=True,
         read_at=READ_AT,
-        recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text=text),),
+        recent=(ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text=text),),
     )
 
 
@@ -149,7 +149,7 @@ def codex_said(*said: tuple[str, str | None]) -> ProgressObservation:
         has_history=True,
         read_at=READ_AT,
         recent=tuple(
-            ProgressEntry(role=ProgressRole.ASSISTANT, text=text, phase=phase)
+            ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text=text, phase=phase)
             for text, phase in said
         ),
     )
@@ -157,7 +157,7 @@ def codex_said(*said: tuple[str, str | None]) -> ProgressObservation:
 
 def told(text: str) -> ProgressEntry:
     """What the Session was told — and, in a tail, where a turn begins."""
-    return ProgressEntry(role=ProgressRole.USER, text=text)
+    return ProgressEntry(ordinal=0, role=ProgressRole.USER, text=text)
 
 
 def codex_tail(*entries: ProgressEntry) -> ProgressObservation:
@@ -166,7 +166,7 @@ def codex_tail(*entries: ProgressEntry) -> ProgressObservation:
 
 
 def answer(text: str, phase: str | None = FINAL_ANSWER) -> ProgressEntry:
-    return ProgressEntry(role=ProgressRole.ASSISTANT, text=text, phase=phase)
+    return ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text=text, phase=phase)
 
 
 def codex_state(*said: tuple[str, str | None]) -> BriefState:

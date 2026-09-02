@@ -113,8 +113,8 @@ def test_the_closure_is_transitive() -> None:
 
 
 def test_a_step_that_reads_a_turn_brings_the_step_that_drove_one() -> None:
-    """`progress` wants history and `stop notice` wants a Stop; `stable name` is the turn."""
-    assert journey.select(("progress",)).setup == ("roster", "stable name")
+    """`brief` wants history and `stop notice` wants a Stop; `stable name` is the turn."""
+    assert journey.select(("brief",)).setup == ("roster", "stable name")
     assert journey.select(("stop notice",)).setup == ("roster", "stable name")
 
 

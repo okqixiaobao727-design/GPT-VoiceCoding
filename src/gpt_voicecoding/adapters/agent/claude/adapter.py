@@ -61,6 +61,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._progress import page as history_page
 from gpt_voicecoding.adapters.agent._progress import source_degradation
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude import (
@@ -98,6 +99,7 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
+    HistoryPage,
     LaneDiscovery,
     LaneUnavailable,
     ProgressAvailability,
@@ -784,6 +786,37 @@ class ClaudeAgentAdapter:
             workspace=Path(),
             lifecycle=SessionLifecycle.ENDED,
             state=SessionState.IDLE,
+        )
+
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page of this Session's transcript, newest-first (#171).
+
+        The same records walk `inspect` reads, windowed by the shared function
+        both lanes call — so a sidechain record is out of the ordinals exactly
+        as it is out of the tail, and the two lanes cannot page differently.
+
+        **Not a roster read.** It opens the transcript and nothing else: no
+        enumeration, no Stop analysis, no fold. A transcript this engine was
+        never told about answers `read_at=None`, which Bridge Core turns into
+        the refusal that says nobody could read it — never into an empty page.
+        """
+        try:
+            records = self._transcripts.records(self._transcript_path(target))
+        except TranscriptUnavailable as unreadable:
+            raise LaneUnavailable(AgentKind.CLAUDE, str(unreadable)) from None
+        if records is None:
+            return HistoryPage()
+        return history_page(
+            transcript_tail.visible(records),
+            before=before,
+            count=count,
+            read_at=datetime.now(UTC),
         )
 
     def supported_routes(self) -> frozenset[RelayRoute]:

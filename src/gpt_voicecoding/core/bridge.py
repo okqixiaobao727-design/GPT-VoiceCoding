@@ -71,6 +71,7 @@ from gpt_voicecoding.seams.agent import (
     AgentAdapter,
     ApprovalVerdict,
     AwaitingApproval,
+    HistoryPage,
     LaneUnavailable,
     ProgressAvailability,
     ProgressObservation,
@@ -394,53 +395,58 @@ class BridgeCore:
             question_answerable=self._question_answerable(session.target),
         )
 
-    async def progress(self, target: SessionTarget) -> Session:
-        """How far along one exact Session is, read now. Never starts a turn.
+    async def history(self, target: SessionTarget, *, before: int | None = None) -> HistoryPage:
+        """One page of what an exact Session said and was told, read now (#171).
 
         A hub verb, and a *read*: it resolves one identity, asks that lane and
-        no other, and returns the same `Session` row `status` renders. The
-        reference implementation's own rule, ported —
-        `legacy@1d32845:bridge/daemon.py:2202-2271` resolved one exact registered
+        no other, and returns a page of `history_page_entries` entries
+        newest-first with `older` saying whether more remain. The reference
+        implementation's rule for its one-Session read, ported —
+        `legacy@1d32845:bridge/daemon.py:2202-2271` and
+        `legacy@1d32845:bridge/codex.py:1319-1348` resolved one exact registered
         identity, asked only that agent's own authority, and never fell back to
-        another lane, a terminal or a screen when its source could not answer.
+        another lane, a terminal or a screen. Legacy had **no paging**: its tail
+        was a fixed 12 entries / 32 KB (`legacy@1d32845:config.plist:449-452`,
+        `bridge/transcript.py:2841`), **dropped, because** a fixed tail cannot
+        answer "the five before those". The count-bounded page and the ordinal
+        cursor are new.
 
-        **It is not a Relay and it costs no turn.** The router says so of the
-        whole class (`core/router.py:31-32`) and the seam keeps it true:
-        `inspect` reads what the agent has already written down.
+        **It is not a Relay and it costs no turn**, and it is **not folded into
+        the roster** (ADR 0016's amendment). `inspect` keeps answering the
+        newest tail and folding; a page is a separate read and is not a roster
+        fact, so nothing here observes the row.
 
-        **Three more refusals, and each is a different fact** — #76 asks for an
-        honest error rather than an answer that says nothing:
+        **One lane read per page.** The registry's `resolve` supplies three of
+        the four refusals — an identity nobody registered, a stale one, and a
+        Child Process, which is seen and never spoken to (#68) — and the lane's
+        own read supplies the fourth. A second `inspect` for a fresher staleness
+        check would fold this read back into the cadence it is kept out of.
 
-        - *The lane could not be read.* `LaneUnreadable`, carrying the lane's own
-          words. The roster's row is left exactly as it stood: not being able to
-          look is not a sighting.
-        - *The Session has ended.* `StaleSessionError`. The row is **not** ended
-          here: `SessionRegistry.observe` is the one component that ends rows,
-          and the value an `inspect` returns for a Session it could not find
-          carries no workspace and no name — folding it in would strip the very
-          fields a surface needs to say what happened to it. The next discovery
-          ends it properly, within one cadence.
-        - *Nothing could read how far it has got.* `ProgressUnavailable` — an
-          unattached Codex Session, or one whose first turn has written no record
-          yet. A Session that *was* read and had said nothing is not this: it
-          answers normally, with an empty reading.
+        The fourth refusal is two facts under one code:
 
-        Two further refusals are the resolver's and are not restated here — an
-        identity nobody registered, and a Child Process, which is seen and never
-        spoken to (#68).
-
-        Whatever is read is folded back into the roster before it is answered, so
-        a surface that asks for progress and then asks for `status` cannot be
-        told two different things about one Session.
+        - *The lane could not be read.* `LaneUnreadable`, carrying the lane's
+          own words.
+        - *Nothing could read what it said.* `ProgressUnavailable` — a Codex
+          thread the shared daemon does not hold, or a Claude Session whose
+          transcript this engine was never told about. A Session that *was* read
+          and had nothing before the cursor is not this: it answers with an empty
+          page and `older=False`, which is an answer.
         """
-        row = await self._inspect_now(target)
-        if row.progress.availability is ProgressAvailability.UNREADABLE:
-            assert row.progress.reason is not None
-            raise LaneUnreadable(str(target.agent), row.progress.reason)
-        read = self._state.sessions.observed_one(row, now=self._stamp())
-        if read.progress.availability is ProgressAvailability.NOT_READ:
+        session = self._state.sessions.resolve(target)
+        adapter = self._agents.get(target.agent)
+        if adapter is None:
+            raise LaneUnreadable(str(target.agent), "this engine has no adapter for that agent")
+        try:
+            page = await adapter.history(
+                session.target,
+                before=before,
+                count=self._policy.history_page_entries,
+            )
+        except LaneUnavailable as unread:
+            raise LaneUnreadable(str(unread.agent), unread.reason) from None
+        if page.read_at is None:
             raise ProgressUnavailable(target)
-        return read
+        return page
 
     async def brief(self, target: SessionTarget | None = None) -> RosterBrief | SessionBrief:
         """The Roster Brief, or one Session Brief with Detail — read now.
@@ -461,10 +467,10 @@ class BridgeCore:
         not replying to one, and a read that moved the focus would let the Voice
         change what it speaks first merely by looking.
 
-        Its refusals are `progress`'s, minus two. An unknown identity, a stale
+        Its refusals are `history`'s, minus one. An unknown identity, a stale
         one, a Child Process and a lane that could not be read all refuse here
         exactly as they do there. What does **not** refuse is a Session whose
-        *progress* could not be read: `progress` exists to answer with a
+        *progress* could not be read: `history` exists to answer with a
         Session's own words and has nothing to say without them, while a brief
         still has a state, a wait and a name — so an unreadable reading becomes
         the UNREADABLE state or an unreadable `newest`, which is the honest
@@ -482,10 +488,11 @@ class BridgeCore:
     async def _inspect_now(self, target: SessionTarget) -> SessionInspection:
         """One exact Session, read now through its own lane and no other.
 
-        The shared half of `progress` and `brief`: resolve one identity, ask the
-        one lane that owns it, and refuse rather than answer from somewhere else.
-        The row is returned unfolded, because the two callers fold it on
-        different terms.
+        `brief`'s reading: resolve one identity, ask the one lane that owns it,
+        and refuse rather than answer from somewhere else. The row is returned
+        unfolded, because the caller folds it on its own terms. `history` does
+        not come through here — a page is a separate read that observes nothing
+        (ADR 0016).
         """
         session = self._state.sessions.resolve(target)
         adapter = self._agents.get(target.agent)

@@ -31,12 +31,17 @@ USAGE: dict[Action, str] = {
     Action.STATUS: "status",
     Action.SWITCH: "switch <name> on|off",
     Action.BRIEF: "brief [<agent>:<session id>[:<pid>]]",
-    Action.PROGRESS: "progress <agent>:<session id>[:<pid>]",
+    Action.HISTORY: "history <agent>:<session id>[:<pid>] [--before <ordinal>]",
     Action.LIVE: "live",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
     Action.APPROVE: "approve <approval id> allow|deny|ask",
     Action.VERIFY: "verify",
 }
+
+#: The word that asks for the page before one already given. Spelled out, and
+#: taking the ordinal beside it, because a bare number after an address would
+#: read as a count of entries — which is configuration, not a caller's to choose.
+BEFORE_FLAG = "--before"
 
 #: The word that asks for the mid-turn route. Spelled out, because route follows
 #: the user's explicit intent and is never inferred from how busy a Session is.
@@ -72,9 +77,8 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
         case Action.APPROVE:
             approval_id, verdict = _exactly(action, arguments, 2)
             return {"approval_id": approval_id, "verdict": verdict}
-        case Action.PROGRESS:
-            (address,) = _exactly(action, arguments, 1)
-            return {"target": parse_address(address)}
+        case Action.HISTORY:
+            return _history(arguments)
     raise CommandError(f"no command called {action!r}")  # unreachable: the set is closed
 
 
@@ -89,6 +93,43 @@ def _brief(arguments: list[str]) -> dict[str, object]:
         return {}
     (address,) = _exactly(Action.BRIEF, arguments, 1)
     return {"target": parse_address(address)}
+
+
+def _history(arguments: list[str]) -> dict[str, object]:
+    """`history <address>` is the newest page; `--before <ordinal>` is the one before it.
+
+    The page size is never on the line: it is `[policy] history_page_entries`,
+    so two surfaces cannot ask one engine for two different pages of one Session.
+    """
+    remaining = list(arguments)
+    before: object = None
+    if BEFORE_FLAG in remaining:
+        flag = remaining.index(BEFORE_FLAG)
+        if flag + 1 >= len(remaining):
+            raise CommandError(f"say it as: {USAGE[Action.HISTORY]}")
+        before = _ordinal(remaining[flag + 1])
+        del remaining[flag : flag + 2]
+    (address,) = _exactly(Action.HISTORY, remaining, 1)
+    return {"target": parse_address(address), "before": before}
+
+
+def _ordinal(word: str) -> int:
+    """One entry's place in a Session's record, as a surface wrote it back.
+
+    **Read by asking `int`, not by deciding it looks like a number.** `str.isdigit`
+    is true of every decimal digit Unicode has — `"\u00b2"` among them — and it is
+    also true of 4,301 ASCII digits, which `int` refuses under CPython's own
+    conversion limit. Both reached `int` behind a spelling test and came back as a
+    traceback where the surface had asked for a refusal it could print. The
+    conversion is the test, so there is nothing left for a second one to miss.
+    """
+    try:
+        ordinal = int(word)
+    except ValueError:
+        raise CommandError(f"not an entry's ordinal: {word!r}") from None
+    if ordinal < 0:
+        raise CommandError("an ordinal counts from the oldest entry, at 0")
+    return ordinal
 
 
 def _relay(arguments: list[str]) -> dict[str, object]:
@@ -173,8 +214,8 @@ def render(reply: Reply) -> str:
             # surface reading the structured fields back into a line of its own
             # is exactly the second voice that rule exists to prevent.
             return str(data["text"])
-        case Action.PROGRESS:
-            return "\n".join(_progress_lines(data["session"]))
+        case Action.HISTORY:
+            return "\n".join(_history_lines(data))
         case Action.SWITCH:
             was = "on" if data["previous"] else "off"
             return f"{data['name']} is {'on' if data['on'] else 'off'} (was {was})"
@@ -220,9 +261,6 @@ def _status_roster_lines(sessions: object) -> list[str]:
     owns every word of that. Two questions, so two renderings; what retired with
     `sessions` was a *third*, which said the second in the first's words.
 
-    `progress` prints one of these too, without the heading, so one Session is
-    not described two ways by the two verbs that carry its row. It retires with
-    `progress` itself (#190).
     """
     assert isinstance(sessions, list)
     if not sessions:
@@ -235,43 +273,43 @@ def _status_roster_lines(sessions: object) -> list[str]:
     ]
 
 
-def _progress_lines(session: object) -> list[str]:
-    """One Session's own words, newest last, and when they were read.
+def _history_lines(data: dict[str, object]) -> list[str]:
+    """One page of what a Session said, newest first, and when it was read.
 
-    `read_at` is said out loud rather than left implicit: a progress line's whole
-    meaning is when it was true, and a surface that printed it bare would let a
-    reading taken before a five-minute silence read as one taken just now.
+    **Every entry is printed, including one whose text could not be carried.**
+    An omitted entry keeps its ordinal and its role and says so, because the
+    page's promise is that it advances: a reader who saw a slot vanish would
+    take the entry before it as the one that followed.
+
+    `read_at` is said out loud rather than left implicit — a page's whole
+    meaning is when it was true — and the oldest ordinal on the page is what the
+    next request passes to `--before`, so the line naming it is the cursor.
     """
-    assert isinstance(session, dict)
-    #: The same one-line summary `status` prints for this Session, without the
-    #: `sessions:` heading a list of them carries — so the two surfaces cannot
-    #: describe one Session two ways.
-    lines = _status_roster_lines([session])[1:]
-    progress = session["progress"]
-    assert isinstance(progress, dict)
-    availability = progress["availability"]
-    if availability == "not_read":
-        return [*lines, "  progress: not read"]
-    if availability == "unreadable":
-        return [*lines, "  progress: unreadable"]
-
-    assert availability == "readable"
-    lines.append(f"  last activity: {session['last_activity'] or 'not read'}")
-    has_history = progress["has_history"]
-    omission = progress["omission"]
-    if has_history is False:
-        assert omission == "none"
-        lines.append("  nothing said yet")
-    elif omission == "older":
-        lines.append("  (older entries dropped)")
-    elif omission == "status_summary":
-        lines.append("  history exists, but this roster carries no chat text")
-    elif omission == "newest_oversize":
-        lines.append("  history exists, but the newest entry is too large to carry")
-
-    if has_history is True:
-        lines.extend(f"  {entry['role']}: {entry['text']}" for entry in progress["recent"])
-    lines.append(f"  read at {progress['read_at']}")
+    entries = data["entries"]
+    assert isinstance(entries, list)
+    if not entries:
+        # Said without reference to a cursor, because the same empty page answers
+        # a first read of a Session that has said nothing and a read past the
+        # oldest entry. Every page is complete on its own (#171), and a line that
+        # leaned on "that" would only be true for one of the two.
+        lines = ["no entries on this page"]
+    else:
+        lines = [
+            f"  {entry['ordinal']} {entry['role']}: "
+            + (
+                "(too large to carry)"
+                if entry.get("omission") == "oversize"
+                else str(entry["text"])
+            )
+            for entry in entries
+        ]
+        oldest = min(int(entry["ordinal"]) for entry in entries)
+        lines.append(
+            f"  older entries remain — ask again with --before {oldest}"
+            if data["older"]
+            else "  that is the whole history"
+        )
+    lines.append(f"  read at {data['read_at']}")
     return lines
 
 
