@@ -864,7 +864,19 @@ class ApprovalListener:
         """
         if self._register is not None:
             self._register(payload)
-        await self._reply(writer, {TYPE_FIELD: REGISTERED_TYPE})
+        # This branch owns its own ending. `SessionStart` runs before the Session
+        # is usable, so `registration.tell_engine` sends one line, half-closes and
+        # leaves without reading (ADR-0011) — the acknowledgement is offered, and
+        # finding nobody there is the ordinary way this branch ends, not a
+        # failure. Letting it reach `_serve`'s arm, which exists for parked
+        # approval dialogs, labelled every healthy registration as an approval
+        # failure (#207) and misdirected #200's first diagnosis.
+        try:
+            await self._reply(writer, {TYPE_FIELD: REGISTERED_TYPE})
+        except (OSError, ConnectionError) as gone:
+            _log.debug(
+                "the session that registered left before reading the acknowledgement: %s", gone
+            )
 
     async def _refuse(self, writer: asyncio.StreamWriter, reason: str) -> None:
         await self._reply(writer, {TYPE_FIELD: REFUSAL_TYPE, REASON_FIELD: reason})

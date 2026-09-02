@@ -25,8 +25,10 @@ import asyncio
 import contextlib
 import itertools
 import json
+import logging
 import os
 import shutil
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,9 @@ from gpt_voicecoding.adapters.agent.claude.approval import (
     DENY_BEHAVIOR,
     HOOK_EVENT,
     MAX_HOOK_REQUEST_BYTES,
+    REGISTRATION_TYPE,
+    SESSION_ID_FIELD,
+    TYPE_FIELD,
     ApprovalListener,
     approval_socket_path,
     hook_decision,
@@ -126,6 +131,18 @@ def environment(path: Path, root: Path) -> dict[str, str]:
 def _request_line() -> bytes:
     """The one line a hook puts on the wire, without a hook process to put it there."""
     return json.dumps(request_for(dialog()), separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def _registration_line() -> bytes:
+    """The one line `SessionStart`'s hook sends, without a hook process to send it."""
+    message = {
+        TYPE_FIELD: REGISTRATION_TYPE,
+        SESSION_ID_FIELD: SESSION,
+        "pid": TARGET.pid,
+        "cwd": "/somewhere",
+        "transcript_path": "/somewhere/transcript.jsonl",
+    }
+    return json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 async def _until(settled) -> None:
@@ -639,6 +656,54 @@ class TestWhichSessionRaisedIt:
             socket_root / "channel.sock",
         )
         assert adapter._registered_as(SESSION) is None
+
+
+class TestARegistrationWhoseClientHasAlreadyGone:
+    """#207: `SessionStart` sends one line and leaves, by design.
+
+    `registration.tell_engine` half-closes and exits without reading, because
+    `SessionStart` runs before the Session is usable (ADR-0011). The listener's
+    acknowledgement therefore lands in a peer that is often already gone, and
+    that ending belongs to the registration branch — not to the failure arm the
+    parked approval dialogs share.
+    """
+
+    def test_the_registration_is_recorded_and_nothing_reads_as_a_failure(
+        self, socket_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        registered: list[dict[str, Any]] = []
+
+        async def scenario() -> None:
+            listener = ApprovalListener(
+                settings=settings_for(socket_root),
+                resolve=lambda session_id: TARGET if session_id == SESSION else None,
+                emit=Sink().emit,
+                pid=1,
+                register=registered.append,
+            )
+            await listener.start()
+            try:
+                # Sent and closed without yielding to the loop, so the peer is
+                # provably gone before the listener can reply — the same order
+                # the hook produces, without the timing.
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                with client:
+                    client.connect(str(listener.path))
+                    client.sendall(_registration_line())
+                    client.shutdown(socket.SHUT_WR)
+                await _until(lambda: bool(registered))
+            finally:
+                await listener.aclose()
+
+        with caplog.at_level("INFO"):
+            asyncio.run(scenario())
+
+        assert [record[SESSION_ID_FIELD] for record in registered] == [SESSION]
+        assert [
+            record.message
+            for record in caplog.records
+            if record.levelno >= logging.INFO and "connection failed" in record.message
+        ] == []
 
 
 class TestTheGradeFollowsTheBytes:
