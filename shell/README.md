@@ -25,13 +25,40 @@ the Command Line Tools.
 ```bash
 cd shell
 swift build
-swift test --disable-xctest
+```
+
+The test run needs the same checkout plus two linker flags:
+
+```bash
+LIB="$(xcode-select -p)/Library/Developer/usr/lib"
+swift test --disable-xctest \
+  -Xlinker -L -Xlinker "$LIB" \
+  -Xlinker -rpath -Xlinker "$LIB"
 ```
 
 `--disable-xctest` is required, not cosmetic: XCTest ships with Xcode, and the
 tests are written in swift-testing, which the package takes as an explicit
 dependency for the same reason. With Xcode installed, a bare `swift test` also
 works.
+
+The flags exist because `lib_TestingInterop.dylib`, swift-testing's runtime
+support library, sits in the toolchain but on neither the linker's default
+search path nor the test bundle's runtime search path. Both are load-bearing,
+and neither alone gets to a green run:
+
+- `-L` covers link time. Without it the link fails with
+  `ld: library '_TestingInterop' not found`.
+- `-rpath` covers the `dlopen` the harness performs at run time. With `-L`
+  alone the link succeeds and the run then dies with
+  `Library not loaded: @rpath/lib_TestingInterop.dylib`.
+
+`LIB` is derived from `xcode-select -p` rather than written out, which is what
+keeps the same command correct on a machine that has full Xcode.
+
+After a toolchain version change, run `swift package clean` first. A `.build`
+holding modules from the previous Swift version reports `module compiled with
+Swift X cannot be imported by the Swift Y compiler` instead, and that error
+hides every other one until the stale modules are gone.
 
 ## Running it
 
