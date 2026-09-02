@@ -14,9 +14,11 @@ all of it while the control plane keeps answering.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+import journey
 import pytest
 
 from claude_adapter_fake import ParkedApproval, claude_waiting_roster
@@ -26,7 +28,6 @@ from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, Se
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
-    stop_notice_for,
 )
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.lifecycle import Lifecycle
@@ -151,100 +152,184 @@ class TestTheStopNoticePipelineEndToEnd:
             )
             assert hub.core.status().sessions[0].progress == observed
 
-    def test_a_stop_notice_speaks_the_newest_assistant_entry(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            progress=ProgressObservation.readable(
-                has_history=True,
-                recent=(
-                    ProgressEntry(
-                        role=ProgressRole.ASSISTANT,
-                        text="The diagnosis points to the session registry.",
+    def test_a_decision_stop_pushes_the_briefs_text(self) -> None:
+        """The Stop Notice is a Session Brief published as text (CONTEXT.md).
+
+        Whole-text equality rather than a substring: what the channel receives is
+        `Briefing.text` and nothing wrapped around it, and a substring assertion
+        would pass on a Core sentence that happened to quote the brief.
+        """
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION,
+                    prompt="Which base?",
+                    options=(
+                        Option(text="main", description="Merge into the default branch"),
+                        Option(text="feature"),
                     ),
+                    recommendation="main",
                 ),
-                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
-            ),
+            )
         )
 
-        assert "The diagnosis points to the session registry." in notice
+        assert hub.channel.sent == [
+            "GPT-VoiceCoding · port the log — codex:abc — waiting for your decision\n"
+            "  newest: not read\n"
+            "  asked: Which base?\n"
+            "  option: main — Merge into the default branch\n"
+            "  option: feature\n"
+            "  recommends: main\n"
+            "  answer: at the terminal\n"
+            "  last activity: not read"
+        ]
 
-    def test_a_stop_with_no_history_says_nothing_was_said_yet(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            progress=ProgressObservation.readable(
-                has_history=False,
-                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
-            ),
+    def test_a_finished_stop_pushes_the_briefs_text(self) -> None:
+        """A Claude turn that ended asking nothing is FINISHED, in Briefing's words."""
+        hub = Hub(voice=False, sessions=((CLAUDE, "port the log"),))
+
+        hub.emit(SessionStopped(target=CLAUDE))
+
+        assert hub.channel.sent == [
+            "GPT-VoiceCoding · port the log — claude:def:100 — finished\n"
+            "  newest: not read\n"
+            "  answer: from here\n"
+            "  last activity: not read"
+        ]
+
+    def test_an_unreadable_stop_pushes_the_briefs_text(self) -> None:
+        """A Stop that could not say what it stopped on is never a decision (#166 B7)."""
+        hub = Hub(voice=False)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=WaitingFor(kind=WaitingKind.UNKNOWN)))
+
+        assert hub.channel.sent == [
+            "GPT-VoiceCoding · port the log — codex:abc — unreadable\n"
+            "  newest: not read\n"
+            "  answer: at the terminal\n"
+            "  last activity: not read"
+        ]
+
+    def test_a_permission_stop_with_no_held_handle_pushes_the_briefs_text(self) -> None:
+        """Nothing is parked on the approval socket, so the Stop Notice is all there is."""
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.PERMISSION, tool_name="Bash", detail="push the branch"
+                ),
+            )
         )
 
-        assert "nothing said yet" in notice
-        assert "it said:" not in notice
+        assert hub.channel.sent == [
+            "GPT-VoiceCoding · port the log — codex:abc — requesting permission\n"
+            "  newest: not read\n"
+            "  permission: Bash — push the branch\n"
+            "  answer: at the terminal\n"
+            "  last activity: not read"
+        ]
 
-    def test_an_oversize_newest_entry_is_reported_as_existing_but_not_carried(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            progress=ProgressObservation.readable(
-                has_history=True,
-                omission=ProgressOmission.NEWEST_OVERSIZE,
-                read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
-            ),
+    def test_the_stops_newest_message_reaches_the_channel_whole(self) -> None:
+        """ADR 0016: the engine never condenses, and `newest` is Briefing's field."""
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                progress=ProgressObservation.readable(
+                    has_history=True,
+                    recent=(
+                        ProgressEntry(
+                            role=ProgressRole.ASSISTANT,
+                            text="The diagnosis points to the session registry.",
+                        ),
+                    ),
+                    read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+                ),
+            )
         )
 
-        assert "history exists" in notice
-        assert "newest entry is too large to carry" in notice
+        (notice,) = hub.channel.sent
+        assert "  newest: The diagnosis points to the session registry." in notice
+
+    def test_a_stop_that_said_nothing_yet_says_so_in_briefings_words(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                progress=ProgressObservation.readable(
+                    has_history=False,
+                    read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+                ),
+            )
+        )
+
+        (notice,) = hub.channel.sent
+        assert "  newest: nothing said yet" in notice
+
+    def test_an_oversize_newest_entry_is_named_as_omitted_in_briefings_words(self) -> None:
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                progress=ProgressObservation.readable(
+                    has_history=True,
+                    omission=ProgressOmission.NEWEST_OVERSIZE,
+                    read_at=datetime(2026, 8, 31, 2, 44, 39, tzinfo=UTC),
+                ),
+            )
+        )
+
+        (notice,) = hub.channel.sent
+        assert "  newest: the newest entry is too large to carry" in notice
         assert "nothing said yet" not in notice
 
-    def test_a_question_notice_carries_each_options_description(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            WaitingFor(
-                kind=WaitingKind.QUESTION,
-                prompt="Which base?",
-                options=(
-                    Option(
-                        text="main",
-                        description="Merge into the default branch",
-                    ),
-                ),
-            ),
-            answerable_here=True,
+    def test_a_stop_for_a_session_the_roster_never_saw_is_briefed_from_its_address(self) -> None:
+        """No row to brief, so the stand-in carries the address and nothing invented."""
+        hub = Hub(voice=False)
+        stranger = SessionTarget(agent=AgentKind.CODEX, session_id="not-in-the-roster")
+
+        hub.emit(
+            SessionStopped(
+                target=stranger,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
         )
 
-        assert "main" in notice
-        assert "Merge into the default branch" in notice
+        assert hub.channel.sent == [
+            "codex:not-in-the-roster — waiting for your decision\n"
+            "  newest: not read\n"
+            "  asked: Which base?\n"
+            "  answer: at the terminal\n"
+            "  last activity: not read"
+        ]
 
-    def test_an_answerable_question_tells_the_user_to_reply_here(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            WaitingFor(
-                kind=WaitingKind.QUESTION,
-                prompt="Which base?",
-                options=(Option("main"), Option("feature")),
-            ),
-            answerable_here=True,
+    def test_the_log_line_carries_the_briefs_text(self, caplog) -> None:
+        """`ENGINE_STOP_LINE` still matches its first line (`tests/acceptance/journey.py`)."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(voice=False)
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
         )
 
-        assert "reply with your answer" in notice
-        assert "answer it in the terminal" not in notice
-
-    def test_several_questions_tell_the_user_to_answer_all_in_one_reply(self) -> None:
-        notice = stop_notice_for(
-            None,
-            CODEX,
-            WaitingFor(
-                kind=WaitingKind.QUESTION,
-                prompt="Tabs or spaces?\nWhich base?",
-                options=(Option("tabs"), Option("spaces"), Option("main")),
-            ),
-            answerable_here=True,
-        )
-
-        assert "answer all of them in one reply" in notice
+        (line,) = [
+            one.getMessage()
+            for one in caplog.records
+            if one.getMessage().startswith("Session stopped:")
+        ]
+        assert re.search(journey.ENGINE_STOP_LINE, line.splitlines()[0])
+        assert "Which base?" in line
 
     def test_a_stop_notice_never_relays_words_back_into_a_session(self) -> None:
         """The system tells the user about a stop; it does not address an agent."""
@@ -373,7 +458,9 @@ class TestTheApprovalPipelineEndToEnd:
         assert hub.agent.question_budgets == [17.0, 17.0, 17.0, 17.0]
         assert len(first) == 1
         assert hub.channel.sent == list(first)
-        assert "answer it in the terminal" in first[0]
+        # The hook that held the question is gone, and Briefing is where that
+        # reads as "at the terminal" — Bridge Core no longer has a sentence.
+        assert "  answer: at the terminal" in first[0]
 
     def test_an_answer_after_budget_release_is_refused_at_the_public_relay(self) -> None:
         hub = Hub(voice=False, approval_budget_seconds=17.0)
@@ -1106,8 +1193,8 @@ class TestSwitchAdjudicationEndToEnd:
     @pytest.mark.parametrize(
         ("label", "named_wait"),
         [
-            ("permission prompt", "a tool needs your permission"),
-            ("sandbox request", "sandbox network access needs your permission"),
+            ("permission prompt", "  permission: a tool"),
+            ("sandbox request", "  permission: sandbox network access"),
         ],
     )
     def test_reconcile_announces_a_roster_only_named_wait(
@@ -1124,7 +1211,9 @@ class TestSwitchAdjudicationEndToEnd:
         assert session.waiting_for.kind is WaitingKind.PERMISSION
         assert len(hub.channel.sent) == 1
         assert named_wait in hub.channel.sent[0]
-        assert "it has not said what it is waiting for yet" not in hub.channel.sent[0]
+        # Briefing's word for a stop nobody could read (#166 B7). A roster-only
+        # permission is a wait that *was* read, so it is never that.
+        assert "unreadable" not in hub.channel.sent[0]
 
     def test_one_reconcile_pass_reoffers_one_promoted_wait_with_its_parked_handle_once(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1635,7 +1724,7 @@ class TestSwitchAdjudicationEndToEnd:
             return pushed
 
         assert asyncio.run(watch()) == [
-            "GPT-VoiceCoding \u00b7 port the log is waiting for your permission to use Bash"
+            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash"
         ]
 
 
@@ -1653,13 +1742,15 @@ class TestEventsThatDecideNothing:
     def test_events_arrive_once_and_in_order(self) -> None:
         hub = Hub(voice=False)
 
-        hub.emit(
-            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="first", detail="first")),
-            SessionStopped(target=CODEX, waiting_for=WaitingFor(prompt="second", detail="second")),
-        )
+        asked = [
+            WaitingFor(kind=WaitingKind.QUESTION, prompt="first"),
+            WaitingFor(kind=WaitingKind.QUESTION, prompt="second"),
+        ]
 
-        assert [sent.endswith("first") for sent in hub.channel.sent] == [True, False]
-        assert hub.channel.sent[1].endswith("second")
+        hub.emit(*(SessionStopped(target=CODEX, waiting_for=one) for one in asked))
+
+        assert [("  asked: first" in sent) for sent in hub.channel.sent] == [True, False]
+        assert "  asked: second" in hub.channel.sent[1]
 
 
 class TestWhatDiscoveryCallsAnEnding:
@@ -1830,8 +1921,8 @@ class TestWhichStopIsAnnouncedWhenAPermissionRaisesTwo:
         )
 
         assert hub.channel.sent == [
-            "GPT-VoiceCoding \u00b7 port the log is waiting for your permission to use Bash "
-            "\u2014 push the branch"
+            "GPT-VoiceCoding · port the log is waiting for your permission to use Bash "
+            "— push the branch"
         ]
 
     def test_the_suppressed_stop_is_written_down_rather_than_dropped_silently(self, caplog) -> None:

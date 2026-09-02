@@ -239,10 +239,15 @@ DISCOVERY_SECONDS = 30.0
 #: measuring a Session with a turn still running underneath.
 BOOT_TURN_ALLOWANCE = 2.0
 
-#: The engine's own line for a Stop it announced (`core/bridge.py:_session_stopped`).
+#: The engine's own line for a Stop it announced (`core/bridge.py:_announce_waiting`).
 #: `stop notice` matches a looser pattern for its own purposes; `drain_boot_notice`
 #: wants the announcement itself, because "was a notice raised for the boot turn"
 #: is exactly the question it is asking.
+#:
+#: **The record is several lines now** (#189): the Stop Notice is a Session Brief
+#: and the log carries `Briefing.text` whole, so `Session stopped:` opens the
+#: first line and the brief's labelled lines follow. `support.matching_lines`
+#: greps line by line, so this still matches once per Stop — the header line.
 ENGINE_STOP_LINE = r"(?i)Session stopped:"
 
 #: What the escalated permission announcement says (`core/approvals.py:52-76`).
@@ -1430,9 +1435,12 @@ class Walk:
         """The Stop `stable name` crossed reached the chat, and it says what it stopped on.
 
         #75's shape: the notice carries the question or the permission, not a
-        flattened sentence. What can be checked from the chat is that a message
-        arrived for that Stop and that it is not empty; whether it carries the
-        typed `WaitingFor` is #75's own exit and is read off the payload.
+        flattened sentence. Since #189 it is a **Session Brief published as
+        text** — `Briefing.text` and nothing wrapped around it — so what can be
+        checked from the chat is that a message arrived for that Stop, that it
+        has the brief's shape (a state word in the header, a `newest` line), and
+        that the roster corroborates what it says the Session stopped on, which
+        is #75's own exit and is read off the payload.
 
         **The message has to name this Session**, which is the module's
         attribution rule and not a nicety of this step: until #109 this took the
@@ -1454,6 +1462,25 @@ class Walk:
             )
         if not message.text.strip():
             raise StepFailed(f"the Stop reached the chat as an empty message ({message.id})")
+        # #189: the Stop Notice **is** a Session Brief published as text
+        # (`CONTEXT.md`), so what arrived has the brief's own shape — the header
+        # line's state word, and the `newest` line, which is what a Bridge Core
+        # sentence would not have. Read where Briefing writes them, never
+        # searched for loose in the message: every state word also occurs inside
+        # the message a brief carries.
+        called = self._briefed_state(message.text)
+        if called not in set(STATE_WORDING.values()):
+            raise StepFailed(
+                f"the Stop reached the chat as {message.text[:200]!r}, whose header line ends "
+                f"{called!r} — not one of Briefing's state words {sorted(STATE_WORDING.values())}. "
+                f"Since #189 the Stop Notice is `Briefing.text`, not a sentence Bridge Core "
+                f"composes"
+            )
+        if not any(line.startswith("  newest: ") for line in message.text.splitlines()):
+            raise StepFailed(
+                f"the Stop reached the chat calling the Session {called!r} but carries no "
+                f"`newest` line, which every Session Brief has: {message.text[:200]!r}"
+            )
         waiting = self._roster_field("waiting_for")
         kind = waiting.get("kind") if isinstance(waiting, dict) else None
         if not kind:
@@ -1470,8 +1497,8 @@ class Walk:
                 f"this engine's own Stop"
             )
         return (
-            f"bot message {message.id}, naming this Session: {message.text!r}; roster "
-            f"waiting_for kind {kind!r}; engine.log: {stop_lines[-1]!r}"
+            f"bot message {message.id}, naming this Session and briefing it as {called!r}: "
+            f"{message.text!r}; roster waiting_for kind {kind!r}; engine.log: {stop_lines[-1]!r}"
         )
 
     # --- relay ------------------------------------------------------------
@@ -2677,13 +2704,22 @@ class Walk:
 
 
 def _address_of(row: dict) -> str:
-    """`agent:session_id[:pid]`, the way `control_plane/commands.py:116` writes it."""
+    """`agent:session_id[:pid]`, the way `seams/identity.py::address_of` writes it.
+
+    **The id half is written as nothing at all where there is none**, not as the
+    word `None` — that is the product's own rule (#73), and it is what
+    `commands.parse_address` reads back as "not named yet". This mirrored it
+    without that clause until #189, which is when the shape started being read
+    rather than only compared: `_naming_forms` names an unnamed Session by this
+    address, because that is what a Session Brief's header prints.
+    """
     target = row.get("target")
     if not isinstance(target, dict):
         return "<no target>"
+    session_id = target.get("session_id")
     pid = target.get("pid")
     tail = f":{pid}" if pid else ""
-    return f"{target.get('agent')}:{target.get('session_id')}{tail}"
+    return f"{target.get('agent')}:{session_id or ''}{tail}"
 
 
 def _first_child_of(rows: list[dict], agent: str, before: set[str]) -> dict | None:
@@ -2727,11 +2763,21 @@ def _naming_forms(row: dict) -> tuple[str, ...]:
     asked the product what it had said would agree with the product by
     construction, and the whole point of reading the chat is that it might not.
 
-    Both forms are kept because the product chooses between them by what it holds
+    Every form is kept because the product chooses between them by what it holds
     *at the moment it speaks* — `spoken_name` where the Session has a Session
     Name, `spoken_target` where it does not — and the roster read that answers
     this question is a different moment from the one the message was composed in.
     A Codex Session, in particular, has no name until its first turn.
+
+    **The address is the third form**, and it is what a Stop Notice uses since
+    the notice became a Session Brief (#189): `Briefing`'s header line is
+    `<name> — <address> — <state>`, and its address half is
+    `seams/identity.py::address_of`'s `agent:session_id[:pid]`, not the
+    space-separated `spoken_target`. A run whose Session has no name yet — every
+    Codex thread before its first turn — is named by that and by nothing else,
+    so a harness that did not know the shape could attribute none of its notices.
+    Written through `_address_of`, which is this module's one mirror of that
+    format: two spellings of one rule are two rules the moment either is edited.
     """
     target = row.get("target")
     target = target if isinstance(target, dict) else {}
@@ -2746,6 +2792,8 @@ def _naming_forms(row: dict) -> tuple[str, ...]:
         forms.append(f"{agent} {session_id}")
     elif agent and pid:
         forms.append(f"{agent} pid {pid}")
+    if agent and (session_id or pid):
+        forms.append(_address_of(row))
     return tuple(forms)
 
 

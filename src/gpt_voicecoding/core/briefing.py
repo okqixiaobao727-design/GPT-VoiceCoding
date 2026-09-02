@@ -548,10 +548,39 @@ def _session_lines(brief: SessionBrief) -> list[str]:
 
 
 def _decision_lines(brief: SessionBrief) -> list[str]:
+    """The one line, or the several, that say what the Session is waiting on.
+
+    **The state decides which shape this is, not the fields.** `Decision` holds
+    two shapes in one type and a permission the roster named without naming its
+    tool carries neither half — `WaitingFor(kind=PERMISSION)` off a roster that
+    says *waiting* and nothing more (`adapters/agent/claude/waiting_labels.py`).
+    Read off the fields alone that is indistinguishable from a question nobody
+    could read, and it used to render as one: "asked: it asked you something"
+    about a permission dialog. The tool name is then the renderer's floor, which
+    is where a name nobody supplied belongs.
+
+    A permission that reaches here under `UNREADABLE` — the progress read failed
+    on top of the dialog — is still recognised by its half of the fields, and one
+    that carries neither is the residue: it renders as an unreadable ask, which
+    is what it is.
+
+    Legacy (ADR 0010): `legacy@1d32845:bridge/host.py:213-235`
+    (`SessionStopSpeech.render`) chose "This session is waiting for permission."
+    off the Hook **event kind** it was created from, never off whether any field
+    about the tool had been read. **Ported** — the same rule, read off the state
+    the brief carries rather than off a ledger's event kind. What gen-1 had no
+    equivalent of is the tool name and its one-line summary, which this
+    generation's `WaitingFor` carries and legacy's line did not: those stay the
+    renderer's optional tail, and "a tool" is the floor beneath them.
+    """
     decision = brief.decision
     if decision is None:
         return []
-    if decision.tool is not None or decision.summary is not None:
+    if (
+        brief.state is BriefState.PERMISSION
+        or decision.tool is not None
+        or decision.summary is not None
+    ):
         asked = decision.tool or "a tool"
         return [f"  permission: {asked}" + (f" — {decision.summary}" if decision.summary else "")]
     lines = [f"  asked: {decision.prompt or 'it asked you something'}"]

@@ -62,10 +62,12 @@ def announcement_for(request: ApprovalRequest, spoken_as: str) -> str:
     found on a run where a stranger's permission prompt was indistinguishable
     from the lane's own).
 
-    Bridge Core composes `spoken_as` at the call site from the same two lines
-    `stop_notice_for` uses — `spoken_name` where the Session is known, its
+    Bridge Core composes `spoken_as` at the call site through
+    `bridge.spoken_reference` — `spoken_name` where the Session is known, its
     address as the floor — because "what to call it" has one answer
-    (`core/sessions.py`) and this is not a second one.
+    (`core/sessions.py`) and this is not a second one. Since #189 that helper has
+    this one caller: the Stop Notice is a Session Brief and names its Session
+    through `Briefing`'s own header.
 
     Legacy: **ported**. `legacy@1d32845:bridge/host.py:213-235` rendered
     `Session: {session_label}` above "This session is waiting for permission.";
