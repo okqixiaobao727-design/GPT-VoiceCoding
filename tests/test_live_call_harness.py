@@ -31,10 +31,13 @@ import json
 import wave
 from pathlib import Path
 
+import journey
 import live_call
 import pytest
 
+from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.adapters.call.realtime.webrtc import FRAME_SAMPLES, SAMPLE_RATE
+from gpt_voicecoding.seams.call import Cue
 
 
 class FakeTrack:
@@ -262,3 +265,108 @@ def test_a_24k_wav_is_resampled_up_to_the_track_rate(tmp_path: Path) -> None:
     # what the tolerance is for, and the padding the probe learned to cut is
     # what would otherwise make this longer.
     assert abs(len(resampled) // 2 - SAMPLE_RATE // 2) < FRAME_SAMPLES
+
+
+# --- the acceptance step's own cue rule, graded at CI speed ------------------
+#
+# The `live call` step reads two cues out of the engine log and grades their
+# order (#186). The walk itself never reaches CI, so the rule is a module-level
+# function and this is where it is held to its wording — #109 is what a harness
+# rule with no test at CI speed costs.
+
+SPOKE = "user speech, for the voice thread to act on: 结束通话"
+
+
+def played(cue: Cue, *, device: int | None = None) -> str:
+    """A line the way the Call adapter really writes it, not a line invented here."""
+    pcm = cues.render(cue)
+    return cues.played_line(cues.CueSpan(cue=cue, device=device, started=0.0, frames=len(pcm) // 2))
+
+
+def test_a_call_that_marked_both_of_its_ends_is_accepted() -> None:
+    complaint = journey._cue_complaint(
+        [played(Cue.CONNECTED), SPOKE, played(Cue.ENDED)], {SPOKE}, device=None
+    )
+    assert complaint == ""
+
+
+def test_a_call_that_made_no_sound_at_all_is_refused_by_name() -> None:
+    """The likeliest failure: an output device the engine could not open. The
+    adapter swallows that, so nothing else in the run would say so."""
+    complaint = journey._cue_complaint([SPOKE], {SPOKE}, device=None)
+    assert "no connected cue, no ended cue" in complaint
+
+
+def test_a_call_that_only_marked_its_ending_is_refused() -> None:
+    complaint = journey._cue_complaint([SPOKE, played(Cue.ENDED)], {SPOKE}, device=None)
+    assert "no connected cue" in complaint
+    assert "no ended cue" not in complaint
+
+
+def test_a_connect_cue_that_arrived_after_the_call_was_talked_into_is_refused() -> None:
+    """Order, not presence. Both lines are there and they are the wrong way round."""
+    lines = [SPOKE, played(Cue.CONNECTED), played(Cue.ENDED)]
+    assert "after the user speech" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+def test_an_end_cue_from_before_this_calls_speech_is_not_this_calls_ending() -> None:
+    lines = [played(Cue.ENDED), played(Cue.CONNECTED), SPOKE]
+    assert "that is not this call's ending" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+def test_a_second_cue_of_the_same_kind_does_not_unseat_the_first() -> None:
+    """Two calls' worth of log read from one mark: the step grades the earliest
+    connect and the latest ending, so a run that dialled twice still reads."""
+    lines = [played(Cue.CONNECTED), SPOKE, played(Cue.ENDED), played(Cue.CONNECTED)]
+    assert journey._cue_complaint(lines, {SPOKE}, device=None) == ""
+
+
+def test_the_mid_call_cue_is_never_what_this_step_looks_for() -> None:
+    """`EVENT` has no caller yet, and an EVENT line is not an ending."""
+    lines = [played(Cue.CONNECTED), SPOKE, played(Cue.EVENT)]
+    assert "no ended cue" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+def test_a_cue_line_that_names_no_device_or_span_is_not_the_record_asked_for() -> None:
+    """The ticket wants the adapter's log to record the output device and the
+    span written — so a line carrying only the phrase is not enough."""
+    lines = ["played the connected cue", SPOKE, played(Cue.ENDED)]
+    complaint = journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "without the output device and the span written" in complaint
+
+
+def test_a_cue_played_to_a_stated_device_is_read_against_that_device() -> None:
+    """A run that pinned `output_device` is graded on the line it really writes."""
+    lines = [played(Cue.CONNECTED, device=4), SPOKE, played(Cue.ENDED, device=4)]
+    assert journey._cue_complaint(lines, {SPOKE}, device=4) == ""
+    assert "without the output device" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+def test_the_span_in_the_line_is_the_one_the_cue_really_synthesises_to() -> None:
+    """Not a number typed twice: a cue whose length changed would fail here."""
+    assert "14400 frames, 0.300s" in played(Cue.CONNECTED)
+    assert "11520 frames, 0.240s" in played(Cue.ENDED)
+    assert "7680 frames, 0.160s" in played(Cue.EVENT)
+
+
+def test_a_thin_early_line_is_not_evidence_that_a_whole_later_one_is_in_order() -> None:
+    """Both claims have to come off the same line.
+
+    The connect cue here is logged twice: once before the speech carrying only
+    the phrase, and once after it carrying the whole record. Read separately,
+    "a whole line exists" and "something was logged early" are both true — of a
+    call whose connect was never actually recorded before it was talked into.
+    """
+    lines = [
+        "played the connected cue",
+        SPOKE,
+        played(Cue.CONNECTED),
+        played(Cue.ENDED),
+    ]
+    assert "after the user speech" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+def test_a_thin_late_end_line_is_not_evidence_for_a_whole_early_one() -> None:
+    """The mirror: the whole `ended` record is from before this call's speech."""
+    lines = [played(Cue.CONNECTED), played(Cue.ENDED), SPOKE, "played the ended cue"]
+    assert "that is not this call's ending" in journey._cue_complaint(lines, {SPOKE}, device=None)

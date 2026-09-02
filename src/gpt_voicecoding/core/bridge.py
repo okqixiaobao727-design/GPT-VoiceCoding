@@ -96,6 +96,7 @@ from gpt_voicecoding.seams.call import (
     CallEnded,
     CallSnapshot,
     CallStarted,
+    Cue,
     UserSpeech,
     VoiceSpeech,
 )
@@ -810,8 +811,15 @@ class BridgeCore:
                 self._relay_receipt(event)
             case CallStarted():
                 self.interlock.note_started(event.call_id)
+                await self._cue(Cue.CONNECTED)
                 self._owe_reconciliation()
             case CallEnded() | CallDropped():
+                # The cue is not conditional on the interlock's answer the way
+                # the reconciliation below is: what the user is owed is the
+                # sound of the call they were on ending, and whether this hub
+                # was still holding that call is a bookkeeping question they
+                # cannot hear (#186).
+                await self._cue(Cue.ENDED)
                 # Only a release is an outlet transition. A late event about a
                 # call the system was not holding changes nothing, so it cannot
                 # justify another inspection and announcement.
@@ -953,6 +961,25 @@ class BridgeCore:
             return
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
+
+    async def _cue(self, cue: Cue) -> None:
+        """Ask the Call adapter to mark one moment with a sound.
+
+        The hub names the moment and never the sound: which notes, how loud and
+        how long were chosen by ear against one machine's speakers (#174), and
+        none of that is policy. The Call Keeper takes these two calls over when
+        it arrives (#195); until then the lifecycle arms are where the moments
+        are known.
+
+        A shipped adapter swallows its own playback failures, so this guard is
+        for a **defective** one — and a defective adapter may not stop the arm
+        it was called from. What follows a `CallEnded` is the interlock being
+        released, and a missing tone is not a reason to keep a call held.
+        """
+        try:
+            await self._call.play_cue(cue)
+        except Exception:  # noqa: BLE001 - a sound may not take down the call it marks
+            _log.exception("the Call adapter raised on the %s cue", cue)
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""

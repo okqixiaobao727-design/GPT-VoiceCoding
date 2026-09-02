@@ -37,7 +37,13 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
 )
-from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply, VoiceSpeech
+from gpt_voicecoding.seams.call import (
+    CallSnapshot,
+    CallState,
+    Cue,
+    DelegatedReply,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
@@ -265,6 +271,10 @@ class FakeCall:
         #: on it to prove the one-call invariant stopped a second one.
         self.calls_started = 0
         self.calls_ended = 0
+        #: Every cue this adapter was asked to play, in the order it was asked
+        #: (#186). Moments, not sounds: the fake opens no device and makes no
+        #: noise, which is exactly what lets a hub test grade the order.
+        self.cues: list[Cue] = []
 
     async def ensure_call(self, instructions: str) -> CallSnapshot:
         if self._snapshot.is_up:
@@ -303,6 +313,9 @@ class FakeCall:
         self.delegated.append((text, model))
         self.delegated_on.append(instructions)
         return DelegatedReply(text=self.delegated_text, model=model)
+
+    async def play_cue(self, cue: Cue) -> None:
+        self.cues.append(cue)
 
     async def verify(self) -> VerifyResult:
         return self.verify_result

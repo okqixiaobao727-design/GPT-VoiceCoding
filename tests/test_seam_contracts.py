@@ -46,6 +46,7 @@ from gpt_voicecoding.seams.call import (
     CallEvent,
     CallStarted,
     CallState,
+    Cue,
     UserSpeech,
     VoiceSpeech,
 )
@@ -366,6 +367,33 @@ class TestTheCallContract:
         call.voice_speech(speaking=False)
 
         assert sink.events == [VoiceSpeech(speaking=True), VoiceSpeech(speaking=False)]
+
+    def test_the_seam_names_the_moment_a_cue_marks_and_never_the_sound(self) -> None:
+        """One verb, three moments (#186). The notes are the adapter's own.
+
+        `play_cue` rather than `play_tone` or three verbs: what varies between a
+        call coming up and a call going down is which moment it is, and an
+        adapter that could not make a sound at all still knows what happened.
+        """
+        assert "play_cue" in _members(CallAdapter)
+        assert set(Cue) == {Cue.CONNECTED, Cue.ENDED, Cue.EVENT}
+        assert [str(cue) for cue in Cue] == ["connected", "ended", "event"]
+
+    def test_a_cue_tells_the_caller_nothing_back(self) -> None:
+        """The span a cue occupies stays behind the seam, where #145 will read it.
+
+        A verb that handed a span upward would be Bridge Core holding a fact
+        about an audio device — and the one consumer of that fact is the capture
+        side, which is on the adapter's own side of this line.
+        """
+        assert inspect.signature(CallAdapter.play_cue).return_annotation == "None"
+
+    def test_the_fake_records_the_cues_it_was_asked_for_in_order(self) -> None:
+        """So a test above the seam can grade the order with no audio anywhere."""
+        call = FakeCall()
+        asyncio.run(call.play_cue(Cue.CONNECTED))
+        asyncio.run(call.play_cue(Cue.ENDED))
+        assert call.cues == [Cue.CONNECTED, Cue.ENDED]
 
 
 class TestTheCompanionChannelContract:

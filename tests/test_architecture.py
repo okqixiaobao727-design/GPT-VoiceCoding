@@ -16,6 +16,7 @@ invariant that erodes silently.
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parents[1] / "src" / "gpt_voicecoding"
@@ -30,6 +31,10 @@ AUDIO_MODULE = ADAPTERS / "call" / "realtime" / "webrtc.py"
 
 #: The distributions that file exists to confine.
 AUDIO_LIBRARIES = frozenset({"aiortc", "av", "sounddevice"})
+
+#: Where the call cues are synthesised, and the reason it is a second file next
+#: to the one above rather than a section inside it (#186).
+CUE_MODULE = ADAPTERS / "call" / "realtime" / "cues.py"
 
 #: Where the Companion Channel's HTTP client is allowed to be, and nowhere else.
 #: The same confinement as the audio stack, for the opposite reason: this
@@ -227,6 +232,33 @@ def test_the_audio_stack_lives_in_exactly_one_file() -> None:
 def test_the_audio_module_is_where_it_says_it_is() -> None:
     """A guard that silently stops guarding is worse than no guard."""
     assert AUDIO_MODULE.is_file(), f"{AUDIO_MODULE} is not there, so nothing is confined"
+
+
+def test_the_cues_are_synthesised_with_the_standard_library_alone() -> None:
+    """Why the cue waveforms are not in the audio module, asserted rather than said.
+
+    #174 said the real adapter would synthesise these shapes "from named module
+    constants inside `webrtc.py`". They are next door instead, because `webrtc.py`
+    is the file that imports the voice extra, CI never installs the voice extra,
+    and #186 asks for the durations and the peaks to be *graded* — which can only
+    happen in a module CI can import. So the deviation buys a test, and this is
+    the check that keeps it paid for: the moment a numpy or a sounddevice import
+    appears here, the synthesis has stopped being gradeable and the second file
+    has stopped earning its keep.
+
+    Stated as "the standard library and this package", not as "not an audio
+    library": the existing confinement already forbids the three named ones, and
+    what would actually happen is somebody reaching for numpy.
+    """
+    assert CUE_MODULE.is_file(), f"{CUE_MODULE} is not there, so nothing is confined"
+    offences = [
+        f"{CUE_MODULE.name} imports {module}"
+        for module in _imported_modules(CUE_MODULE.read_text(encoding="utf-8"))
+        if module.split(".")[0] not in sys.stdlib_module_names
+        and not module.startswith("gpt_voicecoding.")
+    ]
+    named = "; ".join(offences)
+    assert not offences, f"the cues are synthesised with the standard library alone: {named}"
 
 
 def test_the_telegram_wire_lives_in_exactly_one_file() -> None:

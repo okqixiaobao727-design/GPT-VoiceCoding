@@ -19,8 +19,14 @@ middle of the handshake.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
+import sys
+import threading
+import time
+import types
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +41,9 @@ from gpt_voicecoding.adapters.call.realtime import (
     RealtimeCallAdapter,
     RealtimeCallSettings,
     SettingsError,
+    cues,
     realtime_call,
+    webrtc,
 )
 from gpt_voicecoding.adapters.codex_app_server.process import AppServerError, attach
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
@@ -44,6 +52,7 @@ from gpt_voicecoding.seams.call import (
     CallEnded,
     CallStarted,
     CallState,
+    Cue,
     UserSpeech,
     VoiceSpeech,
 )
@@ -53,6 +62,7 @@ from gpt_voicecoding.seams.verify import VerifyOutcome
 from realtime_fake import (
     ANSWER_SDP,
     OFFER_SDP,
+    FakeCueOutput,
     FakeTransport,
     SharedAppServer,
     delegated_script,
@@ -105,11 +115,15 @@ async def riding(
     *,
     transport: FakeTransport | None = None,
     settings: RealtimeCallSettings | None = None,
+    cue_player: FakeCueOutput | None = None,
 ) -> tuple[RealtimeCallAdapter, FakeTransport]:
     """An adapter wired to a scripted app-server, exactly as the root wires it."""
     audio = transport or FakeTransport()
     adapter = RealtimeCallAdapter(
-        sink=sink, settings=settings or quick(), transport_factory=lambda: audio
+        sink=sink,
+        settings=settings or quick(),
+        transport_factory=lambda: audio,
+        cue_player=cue_player or FakeCueOutput(),
     )
     shared = SharedAppServer(connection=None)
     connection = await attach(
@@ -127,6 +141,55 @@ async def riding(
 
 def rid(text: str = "r-1") -> RequestId:
     return RequestId(text)
+
+
+class _Stream:
+    """What `sounddevice.RawOutputStream` is, as far as `CuePlayer` can tell."""
+
+    def __init__(self, blocks_on: tuple[threading.Event, threading.Event] | None) -> None:
+        self._blocks_on = blocks_on
+
+    def start(self) -> None:
+        return None
+
+    def write(self, _pcm: bytes) -> None:
+        if self._blocks_on is not None:
+            writing, release = self._blocks_on
+            writing.set()
+            release.wait(2.0)
+
+    def stop(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _Streams:
+    """A stand-in device. Only the *first* stream opened holds its write open."""
+
+    def __init__(self, *, blocks_on: tuple[threading.Event, threading.Event] | None) -> None:
+        self._blocks_on = blocks_on
+        self.opened: list[dict[str, Any]] = []
+
+    def __call__(self, **parameters: Any) -> _Stream:
+        self.opened.append(parameters)
+        return _Stream(self._blocks_on if len(self.opened) == 1 else None)
+
+
+@contextmanager
+def _sounddevice(streams: _Streams) -> Iterator[None]:
+    """`sounddevice`, for the length of a test. CI does not install the real one."""
+    stood_in = types.SimpleNamespace(RawOutputStream=streams)
+    was = sys.modules.get("sounddevice")
+    sys.modules["sounddevice"] = stood_in  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if was is None:
+            del sys.modules["sounddevice"]
+        else:
+            sys.modules["sounddevice"] = was
 
 
 class TestBringingACallUp:
@@ -1040,3 +1103,451 @@ class TestWhatThisSpokeMayBeTold:
         )
 
         assert isinstance(adapter, RealtimeCallAdapter)
+
+
+class TestTheCuesItPlays:
+    """`play_cue`, and why the player is the adapter's rather than a call's (#186).
+
+    Nothing here makes a sound. The stream lives in the audio module behind
+    `CueOutput` for exactly that reason: what is worth grading is which moment
+    got which sound, that it went out on the configured device, that it can go
+    out with no call left, and that a device which will not open takes nothing
+    down with it.
+    """
+
+    @staticmethod
+    def played(player: FakeCueOutput, count: int = 1, *, within: float = 5.0) -> None:
+        """Wait for the cue worker to have reached `count` cues.
+
+        `play_cue` deliberately does not wait, so every test that reads what went
+        out has to. Counted rather than "anything yet", because the worker plays
+        in order and a test that looked once would read the cue before the one
+        it asked about.
+        """
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if len(player.seen_playing) >= count:
+                return
+            time.sleep(0.005)
+        raise AssertionError(f"only {len(player.seen_playing)} of {count} cues were played")
+
+    def test_each_moment_is_played_as_its_own_sound(self, socket_path: Path) -> None:
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                for number, cue in enumerate(Cue, start=1):
+                    await adapter.play_cue(cue)
+                    self.played(player, number)
+                    assert player.spans[-1].cue is cue
+                return player
+
+        player = asyncio.run(scenario())
+        assert [span.cue for span in player.spans] == list(Cue)
+        assert player.buffers == [cues.render(cue) for cue in Cue]
+
+    def test_a_cue_goes_to_the_output_device_the_call_was_configured_with(self) -> None:
+        """One `output_device` setting, and a cue honours the one the call does.
+
+        Built the way the composition root builds it — no player handed in — so
+        this also asserts that an adapter which was told nothing about cues
+        still has one, on the machine's own default output.
+        """
+        stated = RealtimeCallAdapter(
+            settings=quick(output_device=4), transport_factory=FakeTransport
+        )
+        assert stated.cue_output.device == 4
+
+        default = RealtimeCallAdapter(settings=quick(), transport_factory=FakeTransport)
+        assert default.cue_output.device is None
+
+    def test_the_ended_cue_plays_after_the_calls_own_audio_has_closed(
+        self, socket_path: Path
+    ) -> None:
+        """The whole reason the player is per adapter and not per call.
+
+        A cue mixed into the call's own playback buffer could not mark the end
+        of a call: by the time there is an end to mark, that stream is shut.
+        """
+
+        async def scenario() -> tuple[FakeTransport, FakeCueOutput]:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                adapter, audio = await riding(server, Sink(), cue_player=player)
+                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.end_call()
+                assert audio.closed
+                await adapter.play_cue(Cue.ENDED)
+                self.played(player)
+                return audio, player
+
+        audio, player = asyncio.run(scenario())
+        assert audio.closed
+        assert [span.cue for span in player.spans] == [Cue.ENDED]
+
+    def test_the_adapter_writes_down_the_device_and_the_span_it_played(
+        self, socket_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The engine logs no line for `CallStarted` or `CallEnded`, so this is
+        the only witness the acceptance harness has that a cue went out."""
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput(device=9)
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                with caplog.at_level(logging.INFO):
+                    await adapter.play_cue(Cue.CONNECTED)
+                    self.played(player)
+                return player
+
+        asyncio.run(scenario())
+        written = [record.getMessage() for record in caplog.records]
+        line = next(said for said in written if cues.cue_phrase(Cue.CONNECTED) in said)
+        assert "output device 9" in line
+        assert "14400 frames" in line
+        assert "0.300s" in line
+
+    def test_a_device_that_will_not_open_takes_nothing_down_with_it(
+        self, socket_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No output device, no audio library, somebody unplugged the speakers.
+
+        A cue is feedback about something that already happened; there is no
+        recovery to attempt and nothing above the seam that could attempt one.
+        """
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput(fails="no such output device")
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                with caplog.at_level(logging.INFO):
+                    await adapter.play_cue(Cue.ENDED)
+                    self.played(player)
+                assert (await adapter.call_state()).state is CallState.DOWN
+                return player
+
+        asyncio.run(scenario())
+        written = [record.getMessage() for record in caplog.records]
+        assert any("no such output device" in said for said in written)
+        assert not any(cues.cue_phrase(Cue.ENDED) in said for said in written)
+
+    def test_a_playback_that_finishes_first_does_not_release_another_ones_span(self) -> None:
+        """`playing` answers for every playback in flight, not for the last setter.
+
+        `play_now` is public, so #145 can put a second playback beside the cue
+        worker's. If the *later* one finishes first, a single slot cleared by
+        whoever finishes would announce silence while the earlier cue is still
+        writing — and a capture gate reading that opens the microphone into a
+        live tone. The device is stood in for; the bookkeeping under test is
+        this class's own.
+        """
+        player = webrtc.CuePlayer(device=3)
+        writing, release = threading.Event(), threading.Event()
+        streams = _Streams(blocks_on=(writing, release))
+
+        with _sounddevice(streams):
+            first = threading.Thread(
+                target=lambda: player.play(b"\x00\x00", span="the first"), daemon=True
+            )
+            first.start()
+            assert writing.wait(2.0), "the first playback never reached the device"
+
+            # Started later and finished first, which is the order a single slot
+            # gets wrong.
+            second = threading.Thread(
+                target=lambda: player.play(b"\x00\x00", span="the second"), daemon=True
+            )
+            second.start()
+            second.join(2.0)
+
+            assert player.playing == "the first"
+            release.set()
+            first.join(2.0)
+
+        assert player.playing is None
+
+    def test_a_cue_opens_the_stream_on_the_speakers_own_parameters(self) -> None:
+        """One shape for the whole audio path, so a cue needs no second opinion.
+
+        The PCM is synthesised at these numbers (`cues.py`), so a stream opened
+        at any other would play the cue at the wrong pitch and speed.
+        """
+        player = webrtc.CuePlayer(device=6)
+        streams = _Streams(blocks_on=None)
+
+        with _sounddevice(streams):
+            player.play(cues.render(Cue.CONNECTED), span="a cue")
+
+        assert streams.opened == [
+            {
+                "samplerate": webrtc.SAMPLE_RATE,
+                "channels": webrtc.CHANNELS,
+                "dtype": webrtc.SAMPLE_FORMAT,
+                "blocksize": webrtc.FRAME_SAMPLES,
+                "device": 6,
+            }
+        ]
+
+    def test_the_span_is_readable_while_the_cue_is_going_out(self, socket_path: Path) -> None:
+        """What #145 inherits: the microphone is open through a cue, and the
+        mid-call one is loud enough to carry over speech — so loud enough to be
+        heard back in. A gate needs to know a cue is playing *now*."""
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput(device=2)
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                await adapter.play_cue(Cue.EVENT)
+                self.played(player)
+                return player
+
+        player = asyncio.run(scenario())
+        held = player.seen_playing[-1]
+        assert held.cue is Cue.EVENT
+        assert held.device == 2
+        assert held.seconds == pytest.approx(0.16)
+        # And nothing is held once it has finished: a gate that stayed shut
+        # would be worse than no gate.
+        assert player.playing is None
+
+    def test_asking_for_a_cue_does_not_wait_for_it(self, socket_path: Path) -> None:
+        """A cue costs 320-620 ms of wall time on the real path (#174), and the
+        arm that asks for one is Bridge Core's dispatch. It is not held."""
+        writing = threading.Event()
+        release = threading.Event()
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                player.while_playing = lambda: (writing.set(), release.wait(2.0))
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+
+                await adapter.play_cue(Cue.CONNECTED)
+                # Returned while the write is still in the device. If `play_cue`
+                # had waited, this line would not run until `release` was set.
+                assert writing.wait(2.0)
+                assert not release.is_set()
+                release.set()
+
+        asyncio.run(scenario())
+
+    def test_a_call_that_drops_the_moment_it_came_up_is_still_heard_in_order(
+        self, socket_path: Path
+    ) -> None:
+        """The case a thread a cue could not keep (#186).
+
+        The two cues mark the two ends of one call, so their order is the claim.
+        A call that goes away within one cue's wall time of coming up asks for
+        the second before the first has finished playing — 320-620 ms on the
+        real path (#174) — and two threads racing for the device would have the
+        user hear the call end before they heard it start. The player is fed by
+        one worker, so it cannot.
+
+        The stand-in device holds each write open long enough that an unordered
+        implementation would have to interleave to pass.
+        """
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                player.while_playing = lambda: time.sleep(0.05)
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+
+                # No gap at all between them: both are asked for before the
+                # first has reached the device.
+                await adapter.play_cue(Cue.CONNECTED)
+                await adapter.play_cue(Cue.ENDED)
+                deadline = time.monotonic() + 5.0
+                while len(player.spans) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return player
+
+        player = asyncio.run(scenario())
+        assert [span.cue for span in player.spans] == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_every_cue_asked_for_is_played_once_and_in_order(self, socket_path: Path) -> None:
+        """A burst longer than any real call, to prove the queue drains in order."""
+        asked = [Cue.CONNECTED, Cue.EVENT, Cue.EVENT, Cue.ENDED, Cue.CONNECTED, Cue.ENDED]
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                for cue in asked:
+                    await adapter.play_cue(cue)
+                deadline = time.monotonic() + 5.0
+                while len(player.spans) < len(asked) and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return player
+
+        player = asyncio.run(scenario())
+        assert [span.cue for span in player.spans] == asked
+
+    def test_one_worker_plays_every_cue_rather_than_a_thread_each(self, socket_path: Path) -> None:
+        """The mechanism the order rests on, asserted rather than assumed."""
+
+        async def scenario() -> list[threading.Thread]:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                on: list[threading.Thread] = []
+                player.while_playing = lambda: on.append(threading.current_thread())
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                for cue in Cue:
+                    await adapter.play_cue(cue)
+                deadline = time.monotonic() + 5.0
+                while len(player.spans) < len(list(Cue)) and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return on
+
+        on = asyncio.run(scenario())
+        assert len(on) == len(list(Cue))
+        assert len({thread.name for thread in on}) == 1
+
+    def test_the_cue_worker_never_holds_a_closing_engine_open(self, socket_path: Path) -> None:
+        """A tone is not a reason for an engine to wait, so the worker is a daemon.
+
+        It also never ends by itself — it has to outlive every call, because the
+        cue that matters most is the one that marks a call that has gone — so a
+        non-daemon worker would be a process that could not exit at all.
+        """
+
+        async def scenario() -> list[threading.Thread]:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput()
+                started: list[threading.Thread] = []
+                player.while_playing = lambda: started.append(threading.current_thread())
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                await adapter.play_cue(Cue.CONNECTED)
+                self.played(player)
+                return started
+
+        started = asyncio.run(scenario())
+        assert started and all(thread.daemon for thread in started)
+
+    def test_a_cue_that_could_not_be_played_does_not_stop_the_ones_after_it(
+        self, socket_path: Path
+    ) -> None:
+        """One worker for every cue means one failure could have silenced the rest."""
+
+        async def scenario() -> FakeCueOutput:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                player = FakeCueOutput(fails="no such output device")
+                adapter, _ = await riding(server, Sink(), cue_player=player)
+                await adapter.play_cue(Cue.CONNECTED)
+                deadline = time.monotonic() + 5.0
+                while len(player.seen_playing) < 1 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                player.fails = ""
+                await adapter.play_cue(Cue.ENDED)
+                while len(player.spans) < 1 and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                return player
+
+        player = asyncio.run(scenario())
+        assert [span.cue for span in player.spans] == [Cue.ENDED]
+
+
+class TestWhatALostConnectionReleases:
+    """A connection that went away by itself still gives its devices back.
+
+    Found by #186's review, and it is #186's problem: `ENDED` is played on a
+    drop, out of the adapter's own player, and it must not go out into a
+    microphone that a dead call left open. The bug was older than the cue —
+    `_note` set `_closing` to keep itself from reporting one loss twice, and
+    `_closing` is also what makes `aclose` idempotent, so the `aclose` the
+    adapter runs after a drop returned at its first line and stopped nothing.
+
+    **Built without `aiortc`, deliberately.** `webrtc.py` is the one module CI
+    cannot exercise — the voice extra is not installed there — and that is
+    exactly why a defect in it survived. `_note` and `aclose` touch four
+    attributes between them and none of them is a peer connection, so the object
+    is assembled here rather than constructed, and the rule gets a test that runs
+    on every push instead of on one laptop.
+    """
+
+    class Stopped:
+        def __init__(self) -> None:
+            self.stops = 0
+
+        def stop(self) -> None:
+            self.stops += 1
+
+    class Connection:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    def transport(self) -> Any:
+        made = object.__new__(webrtc._WebRtcTransport)
+        made._pc = self.Connection()
+        made._microphone = self.Stopped()
+        made._speaker = self.Stopped()
+        made._connected = asyncio.get_event_loop().create_future()
+        made._connected.set_result(None)
+        made._closing = False
+        made._reported = False
+        made._on_lost = None
+        return made
+
+    def test_a_drop_is_reported_and_the_devices_are_still_released(self) -> None:
+        async def scenario() -> tuple[Any, list[str]]:
+            made = self.transport()
+            losses: list[str] = []
+            made.on_lost(losses.append)
+
+            made._note("failed")
+            # What the adapter does next, on the task it spawns for it.
+            await made.aclose()
+            return made, losses
+
+        made, losses = asyncio.run(scenario())
+        assert len(losses) == 1
+        assert made._microphone.stops == 1
+        assert made._speaker.stops == 1
+        assert made._pc.closed == 1
+
+    def test_one_loss_is_reported_once_however_many_readings_say_so(self) -> None:
+        async def scenario() -> list[str]:
+            made = self.transport()
+            losses: list[str] = []
+            made.on_lost(losses.append)
+            made._note("failed")
+            made._note("closed")
+            return losses
+
+        assert len(asyncio.run(scenario())) == 1
+
+    def test_a_close_this_side_asked_for_is_never_reported_as_a_loss(self) -> None:
+        async def scenario() -> list[str]:
+            made = self.transport()
+            losses: list[str] = []
+            made.on_lost(losses.append)
+            await made.aclose()
+            made._note("closed")
+            return losses
+
+        assert asyncio.run(scenario()) == []
+
+    def test_closing_twice_releases_the_devices_once(self) -> None:
+        async def scenario() -> Any:
+            made = self.transport()
+            await made.aclose()
+            await made.aclose()
+            return made
+
+        made = asyncio.run(scenario())
+        assert made._microphone.stops == 1
+        assert made._pc.closed == 1

@@ -22,7 +22,7 @@ import journey
 import pytest
 
 from claude_adapter_fake import ParkedApproval, claude_waiting_roster
-from fakes import PROGRESS_CAPTURE, FakeCall
+from fakes import PROGRESS_CAPTURE, FakeCall, UnreachableFarSide
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.core.bridge import (
@@ -60,8 +60,10 @@ from gpt_voicecoding.seams.agent import (
 )
 from gpt_voicecoding.seams.call import (
     CallDropped,
+    CallEnded,
     CallStarted,
     CallState,
+    Cue,
     UserSpeech,
     VoiceSpeech,
 )
@@ -69,6 +71,18 @@ from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
+
+
+class DeafCall(FakeCall):
+    """A Call adapter whose speakers raise instead of playing (#186).
+
+    The shipped adapter swallows its own playback failures, so this is a
+    defective adapter rather than a missing device — and a defective adapter is
+    exactly what the hub's own guard is for.
+    """
+
+    async def play_cue(self, cue: Cue) -> None:
+        raise UnreachableFarSide(f"no output device for the {cue} cue")
 
 
 class EndRefusingCall(FakeCall):
@@ -1927,6 +1941,87 @@ class TestEventsThatDecideNothing:
 
         assert [("  asked: first" in sent) for sent in hub.channel.sent] == [True, False]
         assert "  asked: second" in hub.channel.sent[1]
+
+
+class TestWhatTheUserHearsAtEachEndOfACall:
+    """The two cues that have callers, played from the arms that already existed.
+
+    Bridge Core says which *moment* it is and never which sound; the fake opens
+    no device and records the moments in order, which is what lets the ordering
+    be graded with no audio anywhere (#186). The Call Keeper takes these calls
+    over later (#195), and `EVENT` is the cue that waits for it.
+    """
+
+    def test_a_call_coming_up_is_heard(self) -> None:
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        assert hub.call.cues == [Cue.CONNECTED]
+
+    def test_a_call_ending_as_asked_is_heard(self) -> None:
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(CallEnded(call_id=started.call_id))
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_a_call_that_went_away_by_itself_is_heard_the_same_way(self) -> None:
+        """The user is owed the same news either way: what they hear is that the
+        call is over, not whose idea it was."""
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(CallDropped(call_id=started.call_id, detail="the far side left"))
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_a_call_that_dropped_the_moment_it_came_up_is_heard_in_order(self) -> None:
+        """Both ends of a call inside one cue's wall time, and the order holds.
+
+        Bridge Core asks in order and the adapter keeps that order (#186); this
+        is the hub's half of the claim, with no audio and no threads in it.
+        """
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(
+            CallStarted(call_id=started.call_id),
+            CallDropped(call_id=started.call_id, detail="the far side left"),
+        )
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_the_mid_call_cue_has_no_caller_yet(self) -> None:
+        """`EVENT` ships implemented and unrung. The three sounds were chosen as
+        one set (#174), and the Call Keeper is what will use the third (#170)."""
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(CallStarted(call_id=started.call_id), CallEnded(call_id=started.call_id))
+        hub.now += 600.0
+        hub.tick()
+
+        assert Cue.EVENT not in hub.call.cues
+
+    def test_a_cue_that_raises_never_stops_the_arm_it_was_asked_from(self) -> None:
+        """The interlock still hears about the call. A sound is commentary, and
+        commentary may not take down the thing it is commenting on."""
+        hub = Hub(call=DeafCall())
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        assert hub.emit(CallStarted(call_id=started.call_id)) == 1
+        assert hub.emit(CallEnded(call_id=started.call_id)) == 1
 
 
 class TestWhatDiscoveryCallsAnEnding:

@@ -32,19 +32,39 @@ never goes near them.
 gone, on every path including the failing ones. Keeping one alive per model
 would be a second ledger of which thread is the real one, and nothing in the
 locked decisions asks for continuity between delegated turns.
+
+**The cue player is this adapter's, not a call's.** The user hears the call
+connect and hears it end (#186), and the second of those has to play when the
+call's own audio path has already closed — so the thing that plays it outlives
+any one call, which a per-call transport does not. It opens its own short-lived
+output stream on the same `output_device` the call uses, one per cue.
+
+**Cues go out on one worker thread, in the order they were asked for.** The
+write blocks and `stop` drains after it, and the caller is Bridge Core's
+dispatch loop, which is not a thing to hold for a third of a second over a
+noise — so `play_cue` hands the cue to a queue and returns. One worker rather
+than a thread per cue, because *in order* is the promise: a call that drops
+within one cue's wall time of coming up would otherwise have two threads racing
+for the device, and the user would hear the call end before they heard it start.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
+from gpt_voicecoding.adapters.call.realtime import cues, webrtc
+from gpt_voicecoding.adapters.call.realtime.cues import CueSpan
 from gpt_voicecoding.adapters.call.realtime.settings import RealtimeCallSettings
 from gpt_voicecoding.adapters.call.realtime.transport import (
     CallTransport,
+    CueOutput,
     TransportError,
     TransportFactory,
 )
@@ -56,6 +76,7 @@ from gpt_voicecoding.seams.call import (
     CallSnapshot,
     CallStarted,
     CallState,
+    Cue,
     DelegatedReply,
     UserSpeech,
     VoiceSpeech,
@@ -163,10 +184,23 @@ class RealtimeCallAdapter:
         sink: EventSink | None = None,
         settings: RealtimeCallSettings | None = None,
         transport_factory: TransportFactory,
+        cue_player: CueOutput | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or RealtimeCallSettings()
         self._new_transport = transport_factory
+        #: Where cues go. One per adapter and not one per call, because `ENDED`
+        #: plays after the call's own audio has closed. Handed in only by tests,
+        #: which cannot have an output device; production builds it here, on the
+        #: same `output_device` the call itself is given.
+        self._cues: CueOutput = cue_player or webrtc.CuePlayer(device=self._settings.output_device)
+        #: The cues asked for and not yet played, and the one worker that plays
+        #: them. Unbounded because the only producer is the dispatch loop and a
+        #: call has two cues in it; started on the first cue rather than here,
+        #: so an adapter that never marks a moment never starts a thread.
+        self._queued: queue.SimpleQueue[Cue] = queue.SimpleQueue()
+        self._cue_worker: threading.Thread | None = None
+        self._cue_worker_lock = threading.Lock()
         self._server: OwnedAppServer | None = None
         self._call: _LiveCall | None = None
         self._state = CallState.DOWN
@@ -333,6 +367,87 @@ class RealtimeCallAdapter:
             # Every path, including the failing ones. A thread left behind is a
             # thread nothing will ever close.
             await self._retire(thread_id)
+
+    async def play_cue(self, cue: Cue) -> None:
+        """Mark one moment of the call with a sound. Returns before it is heard.
+
+        **Queued, and played in the order it was asked for.** The write is a
+        device write and `stop` drains after it — 320-620 ms of wall time for
+        60-300 ms of sound, measured on this path (#174) — and the arm that asks
+        for a cue is Bridge Core's dispatch loop, which may not be held for a
+        third of a second to make a noise about something it has already
+        finished. So this hands the cue over and returns at once.
+
+        One worker rather than a thread a cue, because the order is the point:
+        the two cues mark the two ends of a call, and a call that drops within
+        one cue's wall time of coming up would have two threads racing for the
+        device and the user hearing it end before hearing it start. What that
+        costs is that `ENDED` can start up to one cue late, which is a third of
+        a second on a moment that has already happened.
+
+        A daemon thread, so an engine on its way out is never waiting on a tone.
+        """
+        self._queued.put(cue)
+        self._playing_cues()
+
+    def _playing_cues(self) -> threading.Thread:
+        """The one thread that drains the cue queue, started on the first cue."""
+        with self._cue_worker_lock:
+            worker = self._cue_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(target=self._draining, name="call-cues", daemon=True)
+                self._cue_worker = worker
+                worker.start()
+            return worker
+
+    def _draining(self) -> None:
+        """Play whatever has been asked for, one cue at a time, for ever.
+
+        Never exits and never raises: `play_now` swallows its own failures, and a
+        worker that ended on one would leave every later cue in a queue nothing
+        reads. It is a daemon, so the process is free to go without it.
+        """
+        while True:
+            self.play_now(self._queued.get())
+
+    def play_now(self, cue: Cue) -> CueSpan | None:
+        """Synthesise and play one cue on *this* thread, and say what went out.
+
+        The blocking half of `play_cue`, and the half that has an answer: the
+        span the cue occupied on the output device. Public because that span is
+        what a playback reference inherits (#145) — the seam verb returns
+        nothing, and this is where the answer is. `play_cue` reaches it through
+        the queue; a caller that wants the span calls it here and waits.
+
+        Never raises. A cue that could not be played is written down and
+        swallowed: there is no recovery to attempt, and this runs on a thread
+        where a raise would be a stack trace and nothing else.
+        """
+        pcm = cues.render(cue)
+        span = CueSpan(
+            cue=cue,
+            device=self._cues.device,
+            started=time.monotonic(),
+            frames=cues.frames_in(pcm),
+        )
+        try:
+            self._cues.play(pcm, span=span)
+        except Exception as unplayable:  # noqa: BLE001 - a cue may not end a call
+            _log.warning("the %s cue could not be played: %s", cue, unplayable)
+            return None
+        _log.info("%s", cues.played_line(span))
+        return span
+
+    @property
+    def cue_output(self) -> CueOutput:
+        """Where this adapter's cues go, and what is going out right now.
+
+        Exposed rather than private because the span a cue occupies is read from
+        outside this class: #145 gates capture on it, since the microphone stays
+        open through a cue and the mid-call one is deliberately loud enough to
+        carry over speech.
+        """
+        return self._cues
 
     async def verify(self) -> VerifyResult:
         """Report what is loaded, and whether the app-server this rides answers."""
