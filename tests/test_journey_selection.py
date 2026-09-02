@@ -67,7 +67,7 @@ def _walk(chosen: journey.Selection, record: support.Verdict) -> support.Journey
 
 
 def test_every_step_declares_what_it_needs_behind_it() -> None:
-    """The table and the nine names are the same set, or a step has no answer."""
+    """The table and the step names are the same set, or a step has no answer."""
     assert tuple(journey.PREREQUISITES) == journey.STEPS
 
 
@@ -81,7 +81,7 @@ def test_no_step_needs_one_that_runs_after_it() -> None:
 
 
 def test_every_step_name_is_bound_to_a_method() -> None:
-    """`Walk.bound_steps` is where a name becomes code; it covers the nine exactly."""
+    """`Walk.bound_steps` is where a name becomes code; it covers them exactly."""
     walk = object.__new__(journey.Walk)
     assert tuple(walk.bound_steps()) == journey.STEPS
 

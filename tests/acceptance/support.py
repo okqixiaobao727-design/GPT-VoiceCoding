@@ -29,6 +29,7 @@ import filecmp
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -40,6 +41,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+import live_call
 
 from gpt_voicecoding.adapters.agent.claude.settings import DEFAULT_ACK_TIMEOUT_SECONDS
 from gpt_voicecoding.adapters.companion_channel.telegram.api import TelegramError, Transport
@@ -83,6 +86,17 @@ SOCKET_ROOT = Path("/tmp")
 def acceptance_root() -> Path:
     override = os.environ.get(ACCEPTANCE_ROOT_VARIABLE)
     return Path(override).expanduser() if override else ACCEPTANCE_ROOT
+
+
+def harness_root() -> Path:
+    """Where the harness's own modules live — `tests/acceptance`, not the runs.
+
+    Distinct from `acceptance_root`, which is where a run's artifacts go. This is
+    an *import* path: the engine is handed it so `[adapters] call` can name
+    `live_call`, and it is derived from this file rather than from the checkout
+    so a worktree gets its own copy rather than another tree's (#183).
+    """
+    return Path(__file__).resolve().parent
 
 
 def bundle_path() -> Path:
@@ -361,6 +375,18 @@ def _differing(tree: Path, installed: Path) -> Iterator[str]:
 #: engine will refuse.
 CODEX_SETTINGS_KEY = f"agent.{AgentKind.CODEX}"
 
+#: How `[adapters.settings]` names the Call seam's table — flat, by the seam name
+#: the engine itself builds (`config.py:132`), for `CODEX_SETTINGS_KEY`'s reason.
+CALL_SETTINGS_KEY = "call"
+
+#: The Call adapter a Live Call run points `[adapters] call` at. Taken from the
+#: module that defines it rather than spelled again here: two copies of a
+#: `module:attribute` are two things to keep in step, and the engine only ever
+#: resolves one of them. The module is `tests/acceptance/live_call.py`, which the
+#: engine reaches because `Engine.environment` puts this directory on its
+#: `PYTHONPATH`.
+HARNESS_CALL_REFERENCE = live_call.REFERENCE
+
 
 @dataclass(frozen=True)
 class DerivedConfig:
@@ -372,6 +398,15 @@ class DerivedConfig:
     workspace: Path
     token_variable: str
     chat_id: str
+    #: Where the harness's Call adapter writes what it saw, when this run has
+    #: one. `None` on a run that left the user's own Call adapter in place.
+    call_observations: Path | None = None
+    #: Where the WAVs it synthesised are kept, for a person to listen to after.
+    call_wav_directory: Path | None = None
+    #: The `bridgectl` wrapper `[delegate] cli` names, when this run wrote one.
+    cli_wrapper: Path | None = None
+    #: Where that wrapper logs the runs the Call Agent made.
+    cli_wrapper_log: Path | None = None
 
 
 def derive_config(
@@ -384,6 +419,8 @@ def derive_config(
     token_variable: str | None = None,
     codex_socket_directory: Path | None = None,
     dropped_agents: tuple[AgentKind, ...] = (),
+    harness_live_call: bool = False,
+    control_plane_cli: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
 
@@ -433,6 +470,27 @@ def derive_config(
     claimant rather than displacing the first; this is the harness's half, and
     with one claimant there is no contention to refuse. The Claude lane's table
     is untouched, because it is the lane that needs the route.
+
+    **Two more are replaced when the run holds a Live Call** (`harness_live_call`,
+    #183), and both are the shipped mechanism doing what it is for rather than a
+    reach past it:
+
+    `[adapters] call` is pointed at `live_call:harness_call`, which builds the
+    production `RealtimeCallAdapter` with the production WebRTC transport at
+    `silent=True` and feeds its track from synthesised speech. The seam is
+    already a `module:attribute` composition resolves (`config.py:70`), so no
+    `src/` change is needed for a call with nobody at the microphone. Its
+    `[adapters.settings.call]` table carries the two paths that module cannot
+    default — where it writes what it saw, and where it keeps the WAVs — and
+    they are **per lane**, because both lanes hold this call at once.
+
+    `[delegate] cli` is pointed at a wrapper that logs each invocation and execs
+    the real `bridgectl`. The engine puts this value into the generated
+    instructions verbatim (`composition.py:_instruction_context`) and it is
+    **absolute**, so what the Call Agent runs is this run's wrapper rather than
+    whatever its own PATH resolves — a PATH shadow cannot intercept an absolute
+    path. The wrapper is transparent: the real CLI's output and its exit code go
+    straight back, because the Call Agent branches on both.
     """
     run_directory.mkdir(parents=True, exist_ok=True)
     document = tomllib.loads(source.read_text())
@@ -488,6 +546,26 @@ def derive_config(
         codex["socket_directory"] = str(codex_socket_directory)
         settings[CODEX_SETTINGS_KEY] = codex
 
+    observations = wav_directory = wrapper = wrapper_log = None
+    if harness_live_call:
+        observations = run_directory / "live-call.jsonl"
+        wav_directory = run_directory / "live-call-wav"
+        adapters["call"] = HARNESS_CALL_REFERENCE
+        settings[CALL_SETTINGS_KEY] = {
+            **settings.get(CALL_SETTINGS_KEY, {}),
+            "observations": str(observations),
+            "wav_directory": str(wav_directory),
+        }
+        wrapper_log = run_directory / "bridgectl-runs.log"
+        wrapper = write_cli_wrapper(
+            run_directory / "bridgectl-wrapper",
+            real=control_plane_cli if control_plane_cli is not None else bundled_bridgectl(),
+            log=wrapper_log,
+        )
+        delegate = dict(document["delegate"])
+        delegate["cli"] = str(wrapper)
+        document["delegate"] = delegate
+
     path = run_directory / "config.toml"
     path.write_text(_as_toml(document))
     (run_directory / "config-dropped.json").write_text(json.dumps(dropped, indent=2) + "\n")
@@ -500,7 +578,65 @@ def derive_config(
         workspace=workspace,
         token_variable=str(channel["token_env"]),
         chat_id=str(channel["chat_id"]),
+        call_observations=observations,
+        call_wav_directory=wav_directory,
+        cli_wrapper=wrapper,
+        cli_wrapper_log=wrapper_log,
     )
+
+
+#: How the wrapper stamps each run: UTC, to the second, so two lanes' logs and
+#: the engine's own log can be read on one timeline.
+CLI_WRAPPER_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def write_cli_wrapper(path: Path, *, real: Path, log: Path) -> Path:
+    """A `bridgectl` that records what it was asked and then is the real one.
+
+    Ported from the probe's stand-in (`realtime_text_entry_probe.py:776-791`),
+    with the one difference that matters: the probe's stand-in *replaced*
+    `bridgectl` and printed `call ended` without ending anything, because it was
+    measuring whether the Call Agent would run the verb at all. This one runs
+    the real verb, because the step is measuring the route through the product —
+    a `bridgectl live` that ended no call would leave `CallEnded` unobserved.
+
+    `exec` rather than a subshell: the real CLI inherits the process, so its
+    stdout, stderr and exit code reach the Call Agent unchanged and there is no
+    wrapper left holding a descriptor while a call is up.
+
+    The log line is written **before** the exec, which is the only order that
+    works — after it there is no wrapper left to write anything.
+
+    **Both paths are quoted**, and that is the whole difference between a
+    wrapper that records and one that silently does not. The acceptance's own
+    run directory lives under `~/Library/Application Support/…`, which has a
+    space in it: unquoted, `>> $log` is an ambiguous redirect and `exec $real`
+    is a command that does not exist, so every `bridgectl` the Call Agent ran
+    would fail and leave no trace of having been run. Written out because a
+    fixture in a `tmp_path` has no spaces and would never have shown it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf \'%s %s\\n\' "$(date -u +{CLI_WRAPPER_STAMP})" "$*" >> {shlex.quote(str(log))}\n'
+        f'exec {shlex.quote(str(real))} "$@"\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def cli_wrapper_runs(log: Path | None) -> list[str]:
+    """Every `bridgectl` the wrapper recorded. No log is no runs, never an error.
+
+    A lower bound by construction, which is what the step asserts on: #181
+    finding 1 is that a hand-off may happen more than once per request, so the
+    number of runs is not something this run gets to predict.
+    """
+    if log is None or not log.exists():
+        return []
+    return [line for line in log.read_text(errors="replace").splitlines() if line.strip()]
 
 
 def _as_toml(document: dict[str, Any]) -> str:
@@ -597,12 +733,18 @@ class Engine:
         journal: Journal,
         token: str,
         path_value: str,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self._config = config
         self._bundle = bundle
         self._journal = journal
         self._token = token
         self._path_value = path_value
+        #: What the engine's environment is built on. The process's own, unless
+        #: a caller states one — which only a test does, so that "an existing
+        #: `PYTHONPATH` is extended rather than replaced" can be checked without
+        #: writing into the environment of whoever is running the suite.
+        self._base = dict(os.environ if environment is None else environment)
         self._process: subprocess.Popen[bytes] | None = None
 
     @property
@@ -614,10 +756,32 @@ class Engine:
         an agent that has never been logged in. That is the one thing the run
         cannot isolate; the workspaces and every path the engine writes are under
         the run directory instead.
+
+        **`PYTHONPATH` gains this directory, and only on a run that needs it**
+        (#183). `[adapters] call` is a `module:attribute` the *engine* imports,
+        and on a Live Call run that module is the harness's own `live_call` —
+        which the bundle's interpreter, carrying the product and not the tests,
+        otherwise cannot see.
+
+        Conditional rather than always, because this directory is a flat pile of
+        modules with ordinary names (`support`, `journey`, `live_call`) and
+        putting it **ahead** of the engine's own import path changes what every
+        `import` in that process resolves to. A run that never dials has no
+        reason to pay that, and the run this harness exists to accept is the one
+        with nothing of the harness in it.
+
+        Extended, never replaced: the user's own environment is what reaches the
+        engine, and dropping an entry of it would be the harness quietly
+        changing the thing it is accepting.
         """
-        environment = dict(os.environ)
+        environment = dict(self._base)
         environment["PATH"] = self._path_value
         environment[self._config.token_variable] = self._token
+        if self._config.call_observations is not None:
+            roots = [str(harness_root())]
+            existing = environment.get("PYTHONPATH", "")
+            roots.extend(part for part in existing.split(os.pathsep) if part)
+            environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(roots))
         return environment
 
     def start(self) -> None:
@@ -950,7 +1114,7 @@ class Verdict:
     environment: dict[str, Any] = field(default_factory=dict)
     #: Things the run *arranged* or *saw* but does not grade — the trust gate,
     #: #44's approval directory. Kept out of `lanes` so the graded step set stays
-    #: exactly the nine the build tickets cite, and kept out of nothing else.
+    #: exactly the ones the build tickets cite, and kept out of nothing else.
     observations: list[dict[str, Any]] = field(default_factory=list)
     lanes: dict[str, list[StepVerdict]] = field(default_factory=dict)
     #: What the run promised to observe: the **selected** steps, which is all nine
@@ -1310,7 +1474,7 @@ class Journey:
     def observe(self, what: str, detail: str) -> None:
         """Write down something the run arranged, or saw and does not grade.
 
-        Kept out of the graded step set on purpose. The nine steps are cited
+        Kept out of the graded step set on purpose. The steps are cited
         **verbatim** by the "Red first" line of every build ticket (#74–#80), so
         a tenth row in `lanes` would read as a tenth red line for someone to
         clear. These land in `verdict.observations` instead, where a reader sees

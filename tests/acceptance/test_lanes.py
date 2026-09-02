@@ -56,7 +56,7 @@ grades what that lane wrote down. So the run costs one lane's wall clock rather
 than the sum of two, and the verdict is still one file with a block per lane.
 
 What each lane is expected to find on today's `main` is stated on #73 rather than
-guessed at here: the nine steps are the red lines #74–#80 clear, and each is red
+guessed at here: the steps are the red lines #74–#80 and #183 clear, and each is red
 until the ticket that owns it lands.
 """
 

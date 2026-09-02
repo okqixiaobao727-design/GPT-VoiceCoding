@@ -1,4 +1,4 @@
-"""The nine steps of the bridge journey, written once and walked by both lanes.
+"""The steps of the bridge journey, written once and walked by both lanes.
 
 ## What changed, and why
 
@@ -14,7 +14,7 @@ ordinary `claude` / `codex` binary, in a pty, no wrapper (`hand_started.py`).
 Steps `0c`, `1a`, `1b` and `8` are gone with the launcher. `0b` (the realtime
 contract probe) and the provenance compare stay where they were.
 
-## The nine names are a contract
+## The step names are a contract
 
 Every one of the build tickets #74–#80 cites a step name from `STEPS` verbatim in
 its "Red first" line. Renaming one here silently moves seven tickets' exit
@@ -87,6 +87,7 @@ from typing import TYPE_CHECKING
 
 import approval_effect
 import hand_started
+import live_call
 import support
 from support import LaneBlocked, StepFailed
 
@@ -96,7 +97,9 @@ if TYPE_CHECKING:
     # the fast suite imports this file to test its attribution rule without it.
     import telegram_person
 
-#: The nine steps, in the order #73 fixed. Cited verbatim by #74–#80.
+#: Every step, in the order #73 fixed and #183 appended to. The first nine are
+#: cited verbatim by #74–#80; `live call` is #183's, and is last because a call
+#: holds the interlock and a whole-lane run wants the turn-driving steps behind it.
 STEPS = (
     "roster",
     "stable name",
@@ -107,6 +110,7 @@ STEPS = (
     "companion inbound",
     "switches",
     "child",
+    "live call",
 )
 
 #: What each step needs to have run **before** it, so that a step selected on its
@@ -138,11 +142,16 @@ PREREQUISITES: Mapping[str, tuple[str, ...]] = {
     "companion inbound": ("roster",),
     "switches": ("roster",),
     "child": ("roster",),
+    #: `live call` names no Session at all — it is the route from `bridgectl
+    #: live` through the voice surface and back, and nothing in it reads the
+    #: roster or the agent's own record. So it does not need `roster`, and
+    #: #183's blocker clause is explicit that it must be runnable alone.
+    "live call": (),
 }
 
 
 class UnknownStep(Exception):
-    """`--step` named something that is not one of the nine. It carries the nine."""
+    """`--step` named something that is not a step. It carries the ones there are."""
 
 
 @dataclass(frozen=True)
@@ -179,9 +188,9 @@ def select(names: Sequence[str] | None = None) -> Selection:
     """Resolve `--step` into what to walk and what to grade.
 
     No names is the full run: every step graded, nothing as setup. Any name is
-    matched against `STEPS` **exactly** — the nine spellings are the interface
+    matched against `STEPS` **exactly** — these spellings are the interface
     every build ticket's "Red first" line cites, so a near miss is a refusal that
-    carries the nine rather than a run that quietly walks eight of them.
+    carries them all rather than a run that quietly walks one fewer.
     """
     asked = tuple(dict.fromkeys(names or ()))
     if not asked:
@@ -240,6 +249,80 @@ ENGINE_STOP_LINE = r"(?i)Session stopped:"
 #: this pattern's business either** — the sentence opens with the Session's name
 #: since #109, and the attribution rule is what reads it.
 APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
+
+#: The engine's own line for what the user said (`core/bridge.py:796`). It is the
+#: only line either call event has: `CallStarted` and `CallEnded` are noted into
+#: the interlock and never logged (`core/bridge.py:777-785`), which is why the
+#: `live call` step reads those two off the control plane instead.
+USER_SPEECH_LINE = r"user speech, for the voice thread to act on"
+
+#: The fragment of the request the engine's line has to carry. A fragment rather
+#: than the sentence because ASR text is unstable (#181 finding 1), and this one
+#: because it is the request's own tail — every trial in the probe's record
+#: (`docs/research/probes/20260901T213252Z-agent-hangup.jsonl`) carried it.
+#:
+#: **Matched with every space taken out of both sides**, which is not tidying: on
+#: run `20260902T093755Z` the two lanes heard the same four seconds of audio and
+#: wrote it down differently — the Claude lane's engine logged `…结束通话` and the
+#: Codex lane's `…结束通 话`, a space inserted inside the word. The request has no
+#: spaces in it at all, so a space anywhere in the transcript is the recogniser's
+#: and never the speaker's, and a substring test that counted one was a test of
+#: which recogniser answered rather than of whether the words arrived.
+LIVE_CALL_HEARD_SUBSTRING = "结束通话"
+
+
+def _unspaced(text: str) -> str:
+    """One line with all whitespace removed — see `LIVE_CALL_HEARD_SUBSTRING`."""
+    return "".join(text.split())
+
+
+#: How the harness's Call adapter words a connection that went away by itself
+#: (`live_call.HarnessCallTransport.on_lost`). The engine raises `CallDropped`
+#: for that, not `CallEnded`.
+DROPPED_REASON = "went away by itself"
+
+
+def _ended_by(by_agent: bool, end_reason: str | None) -> str:
+    """Who ended the call — and `lost` is a third answer, not a shade of `agent`.
+
+    A connection that goes away by itself also leaves `bridgectl status` saying
+    `call: none`, so "the call was down when the step looked" cannot on its own
+    tell an ending from a loss. Reading only that clock attributed a dropped
+    call to the Call Agent, and the verdict then carried two sentences that
+    contradicted each other: an end reason saying the connection went away by
+    itself, beside a claim that the agent ended it. The audio path is the one
+    that knows, so it is asked first.
+    """
+    if end_reason and DROPPED_REASON in end_reason:
+        return "lost"
+    return "agent" if by_agent else "harness"
+
+
+#: How long `bridgectl live` gets to bring a call up. The adapter's own connect
+#: timeout is 45s (`realtime/settings.py` `DEFAULT_CONNECT_TIMEOUT_SECONDS`) and
+#: a `thread/start` precedes it, so this is that with room for the round trip —
+#: shorter would time the surface out on a handshake that is merely finishing.
+LIVE_CALL_OPEN_SECONDS = 120.0
+
+#: How long the utterance gets to reach the engine as speech. Derived from the
+#: probe's own timeline: the harness waits `live_call.SETTLE_SECONDS` after the
+#: peer connection comes up, the request is about four seconds of audio, and the
+#: user transcript landed at 20.7s from dial on run `20260901T213252Z`. Three
+#: times that, so a slow segmentation is never read as one that never happened.
+LIVE_CALL_HEARD_SECONDS = 90.0
+
+#: How long the hand-off gets after that. The Call Agent has to decide, then run
+#: a shell command; the probe saw the assistant answering 3.6s after the user
+#: transcript and the verb run within the same reply window.
+LIVE_CALL_HANDOFF_SECONDS = 120.0
+
+#: And how long the call then gets to actually go down.
+LIVE_CALL_END_SECONDS = 60.0
+
+#: How often those three are checked. Each poll is a `bridgectl status` or a log
+#: read, so it is cheap; frequent enough that the measured duration means
+#: something and rare enough not to be a load on the engine mid-call.
+LIVE_CALL_POLL_SECONDS = 2.0
 
 #: Preserve the former approval helper's observation cadence while #146 replaces
 #: its sequential waits. This is a cadence, not a deadline; all far-side ceilings
@@ -855,7 +938,7 @@ class Walk:
         )
 
     def bound_steps(self) -> dict[str, Callable[[], str]]:
-        """The nine names bound to the nine methods, and the only place they are.
+        """Every name bound to its method, and the only place they are.
 
         `STEPS` is the contract every build ticket's "Red first" line cites; this
         is where a name becomes code. Written as a table rather than as nine
@@ -874,6 +957,7 @@ class Walk:
             "companion inbound": self.companion_inbound,
             "switches": self.switches,
             "child": self.child,
+            "live call": self.live_call,
         }
 
     def settle_boot_turn(self) -> int | None:
@@ -969,7 +1053,7 @@ class Walk:
         except StepFailed as unattributable:
             # Arrangement, not judgement: this method has no step to fail. A lane
             # whose messages cannot be told from another Session's is a lane none
-            # of the nine steps could read either, so it is blocked here rather
+            # of the steps could read either, so it is blocked here rather
             # than walked into nine reds with one cause.
             raise LaneBlocked(
                 f"the boot turn's notice could not be attributed, and neither could anything "
@@ -1877,6 +1961,220 @@ class Walk:
             f"no notice naming it in {self.far_side.absence_window_seconds:.0f}s; "
             f"relay refused: {refused.text!r}; brief refused: {unbriefed.text!r}"
         )
+
+    # --- live call --------------------------------------------------------
+
+    def live_call(self) -> str:
+        """A Live Call with nobody at the microphone, v0: the route and no more (#183).
+
+        `bridgectl live` opens a real call against the real backend. The audio
+        the user would have spoken is synthesised and put on the track by the
+        harness's own Call adapter (`live_call.py`), which builds the production
+        WebRTC transport with `silent=True` and opens no device — so this runs
+        from an agent session, with no microphone grant anywhere.
+
+        **What is graded, and why each one is a lower bound.** #181's findings 1
+        and 2 are that a hand-off may happen more than once per request and may
+        arrive *before* the user transcript, so nothing here counts, orders, or
+        asserts an absence:
+
+        * the call came up — `bridgectl live` says so, and that is the engine's
+          own account of it. **Not the engine log**: `CallStarted` is an event
+          the hub notes into the interlock and never writes a line for
+          (`core/bridge.py:777-785`), and nothing under `src/` changes for this
+          ticket, so the control plane is where the engine says a call is up
+          (`control_plane/commands.py:181-186`);
+        * the words reached the engine as speech — `UserSpeech` *is* logged
+          (`core/bridge.py:796`), matched by **substring**, because ASR text is
+          unstable and this run does not get to predict it;
+        * the Call Agent acted through the control plane at least once — the
+          wrapper log, **whatever verb it ran**. The wrapper is what
+          `[delegate] cli` names, by absolute path, so a PATH shadow cannot
+          intercept the runs this counts. ADR 0018 makes a hang-up observable as
+          the Call Agent running `bridgectl`, and this line is that observation:
+          the `handoff_request` item the ticket names is not one the harness can
+          see, because the Call adapter surfaces no such notification
+          (`adapters/call/realtime/adapter.py:563-578`) and nothing under `src/`
+          changes here;
+        * the call is down when the step is over — `bridgectl status` stops
+          naming one, and the step ends it itself if the Call Agent has not.
+
+        **Which verb the Call Agent chose is recorded, never graded**, and that
+        is deliberate: the shipped Voice instructions name the CLI invocation
+        (`core/instructions/voice.py:80-88`) and carry no rule that `live` is
+        what ends a call, so the Call Agent guesses. Run `20260902T095448Z` had
+        it guess `live` on one lane and `call end` — not an action this engine
+        serves — on the other, from the same instructions. Grading the guess
+        would make this step a coin toss about a rule no ticket has shipped yet
+        (deferred, #195). The guess stays visible instead: every verb, in order,
+        into `verdict.json`.
+
+        Everything else this step learns is **recorded, never graded**: the
+        transport factory, the wav variant, the end reason the audio path saw,
+        and whether the agent or the harness ended the call.
+        """
+        if self.config.call_observations is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        opened = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
+        if not opened.ok or "is up" not in opened.text:
+            raise StepFailed(
+                f"`bridgectl live` did not open a call: {opened.text[:300]!r}. The engine's "
+                f"log tail: {self.engine.log_lines()[-5:]}"
+            )
+        self.journal("live.call.opened", lane=self.lane.name, answer=opened.text)
+        started = time.monotonic()
+        try:
+            heard = support.wait_for(
+                lambda: bool(self._user_speech_lines()),
+                deadline_seconds=LIVE_CALL_HEARD_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            ran = support.wait_for(
+                lambda: bool(support.cli_wrapper_runs(self.config.cli_wrapper_log)),
+                deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            by_agent = support.wait_for(
+                self._call_is_down,
+                deadline_seconds=LIVE_CALL_END_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # The agent had its window; the call is the run's to close either
+            # way. Ending it here is what keeps a green step from resting on
+            # which verb the Call Agent happened to guess, while `ended_by`
+            # keeps the guess visible.
+            if not by_agent:
+                self._end_any_live_call()
+            ended = self._call_is_down()
+        finally:
+            # The call is this run's to clean up whatever the step decided, and
+            # a call left up would hold the interlock over every later step and
+            # cost backend time until the engine is stopped. The toggle is
+            # idempotent in the direction that matters: `live` on a call that
+            # already ended opens one, so this only fires while one is up.
+            self._end_any_live_call()
+        seen = live_call.observed(self.config.call_observations)
+        ended_by = _ended_by(by_agent, seen.end_reason)
+        self.turns.append(self._measured("live call", started, ended))
+        runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)
+        verbs = self._verbs_run()
+        spoken = self._user_speech_lines()
+        self.journey.observe(
+            "live call transport",
+            f"factory {seen.transport_factory or 'none recorded'}; wav variant "
+            f"{seen.variant or 'none recorded'}; end reason "
+            f"{seen.end_reason or 'none recorded'}; ended by the {ended_by}; observations "
+            f"{self.config.call_observations}",
+        )
+        self.journey.observe(
+            "live call bridgectl runs",
+            f"{len(runs)} logged in {self.config.cli_wrapper_log}; verbs in order: "
+            f"{verbs or 'none'}; the call was ended by the {ended_by}",
+        )
+        if not heard:
+            raise StepFailed(
+                f"the engine never logged the user's speech within "
+                f"{LIVE_CALL_HEARD_SECONDS:.0f}s of the call coming up. The utterance the "
+                f"harness put on the track is {live_call.REQUEST!r} and the line looked for "
+                f"carries {LIVE_CALL_HEARD_SUBSTRING!r}; the adapter recorded "
+                f"{seen.variant or 'no'} wav variant and ended "
+                f"{seen.end_reason or 'without saying why'}. Engine log tail: "
+                f"{self.engine.log_lines()[-5:]}"
+            )
+        if not ran:
+            raise StepFailed(
+                f"the engine heard {spoken[-1]!r} and no `bridgectl` run at all reached "
+                f"{self.config.cli_wrapper_log} within {LIVE_CALL_HANDOFF_SECONDS:.0f}s — the "
+                f"words arrived and nothing was handed off. The wrapper is what "
+                f"`[delegate] cli` names, so a hand-off that ran anything would be here"
+            )
+        if not ended:
+            raise StepFailed(
+                f"the call was still up after the step asked it to end "
+                f"({self._call_line()!r}). Verbs the Call Agent ran: {verbs or 'none'}"
+            )
+        # The three observations the ticket asks `verdict.json` to carry. Graded
+        # rather than merely written down: a run that recorded none of them is a
+        # run whose Call adapter never wrote its file, and a green step that says
+        # `none recorded` three times has reported nothing about the call it held.
+        missing = [
+            name
+            for name, value in (
+                ("transport factory", seen.transport_factory),
+                ("wav variant", seen.variant),
+                ("end reason", seen.end_reason),
+            )
+            if not value
+        ]
+        if missing:
+            raise StepFailed(
+                f"the call ran and {self.config.call_observations} records no "
+                f"{', no '.join(missing)} — the step cannot report what the ticket asks it to "
+                f"observe. What it does hold: {seen.entries[-3:] or 'nothing at all'}"
+            )
+        return (
+            f"call up on `bridgectl live` ({opened.text!r}); engine heard {spoken[-1]!r}; "
+            f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; call down "
+            f"({self._call_line()!r}), ended by the {ended_by}; transport "
+            f"{seen.transport_factory}, wav variant {seen.variant!r}, ended {seen.end_reason!r}"
+        )
+
+    def _verbs_run(self) -> list[str]:
+        """Every verb the Call Agent put to the control plane, in order.
+
+        Recorded rather than graded (see `live_call`). The wrapper logs the whole
+        argv, and what identifies the verb is the first word that is not the
+        `--socket` the engine's own instructions put in front of it — so an
+        invented verb (`call end`, run `20260902T095448Z`) reads as itself rather
+        than being silently dropped for not matching anything known.
+        """
+        spoken: list[str] = []
+        for line in support.cli_wrapper_runs(self.config.cli_wrapper_log):
+            words = line.split()[1:]  # the UTC stamp is the harness's, not the agent's
+            while words and words[0].startswith("--"):
+                # `--socket <path>`, and any other option the instructions carry.
+                words = words[2:] if len(words) > 1 else []
+            if words:
+                spoken.append(" ".join(words))
+        return spoken
+
+    def _user_speech_lines(self) -> list[str]:
+        """Every engine line about what the user said, matched by substring.
+
+        ASR text is unstable, so the pattern is a fragment of the request rather
+        than the request: the probe's three trials came back verbatim
+        (`docs/research/probes/20260901T213252Z-agent-hangup.jsonl`), which is
+        exactly the kind of luck an assertion may not depend on — and run
+        `20260902T093755Z` is where it ran out, with one lane hearing `结束通话`
+        and the other `结束通 话` from the same audio.
+        """
+        return [
+            line
+            for line in support.matching_lines(self.engine.log_lines(), USER_SPEECH_LINE)
+            if _unspaced(LIVE_CALL_HEARD_SUBSTRING) in _unspaced(line)
+        ]
+
+    def _call_line(self) -> str:
+        """What `bridgectl status` says about the call, as the surface renders it."""
+        answer = self.bridgectl("status")
+        for line in answer.text.splitlines():
+            if line.startswith("call:"):
+                return line.strip()
+        return answer.text[:200]
+
+    def _call_is_down(self) -> bool:
+        """No call is up **right now**, in the engine's own words."""
+        return self._call_line() == "call: none"
+
+    def _end_any_live_call(self) -> None:
+        """Leave no call behind, and never open one doing it."""
+        if self._call_is_down():
+            return
+        answer = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
+        self.journal("live.call.cleanup", lane=self.lane.name, answer=answer.text)
 
     # --- plumbing ---------------------------------------------------------
 
