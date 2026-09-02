@@ -77,6 +77,7 @@ class TestTheStopNoticePipelineEndToEnd:
             has_history=True,
             recent=(
                 ProgressEntry(
+                    ordinal=0,
                     role=ProgressRole.ASSISTANT,
                     text="The registry status is the root cause.",
                 ),
@@ -132,6 +133,7 @@ class TestTheStopNoticePipelineEndToEnd:
             has_history=True,
             recent=(
                 ProgressEntry(
+                    ordinal=0,
                     role=ProgressRole.ASSISTANT,
                     text="The readable observation remains authoritative.",
                 ),
@@ -245,6 +247,7 @@ class TestTheStopNoticePipelineEndToEnd:
                     has_history=True,
                     recent=(
                         ProgressEntry(
+                            ordinal=0,
                             role=ProgressRole.ASSISTANT,
                             text="The diagnosis points to the session registry.",
                         ),

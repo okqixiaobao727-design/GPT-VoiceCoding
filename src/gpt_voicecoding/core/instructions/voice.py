@@ -193,7 +193,7 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                     text=(
                         "The shape that works: which session, and its state — the turn "
                         "finished, it awaits an answer, it awaits permission, or it waits on "
-                        "them for something not yet readable. Then what its progress says it "
+                        "them for something not yet readable. Then what the reading says it "
                         "most recently said: the newest assistant entry, that it said nothing "
                         "yet, or that it spoke but the newest entry was too large to carry. "
                         "Then, if it asked something, the question in one sentence and each "
@@ -207,8 +207,10 @@ def _sections(context: InstructionContext) -> tuple[Section, ...]:
                 Block(
                     covers=("voice.notice.reads-progress-when-asked-for-more",),
                     text=(
-                        "If they ask what else that session said, use the existing progress "
-                        "action for that exact session and report its recent entries."
+                        "If they ask what else that session said, use the existing history "
+                        "action for that exact session and read back the page it gives you. "
+                        "When it says older entries remain, ask again with the smallest place "
+                        "number on that page to hear what came before them."
                     ),
                 ),
                 Block(

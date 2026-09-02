@@ -96,6 +96,28 @@ def recent(
     alone exceeds the supplied capture ceiling, the empty tail is paired with
     `newest_oversize`; it can never be mistaken for empty history.
     """
+    entries, moved = _walk(records)
+    kept, omission = capture.select(entries)
+    return kept, omission, moved
+
+
+def visible(records: Sequence[Mapping[str, Any]]) -> tuple[ProgressEntry, ...]:
+    """Every entry this Session's record shows, oldest first and numbered (#171).
+
+    The whole list, before anything trims it — what `recent` hands its capture
+    and what the History page windows (`adapters/agent/_progress.page`). One
+    walk defines both, so the entry a page names and the entry a tail carries
+    are the same entry, and a sidechain record is excluded from ordinals exactly
+    as it is excluded from the tail.
+    """
+    entries, _ = _walk(records)
+    return tuple(entries)
+
+
+def _walk(
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[ProgressEntry], datetime | None]:
+    """The one records walk: what was said, numbered, and when the Session moved."""
     entries: list[ProgressEntry] = []
     moved: datetime | None = None
     for record in records:
@@ -109,12 +131,10 @@ def recent(
             # time. Deliberately wider than the entries below — the module
             # docstring says why, and #76's Advisor ruling is what settled it.
             moved = when
-        entry = _entry(record)
+        entry = _entry(record, ordinal=len(entries))
         if entry is not None:
             entries.append(entry)
-
-    kept, omission = capture.select(entries)
-    return kept, omission, moved
+    return entries, moved
 
 
 def recent_before_question(
@@ -152,8 +172,13 @@ def _question_in(record: Mapping[str, Any]) -> WaitingFor | None:
     return None
 
 
-def _entry(record: Mapping[str, Any]) -> ProgressEntry | None:
-    """One record as something that was said, or `None` if it was not."""
+def _entry(record: Mapping[str, Any], *, ordinal: int) -> ProgressEntry | None:
+    """One record as something that was said, or `None` if it was not.
+
+    The ordinal is the count of entries already kept, so it numbers the visible
+    conversation from its oldest entry and a record that is not one costs no
+    number (#171).
+    """
     role = _ROLES.get(str(record.get("type")))
     if role is None:
         return None
@@ -164,7 +189,7 @@ def _entry(record: Mapping[str, Any]) -> ProgressEntry | None:
     if not is_visible(record) or is_pipeline_noise(record, content):
         return None
     text = visible_text(content)
-    return ProgressEntry(role=role, text=text) if text.strip() else None
+    return ProgressEntry(ordinal=ordinal, role=role, text=text) if text.strip() else None
 
 
 def _moment(stamp: Any) -> datetime | None:

@@ -118,7 +118,17 @@ class TestTheAgentContract:
             ProgressOmission.OLDER,
             ProgressOmission.STATUS_SUMMARY,
             ProgressOmission.NEWEST_OVERSIZE,
+            ProgressOmission.OVERSIZE,
         }
+
+    def test_one_entrys_omission_is_never_a_whole_readings(self) -> None:
+        """`oversize` names one History page entry; a reading cannot wear it (#171)."""
+        with pytest.raises(ValueError, match="one History page entry"):
+            ProgressObservation.readable(
+                has_history=True,
+                read_at=datetime(2026, 9, 1, tzinfo=UTC),
+                omission=ProgressOmission.OVERSIZE,
+            )
 
     def test_readable_empty_history_is_the_only_nothing_said_state(self) -> None:
         read_at = datetime(2026, 8, 30, tzinfo=UTC)
@@ -175,8 +185,8 @@ class TestTheAgentContract:
     def test_a_readable_tail_keeps_roles_order_and_whole_text(self) -> None:
         read_at = datetime(2026, 8, 30, tzinfo=UTC)
         entries = (
-            ProgressEntry(role=ProgressRole.USER, text="do the thing"),
-            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
+            ProgressEntry(ordinal=0, role=ProgressRole.USER, text="do the thing"),
+            ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text="done"),
         )
 
         observed = ProgressObservation.readable(

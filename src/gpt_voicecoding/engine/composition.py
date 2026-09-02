@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding import __version__
-from gpt_voicecoding.config import EngineConfig
+from gpt_voicecoding.config import ConfigError, EngineConfig
 from gpt_voicecoding.control_plane.actions import ControlPlane
 from gpt_voicecoding.control_plane.commands import CommandError, build_request, render
 from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
@@ -173,6 +173,7 @@ class Engine:
         """Build one engine from configuration. Nothing is constructed twice."""
         events = EventQueue()
         progress_publication = ProgressPublication()
+        _refuse_a_page_the_wire_cannot_carry(config, progress_publication)
         progress_capture = progress_publication.capture
         adapters = _adapters(
             config,
@@ -391,6 +392,32 @@ async def _answer_text(plane: ControlPlane, found: Classification) -> str:
     except (CommandError, ValueError) as unreadable:
         return str(unreadable)
     return render(await plane.handle(request))
+
+
+def _refuse_a_page_the_wire_cannot_carry(
+    config: EngineConfig, publication: ProgressPublication
+) -> None:
+    """The dial and the ceiling meet here, and nowhere else (#171).
+
+    `[policy] history_page_entries` says how many entries one History page holds
+    and `ProgressPublication` is the only thing that knows how many slots the
+    Control Plane line carries. A page dialled past that could only ever be
+    published with **every** entry marked `oversize` — which would say the
+    messages were too large when what was too large is the page — so the engine
+    refuses to start on that configuration rather than answering with it.
+
+    Refused here rather than in `config.py` for ADR 0016's own reason: capacity
+    decides what may be asked for, and configuration does not know the capacity.
+    Refused at composition rather than at the first read because a configuration
+    that can only ever answer dishonestly is not a request that failed.
+    """
+    largest = publication.largest_page
+    if config.policy.history_page_entries > largest:
+        raise ConfigError(
+            f"[policy] history_page_entries is {config.policy.history_page_entries}, and a "
+            f"{publication.max_bytes}-byte Control Plane line carries at most {largest} "
+            f"entry slots: every page would be published with every entry marked oversize"
+        )
 
 
 def _adapters(

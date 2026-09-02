@@ -24,10 +24,22 @@ DEFAULT_APPROVAL_BUDGET_SECONDS = 600.0
 #: legacy@1d32845:config.plist:74-78; bridge/config.py:94-96.
 DEFAULT_SILENCE_END_SECONDS = 60.0
 
+#: How many entries one History page holds, both roles counted (#171, ADR 0016).
+#: Legacy's tail was 12 messages / 32 KB with no cursor of any kind
+#: (`legacy@1d32845:config.plist:449-452`); **dropped, because** a fixed tail
+#: cannot answer "the five before those". Five is what the 0901 flow asks to be
+#: read out in one breath.
+DEFAULT_HISTORY_PAGE_ENTRIES = 5
+
 
 @dataclass(frozen=True, slots=True)
 class CorePolicy:
-    """Every configurable duration the pipelines read. Passed in, never imported."""
+    """Every configurable dial the pipelines read. Passed in, never imported.
+
+    Durations and one count: what they have in common is that they are dialled
+    in `[policy]` and given meaning by whichever pipeline reads them, never by
+    this type.
+    """
 
     #: How long an unsolicited Relay may wait for the Reply Window to open.
     relay_ceiling_seconds: float = DEFAULT_RELAY_CEILING_SECONDS
@@ -35,6 +47,12 @@ class CorePolicy:
     approval_budget_seconds: float = DEFAULT_APPROVAL_BUDGET_SECONDS
     #: How long an owned Live Call may have no user or system activity.
     silence_end_seconds: float = DEFAULT_SILENCE_END_SECONDS
+    #: How many entries one History page holds. A count, not a byte budget: the
+    #: encoded Reply's ceiling stays a ceiling the wire applies (ADR 0016).
+    #: Only positivity is checked here — whether the line can carry that many
+    #: entry *slots* is the Control Plane's capacity to answer, and composition
+    #: refuses the pair (`engine/composition.py`).
+    history_page_entries: int = DEFAULT_HISTORY_PAGE_ENTRIES
 
     def __post_init__(self) -> None:
         for name, seconds in (
@@ -47,3 +65,12 @@ class CorePolicy:
                     f"{name} must be a real duration; {seconds!r} would expire everything "
                     "the moment it was accepted"
                 )
+        if isinstance(self.history_page_entries, bool) or not isinstance(
+            self.history_page_entries, int
+        ):
+            raise ValueError("history_page_entries is a whole number of entries")
+        if self.history_page_entries <= 0:
+            raise ValueError(
+                f"history_page_entries must hold at least one entry; "
+                f"{self.history_page_entries!r} would page through nothing forever"
+            )

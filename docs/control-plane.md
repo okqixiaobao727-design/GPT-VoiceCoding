@@ -57,15 +57,15 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 6, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 7, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 6, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 7, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
 `action` is `null` when the line never named a usable one. `protocol` is the
-numeric protocol version, currently `6`. A missing field or JSON `null` means the
+numeric protocol version, currently `7`. A missing field or JSON `null` means the
 reply did not declare a usable version. The Swift shell refuses to interpret any
 reply whose version is missing or differs from the version it supports, and shows
 that protocol mismatch separately from an engine refusal or an unreachable engine.
@@ -92,9 +92,13 @@ the user is told.
 ## The actions
 
 Eight, and the set is closed. Adding one is a contract change. Protocol 6
-retires `sessions` and adds `brief`, the one verb Session state is fetched
-through. A protocol-5 surface must report a mismatch: it would otherwise send
-`sessions` to an engine that answers `unknown_action`.
+retired `sessions` and added `brief`, the one verb Session state is fetched
+through. Protocol 7 retires `progress` and adds `history`: the Session Brief
+carries the newest message whole and the History page carries that message and
+everything before it, five at a time with a cursor, so the exact progress
+publication had no question left to answer. A protocol-6 surface must report a mismatch — it would
+otherwise send `progress` to an engine that answers `unknown_action`, and it has
+no way to ask for a second page of anything.
 
 `launch` and `close` were the eighth and ninth until protocol 4. They are parked
 with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
@@ -156,11 +160,12 @@ rendered sentence. `kind` is one of `none`, `question`, `permission`, `unknown`;
 its `description` is the Agent's optional explanation of that choice, or `null`
 when the Agent supplied none.
 
-`progress` always carries the same five fields:
+A row's `progress` always carries the same five fields:
 
 - `availability`: `not_read`, `unreadable`, or `readable`;
 - `has_history`: a boolean only when readable, otherwise `null`;
-- `omission`: `none`, `older`, `status_summary`, or `newest_oversize`;
+- `omission`: `none`, `older`, `status_summary`, or `newest_oversize`
+  (`oversize` names one History page entry and never a whole reading);
 - `read_at`: the readable observation's timestamp, otherwise `null`; and
 - `recent`: ordered whole entries, each with `role` and `text`.
 
@@ -168,16 +173,16 @@ Only `readable` plus `has_history=false` and `omission=none` means nothing has
 been said. A roster publication carries no chat body: readable history becomes
 `has_history=true`, `recent=[]`, `omission=status_summary`. `not_read` and
 `unreadable` are never inferred from an empty array. The source failure behind
-an unreadable discovery is reported as lane degradation; an exact progress read
-maps it to a typed refusal.
+an unreadable discovery is reported as lane degradation; a `history` read maps
+it to a typed refusal.
 
-`last_activity` is separate from `progress` on purpose. A Session can have moved
+`last_activity` is separate from the progress summary on purpose. A Session can have moved
 without saying anything a reader would show, and this is the field that says so.
 It is `null` when nothing read one.
 
-It is deliberately **wider than `progress`**: it counts any work in the Session,
-its own subagents included, where `progress` carries only what the user would be
-shown. On the Claude lane that means a sidechain record advances it even though
+It is deliberately **wider than that summary**: it counts any work in the Session,
+its own subagents included, where the progress summary carries only what the user
+would be shown. On the Claude lane that means a sidechain record advances it even though
 such a record never becomes an entry; on the Codex lane it is the thread's own
 `updatedAt`, which moves for any work at all. One meaning on both lanes — and a
 Session four minutes into a subagent is not a Session nobody has heard from. A
@@ -269,36 +274,56 @@ acts on — the header, the state, the whole decision — stays. Text is never c
 (ADR 0016).
 
 `brief <address>` is a **read**, read now, through exactly one `inspect`. Its
-refusals are `progress`'s minus one: `unknown_session`, `stale_session`, and
+refusals are `history`'s minus one: `unknown_session`, `stale_session`, and
 `refused` for a Child Process or a lane that could not be read at all. A Session
 whose *progress* could not be read is **not** a refusal here — it is the
 `unreadable` state, or an `unreadable` `newest` on a Session that is still
 running.
 
-### `progress`
+### `history`
 
-Payload: `{"target": {"agent": "codex", "session_id": "abc", "pid": null}}`. Data:
-`{"session": { … }}` — one Session row whose progress is the exact-detail
-publication. For example:
+Payload: `{"target": {"agent": "codex", "session_id": "abc", "pid": null},
+"before": 12}`. `before` is optional, and JSON `null` reads the same as absent.
+Data:
 
 ```json
-{"availability": "readable", "has_history": true, "omission": "older",
- "read_at": "2026-08-26T02:44:39+00:00",
- "recent": [{"role": "user", "text": "do the thing"},
-            {"role": "assistant", "text": "done"}]}
+{"entries": [{"ordinal": 14, "role": "assistant", "text": "done"},
+             {"ordinal": 13, "role": "user", "text": "do the thing"},
+             {"ordinal": 12, "role": "assistant", "omission": "oversize"}],
+ "older": true,
+ "read_at": "2026-08-26T02:44:39+00:00"}
 ```
 
+One page of what a Session said and was told, **newest first**, bounded by a
+count and not by bytes: `[policy] history_page_entries`, five by default, both
+roles counted. The size is the engine's dial and is never on the request — two
+surfaces cannot ask one engine for two different pages of one Session.
+
+`ordinal` is the entry's place in the Session's visible record, **counted from
+the oldest entry and starting at 0**, assigned by the lane at read time. Both
+sources are append-only for the entries this carries — a Claude transcript file,
+a Codex thread's turns — so an ordinal names the same entry across reads while
+the Session lives. `older` says whether anything remains before the oldest entry
+on this page; the next request passes that entry's ordinal as `before`, which is
+**exclusive**.
+
+**No `before` is the newest page, and the newest page includes `newest`.** Every
+page is complete on its own and the engine remembers no cursor between reads, so
+the page a surface gets first is the one a Session Brief's `newest` is on. A
+`before` above every ordinal is the newest page too. A `before` past the oldest
+entry is an **empty page with `older: false`** — an answer, not a refusal, and
+the distinction this whole action is drawn around.
+
+**The 65,536-byte limit stays a ceiling on the line, never the page.** An entry
+that would push the encoded Reply past it is published as *existing but omitted*
+— `ordinal`, `role`, `omission: "oversize"`, and no `text` — and **keeps its
+slot**, so the page always advances and one large message never blocks the ones
+before it. Text is never cut (ADR 0016).
+
 It is a **read**: it resolves one exact identity, asks that lane and no other,
-and never starts a turn. What it adds over the same row in `status` is *when* —
-the Session is read at the moment it was asked about, rather than at the last
-discovery. The publisher keeps the newest complete entry and widens backwards
-while the complete encoded Reply still fits. Entries are whole or omitted;
-message text is never sliced. If the newest entry itself cannot fit, the action
-still answers honestly with `has_history=true`, `recent=[]`, and
-`omission=newest_oversize`. A Session mid-turn is answered here and is
-deliberately not read deeply by the roster cadence: reading it is the expensive
-half, and "how far along is it" is the question a user asks precisely while it
-works.
+and never starts a turn. It is **not folded into the roster** — `inspect` keeps
+answering the newest tail and folding, and a page is a separate read that
+observes nothing. A Session mid-turn is readable here.
 
 **It refuses rather than answering emptily**, and the four refusals are four
 different facts:
@@ -308,12 +333,12 @@ different facts:
 | `unknown_session` | No Session by that identity was ever registered here. |
 | `stale_session` | The identity names a different process now, **or** the Session has ended. The row is not ended by this action: discovery is the whole-lane reading and is the only thing that ends one. |
 | `refused` | The lane could not be read at all. The message is the lane's own words, and the row stands exactly as the roster last saw it: not being able to look is not a sighting. |
-| `refused` | Nothing could read how far it has got — a Codex Session the shared daemon does not hold, or one whose first turn has written no record yet. |
+| `refused` | Nothing could read what it said — a Codex Session the shared daemon does not hold, or one whose first turn has written no record yet. |
 
-The last one is the line this whole action is drawn around. A Session that *was*
-read and had said nothing answers normally with `has_history=false`; a Session
-nobody could read is a refusal. A surface handed the second as the first would
-render a working Session as an idle one.
+The last one is the line this action is drawn around. A Session that *was* read
+and has nothing before the cursor answers with an empty page; a Session nobody
+could read is a refusal. A surface handed the second as the first would render a
+working Session as one that has said nothing.
 
 A Session the Codex daemon does not hold therefore never gets an invented
 reading. Its rollout is on disk and reading it would be a second source answering
@@ -462,7 +487,7 @@ by one parser, so neither can grow a command the other lacks.
 status
 switch <name> on|off
 brief [<agent>:<session id>[:<pid>]]
-progress <agent>:<session id>[:<pid>]
+history <agent>:<session id>[:<pid>] [--before <ordinal>]
 live
 relay <agent>:<session id>[:<pid>] [--supplement] <words>
 approve <approval id> allow|deny|ask

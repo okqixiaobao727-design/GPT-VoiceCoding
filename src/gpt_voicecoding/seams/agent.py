@@ -254,12 +254,21 @@ class ProgressAvailability(StrEnum):
 
 
 class ProgressOmission(StrEnum):
-    """Why known history is absent from, or incomplete in, one progress view."""
+    """Why known history is absent from, or incomplete in, one progress view.
+
+    The first four are an *observation's* omission and describe a whole view.
+    `OVERSIZE` is the History page's and describes **one entry**: the page keeps
+    its slot with its ordinal and role and drops only its text (#171), so an
+    entry too large for the encoded Reply never blocks the entries before it. It
+    is refused on a `ProgressObservation` for that reason — one entry's omission
+    is not a reading's.
+    """
 
     NONE = "none"
     OLDER = "older"
     STATUS_SUMMARY = "status_summary"
     NEWEST_OVERSIZE = "newest_oversize"
+    OVERSIZE = "oversize"
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +294,16 @@ class ProgressEntry:
     that asks whether a turn ended on its answer (`core/briefing.py`).
     """
 
+    #: Where this entry sits in the Session's visible record, counted **from
+    #: the oldest visible entry and starting at 0**, assigned by the lane at
+    #: read time (#171). Both sources are append-only for the entries this seam
+    #: keeps — a Claude transcript file, a Codex thread's turns — so an ordinal
+    #: names the same entry across reads while the Session lives, which is what
+    #: makes it usable as the History page's cursor. Required rather than
+    #: defaulted: both lanes build every entry before anything trims them, so
+    #: there is no reading in which one is unknown, and a default would let a
+    #: fixture ship a cursor that points nowhere.
+    ordinal: int
     role: ProgressRole
     text: str
     #: Which part of the turn this was, in the source's own word, or `None`
@@ -292,6 +311,10 @@ class ProgressEntry:
     phase: str | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int):
+            raise ValueError("a progress entry ordinal is its whole place in the record")
+        if self.ordinal < 0:
+            raise ValueError("a progress entry ordinal counts from the oldest entry, at 0")
         if not isinstance(self.role, ProgressRole):
             raise ValueError("a progress entry role must use the Agent seam vocabulary")
         if not isinstance(self.text, str) or not self.text.strip():
@@ -375,6 +398,8 @@ class ProgressObservation:
             raise ValueError("progress availability must use the Agent seam vocabulary")
         if not isinstance(self.omission, ProgressOmission):
             raise ValueError("progress omission must use the Agent seam vocabulary")
+        if self.omission is ProgressOmission.OVERSIZE:
+            raise ValueError("oversize names one History page entry, never a whole reading")
         if self.has_history is not None and type(self.has_history) is not bool:
             raise ValueError("progress history presence must be true, false or absent")
         if not isinstance(self.recent, tuple) or any(
@@ -419,6 +444,51 @@ class ProgressObservation:
                     ProgressOmission.NEWEST_OVERSIZE,
                 ):
                     raise ValueError(f"{self.omission} carries no progress entries")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryPage:
+    """One page of what a Session said and was told, older on request (#171).
+
+    The third publication of the one canonical observation (ADR 0016's
+    amendment), and a **separate read**: `inspect` still answers the newest tail
+    and folds into the roster, while this never touches the roster at all.
+
+    `entries` are newest-first and bounded by a **count**, not by bytes — the
+    encoded Reply's ceiling stays the wire's, applied by the publication, which
+    keeps an over-ceiling entry's slot rather than dropping it. `older` says
+    whether anything remains before the oldest entry on this page, so the next
+    request passes that entry's `ordinal` as `before`.
+
+    **`read_at=None` is a stated contract, not a missing value.** It means the
+    lane holds no record for this target to read — an unattached Codex thread,
+    or a Claude Session whose transcript this engine was never told about. Bridge
+    Core turns it into the same typed refusal `progress` gave that case, because
+    a Session nobody could read must never be published as one that said
+    nothing. A lane that could not be read *at all* raises `LaneUnavailable`
+    instead, which is a different fact about the lane rather than about this
+    Session. A read that found nothing before the cursor is neither: it is an
+    empty page with `older=False`, and that is an answer.
+    """
+
+    entries: tuple[ProgressEntry, ...] = ()
+    older: bool = False
+    read_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, ProgressEntry) for entry in self.entries
+        ):
+            raise ValueError("a history page carries an ordered tuple of whole entries")
+        if type(self.older) is not bool:
+            raise ValueError("whether older entries remain is true or false")
+        if self.read_at is not None and not isinstance(self.read_at, datetime):
+            raise ValueError("a history page read time is a datetime or absent")
+        if self.read_at is None and (self.entries or self.older):
+            raise ValueError("a page nothing read carries no entries and no promise of more")
+        ordinals = [entry.ordinal for entry in self.entries]
+        if ordinals != sorted(ordinals, reverse=True) or len(set(ordinals)) != len(ordinals):
+            raise ValueError("a history page is newest-first, and names each entry once")
 
 
 class ChildKind(StrEnum):
@@ -722,6 +792,39 @@ class AgentAdapter(Protocol):
         the caller keeps the row's last observed state rather than ending it —
         the same rule `observe` follows for `LaneDiscovery.error`, for the same
         reason.
+        """
+        ...
+
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page of this Session's own record, newest-first, older on request.
+
+        **A separate read, never folded into the roster** (ADR 0016's
+        amendment). `inspect` answers what a Session is doing now; this answers
+        what it said, `count` entries at a time, and Bridge Core publishes the
+        page without touching the row.
+
+        `before` is an `ordinal` this lane handed out on an earlier page: the
+        page returned holds the entries immediately before it. `None` asks for
+        the newest page, which **includes** the newest entry — every page is
+        complete on its own and the engine remembers no cursor between reads
+        (#171). A `before` larger than any ordinal is the newest page too, and a
+        `before` past the oldest entry is an empty page with `older=False` — an
+        answer, not a refusal.
+
+        **The same windowing on both lanes.** Each lane already builds the full
+        list of visible entries before anything trims it; the shared window
+        (`adapters/agent/_progress.py`) is applied to that list, so two lanes
+        cannot page differently over the same record.
+
+        **Raises `LaneUnavailable` when the lane cannot be read at all**, and
+        answers `HistoryPage(read_at=None)` when this lane holds no record for
+        this target — see `HistoryPage` for why those are two different facts.
         """
         ...
 

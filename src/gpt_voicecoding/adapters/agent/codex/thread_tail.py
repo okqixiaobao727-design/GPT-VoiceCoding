@@ -88,9 +88,20 @@ def recent(
     what a `thread/read` answers when turns were not asked for, and a caller that
     took that as an error would turn the cheap roster read into a failure.
     """
+    return capture.select(visible(thread))
+
+
+def visible(thread: Mapping[str, Any]) -> tuple[ProgressEntry, ...]:
+    """Every entry this thread shows, oldest first and numbered (#171).
+
+    The whole list, before anything trims it — what `recent` hands its capture
+    and what the History page windows (`adapters/agent/_progress.page`). One
+    walk of the turns defines both, so the entry a page names and the entry a
+    tail carries are the same entry.
+    """
     turns = thread.get("turns")
     if not isinstance(turns, list):
-        return (), ProgressOmission.NONE
+        return ()
     entries: list[ProgressEntry] = []
     for turn in turns:
         if not isinstance(turn, Mapping):
@@ -98,8 +109,11 @@ def recent(
         items = turn.get("items")
         if not isinstance(items, list):
             continue
-        entries.extend(entry for entry in map(_entry, items) if entry is not None)
-    return capture.select(entries)
+        for item in items:
+            entry = _entry(item, ordinal=len(entries))
+            if entry is not None:
+                entries.append(entry)
+    return tuple(entries)
 
 
 def moment(value: Any) -> datetime | None:
@@ -123,8 +137,13 @@ def last_activity(thread: Mapping[str, Any]) -> datetime | None:
     return moment(thread.get(UPDATED_AT))
 
 
-def _entry(item: Any) -> ProgressEntry | None:
-    """One turn item as something that was said, or `None` if it was not."""
+def _entry(item: Any, *, ordinal: int) -> ProgressEntry | None:
+    """One turn item as something that was said, or `None` if it was not.
+
+    The ordinal is the count of entries already kept, so it numbers the visible
+    conversation from its oldest entry across every turn, and an item that is
+    not something said costs no number (#171).
+    """
     if not isinstance(item, Mapping):
         return None
     kind = item.get("type")
@@ -132,12 +151,13 @@ def _entry(item: Any) -> ProgressEntry | None:
         text = item.get("text")
         phase = item.get(PHASE)
         return _said(
+            ordinal,
             ProgressRole.ASSISTANT,
             text if isinstance(text, str) else "",
             phase=phase if isinstance(phase, str) else None,
         )
     if kind == USER_ITEM:
-        return _said(ProgressRole.USER, _user_text(item.get("content")))
+        return _said(ordinal, ProgressRole.USER, _user_text(item.get("content")))
     return None
 
 
@@ -155,5 +175,9 @@ def _user_text(content: Any) -> str:
     return "".join(part for part in parts if part)
 
 
-def _said(role: ProgressRole, text: str, *, phase: str | None = None) -> ProgressEntry | None:
-    return ProgressEntry(role=role, text=text, phase=phase) if text.strip() else None
+def _said(
+    ordinal: int, role: ProgressRole, text: str, *, phase: str | None = None
+) -> ProgressEntry | None:
+    return (
+        ProgressEntry(ordinal=ordinal, role=role, text=text, phase=phase) if text.strip() else None
+    )

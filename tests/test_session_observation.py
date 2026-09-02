@@ -342,7 +342,7 @@ class TestALaneThatCouldNotLook:
         registry = SessionRegistry()
         observed = ProgressObservation.readable(
             has_history=True,
-            recent=(ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),),
+            recent=(ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text="done"),),
             omission=ProgressOmission.NONE,
             read_at=datetime.fromtimestamp(NOW, UTC),
         )

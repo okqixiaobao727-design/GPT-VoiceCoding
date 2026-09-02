@@ -105,7 +105,7 @@ if TYPE_CHECKING:
 STEPS = (
     "roster",
     "stable name",
-    "progress",
+    "brief",
     "stop notice",
     "relay",
     "approval",
@@ -123,9 +123,10 @@ STEPS = (
 #: * everything needs `roster`, because `roster` is what sets `Walk.address` and
 #:   `Walk.truth`, and every later step either names the address or reads the
 #:   agent's own record through it;
-#: * `progress` needs `stable name`, because what it reads is history "after a
+#: * `brief` needs `stable name`, because what it reads is history "after a
 #:   turn" and `stable name` is the walk's first turn — the Claude lane launches
-#:   silent, so without it there is nothing for `bridgectl progress` to carry;
+#:   silent, so without it there is nothing for `bridgectl brief` to carry and
+#:   nothing for `bridgectl history` to page through;
 #: * `stop notice` needs `stable name` for the same turn seen from the other end:
 #:   the mark it waits behind is taken inside that step (`Walk.before_first_turn`)
 #:   and the Stop it looks for is that turn's;
@@ -137,7 +138,7 @@ STEPS = (
 PREREQUISITES: Mapping[str, tuple[str, ...]] = {
     "roster": (),
     "stable name": ("roster",),
-    "progress": ("roster", "stable name"),
+    "brief": ("roster", "stable name"),
     "stop notice": ("roster", "stable name"),
     "relay": ("roster",),
     "approval": ("roster", "relay"),
@@ -410,11 +411,36 @@ def writing_at(path: Path, content: str) -> Instruction:
 #: a permission would sit in `waiting` until something answered it, and nothing is
 #: supposed to answer one until `approval`. So the first turn is words only, it
 #: ends on its own, and the Stop it ends with is what `stop notice` observes.
+#: How many turns `brief` drives before it reads a page at all. #171's red line:
+#: "more than `history_page_entries` entries driven first (at least six turns)".
+#: Six two-entry turns is already more than twice a five-entry page, and driving
+#: them unconditionally is what makes the walk the step's own rather than the
+#: leftover of whatever the Session had said before it.
+HISTORY_TURNS_FLOOR = 6
+
+#: And how many it will drive before it calls a history that never grows past one
+#: page a failure rather than a slow start.
+HISTORY_TURNS_CEILING = 10
+
+#: One printed History page entry: its ordinal, which side spoke it, and what it
+#: said. An omitted entry prints its own words for the text and is read back the
+#: same way — the page's promise is that every slot is there.
+HISTORY_ENTRY = re.compile(r"^(?P<ordinal>\d+) (?P<role>user|assistant): (?P<text>.*)$")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryReading:
+    """One History page as a surface got it: its entries, and whether more remain."""
+
+    entries: tuple[tuple[int, str], ...]
+    older: bool
+
+
 ACKNOWLEDGE = Instruction(
     words="Reply with the single word READY. Do not use any tools, and do not ask anything."
 )
 
-#: The second turn `progress` drives, on the lane that has two turn endings to
+#: The second turn `brief` drives, on the lane that has two turn endings to
 #: tell apart (`Lane.asking`). Words only, for `ACKNOWLEDGE`'s reasons — it must
 #: raise no permission — and the words it asks for are dictated rather than
 #: described, because what this turn has to produce is a *final answer* the
@@ -981,7 +1007,7 @@ class Walk:
         return {
             "roster": self.roster,
             "stable name": self.stable_name,
-            "progress": self.progress,
+            "brief": self.brief,
             "stop notice": self.stop_notice,
             "relay": self.relay,
             "approval": self.approval,
@@ -1255,85 +1281,27 @@ class Walk:
             f"({turn.seconds:.1f}s turn)"
         )
 
-    # --- progress ---------------------------------------------------------
+    # --- brief -------------------------------------------------------------
 
-    def progress(self) -> str:
-        """Progress is readable without costing a turn (#76).
+    def brief(self) -> str:
+        """A Session is briefed, and its history pages, without costing a turn.
 
-        Two things have to hold at once: there is something to read, and reading
-        it does not make the Session work. The second is checked the only way it
-        can be from outside — the agent's own record does not grow across the
-        read, and the roster's state does not leave `idle`.
+        Renamed from `progress` with the verb it exercised (#171). Three things
+        have to hold at once: the Session Brief carries the newest message
+        whole, the History page can be walked backwards through it, and neither
+        read makes the Session work — checked the only way it can be from
+        outside, which is that the agent's own record does not grow across them.
 
-        **Both publications are exercised.** `bridgectl progress <target>` is the
-        user-facing exact-detail verb. The following roster read must carry the
-        same availability, history presence and read time from the folded
-        observation, while deliberately carrying no chat body.
+        **The page is walked, not sampled.** Enough turns are driven first that
+        the newest page cannot hold the whole history, so `--before` has
+        somewhere to go; then the cursor is taken from the page the engine
+        handed over, never invented here. Past the oldest entry the page is
+        empty and `older` says `false`, which is an answer and not a refusal —
+        the distinction the whole verb is drawn around.
         """
         if self.address is None:
-            raise LaneBlocked("no Session to read progress from")
-        before_size = self._record_size()
-        before_state = self._roster_field("state")
+            raise LaneBlocked("no Session to brief")
 
-        answer = self.bridgectl("progress", self.address)
-        if not answer.ok:
-            raise StepFailed(f"`bridgectl progress {self.address}` refused: {answer.text}")
-        progress_lines = [line.strip() for line in answer.text.splitlines()]
-        said = support.flatten(
-            line for line in progress_lines if line.startswith(("user: ", "assistant: "))
-        )
-        if not said:
-            raise StepFailed(
-                f"`bridgectl progress {self.address}` carried no history after a turn: "
-                f"{answer.text[:200]!r}"
-            )
-        read_at = next(
-            (
-                line.removeprefix("read at ")
-                for line in progress_lines
-                if line.startswith("read at ")
-            ),
-            None,
-        )
-        if read_at is None:
-            raise StepFailed(
-                f"`bridgectl progress {self.address}` carried no observation time: "
-                f"{answer.text[:200]!r}"
-            )
-
-        row = self._roster_row()
-        if row is None:
-            raise StepFailed(f"{self.address} left the roster before progress could be read")
-        if "progress" not in row:
-            raise StepFailed(
-                f"the roster row carries no `progress`: #147 locks "
-                f"`ProgressObservation` on the inspection and exact progress is the verb "
-                f"that fills it; the row has keys {sorted(row)}"
-            )
-        reported = row["progress"]
-        if not isinstance(reported, dict):
-            raise StepFailed(f"roster progress for {self.address} is {reported!r}")
-        if (
-            reported.get("availability") != "readable"
-            or reported.get("has_history") is not True
-            or reported.get("read_at") != read_at
-        ):
-            raise StepFailed(
-                f"the bridgectl observation and roster summary disagree for {self.address}: "
-                f"command read at {read_at!r}, summary {reported!r}"
-            )
-        if reported.get("recent") != [] or reported.get("omission") != "status_summary":
-            raise StepFailed(
-                f"the roster carried chat body or lost history for {self.address}: {reported!r}"
-            )
-        time.sleep(2.0)
-        after_size = self._record_size()
-        after_state = self._roster_field("state")
-        if after_size != before_size:
-            raise StepFailed(
-                f"reading progress grew the Session's own record from {before_size} to "
-                f"{after_size} bytes — that is a turn, and #76 forbids one"
-            )
         brief = self.bridgectl("brief", self.address)
         if not brief.ok:
             raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
@@ -1351,17 +1319,6 @@ class Walk:
                 f"{brief.text[:300]!r}. #187 makes the Session Brief the one place the "
                 f"newest message is handed over, whole."
             )
-        # Compared on a prefix, and only after both sides are collapsed: a
-        # message with newlines in it is one rendered line to Briefing and
-        # several to `progress`, so an exact substring test would fail on the
-        # rendering rather than on the two readings disagreeing.
-        opening = " ".join(newest.split())[:60]
-        if opening not in " ".join(said.split()):
-            raise StepFailed(
-                f"the Session Brief's newest message {newest[:120]!r} is not among the "
-                f"entries `bridgectl progress {self.address}` read ({said[:200]!r}) — two "
-                f"readings of one Session that disagree"
-            )
         # #188: what the turn end is *called*. This one is `stable name`'s turn,
         # which asked nothing (`ACKNOWLEDGE`), so both lanes owe FINISHED here —
         # Claude because its question is structural and there was none, Codex
@@ -1373,13 +1330,134 @@ class Walk:
                 f"`bridgectl brief {self.address}` calls the Session {called!r} after a turn "
                 f"that asked nothing, where #188 requires {finished!r}: {brief.text[:300]!r}"
             )
+
+        driven = self._drive_until_history_pages()
+        before_size = self._record_size()
+        before_state = self._roster_field("state")
+
+        newest_page = self._history_page()
+        if not newest_page.entries:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` carried no entries after "
+                f"{driven} turns: the newest page is the one that includes the newest "
+                f"entry, and #171 makes every page complete on its own"
+            )
+        opening = " ".join(newest.split())[:60]
+        if not any(opening in " ".join(text.split()) for _, text in newest_page.entries):
+            raise StepFailed(
+                f"the Session Brief's newest message {newest[:120]!r} is not on the newest "
+                f"History page ({newest_page.entries!r}) — #171 amends ADR 0016 so that the "
+                f"newest page *includes* `newest`, and two readings of one Session that "
+                f"disagree is what one canonical observation exists to prevent"
+            )
+        if not newest_page.older:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` says nothing is older after {driven} "
+                f"turns, so there is no second page to prove the cursor with: "
+                f"{newest_page.entries!r}"
+            )
+
+        cursor = min(ordinal for ordinal, _ in newest_page.entries)
+        older_page = self._history_page(before=cursor)
+        if not older_page.entries:
+            raise StepFailed(
+                f"`bridgectl history {self.address} --before {cursor}` came back empty while "
+                f"the page before it said older entries remained"
+            )
+        above = [ordinal for ordinal, _ in older_page.entries if ordinal >= cursor]
+        if above:
+            raise StepFailed(
+                f"`--before {cursor}` answered with ordinals {above!r}, which are not before "
+                f"it — the cursor is exclusive (#171)"
+            )
+
+        oldest = min(ordinal for ordinal, _ in older_page.entries)
+        while older_page.older:
+            older_page = self._history_page(before=oldest)
+            if not older_page.entries:
+                raise StepFailed(
+                    f"`--before {oldest}` came back empty while the page before it said "
+                    f"older entries remained"
+                )
+            oldest = min(ordinal for ordinal, _ in older_page.entries)
+        past_the_oldest = self._history_page(before=oldest)
+        if past_the_oldest.entries or past_the_oldest.older:
+            raise StepFailed(
+                f"`--before {oldest}` is past the oldest entry and must be an empty page "
+                f"with no promise of more, not {past_the_oldest!r}"
+            )
+
+        time.sleep(2.0)
+        after_size = self._record_size()
+        after_state = self._roster_field("state")
+        if after_size != before_size:
+            raise StepFailed(
+                f"reading history grew the Session's own record from {before_size} to "
+                f"{after_size} bytes — that is a turn, and #171 forbids one"
+            )
         asked = self._brief_a_turn_that_ends_on_a_question()
         return (
-            f"exact progress read without a turn, roster summary retained its facts, and "
-            f"the Session Brief carried the newest message whole: {newest[:120]!r}; "
-            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}; "
-            f"turn end called {called!r}, and {asked}"
+            f"the Session Brief carried the newest message whole ({newest[:120]!r}) and "
+            f"{driven} turns of history paged back to ordinal {oldest} and then to an empty "
+            f"page; record steady at {after_size} bytes; state {before_state!r} → "
+            f"{after_state!r}; turn end called {called!r}, and {asked}"
         )
+
+    def _drive_until_history_pages(self) -> int:
+        """Drive turns until the history is longer than one page can hold.
+
+        **A floor and a ceiling, and the floor is the ticket's.** #171's red line
+        asks for more than `history_page_entries` entries driven *first*, at
+        least six turns of them — so six are driven whatever the Session already
+        said, and a lane that arrived with a long history is not allowed to skip
+        the walk the step is supposed to make. Past the floor the engine's own
+        `older` is what says the page has somewhere to go, because the page size
+        is the engine's dial and this harness deliberately does not read it.
+
+        Turns are words-only for `ACKNOWLEDGE`'s reason — one that raised a
+        permission would sit in `waiting` until `approval` answered it.
+        """
+        driven = 0
+        while driven < HISTORY_TURNS_FLOOR or not self._history_page().older:
+            if driven >= HISTORY_TURNS_CEILING:
+                raise StepFailed(
+                    f"{driven} turns did not produce more than one History page: either "
+                    f"nothing is being recorded or the page is unbounded"
+                )
+            self._drive_turn("fill the history", ACKNOWLEDGE)
+            driven += 1
+        return driven
+
+    def _history_page(self, *, before: int | None = None) -> HistoryReading:
+        """One page as `bridgectl history` printed it, read back off its own lines.
+
+        Parsed from the printed page rather than from a second request shape,
+        because what this run accepts is the surface a user gets.
+        """
+        assert self.address is not None
+        cursor = ["--before", str(before)] if before is not None else []
+        answer = self.bridgectl("history", self.address, *cursor)
+        if not answer.ok:
+            raise StepFailed(
+                f"`bridgectl history {self.address} {' '.join(cursor)}`".rstrip()
+                + f" refused: {answer.text}"
+            )
+        entries: list[tuple[int, str]] = []
+        older = False
+        for line in answer.text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("older entries remain"):
+                older = True
+                continue
+            match = HISTORY_ENTRY.match(stripped)
+            if match is not None:
+                entries.append((int(match.group("ordinal")), match.group("text")))
+        if "read at " not in answer.text:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` carried no observation time: "
+                f"{answer.text[:200]!r}"
+            )
+        return HistoryReading(entries=tuple(entries), older=older)
 
     def _brief_a_turn_that_ends_on_a_question(self) -> str:
         """Drive a turn that ends on a question, and read what the brief calls it.

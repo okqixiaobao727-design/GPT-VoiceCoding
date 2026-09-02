@@ -8,7 +8,7 @@ import Testing
     @Test func oneRequestGetsOneReply() async throws {
         let engine = try FakeEngineSocket(
             behaviour: .answer(
-                #"{"ok": true, "action": "live", "protocol": 6, "data": {"state": "up", "call_id": "call-1"}}"#
+                #"{"ok": true, "action": "live", "protocol": 7, "data": {"state": "up", "call_id": "call-1"}}"#
             ))
         defer { engine.stop() }
 
@@ -22,7 +22,7 @@ import Testing
     @Test func aRefusalIsAnAnswer() async throws {
         let engine = try FakeEngineSocket(
             behaviour: .answer(
-                #"{"ok": false, "action": "switch", "protocol": 6, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}"#
+                #"{"ok": false, "action": "switch", "protocol": 7, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}"#
             ))
         defer { engine.stop() }
 

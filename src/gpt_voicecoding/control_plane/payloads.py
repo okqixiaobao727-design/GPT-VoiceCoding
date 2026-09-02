@@ -77,6 +77,25 @@ def read_flag(payload: Mapping[str, Any], key: str) -> bool:
     return value
 
 
+def read_optional_ordinal(payload: Mapping[str, Any], key: str) -> int | None:
+    """A cursor a surface read off an earlier page, or nothing at all.
+
+    Absent, or JSON `null`, asks for the newest page — the same reading `brief`
+    gives an absent target. A `bool` is refused before the number check because
+    `True` is an `int` in Python and would page from ordinal 1; a negative one is
+    refused because ordinals count from 0 and nothing lies before the oldest
+    entry (#171).
+    """
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidPayload(f"{key!r} is an entry's ordinal, or absent for the newest page")
+    if value < 0:
+        raise InvalidPayload("an ordinal counts from the oldest entry, at 0")
+    return value
+
+
 def read_target(payload: Mapping[str, Any], key: str = "target") -> SessionTarget:
     """The exact identity a command carries. Never a name, never inferred."""
     raw = payload.get(key)

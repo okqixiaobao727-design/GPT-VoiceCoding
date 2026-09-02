@@ -53,10 +53,12 @@ import asyncio
 import logging
 import os
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding import __version__
+from gpt_voicecoding.adapters.agent._progress import page as history_page
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.codex import approvals as approval_wire
 from gpt_voicecoding.adapters.agent.codex import discovery as codex_discovery
@@ -84,6 +86,7 @@ from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
     AwaitingApproval,
+    HistoryPage,
     LaneDiscovery,
     LaneUnavailable,
     Option,
@@ -658,6 +661,45 @@ class CodexAgentAdapter:
                 capture=self._turns.capture,
             ),
             last_activity=thread_tail.last_activity(described) or row.last_activity,
+        )
+
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page of this thread's turns, newest-first (#171).
+
+        The same `thread/read` with turns the per-target read takes, windowed by
+        the shared function both lanes call, so the two lanes cannot page
+        differently over the same conversation.
+
+        **Not a roster read**, so no enumeration and no cache: this is asked for
+        one exact thread and answers from that thread's own turns.
+
+        **A thread the daemon does not hold is a refusal, not an empty page.** No
+        daemon, or a Session with no thread id yet, answers `read_at=None` and
+        Bridge Core turns that into the typed refusal; a daemon that could not
+        describe the thread raises, which is the lane's own words. Its rollout is
+        on disk and reading it would be a second source answering the same
+        question with worse evidence (port table P6, P13).
+        """
+        if target.session_id is None:
+            return HistoryPage()
+        client = await self._shared_daemon()
+        if client is None:
+            return HistoryPage()
+        reading = await codex_discovery.read_thread(client, target.session_id, with_turns=True)
+        if reading.thread is None:
+            assert reading.reason is not None
+            raise LaneUnavailable(AgentKind.CODEX, reading.reason)
+        return history_page(
+            thread_tail.visible(reading.thread),
+            before=before,
+            count=count,
+            read_at=datetime.now(UTC),
         )
 
     def supported_routes(self) -> frozenset[RelayRoute]:

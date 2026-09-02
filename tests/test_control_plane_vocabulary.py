@@ -29,20 +29,26 @@ class TestTheActionSet:
             "status",
             "switch",
             "brief",
-            "progress",
+            "history",
             "live",
             "relay",
             "approve",
             "verify",
         }
 
-    def test_briefing_replacing_the_roster_verb_moves_the_protocol_to_six(self) -> None:
-        """A v5 surface would send `sessions` to an engine that has no such action.
+    def test_the_history_page_replacing_exact_progress_moves_the_protocol_to_seven(
+        self,
+    ) -> None:
+        """A v6 surface would send `progress` to an engine that has no such action.
 
         The Swift shell compares this number and nothing else, so an action set
         that changed under an unchanged number is a gate that lies (#171).
         """
-        assert PROTOCOL_VERSION == 6
+        assert PROTOCOL_VERSION == 7
+
+    def test_the_retired_exact_progress_verb_is_not_an_action_this_engine_has(self) -> None:
+        """Retired with the History page, and its absence asserted, not assumed."""
+        assert "progress" not in {str(action) for action in Action}
 
     def test_the_retired_roster_verb_is_not_an_action_this_engine_has(self) -> None:
         """Retired with the Briefing verb, and its absence asserted, not assumed."""
