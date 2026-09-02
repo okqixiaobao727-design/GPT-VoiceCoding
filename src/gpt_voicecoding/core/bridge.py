@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Final
 
 from gpt_voicecoding.core import briefing
@@ -73,8 +74,6 @@ from gpt_voicecoding.seams.agent import (
     LaneUnavailable,
     ProgressAvailability,
     ProgressObservation,
-    ProgressOmission,
-    ProgressRole,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -113,43 +112,86 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def stop_notice_for(
+def stop_brief(
     session: Session | None,
     target: SessionTarget,
-    waiting_for: WaitingFor | None = None,
+    waiting_for: WaitingFor,
     *,
     progress: ProgressObservation | None = None,
-    answerable_here: bool = False,
-) -> str:
-    """The words a stopped Session is announced with.
+    question_answerable: bool = False,
+) -> SessionBrief:
+    """The Session Brief a Stop announces — this reading, on the row it is about.
 
-    Names the Session the way the user names it, because that is what they will
-    say back when they answer, and carries **what it stopped on** — the question
-    with its options and any recommendation, or the tool awaiting permission.
-    Rendering happens here rather than in the adapter because the words are
-    Bridge Core's policy; the adapter's job was to keep the structure.
+    **Bridge Core words nothing about a Session.** `CONTEXT.md`'s *Stop Notice*
+    is "a Session Brief published as text", so what a stop produces here is the
+    brief and `briefing.text` is what renders it — one vocabulary for the
+    channel, the log and `bridgectl brief`, which is the defect #166 named. The
+    five renderers that used to live here are gone: the composer, the "it said /
+    nothing said yet / oversize" line, the per-wait-kind sentence with its
+    options and recommendation, the "answer it in the terminal" constant, and
+    their use of `spoken_reference` — which the Approval Relay's announcement
+    still needs, so it stays for that one caller. The omission wording lives in
+    `briefing.NEWEST_WORDING` and the state wording in `briefing.STATE_WORDING`.
+
+    Legacy (ADR 0010): `legacy@1d32845:bridge/host.py:213-235` announced a
+    content-free notice — **adapted**, the notice now carries the brief. Naming
+    the Session on it (ported in #109) is carried by the brief's name field.
+
+    **The reading this path is announcing wins over the row's.** A Stop is read
+    at the moment the Session stopped, and the sweep and reconcile paths each
+    carry the wait they are about; the roster row supplies everything else — the
+    Session Name, the workspace, the last activity — that the reading itself does
+    not know.
+
+    **The state is derived from the wait, because a Stop is not a Session
+    running.** `SessionRegistry.set_stop_reading` deliberately leaves a row that
+    merely ended a turn in whatever state the last discovery pass found (#209),
+    which is right for a standing roster and wrong for a notice: it would brief a
+    Session that has just stopped as `running`. So a wait only the user can end —
+    and a wait nobody could read, which is not an answer either — reads as
+    `WAITING`, and a turn that ended asking nothing reads as `IDLE`, which is
+    exactly what `BriefState.FINISHED` means (#165 Q7).
     """
-    stopped_on = (
-        _stopped_on(waiting_for, answerable_here=answerable_here) if waiting_for is not None else ""
+    row = session if session is not None else _stand_in(target)
+    row = replace(
+        row,
+        state=(SessionState.IDLE if waiting_for.kind is WaitingKind.NONE else SessionState.WAITING),
+        waiting_for=waiting_for,
+        progress=progress if progress is not None else row.progress,
     )
-    detail = [one for one in (_progress_at_stop(progress), stopped_on) if one]
-    tail = f" — {'; '.join(detail)}" if detail else ""
-    return f"{spoken_reference(session, target)} stopped and may need you{tail}"
+    return briefing.session(row, question_answerable=question_answerable)
 
 
-def _progress_at_stop(progress: ProgressObservation | None) -> str:
-    """What the Session most recently said, from the Stop's own observation."""
-    if progress is None or progress.availability is not ProgressAvailability.READABLE:
-        return ""
-    if progress.has_history is False:
-        return "nothing said yet"
-    if progress.omission is ProgressOmission.NEWEST_OVERSIZE:
-        return "history exists, but the newest entry is too large to carry"
-    newest = next(
-        (entry for entry in reversed(progress.recent) if entry.role is ProgressRole.ASSISTANT),
-        None,
+#: The two `Session` fields a brief never reads, for the one row nobody observed.
+#: `Session` is the roster's record and requires both; `briefing.session` reads
+#: neither (`core/briefing.py::session` takes `target`, `name`, `state`,
+#: `waiting_for`, `progress`, `last_activity`, `child`). Named here, once, and
+#: named as unobserved rather than spelled at the call site as a plausible-looking
+#: `Path("/")` and `0.0` — a stand-in that reads like a fact is the thing to
+#: avoid. Nothing consumes either: this row is never registered, never persisted
+#: and never answered from.
+UNOBSERVED_WORKSPACE: Final = Path()
+UNOBSERVED_FIRST_SEEN: Final = 0.0
+
+
+def _stand_in(target: SessionTarget) -> Session:
+    """A row for a Stop the roster holds no Session for, carrying only its address.
+
+    A Stop can arrive for a Session no discovery pass has landed yet, and a
+    notice nobody receives is worse than one naming the Session by the address
+    the user can still answer it by — which is `spoken_name`'s own floor
+    (`core/sessions.py:773-785`) and the shape `Briefing` prints for a row with
+    no name. **Nothing a brief reads is invented**: there is no name, the
+    progress stays the default `NOT_READ` — Briefing's word for "nobody looked" —
+    and the wait is the one the Stop itself carried. The two fields `Session`
+    requires and no brief reads are the constants above, and they are unobserved
+    rather than assumed.
+    """
+    return Session(
+        target=target,
+        workspace=UNOBSERVED_WORKSPACE,
+        first_seen=UNOBSERVED_FIRST_SEEN,
     )
-    return f"it said: {newest.text}" if newest is not None else ""
 
 
 def spoken_reference(session: Session | None, target: SessionTarget) -> str:
@@ -198,58 +240,6 @@ def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
     if held is SessionState.WAITING:
         return held
     return SessionState.IDLE if window is ReplyWindow.OPEN else SessionState.RUNNING
-
-
-#: What a notice says about something this engine can announce and cannot answer.
-#: One sentence, used by both such cases, because they are one fact: a notice the
-#: user tries to answer remotely and cannot is worse than no notice at all.
-ANSWER_IT_AT_THE_TERMINAL: Final = "answer it in the terminal; it cannot be answered from here"
-
-
-def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
-    """One line describing what a Session is waiting for, or nothing to add."""
-    match waiting_for.kind:
-        case WaitingKind.QUESTION:
-            parts = [waiting_for.prompt or "it asked you something"]
-            if waiting_for.options:
-                parts.append(
-                    "options: "
-                    + ", ".join(
-                        f"{option.text}: {option.description}"
-                        if option.description
-                        else option.text
-                        for option in waiting_for.options
-                    )
-                )
-            if waiting_for.recommendation:
-                parts.append(f"it recommends {waiting_for.recommendation}")
-            if answerable_here:
-                action = (
-                    "answer all of them in one reply"
-                    if "\n" in waiting_for.prompt
-                    else "reply with your answer"
-                )
-            else:
-                action = ANSWER_IT_AT_THE_TERMINAL
-            return "; ".join(parts) + f" — {action}"
-        case WaitingKind.PERMISSION:
-            named = waiting_for.tool_name or "a tool"
-            asked = f"{named} needs your permission" + (
-                f": {waiting_for.detail}" if waiting_for.detail else ""
-            )
-            if answerable_here:
-                return asked
-            # No handle means no Approval Relay: the roster saw `waiting` and
-            # nothing is parked on the approval socket to answer into. Saying so
-            # is the whole difference between a notice the user can act on and
-            # one they try to answer from their phone and cannot.
-            return f"{asked} — {ANSWER_IT_AT_THE_TERMINAL}"
-        case WaitingKind.UNKNOWN:
-            # The honest answer while the record has not flushed (#73): say that
-            # rather than invent a reason the Session never gave.
-            return "it has not said what it is waiting for yet"
-        case _:
-            return waiting_for.detail or ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -674,12 +664,10 @@ class BridgeCore:
                     Notice(
                         request_id=new_request_id(),
                         target=target,
-                        text=stop_notice_for(
-                            self._known(target),
-                            target,
-                            waiting_for,
-                            answerable_here=False,
-                        ),
+                        # The hook that held this question is gone, so the brief
+                        # says so: `question_answerable=False` is what makes
+                        # Briefing word it "at the terminal".
+                        text=briefing.text(stop_brief(self._known(target), target, waiting_for)),
                     )
                 )
         approvals = await self.approvals.sweep_expired()
@@ -854,12 +842,20 @@ class BridgeCore:
         of the durable ledgers #67's port table leaves behind, and the rule that
         replaces it is #80's — reconcile the current state and replay nothing.
         """
-        _log.info(
-            "Session stopped: %s waiting on %s%s",
+        brief = stop_brief(
+            session,
             target,
-            waiting_for.kind,
-            f" ({waiting_for.tool_name})" if waiting_for.tool_name else "",
+            waiting_for,
+            progress=progress,
+            question_answerable=(
+                waiting_for.kind is WaitingKind.QUESTION and self._question_answerable(target)
+            ),
         )
+        # The log carries the brief's text too, so the one wording is what the
+        # run's own record shows (#166 B5/B6). `Session stopped:` opens it
+        # unchanged: `tests/acceptance/journey.py::ENGINE_STOP_LINE` greps the
+        # first line of the record, and `drain_boot_notice` reads that grep.
+        _log.info("Session stopped: %s", briefing.text(brief))
         held = waiting_for.as_approval_request(target)
         if held is not None:
             if reconcile:
@@ -868,6 +864,18 @@ class BridgeCore:
                 )
                 if outcome is not None:
                     return outcome
+                # Nothing is parked under that handle any more — the Approval
+                # Relay had nothing to re-offer — so the row's `approval_id` is
+                # stale and the notice must not promise a route that is gone.
+                # Briefing reads the handle off the row it is given
+                # (`briefing._answerable_here`), so what it is given is the row
+                # with the fact this call has just established.
+                brief = stop_brief(
+                    session,
+                    target,
+                    replace(waiting_for, approval_id=None),
+                    progress=progress,
+                )
             # One dialog, two events, one announcement. A Session entering
             # `waiting` raises this Stop, and the same dialog reached
             # `AwaitingApproval` through the hook that is holding it open — so
@@ -892,22 +900,7 @@ class BridgeCore:
             Notice(
                 request_id=new_request_id(),
                 target=target,
-                text=stop_notice_for(
-                    session,
-                    target,
-                    waiting_for,
-                    progress=(
-                        progress
-                        if progress is not None
-                        else session.progress
-                        if session is not None
-                        else None
-                    ),
-                    answerable_here=(
-                        waiting_for.kind is WaitingKind.QUESTION
-                        and self._question_answerable(target)
-                    ),
-                ),
+                text=briefing.text(brief),
             )
         )
         return outcome

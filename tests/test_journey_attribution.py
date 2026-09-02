@@ -28,14 +28,16 @@ import pytest
 import support
 
 from gpt_voicecoding.control_plane.payloads import session_document
+from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.approvals import announcement_for
-from gpt_voicecoding.core.bridge import stop_notice_for
+from gpt_voicecoding.core.bridge import stop_brief
 from gpt_voicecoding.core.sessions import Session, session_from
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ChildClassification,
     ChildKind,
     SessionInspection,
+    WaitingFor,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -76,6 +78,16 @@ def session(target: SessionTarget = MINE, *, task: str | None = "port the log") 
     )
 
 
+def notice_for(one: Session) -> str:
+    """The product's real Stop Notice for that Session — a Session Brief, as text.
+
+    Composed through the product rather than quoted, which is the whole point of
+    this module: the harness's mirror has to break when the product's own words
+    move, and since #189 those words are `Briefing`'s.
+    """
+    return briefing.text(stop_brief(one, one.target, WaitingFor()))
+
+
 def row(one: Session) -> dict:
     """The roster row a surface reads, built the way the control plane builds it."""
     return session_document(
@@ -96,13 +108,19 @@ class TestWhatTheHarnessThinksNamesASession:
 
     def test_a_session_with_no_name_yet_falls_back_to_its_address(self) -> None:
         """Measured: a Codex Session has no name until its first turn."""
-        assert journey._naming_forms(row(session(task=None))) == ("claude 6f723f5c",)
+        assert journey._naming_forms(row(session(task=None))) == (
+            "claude 6f723f5c",
+            "claude:6f723f5c:64312",
+        )
 
     def test_a_session_with_no_id_yet_falls_back_to_its_pid(self) -> None:
         """`spoken_target`'s own second fallback, mirrored — codex before its rollout."""
         bare = {"target": {"agent": "codex", "session_id": None, "pid": 95827}, "name": None}
 
-        assert journey._naming_forms(bare) == ("codex pid 95827",)
+        # `codex::95827` is `address_of` on a target with no id yet: the id half
+        # is written as nothing at all rather than the word `None` (#73), and the
+        # brief's header prints exactly that.
+        assert journey._naming_forms(bare) == ("codex pid 95827", "codex::95827")
 
     def test_a_row_that_names_nothing_yields_nothing_to_attribute_with(self) -> None:
         """Not an empty pass: `_await_message_naming` refuses on this rather than waiting."""
@@ -442,7 +460,7 @@ class TestTheProductsOwnNoticesAreAttributable:
     def test_a_stop_notice_names_the_session_it_is_about(self) -> None:
         mine = session()
 
-        notice = stop_notice_for(mine, mine.target)
+        notice = notice_for(mine)
 
         assert journey._named_in(notice, journey._naming_forms(row(mine)))
 
@@ -460,7 +478,7 @@ class TestTheProductsOwnNoticesAreAttributable:
     def test_an_unnamed_session_is_still_attributable_by_its_address(self) -> None:
         anonymous = session(task=None)
 
-        notice = stop_notice_for(anonymous, anonymous.target)
+        notice = notice_for(anonymous)
 
         assert journey._named_in(notice, journey._naming_forms(row(anonymous)))
 
@@ -478,7 +496,7 @@ class TestWhatTheHarnessMustNotAttributeToItself:
             first_seen=0.0,
         )
 
-        notice = stop_notice_for(theirs, theirs.target)
+        notice = notice_for(theirs)
 
         assert journey._named_in(notice, journey._naming_forms(row(theirs)))
         assert not journey._named_in(notice, journey._naming_forms(row(session())))
@@ -491,7 +509,7 @@ class TestWhatTheHarnessMustNotAttributeToItself:
             task=None,
         )
 
-        parents_notice = stop_notice_for(parent, parent.target)
+        parents_notice = notice_for(parent)
 
         assert not journey._named_in(parents_notice, journey._naming_forms(row(child)))
 
@@ -530,7 +548,10 @@ class TestTwoSessionsTheChatCannotTellApart:
         child = session_from(seen_as_a_child, first_seen=0.0)
 
         assert row(child)["name"] is None
-        assert journey._naming_forms(row(child)) == ("claude 9a11bd2e",)
+        assert journey._naming_forms(row(child)) == (
+            "claude 9a11bd2e",
+            "claude:9a11bd2e:64399",
+        )
         assert (
             journey._indistinguishable_from(
                 journey._naming_forms(row(child)),
@@ -564,9 +585,7 @@ class TestTwoSessionsTheChatCannotTellApart:
         )
 
         assert shared is not None
-        assert journey._named_in(
-            stop_notice_for(long, long.target), journey._naming_forms(row(short))
-        )
+        assert journey._named_in(notice_for(long), journey._naming_forms(row(short)))
 
     def test_the_session_with_the_longer_name_is_not_refused(self) -> None:
         """The direction matters, and refusing both ways would be a red for nothing.
@@ -585,9 +604,7 @@ class TestTwoSessionsTheChatCannotTellApart:
         )
 
         assert shared is None
-        assert not journey._named_in(
-            stop_notice_for(short, short.target), journey._naming_forms(row(long))
-        )
+        assert not journey._named_in(notice_for(short), journey._naming_forms(row(long)))
 
     def test_distinct_sessions_are_not_refused(self) -> None:
         mine = session()

@@ -90,6 +90,20 @@ class Notice:
     #: at all is Bridge Core's current-state reconciliation, not this notice
     #: object's — and since #161 that decision reads only the current state.
     target: SessionTarget
+    #: The words. For a Stop Notice these are `Briefing.text` of the Session
+    #: Brief (#189), which is what `CONTEXT.md`'s *Stop Notice* is: "a Session
+    #: Brief published as text".
+    #:
+    #: **Carrying text into the call is interim, and #194 retires it.** The same
+    #: glossary entry says the Live Call "does not receive text to read out; it
+    #: receives the Session Brief itself and speaks from it" — but a Core type
+    #: may not cross the Call seam (ADR 0001: seams and adapters never depend on
+    #: Core), so the seam-owned carrier for a spoken brief is designed once,
+    #: beside `Dial`, in #194. Until then `SPEAK_INTO_CALL` and
+    #: `OPEN_CALL_AND_SPEAK` hand the brief's text to the existing generic
+    #: `speak(text)` verb, exactly where they used to hand a composed sentence.
+    #: The Companion Channel, the log and the CLI are not interim: text is what
+    #: they render.
     text: str
 
     def __post_init__(self) -> None:
