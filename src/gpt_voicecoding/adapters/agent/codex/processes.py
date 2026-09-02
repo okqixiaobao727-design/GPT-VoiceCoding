@@ -26,14 +26,23 @@ candidate has Session identity.** Its argv is a TUI and `ps` names its
 controlling terminal. Only `codex resume <canonical UUID>` carries a thread id
 that the rollout or daemon can independently name. Bare, prompt, picker,
 `--last`, `fork`, and remote invocations carry no shared key, so this module
-returns their pid and workspace but no identity. `discovery.ProcessEvidence`
-then drops them instead of joining by workspace, time, or equal counts (#144).
+returns their pid and workspace but no identity.
+
+**A candidate without an argv thread id is the ordinary case, not the
+exceptional one** (#201). It used to be read here and discarded one caller up,
+which made the roster reachable only by `codex resume <UUID>` — a shape no
+hand-started TUI has. Such a candidate is now returned like any other, and
+`codex/roster.py` decides what it can vouch for. Identity still never comes
+from here: what this module adds for that rule is **when the process started**,
+which is what lets a terminal be ruled out as the owner of a thread that
+already existed before it did.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -131,6 +140,18 @@ VALUE_TAKING_OPTIONS: Final = frozenset(
 #: How long the process table and the cwd lookups get, together.
 COMMAND_TIMEOUT_SECONDS: Final = 10.0
 
+#: How coarse a start time computed from `etime` is, and therefore how much
+#: slack any comparison against it must allow.
+#:
+#: **Read here rather than guessed, because it follows from the field.** `etime`
+#: is whole seconds and truncated, and it is subtracted from a clock read a
+#: moment *after* `ps` sampled it, so the start this module computes is never
+#: earlier than the true start and can be up to a second later. A rule that
+#: excludes a thread created before a terminal started must therefore allow one
+#: second, or it would drop the true thread of a TUI that opened one in the same
+#: second it launched — the fast start, which is the ordinary one.
+START_TIME_RESOLUTION_SECONDS: Final = 1.0
+
 #: macOS `ps`'s explicit answer that a process has no controlling terminal.
 #: #144 captured this value on a detached `codex` process whose argv and cwd
 #: otherwise looked like a TUI.
@@ -139,15 +160,28 @@ NO_CONTROLLING_TERMINAL: Final = "??"
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """One running Codex TUI, with an exact native id only when argv carries it."""
+    """One running Codex TUI, with an exact native id only when argv carries it.
+
+    `started_at` is epoch seconds, computed from `etime` against a clock read
+    once per pass. It is `None` only for a candidate composed by hand: the
+    reader below skips a `ps` row whose elapsed time it cannot parse, because a
+    terminal that cannot say when it started cannot vouch for a thread's
+    liveness by place (#201) and reporting it as if it could would reinstate
+    #123's ghost rows.
+    """
 
     pid: int
     workspace: Path
     session_id: str | None = None
+    started_at: float | None = None
 
 
 #: Runs one command and returns its stdout, or raises. Injected for tests.
 Runner = Callable[[list[str]], Awaitable[str]]
+
+#: Reads the wall clock, in epoch seconds. Injected so a start time computed
+#: from an elapsed reading is a fixed number in a test.
+Clock = Callable[[], float]
 
 
 async def run_command(argv: list[str]) -> str:
@@ -169,15 +203,34 @@ async def run_command(argv: list[str]) -> str:
     return out.decode("utf-8", errors="replace")
 
 
-async def enumerate_sessions(*, run: Runner = run_command) -> tuple[Candidate, ...]:
-    """Every live interactive `codex` TUI, by pid, workspace and exact argv id.
+async def enumerate_sessions(
+    *, run: Runner = run_command, now: Clock = time.time
+) -> tuple[Candidate, ...]:
+    """Every live interactive `codex` TUI, by pid, workspace, argv id and start.
 
     Raises `OSError` or `TimeoutError` if the process table cannot be read at
     all — the caller turns that into a lane error, because not being able to
     look is not the same as there being nothing to see.
+
+    **The clock is read once, beside the `ps` that it dates.** `ps` reports
+    elapsed time, and turning that into a start time is the one thing on this
+    path that needs to know what time it is; doing it at this boundary is what
+    lets the composition rule (`codex/roster.py`) decide everything from its
+    arguments.
+
+    **Once, not once per candidate**, because the `lsof` below is a subprocess
+    per pid and may take seconds: a clock read after it would date the last
+    candidate's `etime` — sampled in the same `ps` as the first — against a
+    later moment, and push its computed start forward by the whole lookup. The
+    one-second allowance `START_TIME_RESOLUTION_SECONDS` states would not cover
+    that, and the cost would be a real hand-started root read as predating its
+    own terminal and dropped, which is the bug this all exists to fix.
     """
     found: list[Candidate] = []
-    for pid, session_id in await _interactive_pids(run):
+    listed = await _interactive_pids(run)
+    sampled_at = now()
+    for pid, session_id, elapsed in listed:
+        started_at = sampled_at - elapsed
         workspace = await _cwd_of(pid, run)
         if workspace is None:
             # A process that ended between the listing and the lookup, or one
@@ -190,25 +243,47 @@ async def enumerate_sessions(*, run: Runner = run_command) -> tuple[Candidate, .
                 pid=pid,
                 workspace=workspace,
                 session_id=session_id,
+                started_at=started_at,
             )
         )
     return tuple(found)
 
 
-async def _interactive_pids(run: Runner) -> list[tuple[int, str | None]]:
-    """TTY-backed `codex` processes and any exact thread id in their argv."""
-    listing = await run(["/bin/ps", "-axo", "pid=,ppid=,tty=,args="])
-    found: list[tuple[int, str | None]] = []
+async def _interactive_pids(run: Runner) -> list[tuple[int, str | None, float]]:
+    """TTY-backed `codex` processes, their argv thread id, and how long they have run."""
+    listing = await run(["/bin/ps", "-axo", "pid=,ppid=,tty=,etime=,args="])
+    found: list[tuple[int, str | None, float]] = []
     for line in listing.splitlines():
-        pid, terminal, argv = _split(line)
-        if pid is None or terminal is None or not argv:
+        pid, terminal, elapsed, argv = _split(line)
+        if pid is None or terminal is None or elapsed is None or not argv:
             continue
         if terminal == NO_CONTROLLING_TERMINAL:
             continue
         if Path(argv[0]).name != EXECUTABLE or not is_interactive(argv):
             continue
-        found.append((pid, session_id_from_argv(argv)))
+        found.append((pid, session_id_from_argv(argv), elapsed))
     return found
+
+
+def elapsed_seconds(text: str) -> float | None:
+    """How long a process has run, from `ps`'s `etime`, or `None` if unreadable.
+
+    `[[dd-]hh:]mm:ss`, which is POSIX's own spelling of the field. Chosen over
+    `lstart` deliberately: `lstart` is an absolute time but a locale-formatted
+    one — this machine prints `Wed  2 Sep 08:52:06 2026` where an en_US machine
+    prints `Wed Sep  2 08:52:06 2026` — so parsing it would make the roster
+    depend on the locale of whoever's launchd started the engine.
+    """
+    days, _, clock = text.strip().rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3 or (days and not days.isdigit()):
+        return None
+    if not all(part.isdigit() for part in parts):
+        return None
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + int(days or 0) * 86_400
 
 
 def is_interactive(argv: list[str]) -> bool:
@@ -276,19 +351,20 @@ def session_id_from_argv(argv: list[str]) -> str | None:
     return None
 
 
-def _split(line: str) -> tuple[int | None, str | None, list[str]]:
-    """Read `pid ppid tty args` from one macOS `ps` row.
+def _split(line: str) -> tuple[int | None, str | None, float | None, list[str]]:
+    """Read `pid ppid tty etime args` from one macOS `ps` row.
 
-    Split on the three leading fields only, because `args=` is last precisely so
+    Split on the four leading fields only, because `args=` is last precisely so
     that a path with spaces in it stays one field's problem rather than the
-    parser's.
+    parser's. `etime` is a single unpadded token, so it splits like the rest.
     """
     head, _, rest = line.strip().partition(" ")
     parent, _, rest = rest.strip().partition(" ")
-    terminal, _, argv = rest.strip().partition(" ")
+    terminal, _, rest = rest.strip().partition(" ")
+    elapsed, _, argv = rest.strip().partition(" ")
     if not head.isdigit() or not parent.isdigit() or not terminal:
-        return None, None, []
-    return int(head), terminal, argv.split()
+        return None, None, None, []
+    return int(head), terminal, elapsed_seconds(elapsed), argv.split()
 
 
 async def _cwd_of(pid: int, run: Runner) -> Path | None:

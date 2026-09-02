@@ -19,6 +19,7 @@
 | [0017](0017-a-missed-call-is-briefed-from-a-fresh-reading.md) | A missed call is briefed from a fresh reading, never from replayed events |
 | [0018](0018-one-dial-two-audiences.md) | One dial, two audiences: the Voice hears prose, the Call Agent hears its rules |
 | [0019](0019-one-claude-approval-route-per-machine.md) | One Claude approval route per user per machine, and the first live engine holds it |
+| [0020](0020-a-codex-session-is-a-daemon-thread-a-terminal-vouches-for.md) | A Codex Session is a daemon-held user root that a live terminal vouches for |
 
 0008 (headless direct-child launcher) and 0009 (a launch carries its Opening Instruction) were removed with the launcher when v1.0 became a bridge over Sessions the user starts ([#67](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/67), [#68](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/68)); they return with the launch map, from git history.
 

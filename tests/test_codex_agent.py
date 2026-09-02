@@ -1580,7 +1580,7 @@ class TestNotSubscribingToAChildProcess:
         assert watching == (SessionTarget(agent=AgentKind.CODEX, session_id=THREAD, pid=991),)
 
     def test_a_thread_that_names_no_source_is_resumed_too(self, socket_path: Path) -> None:
-        """Absent is not a claim — the same reading `discovery._child_of` gives it."""
+        """Absent is not a claim — the same reading `roster._child_of` gives it."""
 
         async def scenario():
             async with Codex(socket_path).script() as server:

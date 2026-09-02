@@ -107,7 +107,7 @@ The pluggable text surface: it pushes the system's messages to the user and acce
 _Avoid_: Telegram (one adapter, not the concept)
 
 **Session**:
-One interactive terminal run of Claude Code or Codex. The system sees every Session on the machine, reads what it stopped on, and Relays into it.
+One interactive terminal run of Claude Code or Codex. The system sees every Session on the machine, reads what it stopped on, and Relays into it. It sees one by recognising it from what the machine already shows — never by wrapping or instrumenting it — so a Session it cannot recognise is under-reported and said to be, never invented (ADR 0020).
 _Avoid_: task, job, window, launched Session (the system launches nothing)
 
 **Child Process**:
