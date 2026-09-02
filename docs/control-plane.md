@@ -511,7 +511,10 @@ verify
 
 `<agent>:<session id>[:<pid>]` is how a `SessionTarget` is written on one line. A
 Claude target without a pid is refused: `--resume` forks a second process under
-the same session id.
+the same session id. The pid is read by converting it, not by spelling it, so
+anything that is not a whole number above zero — a superscript digit, a run of
+digits past CPython's int-conversion limit — comes back as the refusal `not a
+process id` rather than a traceback.
 
 `bridgectl` exits **0** when the engine answered, **1** when it refused, and **2**
 when there was no engine to ask. Collapsing the last two would tell a user their

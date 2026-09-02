@@ -112,3 +112,37 @@ class TestATargetSaidOutLoudIsTheSameAddress:
     def test_what_it_says_reads_back_as_itself(self) -> None:
         target = SessionTarget(agent=AgentKind.CLAUDE, session_id="d3a776ae", pid=3538)
         assert read_target({"target": parse_address(str(target))}) == target
+
+
+class TestThePidIsReadByAskingInt:
+    """A spelling test lets `int` raise behind it — the shape #190 fixed on `--before`.
+
+    `str.isdigit` is true of every decimal digit Unicode has, `"²"` among
+    them, and it is also true of 4,301 ASCII digits, which `int` refuses under
+    CPython's own conversion limit. Both passed the spelling check and reached
+    `int`, so an address a surface could have been told about came back as a
+    traceback instead.
+    """
+
+    @pytest.mark.parametrize(
+        "pid",
+        ["²", "1" * 4_301, "12.5", "six", "-5", "0"],
+        ids=[
+            "a superscript digit",
+            "past the int-conversion limit",
+            "a fraction",
+            "a word",
+            "a pid below zero",
+            "a pid of zero",
+        ],
+    )
+    def test_a_pid_that_is_not_one_is_refused_in_the_words_a_surface_prints(self, pid: str) -> None:
+        with pytest.raises(CommandError, match="not a process id"):
+            parse_address(f"codex:abc:{pid}")
+
+    def test_a_plain_pid_still_parses(self) -> None:
+        assert parse_address("codex:abc:6548") == {
+            "agent": "codex",
+            "session_id": "abc",
+            "pid": 6548,
+        }

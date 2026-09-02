@@ -164,9 +164,29 @@ def parse_address(address: str) -> dict[str, object]:
     named = session_id.strip() or None
     if not rest:
         return {"agent": agent, "session_id": named, "pid": None}
-    if not rest[0].isdigit():
-        raise CommandError(f"not a process id: {rest[0]!r}")
-    return {"agent": agent, "session_id": named, "pid": int(rest[0])}
+    return {"agent": agent, "session_id": named, "pid": _pid(rest[0])}
+
+
+def _pid(word: str) -> int:
+    """The process half of an address, read by asking `int` rather than by spelling.
+
+    The same shape `_ordinal` is drawn around, for the same reason: `str.isdigit`
+    is true of every decimal digit Unicode has — `"\u00b2"` among them — and of
+    4,301 ASCII digits, which `int` refuses under CPython's own conversion limit.
+    Both reached `int` behind a spelling test and came back as a traceback where
+    the surface had asked for a refusal it could print (#211).
+
+    A pid at or below zero is refused here in the words `SessionTarget` refuses
+    it in, so an address is turned away by the parser that read it rather than
+    one seam later.
+    """
+    try:
+        pid = int(word)
+    except ValueError:
+        raise CommandError(f"not a process id: {word!r}") from None
+    if pid <= 0:
+        raise CommandError(f"not a process id: {word!r}")
+    return pid
 
 
 def format_address(target: dict[str, object]) -> str:

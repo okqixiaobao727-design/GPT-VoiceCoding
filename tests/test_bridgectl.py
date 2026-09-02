@@ -227,6 +227,20 @@ class TestSayingNoOutLoud:
         assert code == 2
         assert "switch <name> on|off" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        "pid",
+        ["\u00b2", "1" * 4_301],
+        ids=["a superscript digit", "past the int-conversion limit"],
+    )
+    def test_an_address_whose_pid_is_not_one_is_refused_rather_than_raised(
+        self, capsys: pytest.CaptureFixture[str], pid: str
+    ) -> None:
+        """The conversion is the test: a spelling test lets `int` raise behind it (#211)."""
+        code = main(["--socket", "/tmp/nothing.sock", "brief", f"codex:abc:{pid}"])
+
+        assert code == 2
+        assert "not a process id" in capsys.readouterr().err
+
 
 class TestRenderingARelayReceipt:
     """The surface prints the receipt's three codes, and composes no sentence.
