@@ -144,12 +144,35 @@ COMMAND_TIMEOUT_SECONDS: Final = 10.0
 #: slack any comparison against it must allow.
 #:
 #: **Read here rather than guessed, because it follows from the field.** `etime`
-#: is whole seconds and truncated, and it is subtracted from a clock read a
-#: moment *after* `ps` sampled it, so the start this module computes is never
-#: earlier than the true start and can be up to a second later. A rule that
-#: excludes a thread created before a terminal started must therefore allow one
-#: second, or it would drop the true thread of a TUI that opened one in the same
-#: second it launched — the fast start, which is the ordinary one.
+#: is whole seconds and truncated, so a start computed from it is up to a second
+#: later than the true one whatever else happens. A rule that excludes a thread
+#: created before a terminal started must therefore allow one second, or it
+#: would drop the true thread of a TUI that opened one in the same second it
+#: launched — the fast start, which is the ordinary one.
+#:
+#: **Which side the clock read is on decides the other half of the error, and
+#: only one side is safe.** `ps` samples `etime` at some moment inside the await
+#: that launches it, and `enumerate_sessions` subtracts it from one clock read:
+#:
+#: * Read *after* the await, the error is `(sample - read) + truncation` — both
+#:   terms positive, so the whole duration of the `ps` is added and the terminal
+#:   reads **younger** than it is. That is not academic: on run
+#:   `20260902T071547Z` a two-lane machine's `ps` cost more than this allowance,
+#:   a hand-started TUI (19:15:56.366) read as younger than the thread it opened
+#:   in that same second (`rollout-2026-09-02T19-15-56-01a060f9…`), the
+#:   start-time filter ruled it out as that thread's owner, and a live Session
+#:   dropped off the roster mid-run.
+#: * Read *before* it, the error is `truncation - (ps duration)` — so a terminal
+#:   can read **older** than it is, by however long the `ps` took. That widens,
+#:   by that duration, the window in which a thread created just *before* a
+#:   terminal could still be vouched for by it.
+#:
+#: The second is the safe direction and this module takes it. What the window
+#: would have to contain to matter is a thread created in the sub-second before
+#: its own terminal launched, and the case ADR 0020 wrote the rule against is
+#: nothing like that shape: the loaded-but-dead root it excludes was sixteen
+#: minutes older than the terminal that could not own it. Truncation, the half
+#: that does not move, is still covered by the one second below.
 START_TIME_RESOLUTION_SECONDS: Final = 1.0
 
 #: macOS `ps`'s explicit answer that a process has no controlling terminal.
@@ -225,10 +248,20 @@ async def enumerate_sessions(
     one-second allowance `START_TIME_RESOLUTION_SECONDS` states would not cover
     that, and the cost would be a real hand-started root read as predating its
     own terminal and dropped, which is the bug this all exists to fix.
+
+    **Before the `ps`, not after it**, for the same reason one moment further
+    back: awaiting that subprocess is itself time, and a clock read afterwards
+    adds all of it to every start it computes. See
+    `START_TIME_RESOLUTION_SECONDS` for both directions of the error and which
+    one is safe; run `20260902T071547Z` is where the unsafe one dropped a live
+    Session.
     """
     found: list[Candidate] = []
-    listed = await _interactive_pids(run)
+    # Read before the launch: `ps` samples `etime` at some moment inside this
+    # await, and the earliest moment consistent with the reading is the only one
+    # that cannot make a terminal younger than it is.
     sampled_at = now()
+    listed = await _interactive_pids(run)
     for pid, session_id, elapsed in listed:
         started_at = sampled_at - elapsed
         workspace = await _cwd_of(pid, run)
