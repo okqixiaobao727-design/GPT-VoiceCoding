@@ -1938,14 +1938,9 @@ class Walk:
         rows: list[dict] = []
         while True:
             rows = self._roster_rows()
-            for row in rows:
-                child = row.get("child")
-                if (
-                    _address_of(row) not in before
-                    and isinstance(child, dict)
-                    and child.get("kind") == "child"
-                ):
-                    return row, rows
+            mine = _first_child_of(rows, self.lane.agent, before)
+            if mine is not None:
+                return mine, rows
             if time.monotonic() >= deadline:
                 return None, rows
             time.sleep(TURN_POLL_SECONDS)
@@ -2304,6 +2299,40 @@ def _address_of(row: dict) -> str:
     pid = target.get("pid")
     tail = f":{pid}" if pid else ""
     return f"{target.get('agent')}:{target.get('session_id')}{tail}"
+
+
+def _first_child_of(rows: list[dict], agent: str, before: set[str]) -> dict | None:
+    """The first Child Process row **this lane's agent** produced, new since `before`.
+
+    The agent is the whole point. Two lanes run at once, each with its own engine,
+    and an engine bridges *every* Session on the machine — so the Codex lane's
+    child has a row on the Claude lane's roster too, and it is a real, correctly
+    classified child, which is what makes it dangerous. Run `20260902T065340Z`
+    measured it: the Claude lane's `child` step took `codex:01a060e9-…` (the Codex
+    lane's child, which the Codex lane's own step passed on) and failed it for
+    being listed under a Codex parent. It could not happen before that run,
+    because until #208 the Codex lane had no roster row at all and so left no
+    child on anyone's roster.
+
+    **The lane's own agent, and not its own Session id**, deliberately. Filtering
+    on the parent would make the step's own assertion — "the child is listed under
+    the Session that started it" — unfalsifiable, since only rows that already
+    satisfied it could be graded. The agent is the coarsest key that separates the
+    two lanes, and it leaves every claim the step makes able to fail.
+
+    `before` carries #79's other rule: first *new* sighting wins, because a child
+    is transient and the roster held before the turn is not evidence of this one.
+    """
+    for row in rows:
+        target, child = row.get("target"), row.get("child")
+        if not isinstance(target, dict) or not isinstance(child, dict):
+            continue
+        if target.get("agent") != agent or child.get("kind") != "child":
+            continue
+        if _address_of(row) in before:
+            continue
+        return row
+    return None
 
 
 def _naming_forms(row: dict) -> tuple[str, ...]:

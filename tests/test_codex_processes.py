@@ -12,6 +12,7 @@ import asyncio
 from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.codex.processes import (
+    START_TIME_RESOLUTION_SECONDS,
     Candidate,
     elapsed_seconds,
     enumerate_sessions,
@@ -22,6 +23,11 @@ from gpt_voicecoding.adapters.agent.codex.processes import (
 #: What `self.found` below pretends the clock says, so a start time computed
 #: from an elapsed reading is an exact number in an assertion.
 NOW = 1_787_700_000.0
+
+#: How long a `ps` takes in the test below. Longer than the one second the
+#: comparison allows, because what it stands for is a machine under an
+#: acceptance run's own load — the case the allowance does not cover.
+SLOW_PS_SECONDS = 1.5
 
 CODEX = "/Users/simon/.nvm/versions/node/v24.13.0/lib/node_modules/@openai/codex/bin/codex"
 
@@ -145,6 +151,45 @@ class TestReadingTheProcessTable:
         )
 
         assert [row.started_at for row in rows] == [NOW - 5, NOW - 5]
+
+    def test_a_slow_ps_cannot_make_a_terminal_younger_than_its_own_thread(self) -> None:
+        """The drift that dropped a live Session on run `20260902T071547Z`.
+
+        `etime` is sampled by `ps` when `ps` reads the process table; the clock
+        this module subtracts it from is read in this process. Every moment
+        between those two readings is added to the computed start, and awaiting
+        a subprocess on a loaded machine is exactly such a moment: two lanes,
+        two engines and two TUIs at once measured well past the one second
+        `START_TIME_RESOLUTION_SECONDS` allows. The cost is the bug #201 exists
+        to prevent, met from the other side — a terminal read as *younger* than
+        the thread it started, so `roster.py`'s start-time filter rules it out
+        as that thread's owner and a live Session drops off the roster. It did:
+        the TUI started at 19:15:56.366 and its rollout is stamped
+        `2026-09-02T19-15-56`, the same second.
+
+        So the clock is read **before** `ps` is launched, and the assertion is
+        the roster's own predicate rather than a number: a thread created just
+        after this terminal must not read as predating it.
+        """
+        created = NOW - 5 + 0.4  # the thread this terminal opened, the same second
+        # The clock moves *because* `ps` was awaited, which is what makes the
+        # order of the two readings the thing under test: a clock read before
+        # the launch answers NOW, one read after it answers NOW + 1.5.
+        reading = [NOW]
+
+        async def run(argv: list[str]) -> str:
+            if argv[0].endswith("ps"):
+                reading[0] += SLOW_PS_SECONDS
+                return f"  101 10 ttys001 00:05 {CODEX}\n"
+            return "p101\nfcwd\nn/tmp/workspace\n"
+
+        rows = asyncio.run(
+            enumerate_sessions(run=run, now=lambda: reading[0])  # type: ignore[arg-type]
+        )
+
+        started = rows[0].started_at
+        assert started == NOW - 5
+        assert not created < started - START_TIME_RESOLUTION_SECONDS
 
     def test_a_line_whose_elapsed_time_cannot_be_read_is_skipped(self) -> None:
         assert self.found(f"  101 10 ttys001 later {CODEX}\n", {101: "/tmp/w"}) == ()
