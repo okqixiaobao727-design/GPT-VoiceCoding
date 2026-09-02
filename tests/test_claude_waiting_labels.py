@@ -15,11 +15,10 @@ import pytest
 from gpt_voicecoding.adapters.agent.claude.waiting_labels import (
     LABELS,
     PROVEN_AGAINST_VERSION,
-    SANDBOX_TOOL_NAME,
     StopDisposition,
     classify,
 )
-from gpt_voicecoding.seams.agent import WaitingKind
+from gpt_voicecoding.seams.agent import SANDBOX_TOOL_NAME, WaitingKind
 
 
 class TestTheThreeAnswers:

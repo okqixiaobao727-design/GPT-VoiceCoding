@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from gpt_voicecoding.seams.delivery import DeliveryReceipt
 from gpt_voicecoding.seams.events import Event
@@ -155,6 +155,17 @@ class Option:
     def __post_init__(self) -> None:
         if not self.text.strip():
             raise ValueError("an option the user could choose must have words")
+
+
+#: What a permission whose tool has no name of its own is called. Claude Code's
+#: `sandbox request` says only that — no tool, no command — so something has to
+#: name it, and the seam is where both sides can read the same word: the lane
+#: writes it onto `WaitingFor.tool_name` and Briefing renders it as it renders
+#: any other tool. It sat in the Claude lane's label table until #187, which is
+#: where #166 B6 found it and asked for it to live once; Briefing itself cannot
+#: hold it, because an adapter may not import Bridge Core (ADR 0001,
+#: `tests/test_architecture.py::test_adapters_never_import_bridge_core`).
+SANDBOX_TOOL_NAME: Final = "sandbox network access"
 
 
 @dataclass(frozen=True, slots=True)

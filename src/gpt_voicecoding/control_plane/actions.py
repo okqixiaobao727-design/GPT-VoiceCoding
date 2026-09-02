@@ -13,7 +13,7 @@ itself — and one that could reach a pipeline the hub would have guarded.
 
 **ADR 0002 is honoured by omission.** Nothing in this file consults switch
 state, and there is no branch that could. The reference implementation gated
-seven actions — `sessions` and six more — behind the Duty Switch, so a user
+seven actions — the Session roster and six more — behind the Duty Switch, so a user
 away from the computer with Duty off could see nothing and do nothing; that
 dispatch behaviour is dropped, not ported, and
 `tests/test_control_plane_actions.py` proves every action still answers with
@@ -33,7 +33,9 @@ from typing import Any
 from gpt_voicecoding.control_plane import payloads
 from gpt_voicecoding.control_plane.payloads import InvalidPayload, NothingPending
 from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
+from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.bridge import BridgeCore
+from gpt_voicecoding.core.briefing import SessionBrief
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
     SecondCallRefused,
@@ -78,7 +80,7 @@ class ControlPlane:
         self.handlers: dict[Action, Handler] = {
             Action.STATUS: self._status,
             Action.SWITCH: self._switch,
-            Action.SESSIONS: self._sessions,
+            Action.BRIEF: self._brief,
             Action.PROGRESS: self._progress,
             Action.LIVE: self._live,
             Action.RELAY: self._relay,
@@ -124,16 +126,36 @@ class ControlPlane:
     async def _status(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return self._progress_publication.status_document(self._core.status())
 
-    async def _sessions(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        return self._progress_publication.sessions_document(self._core.status())
+    async def _brief(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """The Roster Brief, or one Session Brief with Detail for one address.
+
+        One action with an optional address, mirroring the one hub verb behind
+        it. The rendered `text` travels beside the structure because
+        `Briefing.text` is the only renderer there is (#166 B6): a surface that
+        composed its own line from the fields would be a second voice describing
+        one Session, which is the thing Briefing exists to end.
+        """
+        brief = await self._core.brief(payloads.read_optional_target(payload))
+        document = payloads.brief_document(brief)
+        if isinstance(brief, SessionBrief) and not self._progress_publication.fits(
+            Reply.answered(Action.BRIEF, document)
+        ):
+            # The newest message is carried whole, and one whole message can be
+            # larger than the line that has to hold it — the more so because it
+            # travels twice here, once as a field and once inside `text`. ADR
+            # 0016: name it as omitted, never slice it. The header, the state and
+            # the decision are what the user acts on, and they still fit.
+            document = payloads.brief_document(briefing.omitting_newest(brief))
+        return document
 
     async def _progress(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """How far along one exact Session is, rendered as one roster row.
 
-        The same document `sessions` renders, deliberately: a surface that had to
-        learn a second shape to show one Session's progress would be a second
-        reader of the same facts. What this action adds is *when* — the row comes
-        back read at the moment it was asked for, rather than at the last tick.
+        The same document `status` renders each row as, deliberately: a surface
+        that had to learn a second shape to show one Session's progress would be
+        a second reader of the same facts. What this action adds is *when* — the
+        row comes back read at the moment it was asked for, rather than at the
+        last tick.
         """
         session = await self._core.progress(payloads.read_target(payload))
         reply_window = self._core.status().reply_windows.get(

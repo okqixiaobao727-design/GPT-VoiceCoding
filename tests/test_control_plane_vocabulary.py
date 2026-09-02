@@ -28,7 +28,7 @@ class TestTheActionSet:
         assert {str(action) for action in Action} == {
             "status",
             "switch",
-            "sessions",
+            "brief",
             "progress",
             "live",
             "relay",
@@ -36,9 +36,17 @@ class TestTheActionSet:
             "verify",
         }
 
-    def test_progress_summary_and_detail_move_the_protocol_to_five(self) -> None:
-        """A v4 renderer could misread v5 omission as silence (ADR 0016)."""
-        assert PROTOCOL_VERSION == 5
+    def test_briefing_replacing_the_roster_verb_moves_the_protocol_to_six(self) -> None:
+        """A v5 surface would send `sessions` to an engine that has no such action.
+
+        The Swift shell compares this number and nothing else, so an action set
+        that changed under an unchanged number is a gate that lies (#171).
+        """
+        assert PROTOCOL_VERSION == 6
+
+    def test_the_retired_roster_verb_is_not_an_action_this_engine_has(self) -> None:
+        """Retired with the Briefing verb, and its absence asserted, not assumed."""
+        assert "sessions" not in {str(action) for action in Action}
 
     def test_launching_and_closing_are_not_actions_this_engine_has(self) -> None:
         """Parked with the launcher (#72), and their absence is asserted, not assumed.
@@ -83,8 +91,9 @@ class TestARequestOnTheWire:
 
 class TestAReplyOnTheWire:
     def test_the_current_protocol_includes_the_version_four_action_removal(self) -> None:
-        """Version 4 removed launch/close; version 5 retains that closed set."""
-        assert PROTOCOL_VERSION == 5
+        """Version 4 removed launch/close; every version since retains that."""
+        assert PROTOCOL_VERSION >= 4
+        assert {"launch", "close"} & {str(action) for action in Action} == set()
 
     def test_an_answer_carries_the_action_it_answers_and_the_protocol_version(self) -> None:
         document = Reply.answered(Action.STATUS, {"call_id": None}).as_document()

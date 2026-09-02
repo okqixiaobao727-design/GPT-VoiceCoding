@@ -376,7 +376,7 @@ class TestEventsReachTheHub:
                         for held in engine.core.status().sessions
                     )
                 )
-                return await ask(Request(action=Action.SESSIONS), path=engine.socket_path)
+                return await ask(Request(action=Action.STATUS), path=engine.socket_path)
             finally:
                 await engine.aclose()
 

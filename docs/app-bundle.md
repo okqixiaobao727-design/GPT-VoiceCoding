@@ -323,7 +323,7 @@ not think to look, and where a check written against some other address returns
 a confident CLEAN. Two tests settle it wherever it turns up: a `bridgectl` whose
 verbs are the first generation's (`serve`, `duty-toggle`, `session-label`,
 `stop`, `stops`, `install-hooks`) rather than this engine's (`status`,
-`switch`, `sessions`, `launch`, `verify`); and a `.source-revision` that
+`switch`, `brief`, `live`, `verify`); and a `.source-revision` that
 `git cat-file -t` cannot resolve in this repository, which means it was built
 from another codebase. An installed runtime whose daemon is not running is
 still worth knowing about before you attribute anything.

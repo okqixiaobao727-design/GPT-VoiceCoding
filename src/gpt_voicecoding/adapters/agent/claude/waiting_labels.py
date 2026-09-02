@@ -48,16 +48,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from gpt_voicecoding.seams.agent import WaitingFor, WaitingKind
+from gpt_voicecoding.seams.agent import SANDBOX_TOOL_NAME, WaitingFor, WaitingKind
 
 #: The Claude Code build every label below was read off, from the label function
 #: at offset 178702064 of the 2.1.251 bundle. Documentation, not a gate.
 PROVEN_AGAINST_VERSION: Final = "2.1.251"
-
-#: What a `sandbox request` is about. The label is the only thing said about it
-#: — no tool name, no command — so this is the wording the notice carries, and
-#: it lives here beside the table it belongs to rather than in a renderer.
-SANDBOX_TOOL_NAME: Final = "sandbox network access"
 
 
 class StopDisposition(StrEnum):

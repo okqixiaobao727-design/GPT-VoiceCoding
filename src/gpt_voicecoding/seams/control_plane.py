@@ -43,7 +43,13 @@ from typing import Any
 #: the ambiguous nullable/truncated value with explicit availability, history
 #: presence and omission. A version-4 surface could call the same action and
 #: misrender omitted history as silence, so the mismatch must be visible.
-PROTOCOL_VERSION = 5
+#:
+#: 6 retires `sessions` and adds `brief`, the Briefing verb (#171). The Swift
+#: shell compares this number and nothing else, so an action set that changed
+#: under an unchanged number would be a gate that lies: a version-5 surface
+#: would send `sessions` and be answered `unknown_action` by an engine it had
+#: just agreed with.
+PROTOCOL_VERSION = 6
 
 #: The longest line either side will read. Generous for a roster, small enough
 #: that a peer cannot make the engine hold an unbounded buffer.
@@ -62,8 +68,11 @@ class Action(StrEnum):
     STATUS = "status"
     #: Flip one switch. Never gated — ADR 0002.
     SWITCH = "switch"
-    #: The Session roster on its own, for a surface that only renders that.
-    SESSIONS = "sessions"
+    #: The Roster Brief, or one Session Brief with Detail when an address comes
+    #: with it. The one verb the voice side fetches Session state through, and
+    #: the surface `sessions` used to be: a roster of rendered rows was a second
+    #: vocabulary for what Briefing now says once (#166, #171).
+    BRIEF = "brief"
     #: How far along one exact Session is, read now. A status query like every
     #: other one here: it never starts a turn and never touches the Session.
     PROGRESS = "progress"

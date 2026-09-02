@@ -14,8 +14,7 @@ from pathlib import Path
 
 from gpt_voicecoding.adapters.agent._project import ProjectNames
 from gpt_voicecoding.adapters.agent.claude.discovery import CommandResult, discover
-from gpt_voicecoding.adapters.agent.claude.waiting_labels import SANDBOX_TOOL_NAME
-from gpt_voicecoding.seams.agent import SessionState, WaitingKind
+from gpt_voicecoding.seams.agent import SANDBOX_TOOL_NAME, SessionState, WaitingKind
 from gpt_voicecoding.seams.identity import AgentKind
 
 #: One row of `claude agents --json`, exactly as it was measured (#73).

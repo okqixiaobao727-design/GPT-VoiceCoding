@@ -27,9 +27,9 @@ from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.transcript import TranscriptReader
-from gpt_voicecoding.adapters.agent.claude.waiting_labels import SANDBOX_TOOL_NAME
 from gpt_voicecoding.adapters.agent.claude.window import ReplyWindowWatcher, StopReading
 from gpt_voicecoding.seams.agent import (
+    SANDBOX_TOOL_NAME,
     AgentEvent,
     ApprovalRequest,
     LaneDiscovery,
