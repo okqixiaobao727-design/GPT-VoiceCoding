@@ -266,23 +266,38 @@ class ProgressOmission(StrEnum):
 class ProgressEntry:
     """One thing that was said in a Session, and by which side.
 
-    Deliberately just the two fields. Legacy carried `turn_id` and `turn_status`
-    beside them on the Codex lane (`legacy@1d32845:bridge/codex.py:1484-1492,
-    1516-1520`); **dropped, because** no v1.0 consumer reads them — the Live
-    Call, the Companion Channel and the Control Panel ask what a Session last
-    said and what it was last told, never which turn that was or how the turn
-    ended — and adding a field here later is additive rather than a second
-    widening of `ProgressObservation`.
+    Legacy carried `turn_id` and `turn_status` beside them on the Codex lane
+    (`legacy@1d32845:bridge/codex.py:1484-1492, 1516-1520`); **dropped, because**
+    no v1.0 consumer reads them — the Live Call, the Companion Channel and the
+    Control Panel ask what a Session last said and what it was last told, never
+    which turn that was or how the turn ended — and adding a field here is
+    additive rather than a second widening of `ProgressObservation`.
+
+    `phase` is that additive field (#188), and it is the source's own word
+    rather than a vocabulary of this seam's: Codex marks each `agentMessage`
+    `commentary` or `final_answer`
+    (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`, serialised
+    `Option<MessagePhase>`), and a lane that marks nothing leaves it `None`. Not
+    an enum, deliberately: a phase a future build invents must read as *not the
+    answer* and cost the reading nothing, where an enum would raise on a roster
+    row the user is looking at. Who compares it to what is the reader's — the
+    tail readers carry it and never look at it, and Briefing is the one place
+    that asks whether a turn ended on its answer (`core/briefing.py`).
     """
 
     role: ProgressRole
     text: str
+    #: Which part of the turn this was, in the source's own word, or `None`
+    #: when the source did not say.
+    phase: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, ProgressRole):
             raise ValueError("a progress entry role must use the Agent seam vocabulary")
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("an entry with nothing said in it is not progress")
+        if self.phase is not None and not isinstance(self.phase, str):
+            raise ValueError("a progress entry phase is the source's own word, or nothing")
 
 
 class ProgressCapture(Protocol):
