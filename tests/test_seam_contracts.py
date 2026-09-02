@@ -22,7 +22,7 @@ from typing import Any, get_args
 import pytest
 
 from fakes import (
-    HOUSE_RULES,
+    CALL_AGENT_INSTRUCTIONS,
     FakeAgent,
     FakeCall,
     FakeCompanionChannel,
@@ -289,8 +289,8 @@ class TestTheAgentContract:
 class TestTheCallContract:
     def test_ensuring_a_call_twice_returns_the_same_call(self) -> None:
         call = FakeCall()
-        first = asyncio.run(call.ensure_call(HOUSE_RULES))
-        second = asyncio.run(call.ensure_call(HOUSE_RULES))
+        first = asyncio.run(call.ensure_call(CALL_AGENT_INSTRUCTIONS))
+        second = asyncio.run(call.ensure_call(CALL_AGENT_INSTRUCTIONS))
         assert first == second
         assert first.state is CallState.UP
 
@@ -301,7 +301,7 @@ class TestTheCallContract:
 
     def test_ending_a_call_is_idempotent(self) -> None:
         call = FakeCall()
-        asyncio.run(call.ensure_call(HOUSE_RULES))
+        asyncio.run(call.ensure_call(CALL_AGENT_INSTRUCTIONS))
         asyncio.run(call.end_call())
         assert asyncio.run(call.end_call()).state is CallState.DOWN
 
@@ -312,7 +312,7 @@ class TestTheCallContract:
             call.delegate(
                 "summarise the diff",
                 model="claude-sonnet-5",
-                instructions=HOUSE_RULES,
+                instructions=CALL_AGENT_INSTRUCTIONS,
                 request_id=new_request_id(),
             )
         )
@@ -336,8 +336,8 @@ class TestTheCallContract:
 
     def test_the_house_rules_a_call_opened_on_came_from_the_caller(self) -> None:
         call = FakeCall()
-        asyncio.run(call.ensure_call(HOUSE_RULES))
-        assert call.opened_on == [HOUSE_RULES]
+        asyncio.run(call.ensure_call(CALL_AGENT_INSTRUCTIONS))
+        assert call.opened_on == [CALL_AGENT_INSTRUCTIONS]
 
     def test_the_voice_speaking_state_is_one_of_the_events_the_seam_raises(self) -> None:
         """Both edges of the call's own voice cross the seam, as one state (#184).
@@ -361,7 +361,7 @@ class TestTheCallContract:
         """The fake emits it, so every consumer above the seam is testable dry."""
         sink = RecordingSink()
         call = FakeCall(sink=sink)
-        asyncio.run(call.ensure_call(HOUSE_RULES))
+        asyncio.run(call.ensure_call(CALL_AGENT_INSTRUCTIONS))
 
         call.voice_speech(speaking=True)
         call.voice_speech(speaking=False)

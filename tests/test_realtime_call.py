@@ -70,7 +70,7 @@ from realtime_fake import (
 )
 
 THREAD = "01a02110-d18f-74a0-916d-de1208e9977a"
-HOUSE_RULES = "speak the Session Name; never invent a detail"
+CALL_AGENT_INSTRUCTIONS = "speak the Session Name; never invent a detail"
 DELEGATED_RULES = "act only through the control-plane CLI"
 
 _names = iter(range(10_000))
@@ -201,14 +201,14 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
 
-                snapshot = await adapter.ensure_call(HOUSE_RULES)
+                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 assert snapshot.state is CallState.UP
                 assert snapshot.call_id == THREAD
                 start = server.calls_to("thread/realtime/start")[0]
                 assert start["threadId"] == THREAD
                 assert start["transport"] == {"type": "webrtc", "sdp": OFFER_SDP}
-                assert start["realtimeStartInstructions"] == HOUSE_RULES
+                assert start["realtimeStartInstructions"] == CALL_AGENT_INSTRUCTIONS
                 assert audio.answers == [ANSWER_SDP]
                 await adapter.aclose()
 
@@ -229,7 +229,7 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
 
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 started = server.calls_to("thread/start")[0]
                 assert started["approvalPolicy"] == APPROVAL_POLICY == "never"
@@ -260,7 +260,7 @@ class TestBringingACallUp:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
 
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 start = server.calls_to("thread/realtime/start")[0]
                 assert start["model"] == DEFAULT_REALTIME_MODEL == "gpt-live-1-codex"
@@ -279,7 +279,7 @@ class TestBringingACallUp:
                     server, Sink(), settings=quick(realtime_model="gpt-live-2-later")
                 )
 
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 start = server.calls_to("thread/realtime/start")[0]
                 assert start["model"] == "gpt-live-2-later"
@@ -313,7 +313,7 @@ class TestBringingACallUp:
                 server.answers("thread/realtime/start", refuse)
                 adapter, _ = await riding(server, Sink())
 
-                snapshot = await adapter.ensure_call(HOUSE_RULES)
+                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 assert snapshot.state is CallState.DOWN
                 logged = " ".join(record.getMessage() for record in caplog.records)
@@ -332,8 +332,8 @@ class TestBringingACallUp:
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
 
-                first = await adapter.ensure_call(HOUSE_RULES)
-                second = await adapter.ensure_call(HOUSE_RULES)
+                first = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
+                second = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 assert first == second
                 assert len(server.calls_to("thread/start")) == 1
@@ -351,7 +351,7 @@ class TestBringingACallUp:
                 sink = Sink()
                 adapter, audio = await riding(server, sink, transport=FakeTransport(connects=False))
 
-                snapshot = await adapter.ensure_call(HOUSE_RULES)
+                snapshot = await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 assert snapshot.state is CallState.DOWN
                 assert audio.closed
@@ -388,7 +388,7 @@ class TestBringingACallUp:
                 audio = FakeTransport(connects=False)
                 adapter, _ = await riding(server, sink, transport=audio)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(HOUSE_RULES))
+                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
                 await asyncio.sleep(0.05)
                 ended = await adapter.end_call()
                 snapshot = await opening
@@ -432,7 +432,7 @@ class TestHangingUpMidHandshake:
 
                 server.answers("thread/start", dawdle)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(HOUSE_RULES))
+                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
                 await asyncio.sleep(0.05)
                 ended = await adapter.end_call()
                 slow.set()
@@ -460,7 +460,7 @@ class TestHangingUpMidHandshake:
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
 
-                opening = asyncio.ensure_future(adapter.ensure_call(HOUSE_RULES))
+                opening = asyncio.ensure_future(adapter.ensure_call(CALL_AGENT_INSTRUCTIONS))
                 await asyncio.sleep(0.05)
                 await adapter.end_call()
                 snapshot = await opening
@@ -479,7 +479,7 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 receipt = await adapter.speak("that session stopped", request_id=rid())
 
@@ -511,7 +511,7 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 def refuse(_params: dict) -> dict:
                     raise FakeRemoteError("no realtime session on that thread")
@@ -537,7 +537,7 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 def go_quiet_then_accept(_params: dict) -> dict:
                     audio.go_quiet()
@@ -559,7 +559,7 @@ class TestSpeaking:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, _ = await riding(server, Sink())
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 async def die(_params: dict) -> dict:
                     await server.drop_everyone()
@@ -581,7 +581,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 first = await adapter.end_call()
                 second = await adapter.end_call()
@@ -602,7 +602,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 def refuse(_params: dict) -> dict:
                     raise FakeRemoteError("no realtime session on that thread")
@@ -622,7 +622,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 await server.notify_all(
                     "thread/realtime/closed",
@@ -646,7 +646,7 @@ class TestHowACallStops:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, audio = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 audio.lose("the peer connection failed")
                 await asyncio.sleep(0.05)
@@ -666,7 +666,7 @@ class TestHowACallStops:
             async with FakeAppServer(socket_path) as server:
                 realtime_script(server, thread_id=THREAD)
                 adapter, audio = await riding(server, Sink())
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 audio.go_quiet()
 
@@ -683,7 +683,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 await server.notify_all(
                     "thread/realtime/transcript/done",
@@ -702,7 +702,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 await server.notify_all(
                     "thread/realtime/transcript/done",
@@ -731,7 +731,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 for delta in ("that ", "session ", "stopped"):
                     await server.notify_all(
@@ -757,7 +757,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 for _ in range(2):
                     await server.notify_all(
@@ -788,7 +788,7 @@ class TestWhatTheCallRaisesUpward:
                 realtime_script(server, thread_id=THREAD)
                 sink = Sink()
                 adapter, _ = await riding(server, sink)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
 
                 await server.notify_all(
                     "thread/realtime/transcript/delta",
@@ -1176,7 +1176,7 @@ class TestTheCuesItPlays:
                 realtime_script(server, thread_id=THREAD)
                 player = FakeCueOutput()
                 adapter, audio = await riding(server, Sink(), cue_player=player)
-                await adapter.ensure_call(HOUSE_RULES)
+                await adapter.ensure_call(CALL_AGENT_INSTRUCTIONS)
                 await adapter.end_call()
                 assert audio.closed
                 await adapter.play_cue(Cue.ENDED)

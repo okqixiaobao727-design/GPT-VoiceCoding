@@ -261,7 +261,7 @@ class FakeCall:
         self.sink = sink
         self.spoken: list[str] = []
         self.delegated: list[tuple[str, str]] = []
-        #: The house rules every call was opened on, in order. Bridge Core is
+        #: The instructions every call was opened on, in order. Bridge Core is
         #: the only source of these, so a test can prove they came from it.
         self.opened_on: list[str] = []
         #: The same, for the threads Delegated Turns run on.
@@ -391,10 +391,13 @@ class FakeCompanionChannel:
         return self.verify_result
 
 
-#: What a test passes where Bridge Core would pass generated house rules. Any
-#: non-empty string will do: what the Call seam promises about instructions is
-#: that they arrive from the hub at the call site, not what they say.
-HOUSE_RULES = "the voice thread's house rules"
+#: What a test passes where Bridge Core would pass the generated set a call
+#: opens on. Any non-empty string will do: what the Call seam promises about
+#: instructions is that they arrive from the hub at the call site, not what they
+#: say. Named for the **acting** half, because that is the audience the one
+#: string `ensure_call` takes reaches (ADR 0018, #193) — a fake that went on
+#: calling it the voice thread's would be a fake teaching the wrong half.
+CALL_AGENT_INSTRUCTIONS = "the call agent's rules"
 
 
 def instruction_context(

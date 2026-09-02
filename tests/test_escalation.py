@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fakes import HOUSE_RULES, FakeCall, FakeCompanionChannel
+from fakes import CALL_AGENT_INSTRUCTIONS, FakeCall, FakeCompanionChannel
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.errors import VoiceInstructionsMissing
 from gpt_voicecoding.core.escalation import (
@@ -49,7 +49,7 @@ class Harness:
         message: bool = True,
         call: FakeCall | None = None,
         channel: FakeCompanionChannel | None = None,
-        call_agent_instructions: str = HOUSE_RULES,
+        call_agent_instructions: str = CALL_AGENT_INSTRUCTIONS,
     ) -> None:
         self.switches = Switchboard()
         self.switches.flip(SwitchName.DUTY, duty)
@@ -114,7 +114,7 @@ class TestSpeakingIntoTheCallThatIsUp:
     def test_a_stop_that_arrives_mid_call_opens_no_second_call(self) -> None:
         """The exact failure this pipeline exists to prevent."""
         harness = Harness()
-        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
+        asyncio.run(harness.interlock.open_call(CALL_AGENT_INSTRUCTIONS))
 
         outcome = harness.escalate(notice("build finished"))
 
@@ -124,7 +124,7 @@ class TestSpeakingIntoTheCallThatIsUp:
 
     def test_a_delivered_notice_never_pushes_the_same_words_as_text(self) -> None:
         harness = Harness()
-        asyncio.run(harness.interlock.open_call(HOUSE_RULES))
+        asyncio.run(harness.interlock.open_call(CALL_AGENT_INSTRUCTIONS))
 
         harness.escalate(notice())
 
@@ -158,7 +158,7 @@ class TestOpeningACallToEscalateInto:
         assert harness.interlock.owns_call() is False
 
 
-class TestWithNoHouseRulesToOpenOn:
+class TestWithNoInstructionsToOpenOn:
     def test_escalation_opens_no_call_and_drops_this_attempt(self) -> None:
         """The same refusal the hub meets, turned into a reason the notice carries.
 
