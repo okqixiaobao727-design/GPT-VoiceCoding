@@ -21,6 +21,7 @@ from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
     LaneDiscovery,
+    Option,
     ProgressAvailability,
     ProgressEntry,
     ProgressObservation,
@@ -29,6 +30,8 @@ from gpt_voicecoding.seams.agent import (
     SessionInspection,
     SessionLifecycle,
     SessionState,
+    WaitingFor,
+    WaitingKind,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -686,3 +689,174 @@ class TestWhatObserveReportsAsEnded:
         gone = registry.observe(AgentKind.CODEX, seeing(), now=NOW + 5)
 
         assert [target.session_id for target in gone] == ["abc"]
+
+
+#: A parked question, as the Claude adapter's overlay hands one over: the prompt
+#: and options come off the held hook payload, so the reader that says this has
+#: read the record that says it (`seams/agent.py::WaitingFor`).
+A_QUESTION = WaitingFor(
+    kind=WaitingKind.QUESTION,
+    prompt="Which marker should be written?",
+    options=(Option(text="ALPHA"), Option(text="DELTA")),
+    approval_id="8664d1fc-dc6c-44eb-8800-fa8acf0e0c31",
+)
+
+#: The same reading rule 4 produced 100 ms before that question was parked:
+#: Claude Code's roster already said `waiting`, the transcript had not yet
+#: flushed the `AskUserQuestion` record, and nothing was parked to name it from.
+#: `WaitingFor.__post_init__` allows the pair only with `UNKNOWN`, which is the
+#: seam saying *ask again, never guess* (#209).
+NOT_CAUGHT_UP = WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+
+
+class TestAReadingThatHasNotCaughtUp:
+    """*Ask again, never guess* — said to the registry, which used to overwrite.
+
+    Run `20260902T065340Z` failed the claude lane's `switches` step on this. A
+    discovery pass sampled the Session in the ~160 ms window where its roster
+    already said `waiting` but its transcript had not flushed the
+    `AskUserQuestion` record and the hook had not yet parked the question; rule 4
+    correctly returned `caught_up=False`, and `observed()` stored it as though it
+    were knowledge. The question was parked 100 ms later, the Stop path read it
+    correctly a second after that and wrote back **progress only**, and `status`
+    then answered `unknown` with a closed Reply Window for a question that was
+    parked and answerable — for the rest of the cadence. The passing run
+    `20260902T071547Z` had the identical transcript lag with the park 80 ms on
+    the other side of the pass.
+
+    So the race is inherent and the defect is not: what these tests pin is that
+    nothing which admits it has not caught up may overwrite what the registry
+    already knows. `with_progress` has said exactly this about progress since
+    #76; this is the same sentence about `waiting_for`.
+    """
+
+    def waiting_on_a_question(self) -> SessionRegistry:
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="e34368aa",
+                    pid=10045,
+                    state=SessionState.WAITING,
+                    waiting_for=A_QUESTION,
+                )
+            ),
+            now=NOW,
+        )
+        return registry
+
+    def test_it_does_not_overwrite_a_question_the_registry_already_knows(self) -> None:
+        registry = self.waiting_on_a_question()
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="e34368aa",
+                    pid=10045,
+                    state=SessionState.WAITING,
+                    waiting_for=NOT_CAUGHT_UP,
+                )
+            ),
+            now=NOW + 5,
+        )
+
+        held = registry.live()[0]
+        assert held.waiting_for == A_QUESTION
+        assert held.state is SessionState.WAITING
+
+    def test_a_caught_up_reading_that_says_the_turn_moved_on_clears_it(self) -> None:
+        """No ghost: the rule keeps knowledge, never a Session's past."""
+        registry = self.waiting_on_a_question()
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="e34368aa",
+                    pid=10045,
+                    state=SessionState.RUNNING,
+                    waiting_for=WaitingFor(),
+                )
+            ),
+            now=NOW + 5,
+        )
+
+        held = registry.live()[0]
+        assert held.waiting_for == WaitingFor()
+        assert held.state is SessionState.RUNNING
+
+    def test_a_session_that_is_no_longer_waiting_clears_it_even_uncaught_up(self) -> None:
+        """The kept state is a wait, so it lasts exactly as long as the wait does.
+
+        A reading that has not caught up with the record still knows what the
+        *roster* said, and a roster that no longer says `waiting` is not a
+        reading about a wait at all. Keeping the question past that would be the
+        ghost the paragraph above refuses.
+        """
+        registry = self.waiting_on_a_question()
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="e34368aa",
+                    pid=10045,
+                    state=SessionState.IDLE,
+                    waiting_for=NOT_CAUGHT_UP,
+                )
+            ),
+            now=NOW + 5,
+        )
+
+        assert registry.live()[0].waiting_for == NOT_CAUGHT_UP
+
+    def test_nothing_known_yet_takes_the_reading_as_it_came(self) -> None:
+        """The first sighting has nothing to keep, so the rule cannot fire on it."""
+        registry = SessionRegistry()
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(
+                claude_row(
+                    session_id="e34368aa",
+                    pid=10045,
+                    state=SessionState.WAITING,
+                    waiting_for=NOT_CAUGHT_UP,
+                )
+            ),
+            now=NOW,
+        )
+
+        assert registry.live()[0].waiting_for == NOT_CAUGHT_UP
+
+    def test_the_discarded_reading_is_named_once_in_the_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A recurrence has to arrive carrying its own explanation.
+
+        The one thing the failing run's engine log could not say is why `status`
+        disagreed with the Stop announcement one second earlier. This is that
+        line, at the level the registry's other observation decisions use.
+        """
+        registry = self.waiting_on_a_question()
+
+        with caplog.at_level(logging.INFO, logger=sessions_module.__name__):
+            registry.observe(
+                AgentKind.CLAUDE,
+                seeing(
+                    claude_row(
+                        session_id="e34368aa",
+                        pid=10045,
+                        state=SessionState.WAITING,
+                        waiting_for=NOT_CAUGHT_UP,
+                    )
+                ),
+                now=NOW + 5,
+            )
+
+        said = [record.getMessage() for record in caplog.records]
+        assert len(said) == 1, said
+        assert "claude:e34368aa:10045" in said[0]
+        assert "question" in said[0] and "unknown" in said[0]

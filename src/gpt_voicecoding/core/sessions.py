@@ -65,6 +65,7 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
     WaitingFor,
+    WaitingKind,
     derive_reply_window,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
@@ -121,9 +122,10 @@ class Session:
 
         Keeps what the registry knows and the lane does not — `first_seen` and
         the Session Name it has already accepted — and takes everything else
-        from the reading. Progress alone keeps a readable observation when the
-        newer pass could not answer or did not read; `with_progress` is the one
-        merge rule used by both roster discovery and Stop events.
+        from the reading. **Two fields are merged rather than taken**, and both
+        for one reason: a reading that says it could not tell is not an answer,
+        so it never replaces one. `with_progress` holds that for progress and
+        `with_waiting_for` for the wait.
 
         `target` is the identity the registry settled on (`_better_known`),
         which is not always the one the reading carried: a tick with only
@@ -137,11 +139,69 @@ class Session:
             name=self._named_as(row, target),
             lifecycle=row.lifecycle,
             state=row.state,
-            waiting_for=row.waiting_for,
             last_activity=row.last_activity,
             child=row.child,
         )
-        return updated.with_progress(row.progress)
+        return updated.with_waiting_for(
+            row.waiting_for, waiting=row.state is SessionState.WAITING
+        ).with_progress(row.progress)
+
+    def with_waiting_for(self, waiting_for: WaitingFor, *, waiting: bool) -> Session:
+        """Apply a new reading of the wait, without letting *ask again* erase an answer.
+
+        `caught_up=False` is the seam's documented instruction to ask again and
+        never guess (`seams/agent.py::WaitingFor`), and until #209 nothing on
+        this side implemented it: every reading was stored with the authority of
+        knowledge. Run `20260902T065340Z` is what that cost. A discovery pass
+        sampled a Claude Session inside the ~160 ms in which its roster already
+        said `waiting`, its transcript had not flushed the `AskUserQuestion`
+        record, and the hook had not yet parked the question; the reading was
+        honestly `UNKNOWN`, and it landed on top of nothing, because the question
+        arrived 100 ms later. What made it a defect rather than a race was that
+        nothing corrected it until the next cadence: `status` answered `unknown`
+        with a closed Reply Window about a question that was parked and
+        answerable, and the acceptance's `switches` step failed on it.
+
+        So a reading that admits it has not caught up leaves a **known** wait —
+        a question or a permission somebody read from the record or the held
+        dialog — exactly where it was.
+
+        **It cannot make a ghost**, which is the risk of any rule that keeps
+        state. What is kept is a *wait*, and it lasts only while the reading is
+        still about one: a reading whose Session is no longer `waiting` replaces
+        it, whether it caught up or not, and any caught-up reading replaces it
+        outright. `NONE` and `UNKNOWN` are never kept over anything, because
+        neither is an answer this rule exists to protect.
+
+        Legacy (ADR 0010) — `legacy@1d32845:bridge/daemon.py:2115-2165`
+        (`_read_caught_up`) re-read the transcript within a budget and published
+        only once it was caught up, over `caught_up` as
+        `legacy@1d32845:bridge/transcript.py:175-184` defines it. **Adapted**: the
+        Stop announcement path already ports the re-read (`claude/window.py`
+        `_settle`, #150), and blocking a whole-machine discovery pass on one
+        Session's transcript is not a trade this cadence can make — so the
+        budgeted re-read becomes a refusal to overwrite, which needs no I/O and
+        holds for every lane.
+        """
+        if not self._keeps_its_wait(waiting_for, waiting=waiting):
+            return replace(self, waiting_for=waiting_for)
+        _log.info(
+            "%s is waiting on a %s this reading could not see, and the reading has not caught "
+            "up with the record (it offered %s), so the roster keeps what it knows",
+            self.target,
+            self.waiting_for.kind,
+            waiting_for.kind,
+        )
+        return self
+
+    def _keeps_its_wait(self, waiting_for: WaitingFor, *, waiting: bool) -> bool:
+        """Whether this reading is the "ask again" that the wait above outranks."""
+        return (
+            not waiting_for.caught_up
+            and waiting
+            and self.waiting_for.caught_up
+            and self.waiting_for.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
+        )
 
     def with_progress(self, progress: ProgressObservation) -> Session:
         """Apply a new observation without replacing a readable fact with no answer."""
@@ -619,10 +679,40 @@ class SessionRegistry:
         self._sessions[held.target] = updated
         return updated
 
-    def set_progress(self, target: SessionTarget, progress: ProgressObservation) -> Session:
-        """Fold the observation carried by a Stop into that Session's roster row."""
+    def set_stop_reading(
+        self, target: SessionTarget, *, waiting_for: WaitingFor, progress: ProgressObservation
+    ) -> Session:
+        """Fold the whole reading a Stop carried into that Session's roster row.
+
+        **The whole reading, because it is the freshest one the engine holds.** A
+        Stop is read at the moment the Session stopped, through the lane's own
+        overlay — which consults the dialog parked on the approval socket, the
+        one place a question exists before the transcript flushes it — and after
+        the announcement path has waited for the record to catch up (#150). Until
+        #209 only the progress half was written back and the wait was dropped, so
+        `status` went on answering from the last discovery pass: in run
+        `20260902T065340Z` that was a reading taken 100 ms before the question was
+        parked, and a parked, answerable question read as `unknown` for the rest
+        of the cadence.
+
+        Both halves go through the same merge rules the discovery pass uses, for
+        the same reason: a Stop that could not say what it stopped on
+        (`caught_up=False`, which #150's budget can end on) is not an answer
+        either, and it does not erase one.
+
+        **A wait only the user can end also puts the row in `WAITING`**, because
+        the two are one fact and a row that held them apart would answer two
+        ways: `reply_window` is derived from the state *and* the wait
+        (`seams/agent.py::derive_reply_window`), so a row carrying a question
+        beside `RUNNING` would report a parked question and a closed window in
+        the same breath. `needs_the_user` is the seam's own predicate for it, and
+        nothing else here moves the state: a Stop that ended a turn leaves it
+        exactly as the last reading found it, for the discovery pass to say.
+        """
         held = self._live_row(target)
-        updated = held.with_progress(progress)
+        updated = held.with_waiting_for(waiting_for, waiting=True).with_progress(progress)
+        if updated.waiting_for.needs_the_user:
+            updated = replace(updated, state=SessionState.WAITING)
         self._sessions[held.target] = updated
         return updated
 

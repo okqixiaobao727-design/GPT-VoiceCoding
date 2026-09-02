@@ -615,3 +615,87 @@ class TestTwoSessionsTheChatCannotTellApart:
             )
             is None
         )
+
+
+class TestTheChildStepGradesItsOwnLanesChild:
+    """The same rule as #109's, met on the roster instead of the chat.
+
+    Two lanes run at once and each engine bridges every Session on the machine,
+    so both lanes' children are on both lanes' rosters — correctly classified,
+    correctly parented, and belonging to somebody else. Run `20260902T065340Z`
+    is where that first cost a step: the Claude lane's `child` graded
+    `codex:01a060e9-…` and failed it for being listed under a Codex parent, while
+    the Codex lane's own step passed on that very row. Before #208 gave the Codex
+    lane a roster row there was no second child to collide with, which is why the
+    harness had run this way for four months without noticing.
+    """
+
+    def _child_of(self, parent: Session, session_id: str, pid: int) -> dict:
+        return row(
+            session_from(
+                SessionInspection(
+                    target=SessionTarget(agent=parent.target.agent, session_id=session_id, pid=pid),
+                    workspace=Path("/tmp/workspace"),
+                    name=None,
+                    child=ChildClassification(kind=ChildKind.CHILD, parent=parent.target),
+                ),
+                first_seen=0.0,
+            )
+        )
+
+    def _two_lane_roster(self) -> tuple[Session, list[dict]]:
+        """A roster shaped like the one that failed: the other lane's child first."""
+        mine = session()
+        theirs = Session(
+            target=A_STRANGER,
+            name=SessionName("workspace-codex", "some other work"),
+            workspace=Path("/tmp/elsewhere"),
+            first_seen=0.0,
+        )
+        return mine, [
+            row(mine),
+            row(theirs),
+            self._child_of(theirs, "01a060e9", 10200),
+            self._child_of(mine, "9a11bd2e", 64399),
+        ]
+
+    def test_the_other_lanes_child_is_not_graded_however_early_it_appears(self) -> None:
+        mine, rows = self._two_lane_roster()
+
+        found = journey._first_child_of(rows, "claude", before=set())
+
+        assert found is not None
+        assert journey._address_of(found) == "claude:9a11bd2e:64399"
+        assert found["child"]["parent"] == {
+            "agent": "claude",
+            "session_id": mine.target.session_id,
+            "pid": mine.target.pid,
+        }
+
+    def test_a_lane_whose_own_child_has_not_appeared_yet_finds_nothing(self) -> None:
+        """The step then fails with "no child row appeared", which is the truth."""
+        _, rows = self._two_lane_roster()
+        theirs_only = [one for one in rows if one["target"]["agent"] == "codex"]
+
+        assert journey._first_child_of(theirs_only, "claude", before=set()) is None
+
+    def test_the_codex_lane_still_finds_its_own(self) -> None:
+        _, rows = self._two_lane_roster()
+
+        found = journey._first_child_of(rows, "codex", before=set())
+
+        assert found is not None
+        assert journey._address_of(found) == "codex:01a060e9:10200"
+
+    def test_a_child_the_roster_already_held_is_not_this_turns(self) -> None:
+        """#79's first-new-sighting rule, kept: `before` is read after the agent."""
+        _, rows = self._two_lane_roster()
+
+        assert journey._first_child_of(rows, "claude", before={"claude:9a11bd2e:64399"}) is None
+
+    def test_a_row_that_is_not_a_child_is_never_taken_for_one(self) -> None:
+        mine, rows = self._two_lane_roster()
+        parents_only = [one for one in rows if not one.get("child")]
+
+        assert journey._first_child_of(parents_only, "claude", before=set()) is None
+        assert journey._address_of(row(mine)) == "claude:6f723f5c:64312"

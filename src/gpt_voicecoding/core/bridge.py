@@ -812,7 +812,9 @@ class BridgeCore:
             return
         session = self._known(event.target)
         if session is not None:
-            session = self._state.sessions.set_progress(event.target, event.progress)
+            session = self._state.sessions.set_stop_reading(
+                event.target, waiting_for=event.waiting_for, progress=event.progress
+            )
         await self._announce_waiting(
             session,
             event.target,
