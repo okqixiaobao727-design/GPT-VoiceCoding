@@ -554,6 +554,30 @@ class TestTheApprovalRelayCarriesAndNothingMore:
             assert outcome.grade == str(grade)
             assert hub.channel.sent == []
 
+    def test_a_row_still_running_under_its_dialog_stays_answerable(self) -> None:
+        """The Codex shape: the thread is `active`, the prompt is up (#191).
+
+        A Codex thread does not leave `active` while its prompt is on screen, so
+        the Stop that dialog raised is read onto a row that keeps saying
+        `running`. The next discovery pass must not erase that reading (#209's
+        write-back), or the handle is gone and the verdict has nothing to reach.
+        """
+        hub = Hub(voice=False)
+        running_with_a_dialog = SessionInspection(
+            target=CODEX,
+            workspace=Path("/tmp/workspace"),
+            state=SessionState.RUNNING,
+            waiting_for=self.waiting_row().waiting_for,
+        )
+        hub.emit(SessionStopped(target=CODEX, waiting_for=running_with_a_dialog.waiting_for))
+        hub.agent.discovery = LaneDiscovery(rows=(running_with_a_dialog,))
+        asyncio.run(hub.core.discover())
+
+        (row,) = hub.core.status().sessions
+        assert row.waiting_for.approval_id == "a1"
+        assert self.answer(hub) is not None
+        assert [call.verb for call in hub.agent.calls] == ["approval_relay"]
+
     def test_the_engine_keeps_no_clock_on_a_held_dialog(self) -> None:
         """No budget, no sweep: the wire ends the hook, not `tick` (ADR 0015).
 

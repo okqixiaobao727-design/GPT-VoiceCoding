@@ -597,9 +597,84 @@ class TestApprovals:
         assert request.target == TARGET
         assert request.detail == "Do you want to allow me to run this command?"
         assert request.options == ("accept", "acceptForSession", "decline")
-        # And no event of its own: the dialog travels on the Session's Stop and
-        # on the roster row, which is the same reading (#191).
-        assert [event for event in raised if isinstance(event, SessionStopped)] == []
+        # One event, and it is the Stop the prompt going up produces (#191): the
+        # same reading the roster row carries, never a second kind beside it.
+        (stopped,) = [event for event in raised if isinstance(event, SessionStopped)]
+        assert stopped.waiting_for.approval_id == request.approval_id
+
+    def test_a_parked_prompt_stops_the_session_where_it_stands(self, socket_path: Path) -> None:
+        """A dialog on screen *is* the Session stopped and needing the user (#191).
+
+        The Codex lane's fold of the dialog into the Stop's wait. It cannot wait
+        for the thread to leave `active`, because a Codex thread does not leave
+        it while its prompt is up — measured on acceptance run
+        `20260902T133429Z`, where the roster carried the dialog for three minutes
+        and the engine log recorded no Stop at all, so nothing was announced.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+                    await _settled()
+                    return await parked_dialog(adapter)
+                finally:
+                    await adapter.aclose()
+
+        request = asyncio.run(scenario())
+
+        (stopped,) = sink.of(SessionStopped)
+        assert stopped.target == request.target
+        assert stopped.waiting_for.kind is WaitingKind.PERMISSION
+        assert stopped.waiting_for.approval_id == request.approval_id
+        assert stopped.waiting_for.as_approval_request(stopped.target) is not None
+
+    def test_a_dialog_answered_in_the_tui_leaves_the_row_and_raises_no_second_stop(
+        self, socket_path: Path
+    ) -> None:
+        """The TUI holds the same request, and it may answer first.
+
+        `_retire_resolved` drops it, so the next reading of the row carries no
+        handle — the brief says "at the terminal" and a voice verdict is refused
+        — and nothing is raised for it: the dialog leaving is not a Session
+        stopping.
+        """
+        sink = Sink()
+
+        async def scenario():
+            async with Codex(socket_path).script() as server:
+                adapter = await watching(server, sink)
+                try:
+                    await server.notify_all(
+                        "thread/status/changed",
+                        {"threadId": THREAD, "status": {"type": "active", "activeFlags": []}},
+                    )
+                    await _settled()
+                    wire_id = await server.ask_all(
+                        APPROVAL, {"threadId": THREAD, "command": "rm -rf build"}
+                    )
+                    await _settled()
+                    parked = len(sink.of(SessionStopped))
+                    await server.notify_all(
+                        "serverRequest/resolved", {"threadId": THREAD, "requestId": wire_id}
+                    )
+                    await _settled()
+                    return parked, _dialog_waiting(adapter._threads[TARGET])  # noqa: SLF001
+                finally:
+                    await adapter.aclose()
+
+        parked, waiting = asyncio.run(scenario())
+
+        assert parked == 1, "the dialog going up is the one Stop it produces"
+        assert waiting is None, "the row carries no handle once the TUI has it"
+        assert len(sink.of(SessionStopped)) == parked
 
     def test_the_shell_text_is_never_what_the_user_is_told(self) -> None:
         """#109. One rule for both lanes: description-class text, never the arguments.

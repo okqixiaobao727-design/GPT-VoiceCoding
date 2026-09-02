@@ -263,6 +263,14 @@ ENGINE_STOP_LINE = r"(?i)Session stopped:"
 #: attribution rule is what reads that.
 APPROVAL_ANNOUNCEMENT = re.compile(r"^\s*permission:", re.IGNORECASE | re.MULTILINE)
 
+#: What a Session Brief says about where the user's reply can reach the Session
+#: (`core/briefing.py::_session_lines`). Quoted whole, because these two lines
+#: are the product's answer to the one question this harness asks of an
+#: announced wait: can the person act on it from here, or are they being sent to
+#: the keyboard?
+ANSWERABLE_HERE = "answer: from here"
+ANSWERABLE_AT_THE_TERMINAL = "answer: at the terminal"
+
 #: The engine's own line for what the user said (`core/bridge.py:796`). It is the
 #: only line either call event has: `CallStarted` and `CallEnded` are noted into
 #: the interlock and never logged (`core/bridge.py:777-785`), which is why the
@@ -1944,10 +1952,26 @@ class Walk:
             )
 
         def is_question_notice(seen) -> bool:
+            """A brief about *this question*, matched on the lines only it has.
+
+            The brief's own words for what a Session is waiting on and where the
+            user can answer it (`core/briefing.py::_decision_lines`,
+            `_session_lines`). It read "reply with your answer" until #189 made
+            the Stop Notice a Session Brief, which is what this harness must
+            mirror rather than remember.
+
+            **Matched on the decision lines, not on the words anywhere in the
+            text.** A brief also quotes the Session's newest message, so the
+            permission notice for the `Write` this question leads to carries the
+            question and both option labels inside `newest:` — measured on run
+            `20260902T133429Z`, where a looser match counted two notices for one
+            question. `asked:` and `option:` are the question brief's own; a
+            permission's decision line is `permission:`.
+            """
             return (
-                CLAUDE_QUESTION in seen.text
-                and all(option in seen.text for option in CLAUDE_OPTIONS)
-                and "reply with your answer" in seen.text
+                f"  asked: {CLAUDE_QUESTION}" in seen.text
+                and all(f"  option: {option}" in seen.text for option in CLAUDE_OPTIONS)
+                and ANSWERABLE_HERE in seen.text
             )
 
         announced = self._await_own_message(
@@ -1965,7 +1989,7 @@ class Walk:
             raise StepFailed(
                 f"the question notice did not name the Session first: {announced.text!r}"
             )
-        if "answer it in the terminal" in announced.text:
+        if ANSWERABLE_AT_THE_TERMINAL in announced.text:
             raise StepFailed(
                 f"the answerable question told the user to use the terminal: {announced.text!r}"
             )
@@ -2769,17 +2793,25 @@ class Walk:
         """Every pending dialog, read off the roster rows that carry one (#191).
 
         `status` retired its `pending_approvals` list at protocol 8, because a
-        pending permission *is* one of the three Session states: the row says
-        `waiting` on a `permission`, and its `approval_id` is the handle
-        `bridgectl approve` answers with. A row in that state whose handle is
-        gone is a dialog that went back to the keyboard, and it is deliberately
-        not offered here — correlating one would send the walk to answer
-        something no verdict can reach.
+        pending permission is what the row is waiting on, and its `approval_id`
+        is the handle `bridgectl approve` answers with. A permission row whose
+        handle is gone is a dialog that went back to the keyboard, and it is
+        deliberately not offered here — correlating one would send the walk to
+        answer something no verdict can reach.
+
+        **The row's `state` is not read, and that is the Codex lane's whole
+        case.** A Codex thread stays `active` while its prompt is on screen —
+        the turn has not ended — so the row says `running` and carries the
+        dialog's handle at the same time, which is exactly the state a verdict
+        is wanted in. `answer_approval` reads the handle and not the state for
+        the same reason (`core/bridge.py::_dialog_on_the_roster`), and a filter
+        here that the product does not apply would make this harness answer a
+        different question from the one the product answers.
         """
         data = support.control_plane_status(self.config.socket_path, self.journal)
         pending: list[approval_effect.PendingApproval] = []
         for row in data.get("sessions", []):
-            if not isinstance(row, dict) or row.get("state") != "waiting":
+            if not isinstance(row, dict):
                 continue
             waiting = row.get("waiting_for")
             if not isinstance(waiting, dict) or waiting.get("kind") != "permission":

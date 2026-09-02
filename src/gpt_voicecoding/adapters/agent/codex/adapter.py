@@ -1077,9 +1077,23 @@ class CodexAgentAdapter:
             method=str(method),
             request=request,
         )
-        # Held and not raised: the thread's own transition out of `active`
-        # carries this handle on its Stop (`_dialog_waiting`), which is the one
-        # event the dialog reaches the user on (#191).
+        # **The dialog going up is the Session stopping** (#191). One dialog,
+        # one event, and this is the Codex lane's fold of it into the Stop's
+        # wait: a thread with a prompt on screen is stalled on the person, and
+        # `SessionStopped` is what that means. It cannot wait for the thread to
+        # leave `active`, because a Codex thread does not leave it while its
+        # prompt is up — measured on acceptance run `20260902T133429Z`, where
+        # the roster carried the dialog for three minutes and the engine
+        # announced nothing at all.
+        #
+        # The later idle Stop is a different fact — the turn ended — and it
+        # carries no handle, because by then either a verdict or the TUI has
+        # retired this entry. A dialog *leaving* raises nothing: that is not a
+        # Session stopping, and the next reading of the row says it (`
+        # _dialog_waiting` reads `pending`, which `_retire_resolved` empties).
+        waiting_for = _dialog_waiting(watched) or WaitingFor(kind=WaitingKind.PERMISSION)
+        watched.stopped_on_dialog = request.approval_id
+        self._spawn(self._emit_stopped(watched, waiting_for, turn_revision=watched.turn_revision))
 
     def _retire_resolved(self, watched: WatchedThread, wire_id: Any) -> None:
         """Drop a prompt somebody else answered, so no verdict lands on a closed one."""
@@ -1087,6 +1101,12 @@ class CodexAgentAdapter:
             if pending.wire_id == wire_id:
                 del watched.pending[approval_id]
                 watched.answered_elsewhere.add(approval_id)
+                if watched.stopped_on_dialog == approval_id:
+                    # The dialog left; nothing is raised for that. What the next
+                    # reading of the row says is that it carries no handle, and
+                    # the Stop this thread takes when its turn ends is free to
+                    # be its own again.
+                    watched.stopped_on_dialog = None
 
     def _note_status(self, watched: WatchedThread, status: Any) -> None:
         """Map a thread status onto the Reply Window, and onto having stopped.
@@ -1119,7 +1139,14 @@ class CodexAgentAdapter:
             # `approval_id` on it nothing on the roster carries the handle, so
             # the brief tells the user to answer at the keyboard and
             # `answer_approval` has nothing to find.
-            waiting_for = _dialog_waiting(watched) or (
+            dialog = _dialog_waiting(watched)
+            if dialog is not None and dialog.approval_id == watched.stopped_on_dialog:
+                # One dialog, one event (#191). This thread already stopped when
+                # the prompt went up, and the prompt is still the same one: the
+                # turn ending under it changes nothing the user has not been
+                # told, and a second Stop is the same decision asked twice.
+                return
+            waiting_for = dialog or (
                 WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
                 if kind == "systemError"
                 else WaitingFor()
