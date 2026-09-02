@@ -2397,7 +2397,7 @@ class Walk:
             by_ceiling=self._ceiling_ended_the_call(since=call.mark),
             by_agent=by_agent,
         )
-        self.turns.append(self._measured("live call", call.started, ended))
+        self._measured("live call", call.started, ended)
         runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)
         verbs = self._verbs_run()
         spoken = self._user_speech_lines(since=call.mark)
