@@ -36,7 +36,6 @@ from gpt_voicecoding.seams.agent import (
     SessionInspection,
     SessionLifecycle,
     SessionState,
-    WaitingFor,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
@@ -104,10 +103,6 @@ class FakeAgent:
         self.asked_windows: list[SessionTarget] = []
         #: Exact questions this fake says its lane can still answer.
         self.answerable_questions: set[SessionTarget] = set()
-        #: Budget values Core passed to this seam, in call order.
-        self.question_budgets: list[float] = []
-        #: Releases the next budget sweep returns, then clears.
-        self.question_releases: list[tuple[SessionTarget, WaitingFor]] = []
         #: What this fake answers `discover` with. Empty and enumerated by
         #: default: a lane that really sees no Sessions, which is not the same
         #: as one that could not look.
@@ -180,16 +175,6 @@ class FakeAgent:
 
     def question_answerable(self, target: SessionTarget) -> bool:
         return target in self.answerable_questions
-
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        self.question_budgets.append(budget_seconds)
-        released = tuple(self.question_releases)
-        self.question_releases.clear()
-        for target, _ in released:
-            self.answerable_questions.discard(target)
-        return released
 
     async def discover(self) -> LaneDiscovery:
         """Whatever a test told this fake to see."""

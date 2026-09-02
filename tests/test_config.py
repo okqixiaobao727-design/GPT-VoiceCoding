@@ -69,7 +69,6 @@ class TestACompleteConfiguration:
         config = load(written(tmp_path, COMPLETE))
 
         assert config.policy.relay_ceiling_seconds == 600.0
-        assert config.policy.approval_budget_seconds == 600.0
         # legacy@1d32845:config.plist:74-78 — one 60-second heartbeat.
         assert config.policy.silence_end_seconds == 60.0
         # #171: five entries read out in one breath. Legacy's fixed 12/32 KB tail
@@ -80,11 +79,11 @@ class TestACompleteConfiguration:
         config = load(
             written(
                 tmp_path,
-                COMPLETE + "\n[policy]\napproval_budget_seconds = 90\nsilence_end_seconds = 12.5\n",
+                COMPLETE + "\n[policy]\nrelay_ceiling_seconds = 90\nsilence_end_seconds = 12.5\n",
             )
         )
 
-        assert config.policy.approval_budget_seconds == 90.0
+        assert config.policy.relay_ceiling_seconds == 90.0
         assert config.policy.silence_end_seconds == 12.5
 
     def test_the_history_page_size_may_be_dialled(self, tmp_path: Path) -> None:

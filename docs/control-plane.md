@@ -57,15 +57,15 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 7, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 8, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 7, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 8, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
 `action` is `null` when the line never named a usable one. `protocol` is the
-numeric protocol version, currently `7`. A missing field or JSON `null` means the
+numeric protocol version, currently `8`. A missing field or JSON `null` means the
 reply did not declare a usable version. The Swift shell refuses to interpret any
 reply whose version is missing or differs from the version it supports, and shows
 that protocol mismatch separately from an engine refusal or an unreachable engine.
@@ -84,7 +84,7 @@ the user is told.
 | `unknown_switch` | No switch by that name is registered. |
 | `unknown_session` | No Session by that identity was ever registered here. |
 | `stale_session` | Known session id, unreachable under that identity — a fork, or an end. |
-| `unknown_pending` | Nothing is waiting under that id; it was answered or it expired. |
+| `unknown_pending` | Nothing is waiting under that id; it was answered, or its hook ended. |
 | `second_call_refused` | Something asked to open a call while the system owns one. |
 | `refused` | Any other Bridge Core refusal. Still carries its own words. |
 | `engine_unreachable` | Raised by a **surface**, never sent by the engine: nothing answered. |
@@ -93,12 +93,20 @@ the user is told.
 
 Eight, and the set is closed. Adding one is a contract change. Protocol 6
 retired `sessions` and added `brief`, the one verb Session state is fetched
-through. Protocol 7 retires `progress` and adds `history`: the Session Brief
+through. Protocol 7 retired `progress` and added `history`: the Session Brief
 carries the newest message whole and the History page carries that message and
 everything before it, five at a time with a cursor, so the exact progress
 publication had no question left to answer. A protocol-6 surface must report a mismatch — it would
 otherwise send `progress` to an engine that answers `unknown_action`, and it has
 no way to ask for a second page of anything.
+
+Protocol 8 changes no action. It retires `pending_approvals` from `status`: a
+pending permission is one of the three Session states, so the roster row in
+`permission` is the whole of what is waiting, and its `approval_id` is the handle
+`approve` answers with. A protocol-7 surface must report a mismatch rather than
+count an absent list as zero — "0 pending approvals" over a dialog that is on
+screen is a silent wrong number, which is what the version gate exists to
+prevent.
 
 `launch` and `close` were the eighth and ninth until protocol 4. They are parked
 with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
@@ -118,9 +126,7 @@ Payload: none. Data:
   "call_id": null,
   "pending_relays": [{"request_id": "…", "target": {…}, "kind": "answer", "text": "…",
                       "route": "deliver", "queued_at": 0.0, "expires_at": 600.0,
-                      "outcome": "unknown" /* or null: nothing has been attempted */}],
-  "pending_approvals": [{"approval_id": "…", "target": {…}, "tool_name": "Bash",
-                         "detail": "", "options": [], "opened_at": 0.0, "expires_at": 600.0}]
+                      "outcome": "unknown" /* or null: nothing has been attempted */}]
 }
 ```
 
@@ -441,16 +447,25 @@ a surface claiming to be the system.
 
 ### `approve`
 
-Payload: `{"approval_id": "a1", "verdict": "allow" | "deny" | "ask"}`. Data:
+Payload: `{"approval_id": "a1", "verdict": "allow" | "deny" | "ask"}`. Data: the
+verdict that was carried, and `relay`'s receipt for carrying it — an Approval
+Relay is a Relay, so its receipt is the same state, grade and reason.
 
 ```json
-{"approval_id": "a1", "target": {…}, "verdict": "allow", "state": "delivered",
- "outcome": "delivered", "closing_notice": "…"}
+{"approval_id": "a1", "verdict": "allow", "request_id": "…", "target": {…},
+ "state": "delivered", "route": "deliver", "reason": "delivered",
+ "receipt": {"outcome": "delivered", "reason": "…"}}
 ```
 
-A verdict for a request that already resolved is refused with `unknown_pending`:
-Bridge Core discards it safely because its closing notice has already gone out,
-and the user is owed the news that their verdict landed on nothing.
+The handle is the `approval_id` on a live roster row that is `waiting` on a
+`permission`. Two refusals, and they mean different things to the user:
+
+- `unknown_pending` — no live row carries that handle. The dialog was answered,
+  or its hook ended and it went back to the screen; that is where it is answered
+  now. The engine keeps no clock over it and no ledger of it, so a handle that is
+  not on the roster is not waiting anywhere.
+- `refused` — the row is a Child Process. It is seen and never spoken to, and
+  that includes never answered.
 
 ### `verify` — ADR 0003
 
@@ -533,7 +548,6 @@ workspace = "~/code"                # where the bridge's own threads run; defaul
 
 [policy]                            # optional; these are the locked defaults
 relay_ceiling_seconds   = 600
-approval_budget_seconds = 600
 silence_end_seconds     = 60
 
 [log]                               # required: three numbers with no default

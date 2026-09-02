@@ -21,7 +21,6 @@ waiting. Historical notice objects are never replayed.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
@@ -48,41 +47,16 @@ class NoticeRoute(StrEnum):
     PUSH_TO_CHANNEL = "push_to_channel"
 
 
-class Reach(StrEnum):
-    """How many outlets one escalation uses.
-
-    The two reaches read permission at different moments, and that is one
-    principle rather than two behaviours: **permission is read at the moment an
-    attempt becomes irrevocable.** FIRST_OUTLET re-reads between routes because
-    each route is a fresh decision point, so Duty going off mid-escalation halts
-    what has not gone yet. EVERY_OUTLET reads once at the top because both
-    attempts become irrevocable together — a switch flipped a moment later
-    cannot recall a call already in flight.
-
-    A closing notice is its own later emission and is adjudicated at its own
-    time, by the same rule.
-    """
-
-    #: Stop at the first outlet that proved delivery — a Stop Notice heard
-    #: twice is worse than one heard once. The default, and what a Stop Notice
-    #: uses.
-    FIRST_OUTLET = "first_outlet"
-    #: Use every outlet the switches allow, in parallel with each other. A
-    #: pending permission dialog is a stall the user may be nowhere near, so the
-    #: push does not wait on the voice attempt; a closing notice absorbs the
-    #: duplicate when the request resolves.
-    EVERY_OUTLET = "every_outlet"
-
-
 @dataclass(frozen=True, slots=True)
 class Notice:
     """One attention-needing thing to tell the user, and the words for it.
 
     Deliberately *not* called a Stop Notice. `CONTEXT.md` defines that term
     narrowly — the announcement that a Session stopped — and this pipeline
-    carries more than one kind: a pending permission dialog, a closing notice, a
-    Relay that never arrived. The Stop Notice is the archetype the pipeline is
-    named for, not the only thing that rides it.
+    carries a Relay that never arrived as well. The Stop Notice is the archetype
+    the pipeline is named for, not the only thing that rides it. Two other kinds
+    used to: the permission dialog's own announcement and the closing notice
+    that absorbed its duplicate, both retired with that budget (#191).
     """
 
     request_id: RequestId
@@ -183,17 +157,21 @@ class EscalationPipeline:
         self._interlock = interlock
         self._adjudicator = adjudicator
 
-    async def escalate(self, notice: Notice, *, reach: Reach = Reach.FIRST_OUTLET) -> NoticeOutcome:
-        """Take one notice out through the matrix, or drop this attempt."""
+    async def escalate(self, notice: Notice) -> NoticeOutcome:
+        """Take one notice out through the matrix, or drop this attempt.
+
+        **One reach, and it is the first outlet that proves delivery.** A second
+        reach existed for the retired approval announcement, which fired every
+        outlet at once against a budget it was racing; with the budget gone
+        (#191, ADR 0015 amended) a notice heard twice is simply worse than one
+        heard once, which is what this pipeline was named for.
+        """
         routes = route_matrix(
             call_is_up=self._interlock.owns_call(),
             may_touch_call=self._adjudicator.may_touch_call(),
             may_push=self._adjudicator.may_push(),
         )
-        if reach is Reach.EVERY_OUTLET:
-            attempts = await self._fan_out(routes, notice)
-        else:
-            attempts = await self._in_turn(routes, notice)
+        attempts = await self._in_turn(routes, notice)
         delivered = any(attempt.outcome.is_delivered for attempt in attempts)
 
         if delivered:
@@ -212,9 +190,10 @@ class EscalationPipeline:
     ) -> list[NoticeAttempt]:
         """Try one outlet at a time and stop at the one that worked.
 
-        Permission is re-read **between** routes: Duty going off while an
-        earlier route was in flight halts whatever has not gone out yet, rather
-        than forcing it through on a stale permission.
+        **Permission is read at the moment an attempt becomes irrevocable**, so
+        it is re-read between routes: Duty going off while an earlier route was
+        in flight halts whatever has not gone out yet, rather than forcing it
+        through on a stale permission.
         """
         attempts: list[NoticeAttempt] = []
         for route in routes:
@@ -227,28 +206,6 @@ class EscalationPipeline:
             if receipt.outcome.is_delivered:
                 break
         return attempts
-
-    async def _fan_out(
-        self, routes: tuple[NoticeRoute, ...], notice: Notice
-    ) -> list[NoticeAttempt]:
-        """Try every open outlet at once.
-
-        "In parallel" is the locked word and it has to be literal: a pending
-        permission dialog is burning its budget, so the push must not wait to
-        find out whether the voice attempt worked. Sequential fall-through would
-        make a stalled call hold the text back for as long as it stalls.
-
-        Permission is therefore read once, at the top — an attempt already in
-        flight cannot be recalled by a switch flipped a moment later. That is
-        inherent to firing them together, and it is why the Stop Notice path
-        does not use this reach.
-        """
-        permitted = tuple(route for route in routes if self._still_permitted(route))
-        receipts = await asyncio.gather(*(self._attempt(route, notice) for route in permitted))
-        return [
-            NoticeAttempt(route=route, outcome=receipt.outcome, reason=receipt.reason)
-            for route, receipt in zip(permitted, receipts, strict=True)
-        ]
 
     def _still_permitted(self, route: NoticeRoute) -> bool:
         if route is NoticeRoute.PUSH_TO_CHANNEL:

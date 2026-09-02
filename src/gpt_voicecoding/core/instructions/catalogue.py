@@ -290,7 +290,7 @@ def _rules() -> tuple[Rule, ...]:
                 "permission and its tool, or nothing yet readable — is structured state "
                 "Bridge Core holds, including that a fact is missing."
             ),
-            enforced_by="the approval pipeline's PendingApproval and the escalation Notice",
+            enforced_by="the roster row's WaitingFor and the escalation Notice",
         ),
         Rule(
             id="voice.notice.invents-no-detail",

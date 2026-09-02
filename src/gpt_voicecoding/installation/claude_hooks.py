@@ -78,10 +78,12 @@ REGISTRATION_MODULE: Final = "gpt_voicecoding.adapters.agent.claude.registration
 #: not answering must be a lost registration, not a wait the user watches.
 REGISTRATION_TIMEOUT_SECONDS: Final = 5
 
-#: The ceiling Claude Code puts on the hook process. It must not be *below*
-#: Bridge Core's approval budget, or Claude Code would give up on a dialog the
-#: engine is still holding open for the user — a test holds the two together
-#: rather than a comment, because this number and that one live in two packages.
+#: The ceiling Claude Code puts on the hook process, and **the only clock a held
+#: dialog has** (ADR 0015, amended by #191). It used to sit above Bridge Core's
+#: approval budget; both engine-side clocks are gone, so this number alone
+#: decides how long a permission stays answerable by voice. Declared here rather
+#: than left to Claude Code's own default, which is not a number this product
+#: chose.
 APPROVAL_TIMEOUT_SECONDS: Final = 600
 
 #: What makes a handler ours: the interpreter is told to run a module of this

@@ -36,15 +36,18 @@ class TestTheActionSet:
             "verify",
         }
 
-    def test_the_history_page_replacing_exact_progress_moves_the_protocol_to_seven(
+    def test_retiring_pending_approvals_from_status_moves_the_protocol_to_eight(
         self,
     ) -> None:
-        """A v6 surface would send `progress` to an engine that has no such action.
+        """A v7 surface would count an absent list as zero pending approvals.
 
-        The Swift shell compares this number and nothing else, so an action set
-        that changed under an unchanged number is a gate that lies (#171).
+        The Swift shell compares this number and nothing else, so a `status`
+        shape that changed under an unchanged number is a gate that lies — and
+        the silent zero over a dialog that is on screen is exactly the failure
+        the gate exists to prevent (#191). Protocol 7 was the History page
+        replacing exact progress (#171).
         """
-        assert PROTOCOL_VERSION == 7
+        assert PROTOCOL_VERSION == 8
 
     def test_the_retired_exact_progress_verb_is_not_an_action_this_engine_has(self) -> None:
         """Retired with the History page, and its absence asserted, not assumed."""

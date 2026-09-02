@@ -85,7 +85,6 @@ from gpt_voicecoding.adapters.codex_app_server.wire import (
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
     HistoryPage,
     LaneDiscovery,
     LaneUnavailable,
@@ -342,12 +341,6 @@ class CodexAgentAdapter:
         """Codex exposes no held question-answer route."""
         return False
 
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        """Codex holds no question hook, so there is nothing to release."""
-        return ()
-
     async def forget_session(self, target: SessionTarget) -> None:
         """Stop watching one Session. The Session itself is left running.
 
@@ -581,11 +574,11 @@ class CodexAgentAdapter:
         """One roster row, carrying the dialog this adapter is holding for it.
 
         **The projection the Codex lane never had** (#77, from #75's review).
-        `_asked` raised `AwaitingApproval` and stopped there, so a Codex row and
-        a Codex `SessionStopped` could not say what the Session had stopped on
+        `_asked` raised a second event and stopped there, so a Codex row and a
+        Codex `SessionStopped` could not say what the Session had stopped on
         while the Claude lane could. The request is already parsed into an
         `ApprovalRequest`; this is that same fact in the seam's one inspection
-        vocabulary.
+        vocabulary — and since #191 it is the only way a dialog travels.
 
         **No transcript parser for Codex, ever.** The rollout on disk is a second
         source answering the same question with worse evidence, and the port
@@ -1084,7 +1077,23 @@ class CodexAgentAdapter:
             method=str(method),
             request=request,
         )
-        self._emit(AwaitingApproval(request=request))
+        # **The dialog going up is the Session stopping** (#191). One dialog,
+        # one event, and this is the Codex lane's fold of it into the Stop's
+        # wait: a thread with a prompt on screen is stalled on the person, and
+        # `SessionStopped` is what that means. It cannot wait for the thread to
+        # leave `active`, because a Codex thread does not leave it while its
+        # prompt is up — measured on acceptance run `20260902T133429Z`, where
+        # the roster carried the dialog for three minutes and the engine
+        # announced nothing at all.
+        #
+        # The later idle Stop is a different fact — the turn ended — and it
+        # carries no handle, because by then either a verdict or the TUI has
+        # retired this entry. A dialog *leaving* raises nothing: that is not a
+        # Session stopping, and the next reading of the row says it (`
+        # _dialog_waiting` reads `pending`, which `_retire_resolved` empties).
+        waiting_for = _dialog_waiting(watched) or WaitingFor(kind=WaitingKind.PERMISSION)
+        watched.stopped_on_dialog = request.approval_id
+        self._spawn(self._emit_stopped(watched, waiting_for, turn_revision=watched.turn_revision))
 
     def _retire_resolved(self, watched: WatchedThread, wire_id: Any) -> None:
         """Drop a prompt somebody else answered, so no verdict lands on a closed one."""
@@ -1092,6 +1101,12 @@ class CodexAgentAdapter:
             if pending.wire_id == wire_id:
                 del watched.pending[approval_id]
                 watched.answered_elsewhere.add(approval_id)
+                if watched.stopped_on_dialog == approval_id:
+                    # The dialog left; nothing is raised for that. What the next
+                    # reading of the row says is that it carries no handle, and
+                    # the Stop this thread takes when its turn ends is free to
+                    # be its own again.
+                    watched.stopped_on_dialog = None
 
     def _note_status(self, watched: WatchedThread, status: Any) -> None:
         """Map a thread status onto the Reply Window, and onto having stopped.
@@ -1119,12 +1134,19 @@ class CodexAgentAdapter:
             watched.active_turn_id = None
             # **The same projection the roster row gets, on the same fact.** A
             # Stop that could not say what it stopped on was the Claude lane's
-            # gap too (#75) and it is worse here, because a Codex permission
-            # already reaches the user as `AwaitingApproval`: without the
-            # `approval_id` on this event Bridge Core cannot recognise the two as
-            # one dialog, so it announces the Stop as well and asks the user
-            # twice for one decision (`core/bridge.py:_session_stopped`).
-            waiting_for = _dialog_waiting(watched) or (
+            # gap too (#75) and it is worse here, because this Stop is the only
+            # event a Codex permission travels on (#191): without the
+            # `approval_id` on it nothing on the roster carries the handle, so
+            # the brief tells the user to answer at the keyboard and
+            # `answer_approval` has nothing to find.
+            dialog = _dialog_waiting(watched)
+            if dialog is not None and dialog.approval_id == watched.stopped_on_dialog:
+                # One dialog, one event (#191). This thread already stopped when
+                # the prompt went up, and the prompt is still the same one: the
+                # turn ending under it changes nothing the user has not been
+                # told, and a second Stop is the same decision asked twice.
+                return
+            waiting_for = dialog or (
                 WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
                 if kind == "systemError"
                 else WaitingFor()
@@ -1271,11 +1293,11 @@ def _dialog_waiting(watched: WatchedThread | None) -> WaitingFor | None:
     """The dialog this adapter is holding for one thread, in the seam's vocabulary.
 
     **The projection the Codex lane never had** (#77, from #75's review).
-    `_asked` raised `AwaitingApproval` and stopped there, so a Codex row and a
-    Codex `SessionStopped` could not say what the Session had stopped on while
-    the Claude lane could. The request is already parsed into an
-    `ApprovalRequest`; this is that same fact, read once and shared by both, so
-    the row and the Stop can never describe one dialog differently.
+    `_asked` raised a second event and stopped there, so a Codex row and a Codex
+    `SessionStopped` could not say what the Session had stopped on while the
+    Claude lane could. The request is already parsed into an `ApprovalRequest`;
+    this is that same fact, read once and shared by both, so the row and the Stop
+    can never describe one dialog differently.
 
     **No transcript parser for Codex, ever.** The rollout on disk is a second
     source answering the same question with worse evidence, and the port table

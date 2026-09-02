@@ -317,7 +317,7 @@ class TestReplyWindow:
         assert registry.resolve(session.target).reply_window is ReplyWindow.CLOSED
 
     def test_a_session_waiting_on_a_dialog_is_closed(self) -> None:
-        """`AwaitingApproval` locks it: a dialog blocks every other Relay."""
+        """A dialog on screen blocks every other Relay until it is answered."""
         registry = SessionRegistry()
         session = codex("abc")
         registry.register(session)

@@ -23,7 +23,6 @@ from gpt_voicecoding.core.escalation import (
     EscalationPipeline,
     Notice,
     NoticeRoute,
-    Reach,
     route_matrix,
 )
 from gpt_voicecoding.core.interlock import CallInterlock
@@ -255,45 +254,36 @@ class TestDroppedAttempts:
         assert [attempt.reason for attempt in outcome.attempts] == ["chat unreachable"]
 
 
-class TestReach:
-    def test_a_pending_approval_pushes_and_speaks_together(self) -> None:
-        """The notification fires immediately, in parallel with the voice attempt."""
+class TestOneReach:
+    """Every notice stops at the first outlet that proved delivery (#191).
+
+    A second reach existed for the retired approval announcement, which fired
+    every outlet at once because it was racing a budget. Both are gone: a notice
+    heard twice is worse than one heard once, which is what this pipeline was
+    named for, and there is no longer a caller with a reason to differ.
+    """
+
+    def test_a_notice_stops_at_the_first_outlet_that_worked(self) -> None:
         harness = Harness()
 
-        outcome = harness.escalate(notice("approval needed"), reach=Reach.EVERY_OUTLET)
-
-        assert harness.call.spoken == ["approval needed"]
-        assert harness.channel.sent == ["approval needed"]
-        assert outcome.state is Lifecycle.DELIVERED
-
-    def test_a_stop_notice_stops_at_the_first_outlet_that_worked(self) -> None:
-        harness = Harness()
-
-        harness.escalate(notice("stopped"), reach=Reach.FIRST_OUTLET)
+        harness.escalate(notice("stopped"))
 
         assert harness.call.spoken == ["stopped"]
         assert harness.channel.sent == []
 
-    def test_every_outlet_still_means_every_outlet_the_switches_allow(self) -> None:
-        harness = Harness(message=False)
-
-        harness.escalate(notice("approval needed"), reach=Reach.EVERY_OUTLET)
-
-        assert harness.call.spoken == ["approval needed"]
-        assert harness.channel.sent == []
-
-    def test_every_outlet_with_voice_off_is_the_channel_alone(self) -> None:
+    def test_with_voice_off_the_channel_is_the_first_outlet(self) -> None:
         harness = Harness(voice=False)
 
-        harness.escalate(notice("approval needed"), reach=Reach.EVERY_OUTLET)
+        outcome = harness.escalate(notice("stopped"))
 
         assert harness.call.spoken == []
-        assert harness.channel.sent == ["approval needed"]
+        assert harness.channel.sent == ["stopped"]
+        assert outcome.state is Lifecycle.DELIVERED
 
-    def test_every_outlet_with_nothing_open_drops_this_attempt(self) -> None:
+    def test_with_nothing_open_the_attempt_is_dropped(self) -> None:
         harness = Harness(duty=False)
 
-        outcome = harness.escalate(notice(), reach=Reach.EVERY_OUTLET)
+        outcome = harness.escalate(notice())
 
         assert outcome.state is Lifecycle.DROPPED
         assert outcome.attempts == ()

@@ -24,12 +24,13 @@ hook instead of the inbox while the exact prompt remains parked. At the wire,
 that answer is a denial whose framed message Claude consumes as the question's
 tool result. `ask` is the one verdict said by saying nothing.
 
-**The listener timestamps; Bridge Core owns the duration.** A parked question
-records the listener's injected monotonic clock. Bridge Core passes its configured
-`approval_budget_seconds` into `sweep_question_budget`, so this module imports no
-policy and mirrors no default. Expiry pops first and writes `ASK`. Claude Code's
-own default hook budget happens to be 600 s, the same number `CorePolicy` defaults
-to — a coincidence worth knowing and not a constant to copy.
+**The wire keeps the only clock (ADR 0015, amended by #191).** A parked entry
+lives exactly as long as the hook holding it: Claude Code ends that hook at the
+timeout the installed block declares, or the human answers the dialog on screen,
+and this listener's per-connection task already releases the entry when the
+socket closes (`_serve`). The engine keeps no timer beside it — a second clock
+racing the first is the objection the hook process itself records for keeping
+none of its own — so nothing here reads a budget or a default.
 
 **The grant ceiling is a policy this file keeps, not a limit the route imposes.**
 `permission_suggestions` arrives on the hook payload and an `allow` decision may
@@ -53,7 +54,6 @@ import contextlib
 import json
 import logging
 import os
-import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -73,7 +73,6 @@ from gpt_voicecoding.seams.agent import (
     AgentEvent,
     ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
     ReplyWindow,
     ReplyWindowChanged,
     WaitingFor,
@@ -317,7 +316,6 @@ class _Waiting:
         "acknowledged",
         "answered",
         "gone",
-        "parked_at",
         "permission",
         "question",
         "target",
@@ -331,7 +329,6 @@ class _Waiting:
         *,
         permission: ApprovalRequest | None = None,
         question: WaitingFor | None = None,
-        parked_at: float,
     ) -> None:
         if (permission is None) == (question is None):
             raise ValueError("a parked hook is exactly one permission or question")
@@ -342,7 +339,6 @@ class _Waiting:
         #: permission. Parsed once, here, when the payload arrives: two parses of
         #: one message are two answers that can disagree.
         self.question = question
-        self.parked_at = parked_at
         #: Set once a verdict has been written to this hook. It is what tells the
         #: connection's own task that the end it is about to see is an ordinary
         #: goodbye rather than a human winning the race.
@@ -372,7 +368,6 @@ class ApprovalListener:
         emit: Callable[[AgentEvent], None],
         pid: int | None = None,
         register: Callable[[dict[str, Any]], None] | None = None,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         #: What to do with a `SessionStart` line. `None` drops it, which is what
@@ -382,7 +377,6 @@ class ApprovalListener:
         #: holds a registration for — or `None`, which is the authority check.
         self._resolve = resolve
         self._emit = emit
-        self._clock = clock
         self._path = approval_socket_path(settings.socket_directory, pid or os.getpid())
         self._server: asyncio.Server | None = None
         self._waiting: dict[str, _Waiting] = {}
@@ -637,27 +631,6 @@ class ApprovalListener:
         await self._reply(waiting.writer, frame)
         waiting.answered.set()
 
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        """Pop and release every held question past Core's configured budget."""
-        now = self._clock()
-        expired = [
-            (approval_id, waiting)
-            for approval_id, waiting in self._waiting.items()
-            if waiting.question is not None and waiting.parked_at + budget_seconds <= now
-        ]
-        released: list[tuple[SessionTarget, WaitingFor]] = []
-        for approval_id, waiting in expired:
-            self._waiting.pop(approval_id, None)
-            question = waiting.question
-            assert question is not None
-            with contextlib.suppress(OSError, ConnectionError):
-                await self._write_verdict(waiting, ApprovalVerdict.ASK)
-            self._question_released(waiting)
-            released.append((waiting.target, question))
-        return tuple(released)
-
     def _question_released(
         self,
         waiting: _Waiting,
@@ -673,9 +646,10 @@ class ApprovalListener:
     async def _hook_acknowledged(self, waiting: _Waiting) -> bool:
         """Wait, bounded, for the hook's own receipt. Nothing else is a proof.
 
-        The wait ends on the receipt, on the connection closing, or on the budget
-        — and only the first of those is an answer. A connection that ends is
-        what stops this waiting for something that is never coming; it says
+        The wait ends on the receipt, on the connection closing, or on this
+        method's own bound — and only the first of those is an answer. A
+        connection that ends is what stops this waiting for something that is
+        never coming; it says
         nothing about whether the verdict arrived, because the close may have
         been in flight before the verdict was written.
         """
@@ -724,25 +698,17 @@ class ApprovalListener:
             else:
                 approval_id = str(uuid.uuid4())
                 request = request_from(payload, target=target, approval_id=approval_id)
-            waiting = _Waiting(
-                target,
-                writer,
-                permission=request,
-                question=question,
-                parked_at=self._clock(),
-            )
+            waiting = _Waiting(target, writer, permission=request, question=question)
             self._waiting[approval_id] = waiting
             if question is not None:
                 self._released_questions.pop(target, None)
 
-            # Raised only once the request is parked, so a verdict answered the
-            # same tick has somewhere to land. A question never enters the
-            # Approval Relay. This held writer privately addresses the next
-            # Answer Relay, using Claude's prompt id or this listener's opaque
-            # fallback key.
-            if question is None:
-                assert request is not None
-                self._emit(AwaitingApproval(request=request))
+            # The permission is parked and nothing is raised for it: the Stop
+            # the Session's own transition produces carries this handle in its
+            # `WaitingFor`, and that is the one event the dialog travels on
+            # (#191). A question never enters the Approval Relay at all — its
+            # held writer privately addresses the next Answer Relay, using
+            # Claude's prompt id or this listener's opaque fallback key.
             if question is not None:
                 self._emit(ReplyWindowChanged(target=target, window=ReplyWindow.OPEN))
             if question is not None and question.approval_id is not None:
@@ -805,8 +771,8 @@ class ApprovalListener:
         """Read until the hook says it has the verdict, or until it is gone.
 
         Unbounded on purpose, like everything else on this connection: the hook
-        is parked for as long as Bridge Core's budget lasts, and a timer here
-        would be a second budget. The connection ending is what ends it.
+        is parked for as long as Claude Code holds it, and a timer here would be
+        a second clock racing that one. The connection ending is what ends it.
         """
         while True:
             try:

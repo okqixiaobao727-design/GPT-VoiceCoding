@@ -98,6 +98,12 @@ class WatchedThread:
     #: Kept so a verdict arriving afterwards is told what happened rather than
     #: told the prompt never existed.
     answered_elsewhere: set[str] = field(default_factory=set)
+    #: The dialog this thread has already stopped on, if it is still up. One
+    #: dialog, one event (#191): the prompt going up raises the Stop, and a
+    #: later status change that would carry the *same* parked dialog is the same
+    #: fact said twice — which is the user asked twice for one decision. A
+    #: different dialog, or none, is not this handle and stops as usual.
+    stopped_on_dialog: str | None = None
 
     @property
     def thread_id(self) -> str:

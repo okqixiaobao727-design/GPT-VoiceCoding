@@ -36,7 +36,6 @@ from typing import Final
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
-from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
 from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
@@ -51,11 +50,12 @@ from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOu
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
+from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
-from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, terminal_line
+from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, reason_for, terminal_line
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session, spoken_name, spoken_target
+from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -69,8 +69,8 @@ from gpt_voicecoding.core.verification import (
 )
 from gpt_voicecoding.seams.agent import (
     AgentAdapter,
+    ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
     HistoryPage,
     LaneUnavailable,
     ProgressAvailability,
@@ -130,8 +130,8 @@ def stop_brief(
     five renderers that used to live here are gone: the composer, the "it said /
     nothing said yet / oversize" line, the per-wait-kind sentence with its
     options and recommendation, the "answer it in the terminal" constant, and
-    their use of `spoken_reference` — which the Approval Relay's announcement
-    still needs, so it stays for that one caller. The omission wording lives in
+    their use of a `spoken_reference` helper, which went with the approval
+    announcement that was its last caller (#191). The omission wording lives in
     `briefing.NEWEST_WORDING` and the state wording in `briefing.STATE_WORDING`.
 
     Legacy (ADR 0010): `legacy@1d32845:bridge/host.py:213-235` announced a
@@ -195,20 +195,6 @@ def _stand_in(target: SessionTarget) -> Session:
     )
 
 
-def spoken_reference(session: Session | None, target: SessionTarget) -> str:
-    """The string a notice refers to this Session by — its name, else its address.
-
-    Third of the `spoken_*` family and the one that chooses between the other
-    two: what to call a Session is `core/sessions.py`'s answer, and its floor is
-    the address, because a notice that names nothing is a notice the user cannot
-    answer. Both notices Bridge Core composes ask this question — the Stop Notice
-    and, since #109, the Approval Relay's announcement — so it is one expression
-    rather than the same line twice, which is how one of them came to have it and
-    the other not.
-    """
-    return spoken_name(session) if session is not None else spoken_target(target)
-
-
 def _as_read_now(read: Session, fresh: ProgressObservation) -> Session:
     """The folded row, but saying what *this* read found about its progress.
 
@@ -263,7 +249,6 @@ class Status:
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
-    pending_approvals: tuple[PendingApproval, ...]
     #: Reply Window levels include the lane's live question-route fact, which is
     #: deliberately not copied onto the roster row.
     reply_windows: Mapping[SessionTarget, ReplyWindow] = field(default_factory=dict)
@@ -331,12 +316,6 @@ class BridgeCore:
             policy=self._policy,
             clock=clock,
         )
-        self.approvals = ApprovalPipeline(
-            agents=agents,
-            escalation=self.escalation,
-            policy=self._policy,
-            clock=clock,
-        )
         self.router = InboundRouter(sessions=state.sessions, grammar=grammar)
 
     @property
@@ -368,7 +347,6 @@ class BridgeCore:
             degraded_lanes=self._state.sessions.lane_degradations(),
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
-            pending_approvals=self.approvals.pending(),
             reply_windows={
                 session.target: self._reply_window(session)
                 for session in self._state.sessions.all()
@@ -576,12 +554,7 @@ class BridgeCore:
             if session.target.agent not in fresh or not session.child.is_main:
                 continue
             if session.waiting_for.needs_the_user:
-                await self._announce_waiting(
-                    session,
-                    session.target,
-                    session.waiting_for,
-                    reconcile=True,
-                )
+                await self._announce_waiting(session, session.target, session.waiting_for)
 
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
@@ -603,17 +576,71 @@ class BridgeCore:
 
     async def answer_approval(
         self, approval_id: str, verdict: ApprovalVerdict
-    ) -> ApprovalOutcome | None:
-        """Carry the user's verdict. None when nothing is waiting under that id.
+    ) -> RelayOutcome | None:
+        """Carry the user's verdict. None when no live row carries that handle.
+
+        **The Approval Relay carries and nothing more** (#191). There is no
+        pending-approval ledger to consult: the roster's current reading is the
+        one truth about which dialogs are open, and the row that carries this
+        handle in its wait is the Session the verdict belongs to. A handle no
+        row carries is a hook that has ended — the dialog is the keyboard's
+        again — and the receipt for that is the refusal this None becomes.
+
+        **A spawned target is refused in its own words.** A Codex subagent
+        thread can raise a real permission prompt; answering it would carry the
+        user's authority into a Session `resolve` refuses to address a moment
+        later, so it stays the keyboard's — "never spoken to" includes never
+        answered (advisor, 2026-08-27). It reads differently from the refusal
+        above because the user acts on it differently.
 
         Answering a permission is replying to that Session, so it takes the
-        focus exactly as an Answer Relay does. A verdict that found nothing to
-        answer moves nothing: there was no Session to have replied to.
+        focus exactly as an Answer Relay does — whatever the receipt says.
+
+        The receipt is `RelayOutcome`, the same shape `relay` answers with
+        (#192): the state, the attempt's grade, and one reason code. `DELIVERED`
+        exactly when the adapter proved it; every other grade is terminal here,
+        because a verdict is never retried on this system's own authority and
+        the dialog on screen is still the thing that can resolve it.
         """
-        outcome = await self.approvals.answer(approval_id, verdict)
-        if outcome is not None:
-            self._state.sessions.set_focus(outcome.request.target)
-        return outcome
+        found = self._dialog_on_the_roster(approval_id)
+        if found is None:
+            _log.info("no live Session carries the dialog %s; the verdict is refused", approval_id)
+            return None
+        session, request = found
+        if not session.child.is_main:
+            raise ChildSessionError(session.target, session.child.parent)
+
+        adapter = self._agents.get(session.target.agent)
+        if adapter is None:
+            _log.info("no %s lane is loaded to carry the verdict", session.target.agent)
+            return None
+
+        request_id = new_request_id()
+        receipt = await adapter.approval_relay(request, verdict, request_id=request_id)
+        self._state.sessions.set_focus(session.target)
+        return RelayOutcome(
+            request_id=request_id,
+            target=session.target,
+            state=Lifecycle.DELIVERED if receipt.is_delivered else Lifecycle.REPORTED_FAILED,
+            route=RelayRoute.DELIVER,
+            reason=reason_for(receipt),
+            receipt=receipt,
+        )
+
+    def _dialog_on_the_roster(self, approval_id: str) -> tuple[Session, ApprovalRequest] | None:
+        """The live row whose current wait carries that handle, and the request for it.
+
+        Read off `WaitingFor.as_approval_request`, which is the one place a wait
+        becomes the request the Approval Relay addresses, so the roster row the
+        user was briefed from and the request the adapter is handed are the same
+        fact. Child rows are found here and refused by the caller: they are on
+        the roster, and a handle nobody could match would be the wrong refusal.
+        """
+        for session in self._state.sessions.live():
+            request = session.waiting_for.as_approval_request(session.target)
+            if request is not None and request.approval_id == approval_id:
+                return session, request
+        return None
 
     async def verify(self) -> tuple[SeamVerification, ...]:
         """What configuration named, against what this engine actually loaded.
@@ -655,29 +682,26 @@ class BridgeCore:
             await self.dispatch(event)
         return len(waiting)
 
-    async def tick(self) -> tuple[tuple[RelayOutcome, ...], tuple[ApprovalOutcome, ...]]:
+    async def tick(self) -> tuple[RelayOutcome, ...]:
         """Advance the time-driven ceilings. The composition root calls this on a timer.
 
-        Deliberately the only time-driven thing in the hub. Stop Notices are not
-        replayed here; current state is reconciled only on outlet transitions.
+        Deliberately the only time-driven thing in the hub, and there are two of
+        them left: the undelivered Relay ceiling and the Live Call's silence
+        ceiling. Stop Notices are not replayed here; current state is reconciled
+        only on outlet transitions.
+
+        **No clock runs on a held dialog** (ADR 0015, amended by #191). A parked
+        permission or question is bounded by the wire that holds it — Claude Code
+        ends its hook at the installed block's timeout, the listener releases the
+        entry when that socket closes, and a Codex dialog stays answerable from
+        the TUI — so an engine-side sweep here was a second clock racing the
+        first. What a release does is unchanged, and nothing is pushed on it: the
+        next brief reads a row with no handle and says `answer: at the terminal`
+        (ADR 0017, a fresh reading).
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
             await self._announce(outcome.target, terminal_line(outcome))
-        for adapter in self._agents.values():
-            released = await adapter.sweep_question_budget(self._policy.approval_budget_seconds)
-            for target, waiting_for in released:
-                await self.escalation.escalate(
-                    Notice(
-                        request_id=new_request_id(),
-                        target=target,
-                        # The hook that held this question is gone, so the brief
-                        # says so: `question_answerable=False` is what makes
-                        # Briefing word it "at the terminal".
-                        text=briefing.text(stop_brief(self._known(target), target, waiting_for)),
-                    )
-                )
-        approvals = await self.approvals.sweep_expired()
         # Asked before the Call Keeper is, and not inside it: with the Auto
         # Hang-up Switch off the ceiling is never measured, so the Keeper's one
         # ending attempt per call stays unspent and turning the switch back on
@@ -697,7 +721,7 @@ class BridgeCore:
                         "ended the Live Call after %g seconds without call activity",
                         self._policy.silence_end_seconds,
                     )
-        return expired, approvals
+        return expired
 
     async def discover(self) -> tuple[SessionTarget, ...]:
         """Ask every lane what Sessions exist, and make the roster agree.
@@ -755,16 +779,6 @@ class BridgeCore:
                 await self._session_stopped(event)
             case SessionEnded():
                 await self._session_ended(event)
-            case AwaitingApproval():
-                if self._spawned(event.request.target):
-                    # A Codex subagent thread can raise a real permission
-                    # prompt, and this is where it stops. Answering it would be
-                    # an Approval Relay carrying the user's authority into a
-                    # Session `resolve` refuses to address a moment later, so
-                    # the dialog stays the keyboard's — "never spoken to"
-                    # includes never answered (advisor, 2026-08-27).
-                    return
-                await self.approvals.opened(event.request, self._spoken_as(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
@@ -815,7 +829,6 @@ class BridgeCore:
             event.target,
             event.waiting_for,
             progress=event.progress,
-            reconcile=False,
         )
 
     async def _announce_waiting(
@@ -825,7 +838,6 @@ class BridgeCore:
         waiting_for: WaitingFor,
         *,
         progress: ProgressObservation | None = None,
-        reconcile: bool,
     ) -> NoticeOutcome | None:
         """Announce one current wait through the same producer as its live event.
 
@@ -838,9 +850,12 @@ class BridgeCore:
         where Bridge Core cannot see it, so any key Bridge Core computes goes
         stale unseen.
 
-        The current handle is still *read*, just below: it decides **who**
-        announces, the Approval Relay or a Stop Notice. Reading it is not
-        recording it.
+        **One wait, one notice, and the handle is not read here at all.** A
+        permission used to reach this method twice — once as the Stop, once as
+        the announcement its own pipeline made — and the tiebreak between them
+        lived here. Since #191 a dialog travels on the Stop alone, so what the
+        handle is for is `Briefing`'s question of whether the user can answer
+        from here, read off the row it is given.
 
         Legacy (ADR 0010) — **dropped, because** its record of what a Session was
         last announced on is `CurrentSessionStop`
@@ -863,46 +878,6 @@ class BridgeCore:
         # unchanged: `tests/acceptance/journey.py::ENGINE_STOP_LINE` greps the
         # first line of the record, and `drain_boot_notice` reads that grep.
         _log.info("Session stopped: %s", briefing.text(brief))
-        held = waiting_for.as_approval_request(target)
-        if held is not None:
-            if reconcile:
-                outcome = await self.approvals.reoffer(
-                    held.approval_id, spoken_reference(session, target)
-                )
-                if outcome is not None:
-                    return outcome
-                # Nothing is parked under that handle any more — the Approval
-                # Relay had nothing to re-offer — so the row's `approval_id` is
-                # stale and the notice must not promise a route that is gone.
-                # Briefing reads the handle off the row it is given
-                # (`briefing._answerable_here`), so what it is given is the row
-                # with the fact this call has just established.
-                brief = stop_brief(
-                    session,
-                    target,
-                    replace(waiting_for, approval_id=None),
-                    progress=progress,
-                )
-            # One dialog, two events, one announcement. A Session entering
-            # `waiting` raises this Stop, and the same dialog reached
-            # `AwaitingApproval` through the hook that is holding it open — so
-            # announcing both would ask the user twice for one decision. The
-            # approval notice wins wherever it exists: it is the one carrying a
-            # budget, a never-deny fallback and a closing notice, so it is the
-            # one that can actually be answered, and `approvals.opened` already
-            # asks for `Reach.EVERY_OUTLET`, which is the wider reach of the two.
-            #
-            # Said out loud rather than dropped: a Stop that produced no notice
-            # is otherwise indistinguishable in the log from a Stop that failed
-            # to reach every outlet.
-            _log.info(
-                "the Stop on %s is the dialog %s, which the Approval Relay announces; "
-                "not announced twice",
-                target,
-                held.approval_id,
-            )
-            if not reconcile:
-                return None
         outcome = await self.escalation.escalate(
             Notice(
                 request_id=new_request_id(),
@@ -1083,7 +1058,3 @@ class BridgeCore:
         except BridgeCoreError:
             return False
         return False
-
-    def _spoken_as(self, target: SessionTarget) -> str:
-        """What a notice refers to this Session by, whether or not the roster knows it."""
-        return spoken_reference(self._known(target), target)

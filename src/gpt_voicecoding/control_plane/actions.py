@@ -187,14 +187,23 @@ class ControlPlane:
         return payloads.relay_document(outcome)
 
     async def _approve(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """An Approval Relay: the user's verdict on one pending permission.
+
+        Two refusals, and they read differently because the user acts on them
+        differently. Nothing on the roster carrying the handle means the hook
+        ended — the dialog went back to the screen, and that is where it is
+        answered now. A Child Process carrying it is refused in Bridge Core's
+        own words (`ChildSessionError`), which say why it is never spoken to.
+        """
         approval_id = payloads.read_text(payload, "approval_id")
         verdict = payloads.read_verdict(payload)
         outcome = await self._core.answer_approval(approval_id, verdict)
         if outcome is None:
             raise NothingPending(
-                f"nothing is waiting under {approval_id!r} — it was answered or it expired"
+                f"no live Session is waiting under {approval_id!r} — the dialog was answered "
+                "or its hook ended; if it is still on screen, answer it there"
             )
-        return payloads.approval_document(outcome)
+        return payloads.approval_document(approval_id, verdict, outcome)
 
     async def _verify(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return payloads.verification_document(await self._core.verify())
