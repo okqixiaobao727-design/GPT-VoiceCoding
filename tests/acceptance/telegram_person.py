@@ -22,6 +22,11 @@ Two boundaries this module keeps:
   `getMe` on the Bot API and hands the username down, so this file names no bot,
   no chat and no account.
 
+One account, and since #182 more than one peer: the two lanes run at the same
+time against **two bots**, and the same human account holds a chat with each.
+That is one `PersonConnection` — one session file backs one client — with a
+`TelegramPerson` per peer over it.
+
 Run the one-time authorisation with:
 
     .venv/bin/python tests/acceptance/telegram_person.py login
@@ -38,6 +43,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -200,23 +206,24 @@ def _no_journal(event: str, **fields: object) -> None:  # noqa: ARG001
     """The default sink: a person driven outside a run journals nowhere."""
 
 
-class TelegramPerson:
-    """A synchronous facade over one Telethon client, scoped to one peer.
+class PersonConnection:
+    """One authorised Telethon client, its event loop, and the lock they share.
+
+    **One session file backs one client.** That is Telethon's own rule, and it is
+    not advisory: the session is an SQLite file holding a bearer auth key, and two
+    clients opened on it race each other's writes and present the same key on two
+    connections. Two lanes now walk at once (#182), each talking to its **own
+    bot** — so the harness needs two peers, not two accounts, and this is the
+    object that keeps that distinction: one connection, many `TelegramPerson`.
 
     The harness is a pytest suite and pytest is synchronous, so the event loop is
     owned here — created, handed to Telethon, and closed with the client — rather
     than left to Telethon's implicit one. One object, one loop, one lifetime.
+    Every call goes through `run`, under a lock, because `run_until_complete` is
+    not re-entrant and the two lanes call it from two threads.
     """
 
-    def __init__(
-        self,
-        peer: str,
-        *,
-        journal: Journal = _no_journal,
-        directory: Path | None = None,
-    ) -> None:
-        self._peer_name = peer
-        self._journal = journal
+    def __init__(self, *, directory: Path | None = None) -> None:
         self._directory = directory or person_directory()
         self._credentials = load_credentials(self._directory)
         self._loop = asyncio.new_event_loop()
@@ -226,6 +233,59 @@ class TelegramPerson:
             self._credentials.api_hash,
             loop=self._loop,
         )
+        self._lock = threading.Lock()
+        self.account: object | None = None
+
+    def __enter__(self) -> PersonConnection:
+        self.open()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def open(self) -> None:
+        """Connect, and refuse if this session is not an authorised account."""
+        self.run(self._client.connect())
+        if not self.run(self._client.is_user_authorized()):
+            raise PersonError(
+                f"the Telegram user-account session at {session_path(self._directory)} is not "
+                f"authorised. Run `python tests/acceptance/telegram_person.py login` once."
+            )
+        self.account = self.run(self._client.get_me())
+
+    def close(self) -> None:
+        _shut_down(self._client, self._loop)
+
+    def run(self, coroutine):  # noqa: ANN001, ANN202 - Telethon's own return types
+        with self._lock:
+            return self._loop.run_until_complete(coroutine)
+
+    @property
+    def client(self) -> TelegramClient:
+        return self._client
+
+
+class TelegramPerson:
+    """A synchronous facade over one Telethon client, scoped to one peer.
+
+    The connection is passed in when there is one to share — two lanes, two bots,
+    one account (`PersonConnection`). A person given none opens its own and closes
+    it again, which is what the single-peer callers and this module's own CLI want.
+    """
+
+    def __init__(
+        self,
+        peer: str,
+        *,
+        journal: Journal = _no_journal,
+        directory: Path | None = None,
+        connection: PersonConnection | None = None,
+    ) -> None:
+        self._peer_name = peer
+        self._journal = journal
+        self._directory = directory or person_directory()
+        self._owns_connection = connection is None
+        self._connection = connection or PersonConnection(directory=self._directory)
         self._peer: object | None = None
 
     # --- lifetime ---------------------------------------------------------
@@ -238,15 +298,11 @@ class TelegramPerson:
         self.close()
 
     def open(self) -> None:
-        """Connect, refuse if the session is not authorised, resolve the peer."""
-        self._run(self._client.connect())
-        if not self._run(self._client.is_user_authorized()):
-            raise PersonError(
-                f"the Telegram user-account session at {session_path(self._directory)} is not "
-                f"authorised. Run `python tests/acceptance/telegram_person.py login` once."
-            )
-        self._peer = self._run(self._client.get_entity(self._peer_name))
-        me = self._run(self._client.get_me())
+        """Connect if this person owns the connection, then resolve the peer."""
+        if self._owns_connection:
+            self._connection.open()
+        self._peer = self._run(self._connection.client.get_entity(self._peer_name))
+        me = self._connection.account or self._run(self._connection.client.get_me())
         self._journal(
             "telegram.person.opened",
             account_id=me.id,
@@ -255,7 +311,8 @@ class TelegramPerson:
         )
 
     def close(self) -> None:
-        _shut_down(self._client, self._loop)
+        if self._owns_connection:
+            self._connection.close()
         self._journal("telegram.person.closed", peer=self._peer_name)
 
     # --- reading and writing the chat -------------------------------------
@@ -307,7 +364,7 @@ class TelegramPerson:
 
     def send(self, text: str) -> PersonMessage:
         """Type one line into the chat, as the person would."""
-        sent = self._run(self._client.send_message(self._peer, text))
+        sent = self._run(self._connection.client.send_message(self._peer, text))
         message = _as_person_message(sent)
         self._journal("telegram.person.sent", **message.as_journal_fields())
         return message
@@ -319,10 +376,12 @@ class TelegramPerson:
         return (_as_person_message(message) for message in raw)
 
     async def _collect(self, **query: object) -> list[object]:
-        return [message async for message in self._client.iter_messages(self._peer, **query)]
+        return [
+            message async for message in self._connection.client.iter_messages(self._peer, **query)
+        ]
 
     def _run(self, coroutine):  # noqa: ANN001, ANN202 - Telethon's own return types
-        return self._loop.run_until_complete(coroutine)
+        return self._connection.run(coroutine)
 
 
 def _as_person_message(message: object) -> PersonMessage:
