@@ -23,8 +23,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.approvals import ApprovalOutcome, PendingApproval
 from gpt_voicecoding.core.bridge import Status
+from gpt_voicecoding.core.briefing import Decision, RosterBrief, SessionBrief
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome
 from gpt_voicecoding.core.sessions import Session
@@ -95,6 +97,20 @@ def read_target(payload: Mapping[str, Any], key: str = "target") -> SessionTarge
         return SessionTarget(agent=read_agent(raw, "agent"), session_id=session_id, pid=pid)
     except ValueError as refusal:
         raise InvalidPayload(str(refusal)) from None
+
+
+def read_optional_target(payload: Mapping[str, Any], key: str = "target") -> SessionTarget | None:
+    """The address an action may carry, or `None` when it carried none.
+
+    An omitted key and an explicit JSON `null` are one answer — "no address" —
+    which is how `read_route` already reads an absent value, and how a surface
+    that builds its payload from a nullable field will write it.
+
+    **Unusable is not absent.** A `target` that is present and names nothing is
+    a refusal, because a reader that widened it would answer the whole roster to
+    a surface that asked about one Session.
+    """
+    return None if payload.get(key) is None else read_target(payload, key)
 
 
 def read_agent(payload: Mapping[str, Any], key: str = "agent") -> AgentKind:
@@ -246,6 +262,74 @@ def status_document(
         "call_id": status.call_id,
         "pending_relays": [pending_relay_document(item) for item in status.pending_relays],
         "pending_approvals": [pending_approval_document(item) for item in status.pending_approvals],
+    }
+
+
+def brief_document(brief: RosterBrief | SessionBrief) -> dict[str, Any]:
+    """One brief on the wire: its structure, and the one rendering of it.
+
+    **Both, deliberately.** `text` is what a surface prints, and it is the
+    engine's own — `briefing.text` is the only renderer of Session state there
+    is (#166 B6), so a `bridgectl` that composed its own line would be the
+    second voice this whole module exists to prevent. The structure travels
+    beside it because later work reads fields rather than lines: the dial's
+    hand-over is built from the brief, never from its rendering.
+    """
+    rendered = {"text": briefing.text(brief)}
+    if isinstance(brief, RosterBrief):
+        return {"kind": "roster", "roster": roster_brief_document(brief), **rendered}
+    return {"kind": "session", "session": session_brief_document(brief), **rendered}
+
+
+def roster_brief_document(brief: RosterBrief) -> dict[str, Any]:
+    return {
+        "counts": {str(state): count for state, count in brief.counts.items()},
+        "focus": target_document(brief.focus) if brief.focus is not None else None,
+        "rows": [
+            {
+                "target": target_document(row.target),
+                "name": str(row.name) if row.name is not None else None,
+                "agent": str(row.agent),
+                "state": str(row.state),
+                "focus": row.focus,
+            }
+            for row in brief.rows
+        ],
+    }
+
+
+def session_brief_document(brief: SessionBrief) -> dict[str, Any]:
+    return {
+        "target": target_document(brief.target),
+        "name": str(brief.name) if brief.name is not None else None,
+        "agent": str(brief.agent),
+        "state": str(brief.state),
+        "newest": {"state": str(brief.newest.state), "text": brief.newest.text},
+        "decision": decision_document(brief.decision),
+        "answerable_here": brief.answerable_here,
+        "last_activity_at": (
+            brief.last_activity_at.isoformat() if brief.last_activity_at is not None else None
+        ),
+    }
+
+
+def decision_document(decision: Decision | None) -> dict[str, Any] | None:
+    """What the Session is waiting on, whole. `null` when it waits on nothing."""
+    if decision is None:
+        return None
+    return {
+        "prompt": decision.prompt,
+        "options": [
+            {
+                "text": option.text,
+                "description": option.description,
+                "recommended": option.recommended,
+            }
+            for option in decision.options
+        ],
+        "recommendation": decision.recommendation,
+        "tool": decision.tool,
+        "summary": decision.summary,
     }
 
 

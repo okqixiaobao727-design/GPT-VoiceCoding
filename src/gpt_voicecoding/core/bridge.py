@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Final
 
+from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
+from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
@@ -78,6 +80,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionInspection,
     SessionLifecycle,
     SessionState,
     SessionStopped,
@@ -161,6 +164,26 @@ def spoken_reference(session: Session | None, target: SessionTarget) -> str:
     the other not.
     """
     return spoken_name(session) if session is not None else spoken_target(target)
+
+
+def _as_read_now(read: Session, fresh: ProgressObservation) -> Session:
+    """The folded row, but saying what *this* read found about its progress.
+
+    `Session.with_progress` keeps a readable observation when a newer pass could
+    not answer, which is the right rule for a roster: a row that says nothing
+    where it used to say something has lost a fact rather than gained one, and
+    the roster is a standing account.
+
+    It is the wrong rule for a verb that answers *now*. `brief <address>` is one
+    fresh reading taken at the moment the user is spoken to, so a read that
+    failed has to reach them as a failure — otherwise the Voice reads out a
+    message from some earlier tick as though it had just been said, which is the
+    one thing "read at the moment you speak" exists to prevent. The roster keeps
+    what it had; the brief says what it found.
+    """
+    if fresh.availability is not ProgressAvailability.UNREADABLE:
+        return read
+    return replace(read, progress=fresh)
 
 
 def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
@@ -420,6 +443,60 @@ class BridgeCore:
         a surface that asks for progress and then asks for `status` cannot be
         told two different things about one Session.
         """
+        row = await self._inspect_now(target)
+        if row.progress.availability is ProgressAvailability.UNREADABLE:
+            assert row.progress.reason is not None
+            raise LaneUnreadable(str(target.agent), row.progress.reason)
+        read = self._state.sessions.observed_one(row, now=self._stamp())
+        if read.progress.availability is ProgressAvailability.NOT_READ:
+            raise ProgressUnavailable(target)
+        return read
+
+    async def brief(self, target: SessionTarget | None = None) -> RosterBrief | SessionBrief:
+        """The Roster Brief, or one Session Brief with Detail — read now.
+
+        One verb with an optional address, because they are one question at two
+        widths: *what is everything doing* and *what is that one doing*. The
+        words come from Briefing and from nowhere else (#166), so the Voice, the
+        Companion Channel and `bridgectl` are told the same thing.
+
+        With no address it is a read of state the hub already holds — no lane is
+        touched, so it answers as fast as `status` and cannot be made to hang by
+        a lane that is down. With an address it is exactly one `inspect`,
+        legacy's "exactly one fetch, read at the moment you speak"
+        (`legacy@1d32845:skill/announcing.md` step 1, `bridge/host.py:399-405`),
+        **ported**.
+
+        **It never sets the Focus Session** (#165 Q2): asking about a Session is
+        not replying to one, and a read that moved the focus would let the Voice
+        change what it speaks first merely by looking.
+
+        Its refusals are `progress`'s, minus two. An unknown identity, a stale
+        one, a Child Process and a lane that could not be read all refuse here
+        exactly as they do there. What does **not** refuse is a Session whose
+        *progress* could not be read: `progress` exists to answer with a
+        Session's own words and has nothing to say without them, while a brief
+        still has a state, a wait and a name — so an unreadable reading becomes
+        the UNREADABLE state or an unreadable `newest`, which is the honest
+        answer and the one the five states were drawn to carry.
+        """
+        if target is None:
+            return briefing.roster(self._state.sessions.all(), self._state.sessions.focus)
+        row = await self._inspect_now(target)
+        read = self._state.sessions.observed_one(row, now=self._stamp())
+        return briefing.session(
+            _as_read_now(read, row.progress),
+            question_answerable=self._question_answerable(read.target),
+        )
+
+    async def _inspect_now(self, target: SessionTarget) -> SessionInspection:
+        """One exact Session, read now through its own lane and no other.
+
+        The shared half of `progress` and `brief`: resolve one identity, ask the
+        one lane that owns it, and refuse rather than answer from somewhere else.
+        The row is returned unfolded, because the two callers fold it on
+        different terms.
+        """
         session = self._state.sessions.resolve(target)
         adapter = self._agents.get(target.agent)
         if adapter is None:
@@ -428,16 +505,9 @@ class BridgeCore:
             row = await adapter.inspect(session.target)
         except LaneUnavailable as unread:
             raise LaneUnreadable(str(unread.agent), unread.reason) from None
-
         if row.lifecycle is not SessionLifecycle.LIVE:
             raise StaleSessionError(target, reason=f"that Session is {row.lifecycle}")
-        if row.progress.availability is ProgressAvailability.UNREADABLE:
-            assert row.progress.reason is not None
-            raise LaneUnreadable(str(target.agent), row.progress.reason)
-        read = self._state.sessions.observed_one(row, now=self._stamp())
-        if read.progress.availability is ProgressAvailability.NOT_READ:
-            raise ProgressUnavailable(target)
-        return read
+        return row
 
     async def flip_switch(self, name: str, on: bool) -> bool:
         """Flip a switch and report the state it held before.
@@ -519,13 +589,27 @@ class BridgeCore:
         which decision would be a surface that has to be changed when the hub
         rearranges itself.
         """
-        return await self.relays.relay(target, text, route=route)
+        outcome = await self.relays.relay(target, text, route=route)
+        # The user has just spoken to this Session, so it becomes the Focus
+        # Session (#165 Q2) — whatever the receipt says. Focus follows the
+        # user's attention, and a Relay that failed to land is precisely the
+        # Session they are still waiting on.
+        self._state.sessions.set_focus(outcome.target)
+        return outcome
 
     async def answer_approval(
         self, approval_id: str, verdict: ApprovalVerdict
     ) -> ApprovalOutcome | None:
-        """Carry the user's verdict. None when nothing is waiting under that id."""
-        return await self.approvals.answer(approval_id, verdict)
+        """Carry the user's verdict. None when nothing is waiting under that id.
+
+        Answering a permission is replying to that Session, so it takes the
+        focus exactly as an Answer Relay does. A verdict that found nothing to
+        answer moves nothing: there was no Session to have replied to.
+        """
+        outcome = await self.approvals.answer(approval_id, verdict)
+        if outcome is not None:
+            self._state.sessions.set_focus(outcome.request.target)
+        return outcome
 
     async def verify(self) -> tuple[SeamVerification, ...]:
         """What configuration named, against what this engine actually loaded.

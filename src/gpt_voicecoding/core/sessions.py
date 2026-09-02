@@ -31,6 +31,12 @@ There is one registry and one Reply Window per Session — and the Reply Window 
 **derived**, so there is no second copy to disagree with the first. The reference
 implementation ran two live ledgers and rendered both; nothing here may grow a
 second.
+
+The **Focus Session** is the one piece of state here that is about the roster
+rather than about a row: one pointer at the Session the user last replied to,
+set by a Relay or an Approval Relay and cleared when that Session ends. It is a
+pointer and not a flag on a row for the reason everything else here is one thing
+— a flag per row is a shape that can hold two.
 """
 
 from __future__ import annotations
@@ -291,6 +297,65 @@ class SessionRegistry:
         #: other has no news at all. Collapsing them would repeat the two-field
         #: encoding `LaneDiscovery` exists to avoid.
         self._lane_degradations: dict[AgentKind, str] = {}
+        #: The Focus Session — the one the user last replied to, by Answer Relay
+        #: or Approval Relay (#165 Q2). **One pointer on the registry, never a
+        #: flag on a row**: it is a fact about the roster rather than about any
+        #: Session, and there is exactly one at a time — a per-row flag is a
+        #: shape that can hold two, and nothing but a sweep would notice.
+        self._focus: SessionTarget | None = None
+
+    # -- the Focus Session ----------------------------------------------
+
+    @property
+    def focus(self) -> SessionTarget | None:
+        """The Session whose news is spoken first, or None when there is none."""
+        return self._focus
+
+    def set_focus(self, target: SessionTarget) -> None:
+        """The user replied to this Session, so it becomes the Focus Session.
+
+        Held as the identity the *roster* addresses it by rather than the one
+        the caller happened to write, so a Codex Session named `codex::6548` by
+        a surface and `codex:abc:6548` by the roster is one focus and not two.
+
+        Set only by the user replying — never by asking about a Session (#165
+        Q2). `brief` is a read, and a read that moved the focus would let the
+        Voice change what it speaks first merely by looking.
+
+        **It never raises.** A Session the roster does not hold — an approval
+        answered for a row that ended between the dialog opening and the verdict
+        arriving — cannot be the one spoken first, because there is nothing to
+        speak about. Refusing here would turn a verdict that was carried into a
+        refusal the user reads as their answer having been dropped, which is the
+        opposite of what happened. The focus stands where it was, and the
+        attempt is said out loud rather than swallowed.
+        """
+        try:
+            self._focus = self._live_row(target).target
+        except (UnknownSessionError, StaleSessionError):
+            _log.info("the user replied to a Session this roster does not hold: %s", target)
+
+    def _focus_ended(self, target: SessionTarget) -> None:
+        """Clear the focus if this is the Session it named. Ended is ended."""
+        if self._focus == target:
+            self._focus = None
+
+    def _refocus(self, held: SessionTarget, target: SessionTarget) -> None:
+        """One row has been re-keyed. Either the focus follows it, or it is dropped.
+
+        `_better_known` takes a newly-read session id in **two** cases and they
+        are not the same event. A row we held anonymously that has taken its
+        first turn is the same Session gaining the id it had none of (#73), so
+        the focus follows it: the user replied to that Session, and it is still
+        the Session they replied to. A row whose *known* id changed under one
+        pid is `/new` in that TUI — a different thread on the same process (#77)
+        — and the focus does not follow: it would name a Session the user has
+        never replied to, which is the one way the Focus Session must not be set
+        (#165 Q2).
+        """
+        if self._focus != held:
+            return
+        self._focus = target if held.session_id is None else None
 
     # -- observation ----------------------------------------------------
 
@@ -367,6 +432,7 @@ class SessionRegistry:
         for held in [row for row in self._of(agent) if row.target not in seen]:
             if held.is_live:
                 self._sessions[held.target] = replace(held, lifecycle=SessionLifecycle.ENDED)
+                self._focus_ended(held.target)
                 ended.append(held.target)
             else:
                 del self._sessions[held.target]
@@ -408,6 +474,7 @@ class SessionRegistry:
         target = _better_known(held.target, row.target)
         updated = held.observed(row, target=target)
         if target != held.target:
+            self._refocus(held.target, target)
             del self._sessions[held.target]
         self._sessions[target] = updated
         return updated
@@ -570,6 +637,7 @@ class SessionRegistry:
         held = self._live_row(target)
         ended = replace(held, lifecycle=SessionLifecycle.ENDED)
         self._sessions[held.target] = ended
+        self._focus_ended(held.target)
         return ended
 
     def _live_row(self, target: SessionTarget) -> Session:
@@ -591,6 +659,7 @@ class SessionRegistry:
         session = self._sessions.pop(target, None)
         if session is None:
             raise UnknownSessionError(target)
+        self._focus_ended(target)
 
     def live(self) -> tuple[Session, ...]:
         """The roster, in the order the Sessions were first seen."""

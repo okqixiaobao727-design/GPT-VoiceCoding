@@ -24,7 +24,9 @@ from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
+    LaneDiscovery,
     ReplyWindow,
+    SessionInspection,
     SessionLifecycle,
     SessionState,
     WaitingFor,
@@ -369,3 +371,100 @@ class TestRoster:
         registry.mark_ended(session.target)
         assert registry.live() == ()
         assert len(registry.all()) == 1
+
+
+class TestTheFocusSession:
+    """One pointer, cleared by the Session ending and by nothing else (#165 Q2)."""
+
+    def test_the_focus_is_held_as_the_identity_the_roster_addresses_it_by(self) -> None:
+        """A surface may write a weaker address than the roster holds."""
+        registry = SessionRegistry()
+        held = registry.register(claude("abc", pid=100))
+
+        registry.set_focus(SessionTarget(agent=AgentKind.CLAUDE, session_id="abc", pid=100))
+
+        assert registry.focus == held.target
+
+    def test_a_session_the_roster_does_not_hold_leaves_the_focus_where_it_was(self) -> None:
+        """A verdict carried for a row that ended is still a verdict carried.
+
+        Refusing here would turn the answer landing into the user being told it
+        did not — the opposite of what happened.
+        """
+        registry = SessionRegistry()
+        registry.register(codex("abc"))
+        registry.set_focus(SessionTarget(agent=AgentKind.CODEX, session_id="abc"))
+
+        registry.set_focus(SessionTarget(agent=AgentKind.CODEX, session_id="gone"))
+
+        assert registry.focus == SessionTarget(agent=AgentKind.CODEX, session_id="abc")
+
+    def test_the_focus_clears_when_that_session_is_marked_ended(self) -> None:
+        registry = SessionRegistry()
+        session = registry.register(codex("abc"))
+        registry.set_focus(session.target)
+
+        registry.mark_ended(session.target)
+
+        assert registry.focus is None
+
+    def test_the_focus_clears_when_a_discovery_stops_seeing_that_session(self) -> None:
+        registry = SessionRegistry()
+        session = registry.register(codex("abc"))
+        registry.set_focus(session.target)
+
+        registry.observe(AgentKind.CODEX, LaneDiscovery(), now=2_000.0)
+
+        assert registry.focus is None
+
+    def test_the_focus_clears_when_that_session_is_forgotten(self) -> None:
+        registry = SessionRegistry()
+        session = registry.register(codex("abc"))
+        registry.set_focus(session.target)
+
+        registry.forget(session.target)
+
+        assert registry.focus is None
+
+    def test_another_session_ending_leaves_the_focus_alone(self) -> None:
+        registry = SessionRegistry()
+        focused = registry.register(codex("abc"))
+        other = registry.register(codex("def"))
+        registry.set_focus(focused.target)
+
+        registry.mark_ended(other.target)
+
+        assert registry.focus == focused.target
+
+    def test_the_focus_does_not_follow_a_new_thread_on_the_same_process(self) -> None:
+        """`/new` in a Codex TUI is a different Session under one pid (#77).
+
+        Following it would make the Focus Session one the user has never replied
+        to, which is the one way #165 Q2 says it must not be set.
+        """
+        registry = SessionRegistry()
+        held = SessionTarget(agent=AgentKind.CODEX, session_id="abc", pid=6548)
+        registry.register(Session(target=held, workspace=WORKSPACE, first_seen=1_000.0))
+        registry.set_focus(held)
+
+        registry.observed_one(
+            SessionInspection(
+                target=SessionTarget(agent=AgentKind.CODEX, session_id="def", pid=6548),
+                workspace=WORKSPACE,
+            ),
+            now=2_000.0,
+        )
+
+        assert registry.focus is None
+
+    def test_the_focus_follows_a_codex_row_that_gains_its_thread_id(self) -> None:
+        """A better-known identity is the same Session, and nothing ended (#73)."""
+        registry = SessionRegistry()
+        anonymous = SessionTarget(agent=AgentKind.CODEX, pid=6548)
+        registry.register(Session(target=anonymous, workspace=WORKSPACE, first_seen=1_000.0))
+        registry.set_focus(anonymous)
+
+        named = SessionTarget(agent=AgentKind.CODEX, session_id="abc", pid=6548)
+        registry.observed_one(SessionInspection(target=named, workspace=WORKSPACE), now=2_000.0)
+
+        assert registry.focus == named

@@ -198,7 +198,7 @@ class TestActingOnASessionThatIsNotThere:
     def test_an_empty_roster_says_so(
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert main(["--config", str(engine_at), "sessions"]) == 0
+        assert main(["--config", str(engine_at), "brief"]) == 0
         assert "sessions: none" in capsys.readouterr().out
 
 
@@ -229,12 +229,23 @@ class TestSayingNoOutLoud:
 
 
 class TestRenderingLaneDegradation:
-    def test_sessions_says_when_progress_was_unreadable(self) -> None:
+    def test_status_says_when_progress_was_unreadable(self) -> None:
+        """Where degradation is said, now that the roster verb is a Briefing.
+
+        A degraded lane is news about the lane, not about any Session, and a
+        Session Brief is only ever about a Session. `status` is the surface that
+        answers "what is this engine holding", so it is the one that says its
+        rows were read by something weaker than usual.
+        """
         rendered = render(
             Reply.answered(
-                Action.SESSIONS,
+                Action.STATUS,
                 {
+                    "switches": {"duty": True},
                     "sessions": [],
+                    "call_id": None,
+                    "pending_relays": [],
+                    "pending_approvals": [],
                     "degraded_lanes": {"codex": "the daemon dropped the progress read"},
                 },
             )
@@ -242,6 +253,21 @@ class TestRenderingLaneDegradation:
 
         assert "codex lane degraded" in rendered
         assert "the daemon dropped the progress read" in rendered
+
+    def test_a_brief_is_printed_in_the_engines_own_words(self) -> None:
+        """One renderer (#166 B6): this surface prints, and never composes."""
+        rendered = render(
+            Reply.answered(
+                Action.BRIEF,
+                {
+                    "kind": "roster",
+                    "roster": {"counts": {}, "focus": None, "rows": []},
+                    "text": "sessions: none",
+                },
+            )
+        )
+
+        assert rendered == "sessions: none"
 
 
 class TestNoEngineAtAll:

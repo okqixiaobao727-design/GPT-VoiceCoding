@@ -910,9 +910,19 @@ class Walk:
                 f"harness started it in ({self.config.workspace}) — the join that makes this "
                 f"row this Session rather than a coincidence"
             )
+        brief = self.bridgectl("brief")
+        if not brief.ok:
+            raise StepFailed(f"`bridgectl brief` refused: {brief.text}")
+        if self.address not in brief.text:
+            raise StepFailed(
+                f"the Roster Brief does not carry {self.address}, so the voice side has no "
+                f"row to ask about: {brief.text[:300]!r}. #187 makes `brief` the surface the "
+                f"roster is read through, and every row it lists is one it can be asked about."
+            )
         return (
-            f"{self.address} present in the roster against its own workspace; "
-            f"agent's own record {truth.describe()}; the engine lists {len(rows)} session(s)"
+            f"{self.address} present in the roster against its own workspace and in the "
+            f"Roster Brief; agent's own record {truth.describe()}; "
+            f"the engine lists {len(rows)} session(s)"
         )
 
     # --- stable name ------------------------------------------------------
@@ -947,7 +957,19 @@ class Walk:
                 f"the name held at {after!r}, but the turn never ended within "
                 f"{self.far_side.agent_turn_seconds:.0f}s so no Stop was crossed"
             )
-        return f"{after!r} across {NAME_READS} reads and across a Stop ({turn.seconds:.1f}s turn)"
+        brief = self.bridgectl("brief")
+        if not brief.ok:
+            raise StepFailed(f"`bridgectl brief` refused: {brief.text}")
+        if after not in brief.text:
+            raise StepFailed(
+                f"the roster holds the name {after!r} and the Roster Brief says "
+                f"{brief.text[:300]!r} — the name the user hears has to be the name the "
+                f"roster stabilised, or #78's stability is about a field nobody is told"
+            )
+        return (
+            f"{after!r} across {NAME_READS} reads, across a Stop, and in the Roster Brief "
+            f"({turn.seconds:.1f}s turn)"
+        )
 
     # --- progress ---------------------------------------------------------
 
@@ -1028,10 +1050,38 @@ class Walk:
                 f"reading progress grew the Session's own record from {before_size} to "
                 f"{after_size} bytes — that is a turn, and #76 forbids one"
             )
+        brief = self.bridgectl("brief", self.address)
+        if not brief.ok:
+            raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
+        newest = next(
+            (
+                line.strip().removeprefix("newest: ")
+                for line in brief.text.splitlines()
+                if line.strip().startswith("newest: ")
+            ),
+            None,
+        )
+        if not newest:
+            raise StepFailed(
+                f"`bridgectl brief {self.address}` carried no newest message after a turn: "
+                f"{brief.text[:300]!r}. #187 makes the Session Brief the one place the "
+                f"newest message is handed over, whole."
+            )
+        # Compared on a prefix, and only after both sides are collapsed: a
+        # message with newlines in it is one rendered line to Briefing and
+        # several to `progress`, so an exact substring test would fail on the
+        # rendering rather than on the two readings disagreeing.
+        opening = " ".join(newest.split())[:60]
+        if opening not in " ".join(said.split()):
+            raise StepFailed(
+                f"the Session Brief's newest message {newest[:120]!r} is not among the "
+                f"entries `bridgectl progress {self.address}` read ({said[:200]!r}) — two "
+                f"readings of one Session that disagree"
+            )
         return (
-            f"exact progress read without a turn and roster summary retained its facts: "
-            f"{said[:160]!r}; record steady at {after_size} bytes; "
-            f"state {before_state!r} → {after_state!r}"
+            f"exact progress read without a turn, roster summary retained its facts, and "
+            f"the Session Brief carried the newest message whole: {newest[:120]!r}; "
+            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}"
         )
 
     # --- stop notice ------------------------------------------------------
@@ -1583,11 +1633,33 @@ class Walk:
                 f"{refused.text!r} does not name it, so this is the call going wrong rather than "
                 f"the child rule being applied"
             )
+        # Seen, never spoken to — and never briefed about either. The Roster
+        # Brief is what the voice side picks rows from, so a child listed there
+        # would be a row the model can ask about and nothing can answer.
+        roster_brief = self.bridgectl("brief")
+        if roster_brief.ok and child_address in roster_brief.text:
+            raise StepFailed(
+                f"the child {child_address} has a row in the Roster Brief: "
+                f"{roster_brief.text[:300]!r} — every row there is one `brief <address>` "
+                f"answers, and a child is refused"
+            )
+        unbriefed = self.bridgectl("brief", child_address)
+        if unbriefed.ok:
+            raise StepFailed(
+                f"the child {child_address} was briefed: {unbriefed.text!r} — #79: seen, "
+                f"never spoken to, and #187 refuses it by the same rule `relay` does"
+            )
+        if child_address not in unbriefed.text:
+            raise StepFailed(
+                f"`brief {child_address}` failed without refusing it — the answer "
+                f"{unbriefed.text!r} does not name it, so this is the call going wrong rather "
+                f"than the child rule being applied"
+            )
         return (
             f"{child_address} listed under {support.flatten([parent])} (asked to work for "
             f"{CHILD_LIFETIME_SECONDS}s, so the window it was read in is one this step made); "
             f"no notice naming it in {self.far_side.absence_window_seconds:.0f}s; "
-            f"relay refused: {refused.text!r}"
+            f"relay refused: {refused.text!r}; brief refused: {unbriefed.text!r}"
         )
 
     # --- plumbing ---------------------------------------------------------
@@ -1663,11 +1735,21 @@ class Walk:
             time.sleep(TURN_POLL_SECONDS)
 
     def _roster_rows(self) -> list[dict]:
+        """Every roster row the engine holds, with every field on it.
+
+        Read from `status` since #187 retired `sessions`. It is the same rows —
+        `status` always carried them — and it is the surface that still answers
+        "what is this engine holding": workspace, `waiting_for`, the roster
+        progress summary, `ChildClassification`. `brief` answers the other
+        question, "what should the user be told", and deliberately carries none
+        of those; the steps that make a claim about Briefing's words ask `brief`
+        for them, beside this.
+        """
         data = support.control_plane_payload(
-            support.Action.SESSIONS,
+            support.Action.STATUS,
             socket_path=self.config.socket_path,
             journal=self.journal,
-            why="the roster payload carries fields `bridgectl sessions` does not render",
+            why="the roster payload carries fields no rendered line does",
         )
         rows = data.get("sessions", [])
         return [row for row in rows if isinstance(row, dict)]

@@ -57,15 +57,15 @@ start with a named error rather than an `OSError` from inside asyncio.
 ### Reply
 
 ```json
-{"ok": true, "action": "switch", "protocol": 5, "data": {"name": "duty", "on": true, "previous": false}}
+{"ok": true, "action": "switch", "protocol": 6, "data": {"name": "duty", "on": true, "previous": false}}
 ```
 
 ```json
-{"ok": false, "action": "switch", "protocol": 5, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
+{"ok": false, "action": "switch", "protocol": 6, "error": {"code": "unknown_switch", "message": "unknown switch: 'sound'"}}
 ```
 
 `action` is `null` when the line never named a usable one. `protocol` is the
-numeric protocol version, currently `5`. A missing field or JSON `null` means the
+numeric protocol version, currently `6`. A missing field or JSON `null` means the
 reply did not declare a usable version. The Swift shell refuses to interpret any
 reply whose version is missing or differs from the version it supports, and shows
 that protocol mismatch separately from an engine refusal or an unreachable engine.
@@ -91,10 +91,10 @@ the user is told.
 
 ## The actions
 
-Eight, and the set is closed. Adding one is a contract change. Protocol 5 makes
-progress availability and omission explicit and separates compact roster
-summaries from exact detail. A protocol-4 surface must report a mismatch: it
-could otherwise interpret omitted history as silence.
+Eight, and the set is closed. Adding one is a contract change. Protocol 6
+retires `sessions` and adds `brief`, the one verb Session state is fetched
+through. A protocol-5 surface must report a mismatch: it would otherwise send
+`sessions` to an engine that answers `unknown_action`.
 
 `launch` and `close` were the eighth and ninth until protocol 4. They are parked
 with the code behind them ([#72](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/72)):
@@ -187,12 +187,93 @@ row of its own.
 `reply_window` is derived on the row and rendered here, so no surface re-derives
 it and no two surfaces can disagree about one Session.
 
-### `sessions`
+### `brief`
 
-Payload: none. Data: `{"sessions": [...], "degraded_lanes": {...}}` — the same
-rows and lane-degradation facts `status` carries, for a surface that renders
-only the roster. The degradation map is required to distinguish a retained last
-observation from a source that was unreadable on the latest pass.
+Payload: none, or `{"target": {"agent": "codex", "session_id": "abc", "pid": null}}`.
+Answered by Briefing (`core/briefing.py`), which is the **only** thing in this
+engine that puts words to what a Session is doing. An omitted `target`, or one
+written as JSON `null`, means the whole roster — the same reading `route` gives
+an absent value. A `target` that is **present and unusable** is refused rather
+than widened: a surface that asked about one Session is never answered with all
+of them.
+
+Every reply carries `kind`, `text`, and the structure `text` was rendered from:
+
+```json
+{"kind": "roster",
+ "text": "the others: 1 running\n  …",
+ "roster": {"counts": {"running": 1},
+            "focus": {"agent": "codex", "session_id": "abc", "pid": null},
+            "rows": [{"target": {…}, "name": "gpt-voicecoding · port the log",
+                      "agent": "codex", "state": "decision", "focus": true}]}}
+```
+
+```json
+{"kind": "session",
+ "text": "gpt-voicecoding · port the log — codex:abc — waiting for your decision\n  …",
+ "session": {"target": {…}, "name": "gpt-voicecoding · port the log", "agent": "codex",
+             "state": "decision",
+             "newest": {"state": "said", "text": "I rebuilt the index."},
+             "decision": {"prompt": "Which base?",
+                          "options": [{"text": "main", "description": "the default branch",
+                                       "recommended": true}],
+                          "recommendation": "main", "tool": null, "summary": null},
+             "answerable_here": true,
+             "last_activity_at": "2026-09-02T03:04:05+00:00"}}
+```
+
+**`text` is the engine's own rendering and surfaces print it unchanged.**
+`bridgectl brief` prints exactly this string; so does the Companion Channel. One
+renderer is the point: two would be two descriptions of one Session. The
+structure travels beside it for a surface that reads fields rather than lines.
+
+`state` is one of five, and they are what the user is told:
+
+| State | When |
+| --- | --- |
+| `decision` | A question is waiting, **or** a Codex turn ended — Codex has no question hook, so the ambiguity is briefed as the answerable state until the heuristic that tells them apart lands. |
+| `permission` | A permission dialog is open. |
+| `finished` | This turn is done and the Session is idle for a new instruction. Exited Sessions appear nowhere. |
+| `running` | Mid-turn. Nothing is being asked of the user. |
+| `unreadable` | It stopped, and what it stopped on or what it said could not be read. **Never counted as a decision**, and the brief still carries whatever *was* read. |
+
+`newest` is the newest assistant message **whole**, under ADR 0016's omission
+rules — the engine never condenses, so the one-line conclusion a user hears and
+the detail they may ask for are one field. Its `state` is `said`, `nothing_said`,
+`not_read`, `unreadable` or `oversize`, and `text` is present only for `said`.
+
+`decision` is `null` when nothing is being asked. A question carries `prompt`,
+every `option` and any `recommendation`; a permission carries `tool` and a
+one-line `summary`. Both shapes use the one object, and which one it is follows
+from `state`.
+
+`answerable_here` says whether the user's reply can reach this Session from
+here. A question is answerable while its lane still holds the route; a
+permission is answerable while a handle still holds the dialog open. Anything
+else is answered at the terminal.
+
+The **Roster Brief** lists one header row per live Session, the Focus Session
+first, and children nowhere: every row is one `brief <address>` answers, and a
+Child Process is seen and never spoken to. `counts` is **the others** whenever
+there is a Focus Session — that Session is named in full, so counting it again
+would be one Session told twice.
+
+**The Focus Session is never set here.** It moves when the user *replies* to a
+Session — `relay` or `approve` — and is cleared when that Session ends. Asking
+about a Session is not replying to one.
+
+`newest` travels twice — as a field and inside `text` — so one whole message can
+overflow the line that has to hold it. When it does, the reply still answers:
+`newest` becomes `{"state": "oversize", "text": null}` and everything the user
+acts on — the header, the state, the whole decision — stays. Text is never cut
+(ADR 0016).
+
+`brief <address>` is a **read**, read now, through exactly one `inspect`. Its
+refusals are `progress`'s minus one: `unknown_session`, `stale_session`, and
+`refused` for a Child Process or a lane that could not be read at all. A Session
+whose *progress* could not be read is **not** a refusal here — it is the
+`unreadable` state, or an `unreadable` `newest` on a Session that is still
+running.
 
 ### `progress`
 
@@ -208,7 +289,7 @@ publication. For example:
 ```
 
 It is a **read**: it resolves one exact identity, asks that lane and no other,
-and never starts a turn. What it adds over the same row in `sessions` is *when* —
+and never starts a turn. What it adds over the same row in `status` is *when* —
 the Session is read at the moment it was asked about, rather than at the last
 discovery. The publisher keeps the newest complete entry and widens backwards
 while the complete encoded Reply still fits. Entries are whole or omitted;
@@ -225,7 +306,7 @@ different facts:
 | Code | When |
 | --- | --- |
 | `unknown_session` | No Session by that identity was ever registered here. |
-| `stale_session` | The identity names a different process now, **or** the Session has ended. The row is not ended by this action: `sessions` is the whole-lane reading and is the only thing that ends one. |
+| `stale_session` | The identity names a different process now, **or** the Session has ended. The row is not ended by this action: discovery is the whole-lane reading and is the only thing that ends one. |
 | `refused` | The lane could not be read at all. The message is the lane's own words, and the row stands exactly as the roster last saw it: not being able to look is not a sighting. |
 | `refused` | Nothing could read how far it has got — a Codex Session the shared daemon does not hold, or one whose first turn has written no record yet. |
 
@@ -324,7 +405,7 @@ by one parser, so neither can grow a command the other lacks.
 ```
 status
 switch <name> on|off
-sessions
+brief [<agent>:<session id>[:<pid>]]
 progress <agent>:<session id>[:<pid>]
 live
 relay <agent>:<session id>[:<pid>] [--supplement] <words>

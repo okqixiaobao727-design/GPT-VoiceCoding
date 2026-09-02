@@ -7,7 +7,7 @@ public let maxRequestBytes = 65536
 
 /// The control-plane protocol this shell can interpret. Held to the engine's
 /// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
-public let controlPlaneProtocolVersion = 5
+public let controlPlaneProtocolVersion = 6
 
 /// Whether an Agent's authoritative progress source was read and answered.
 public enum ProgressAvailability: String, Sendable, CaseIterable {
@@ -32,9 +32,15 @@ public enum ProgressOmission: String, Sendable, CaseIterable {
 /// `launch` and `close` were here until protocol 4, and are parked with the code
 /// behind them: the engine answers `unknown_action` for either now, so naming
 /// them here would let this shell offer an action nothing can carry out.
+///
+/// `sessions` was here until protocol 6 and retired with the Briefing verb: the
+/// roster it answered is `brief`'s now, and this panel reads `status`, which
+/// carries the same rows and the switches beside them.
 public enum Action: String, Sendable, CaseIterable {
     case status
-    case sessions
+    /// What the Sessions are doing, in the words the user is told. The whole
+    /// roster with no address, one Session whole with one.
+    case brief
     /// How far along one exact Session is, read now. A question, never a turn.
     case progress
     case `switch`

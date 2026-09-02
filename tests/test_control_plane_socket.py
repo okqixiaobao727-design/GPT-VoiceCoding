@@ -33,6 +33,7 @@ from gpt_voicecoding.control_plane.ownership import SOCKET_MODE, SocketPathTooLo
 from gpt_voicecoding.control_plane.server import AlreadyServing, ControlPlaneServer
 from gpt_voicecoding.seams.control_plane import (
     MAX_REQUEST_BYTES,
+    PROTOCOL_VERSION,
     Action,
     ErrorCode,
     Reply,
@@ -123,7 +124,7 @@ class TestServingAndAnswering:
             server = await serving(socket_dir, plane)
             try:
                 reader, writer = await asyncio.open_unix_connection(str(server.path))
-                for action in (Action.STATUS, Action.SESSIONS, Action.VERIFY):
+                for action in (Action.STATUS, Action.BRIEF, Action.VERIFY):
                     writer.write(json.dumps(Request(action=action).as_document()).encode() + b"\n")
                     await writer.drain()
                     assert Reply.of(json.loads(await reader.readline())).action is action
@@ -133,7 +134,7 @@ class TestServingAndAnswering:
                 await server.aclose()
 
         asyncio.run(scenario())
-        assert plane.handled == [Action.STATUS, Action.SESSIONS, Action.VERIFY]
+        assert plane.handled == [Action.STATUS, Action.BRIEF, Action.VERIFY]
 
     def test_the_socket_is_private_to_this_user(self, socket_dir: Path) -> None:
         async def scenario() -> int:
@@ -290,7 +291,7 @@ class TestOneBadLineCostsOneRequest:
         assert reply.error is not None
         assert reply.error.code is ErrorCode.REFUSED
 
-    def test_the_physical_reply_declares_protocol_five(self, socket_dir: Path) -> None:
+    def test_the_physical_reply_declares_the_current_protocol(self, socket_dir: Path) -> None:
         async def scenario() -> bytes:
             server = await serving(socket_dir, StubPlane())
             try:
@@ -302,7 +303,7 @@ class TestOneBadLineCostsOneRequest:
         answer = asyncio.run(scenario())
 
         assert answer.endswith(b"\n")
-        assert json.loads(answer)["protocol"] == 5
+        assert json.loads(answer)["protocol"] == PROTOCOL_VERSION
 
 
 class TestTwoSurfacesAtOnce:

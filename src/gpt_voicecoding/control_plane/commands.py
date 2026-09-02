@@ -29,7 +29,7 @@ from gpt_voicecoding.seams.identity import ADDRESS_SEPARATOR, address_of
 USAGE: dict[Action, str] = {
     Action.STATUS: "status",
     Action.SWITCH: "switch <name> on|off",
-    Action.SESSIONS: "sessions",
+    Action.BRIEF: "brief [<agent>:<session id>[:<pid>]]",
     Action.PROGRESS: "progress <agent>:<session id>[:<pid>]",
     Action.LIVE: "live",
     Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
@@ -59,8 +59,10 @@ def build_request(command: str, arguments: Sequence[str]) -> Request:
 
 def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
     match action:
-        case Action.STATUS | Action.SESSIONS | Action.LIVE | Action.VERIFY:
+        case Action.STATUS | Action.LIVE | Action.VERIFY:
             return {}
+        case Action.BRIEF:
+            return _brief(arguments)
         case Action.SWITCH:
             name, state = _exactly(action, arguments, 2)
             return {"name": name, "on": _state(state)}
@@ -73,6 +75,19 @@ def _payload(action: Action, arguments: list[str]) -> dict[str, object]:
             (address,) = _exactly(action, arguments, 1)
             return {"target": parse_address(address)}
     raise CommandError(f"no command called {action!r}")  # unreachable: the set is closed
+
+
+def _brief(arguments: list[str]) -> dict[str, object]:
+    """`brief` is the Roster Brief; `brief <address>` is one Session Brief.
+
+    The address is optional and never inferred — not from a Focus Session, not
+    from the last one asked about. Two questions, one verb, and which one is
+    being asked is written on the line.
+    """
+    if not arguments:
+        return {}
+    (address,) = _exactly(Action.BRIEF, arguments, 1)
+    return {"target": parse_address(address)}
 
 
 def _relay(arguments: list[str]) -> dict[str, object]:
@@ -151,13 +166,12 @@ def render(reply: Reply) -> str:
     match reply.action:
         case Action.STATUS:
             return "\n".join(_status_lines(data))
-        case Action.SESSIONS:
-            return "\n".join(
-                [
-                    *_roster_lines(data["sessions"]),
-                    *_degraded_lane_lines(data.get("degraded_lanes")),
-                ]
-            )
+        case Action.BRIEF:
+            # The engine's own rendering, printed unchanged. `briefing.text` is
+            # the only renderer of Session state there is (#166 B6), and this
+            # surface reading the structured fields back into a line of its own
+            # is exactly the second voice that rule exists to prevent.
+            return str(data["text"])
         case Action.PROGRESS:
             return "\n".join(_progress_lines(data["session"]))
         case Action.SWITCH:
@@ -186,7 +200,7 @@ def _status_lines(data: dict[str, object]) -> list[str]:
     ]
     call_id = data["call_id"]
     lines.append(f"call: {call_id}" if call_id else "call: none")
-    lines.extend(_roster_lines(data["sessions"]))
+    lines.extend(_status_roster_lines(data["sessions"]))
     lines.extend(_lane_lines(data.get("lanes")))
     lines.extend(_degraded_lane_lines(data.get("degraded_lanes")))
     pending_relays = data["pending_relays"]
@@ -196,7 +210,19 @@ def _status_lines(data: dict[str, object]) -> list[str]:
     return lines
 
 
-def _roster_lines(sessions: object) -> list[str]:
+def _status_roster_lines(sessions: object) -> list[str]:
+    """The roster inside `status`, which is a different question from `brief`.
+
+    `status` answers "what is this engine holding" — every row, ended ones
+    included, with the workspace and the Reply Window an operator debugging a
+    lane needs. `brief` answers "what should the user be told", and Briefing
+    owns every word of that. Two questions, so two renderings; what retired with
+    `sessions` was a *third*, which said the second in the first's words.
+
+    `progress` prints one of these too, without the heading, so one Session is
+    not described two ways by the two verbs that carry its row. It retires with
+    `progress` itself (#190).
+    """
     assert isinstance(sessions, list)
     if not sessions:
         return ["sessions: none"]
@@ -216,10 +242,10 @@ def _progress_lines(session: object) -> list[str]:
     reading taken before a five-minute silence read as one taken just now.
     """
     assert isinstance(session, dict)
-    #: The same one-line summary the roster prints for this Session, without the
+    #: The same one-line summary `status` prints for this Session, without the
     #: `sessions:` heading a list of them carries — so the two surfaces cannot
     #: describe one Session two ways.
-    lines = _roster_lines([session])[1:]
+    lines = _status_roster_lines([session])[1:]
     progress = session["progress"]
     assert isinstance(progress, dict)
     availability = progress["availability"]

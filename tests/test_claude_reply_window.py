@@ -27,7 +27,6 @@ import pytest
 from gpt_voicecoding.adapters.agent.claude import window as window_module
 from gpt_voicecoding.adapters.agent.claude.registry import PEER_PROTOCOL, SessionRecord
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
-from gpt_voicecoding.adapters.agent.claude.waiting_labels import SANDBOX_TOOL_NAME
 from gpt_voicecoding.adapters.agent.claude.window import (
     PID_RECYCLED,
     PROCESS_GONE,
@@ -37,6 +36,7 @@ from gpt_voicecoding.adapters.agent.claude.window import (
     window_for,
 )
 from gpt_voicecoding.seams.agent import (
+    SANDBOX_TOOL_NAME,
     AgentEvent,
     Option,
     ProgressObservation,

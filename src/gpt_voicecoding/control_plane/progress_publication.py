@@ -102,14 +102,6 @@ class ProgressPublication:
             progress_for=self.summary_document,
         )
 
-    def sessions_document(self, status: Status) -> dict[str, Any]:
-        """Roster rows plus the degradation facts required to interpret them."""
-        document = self.status_document(status)
-        return {
-            "sessions": document["sessions"],
-            "degraded_lanes": document["degraded_lanes"],
-        }
-
     def exact_document(
         self,
         session: Session,
