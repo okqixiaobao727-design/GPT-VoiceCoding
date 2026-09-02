@@ -22,14 +22,17 @@ import journey
 import pytest
 
 from claude_adapter_fake import ParkedApproval, claude_waiting_roster
-from fakes import PROGRESS_CAPTURE, FakeCall
+from fakes import PROGRESS_CAPTURE, FakeCall, UnreachableFarSide, handed_over, spoken_words
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
+    USER_OPENED,
+    VOICE_QUIET_LINE,
+    VOICE_SPEAKING_LINE,
 )
-from gpt_voicecoding.core.errors import ChildSessionError, VoiceInstructionsMissing
+from gpt_voicecoding.core.errors import CallInstructionsMissing, ChildSessionError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.core.router import Classification
@@ -56,11 +59,34 @@ from gpt_voicecoding.seams.agent import (
     WaitingFor,
     WaitingKind,
 )
-from gpt_voicecoding.seams.call import CallDropped, CallStarted, CallState, UserSpeech
+from gpt_voicecoding.seams.call import (
+    CallDropped,
+    CallEnded,
+    CallStarted,
+    CallState,
+    Cue,
+    DialReason,
+    SpokenBrief,
+    SpokenRosterBrief,
+    UserSpeech,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.companion_channel import InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
+
+
+class DeafCall(FakeCall):
+    """A Call adapter whose speakers raise instead of playing (#186).
+
+    The shipped adapter swallows its own playback failures, so this is a
+    defective adapter rather than a missing device — and a defective adapter is
+    exactly what the hub's own guard is for.
+    """
+
+    async def play_cue(self, cue: Cue) -> None:
+        raise UnreachableFarSide(f"no output device for the {cue} cue")
 
 
 class EndRefusingCall(FakeCall):
@@ -86,7 +112,12 @@ class TestTheStopNoticePipelineEndToEnd:
 
         hub.emit(SessionStopped(target=CODEX, progress=observed))
 
-        assert "The registry status is the root cause." in hub.call.spoken[0]
+        # The words go out on the notice's own text — the log line and, where
+        # Message is on, the Companion Channel. What the *call* is handed comes
+        # off the roster, which still reads this Session as running, so it is a
+        # header row there (`test_a_session_the_roster_reads_as_running_…`).
+        assert hub.call.calls_started == 1
+        assert "port the log" in handed_over(hub.call)
         assert hub.core.status().sessions[0].progress == observed
 
     def test_a_stop_that_read_a_question_puts_it_on_the_roster_row(self) -> None:
@@ -346,7 +377,7 @@ class TestTheStopNoticePipelineEndToEnd:
 
         hub.emit(SessionStopped(target=CODEX))
 
-        assert "port the log" in hub.call.spoken[0]
+        assert "port the log" in handed_over(hub.call)
 
     def test_a_stop_while_the_system_owns_a_call_opens_no_second_call(self) -> None:
         """The reference implementation's loop, made unreachable."""
@@ -403,11 +434,11 @@ class TestTheStopNoticePipelineEndToEnd:
         hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
-        assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
 
     def test_the_auto_hangup_switch_is_no_outlet_transition(self) -> None:
@@ -425,12 +456,14 @@ class TestTheStopNoticePipelineEndToEnd:
             )
         )
         hub.call.spoken.clear()
+        hub.call.opened_on.clear()
         hub.channel.sent.clear()
 
         hub.flip(SwitchName.AUTO_HANGUP, True)
         asyncio.run(hub.core.discover())
 
         assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
         assert hub.channel.sent == []
 
     def test_message_off_and_voice_on_never_pushes_text(self) -> None:
@@ -637,7 +670,13 @@ class TestTheLiveCallSilenceCeiling:
         hub.tick()
         assert hub.call.calls_ended == 1
 
-    def test_a_notice_spoken_into_the_call_restarts_its_silence_window(self) -> None:
+    def test_a_notice_handed_to_the_call_does_not_by_itself_restart_the_window(self) -> None:
+        """The receipt says the words were handed over, not that anything was said.
+
+        What keeps the call alive is the Voice speaking them, and that arrives
+        on its own as `VoiceSpeech` (#184). The stamp this test used to prove
+        was a text hand-over wearing a voice's clothes.
+        """
         hub = Hub(silence_end_seconds=60.0)
         started = hub.toggle()
         assert started.call_id is not None
@@ -645,11 +684,139 @@ class TestTheLiveCallSilenceCeiling:
 
         hub.now += 50.0
         hub.emit(SessionStopped(target=CODEX))
-        hub.now += 59.9
+        hub.now += 10.0
         hub.tick()
 
         assert hub.call.spoken
+        assert hub.call.calls_ended == 1
+
+    def test_the_voice_speaking_holds_the_ceiling_open(self) -> None:
+        """A 75 s answer generated in 10 s is still a call somebody is talking on."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        # Deltas every 5 s for 75 s: one span, one start edge, no end edge yet.
+        hub.emit(VoiceSpeech(speaking=True))
+        for _ in range(15):
+            hub.now += 5.0
+            hub.tick()
+
         assert hub.call.calls_ended == 0
+
+        hub.emit(VoiceSpeech(speaking=False))
+        hub.now += 59.9
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.now += 0.1
+        hub.tick()
+        assert hub.call.calls_ended == 1
+
+    def test_a_voice_that_stopped_and_then_silence_ends_the_call(self) -> None:
+        """The stop edge is activity too: the window runs from the end of the answer."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 50.0
+        hub.emit(VoiceSpeech(speaking=True), VoiceSpeech(speaking=False))
+        hub.now += 59.9
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        hub.now += 0.1
+        hub.tick()
+        assert hub.call.calls_ended == 1
+
+    def test_a_call_dropped_mid_answer_leaves_the_next_one_unheld(self) -> None:
+        """A start edge with no stop, then the call goes away. No flag outlives it."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+        hub.emit(VoiceSpeech(speaking=True))
+        hub.emit(CallDropped(call_id=started.call_id, detail="the far side left"))
+
+        hub.emit(CallStarted(call_id="call-2"))
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_a_ceiling_is_not_measured_while_news_is_unread(self) -> None:
+        """The two loops are two tasks, so an emitted edge is not a noted one.
+
+        `_ticking` and `_dispatching` are separate (`engine/composition.py`), so
+        a `VoiceSpeech(True)` sitting in the queue has not reached the interlock.
+        A tick that measured silence then would end the call one event before
+        being told the Voice was speaking on it — which is #184's bug arriving by
+        a different door.
+        """
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        # Emitted, deliberately not drained: this is the state the tick loop can
+        # find the hub in.
+        hub.core.events.emit(VoiceSpeech(speaking=True))
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+        # Read, and now the flag itself is what holds the ceiling open.
+        hub.emit()
+        hub.now += 600.0
+        hub.tick()
+        assert hub.call.calls_ended == 0
+
+    def test_news_about_a_session_does_not_hold_a_silent_call_open(self) -> None:
+        """The ceiling's question is about the call, so only the call can defer it.
+
+        Asking the queue whether it held *anything* was the first shape of the
+        guard above, and it was too wide: a `SessionStopped` waiting to be read
+        is not activity on a call, and a lane that kept producing events could
+        have held a forgotten call open for as long as it kept producing them.
+        """
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.core.events.emit(SessionStopped(target=CODEX))
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_a_call_with_nothing_unread_is_still_ended_when_it_is_silent(self) -> None:
+        """The guard is about unread news, not about being cautious in general."""
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.now += 60.0
+        hub.tick()
+
+        assert hub.call.calls_ended == 1
+
+    def test_both_voice_edges_are_written_down(self, caplog) -> None:
+        """The engine's log is where a run says the Voice held the call open."""
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub(silence_end_seconds=60.0)
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(VoiceSpeech(speaking=True), VoiceSpeech(speaking=False))
+
+        said = [record.getMessage() for record in caplog.records]
+        assert VOICE_SPEAKING_LINE in said
+        assert VOICE_QUIET_LINE in said
 
     def test_the_ceiling_holds_with_duty_off_on_a_call_the_user_opened(self) -> None:
         """Only the Auto Hang-up Switch governs it; Duty and Voice do not reach it."""
@@ -797,7 +964,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=CODEX))
 
-        assert "port the log" in hub.call.spoken[0]
+        assert "port the log" in handed_over(hub.call)
 
     def test_a_stop_on_a_session_the_roster_has_not_seen_is_still_announced(self) -> None:
         """Unknown is not child, and the asymmetry is the point.
@@ -811,7 +978,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=SessionTarget(agent=AgentKind.CODEX, session_id="new")))
 
-        assert hub.call.spoken
+        assert hub.call.calls_started == 1
 
     def test_a_permission_a_child_raises_is_not_announced(self) -> None:
         """A Codex subagent thread can raise a real `requestApproval`.
@@ -835,7 +1002,7 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=CODEX, waiting_for=self.permission()))
 
-        assert hub.call.spoken
+        assert "requesting permission" in handed_over(hub.call)
 
 
 class TestTheRelayPipelineEndToEnd:
@@ -934,7 +1101,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.tick()
 
         assert hub.state.relays.pending() == ()
-        assert hub.call.spoken == ["state=reported_failed grade=none reason=ceiling_passed"]
+        assert hub.channel.sent[-1] == "state=reported_failed grade=none reason=ceiling_passed"
 
     def test_an_expired_relay_that_was_attempted_does_not_read_like_one_that_was_not(
         self,
@@ -955,7 +1122,7 @@ class TestTheRelayPipelineEndToEnd:
         hub.now += TEN_MINUTES
         hub.tick()
 
-        assert hub.call.spoken[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
+        assert hub.channel.sent[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
 
     def test_a_session_that_ends_reports_the_words_still_waiting_for_it(self) -> None:
         hub = Hub()
@@ -1085,11 +1252,11 @@ class TestTheOneCallInvariantEndToEnd:
 
         assert snapshot.is_up
         assert hub.agent.inspections == []
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice] == []
+        assert "Which base?" not in spoken_words(hub.call)
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in spoken_words(hub.call)
 
     def test_a_call_started_event_reconciles_current_stops(self) -> None:
         hub = Hub(voice=False)
@@ -1123,6 +1290,115 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.toggle().state is CallState.DOWN
         assert hub.core.interlock.owns_call() is False
 
+    def test_a_call_opens_addressing_both_audiences_by_name(self) -> None:
+        """Each half gets its own set, and the hub names the audience, not the slot.
+
+        `realtimeStartInstructions` was proved by slot-swap to reach the Call
+        Agent and never the Voice, and `prompt` to reach the Voice (ADR 0018,
+        #175 Q4). The hub knows none of that: it hands over a `Dial` whose fields
+        are *voice* and *agent*, and which wire slot each lands in is the realtime
+        adapter's alone (#194). Before the Dial, one string carried the Agent set
+        and the Voice's prose had no carrier at all.
+        """
+        hub = Hub()
+        assert hub.core.instructions is not None
+
+        hub.toggle()
+
+        dialled = hub.call.opened_on[0]
+        assert dialled.voice == hub.core.instructions.voice.text
+        assert dialled.agent == hub.core.instructions.agent.text
+
+    def test_a_call_the_user_opened_carries_one_item_and_no_hand_over(self) -> None:
+        """#167 Q6. They pressed the toggle to talk; the system does not talk first.
+
+        Briefing them on the roster they were looking at when they pressed it
+        would be the system opening the conversation on a call the user opened to
+        open it themselves.
+        """
+        hub = Hub()
+
+        hub.toggle()
+
+        assert hub.call.opened_on[0].hand_over == (DialReason(text=USER_OPENED),)
+        assert "wait to be spoken to" in USER_OPENED.lower()
+
+    def test_a_system_dialled_call_comes_up_holding_the_roster_and_the_waiting(
+        self,
+    ) -> None:
+        """The hand-over is the briefing, and it is read now rather than replayed.
+
+        ADR 0017: a missed call is briefed from a fresh reading. The notice names
+        which Session and the moment; every word about state comes off the roster
+        as it stands when the dial is built (#194).
+        """
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        kinds = [type(item) for item in hub.call.opened_on[0].hand_over]
+        assert kinds[0] is DialReason
+        assert kinds[1] is SpokenRosterBrief
+        assert SpokenBrief in kinds
+        assert hub.call.spoken == []
+        assert "Which base?" in handed_over(hub.call)
+
+    def test_the_session_a_stop_dialled_about_is_briefed_though_its_row_reads_running(
+        self,
+    ) -> None:
+        """The one row the roster is knowingly stale about is briefed from the Stop.
+
+        `sessions.set_stop_reading` leaves a Stop that merely ended a turn in
+        `RUNNING` (#209), and a hand-over briefs no running Session — so without
+        this the call would come up saying a Session needs the user and never say
+        which. What travels is the notice's own brief, whose state `stop_brief`
+        derived from the wait, so it reads `finished` and never `running`: this
+        is not the removed `about` parameter, which briefed whatever the stale
+        row said and put it ahead of the Focus Session.
+        """
+        hub = Hub()
+
+        hub.emit(SessionStopped(target=CODEX))
+
+        assert [type(item) for item in hub.call.opened_on[0].hand_over] == [
+            DialReason,
+            SpokenRosterBrief,
+            SpokenBrief,
+        ]
+        briefed = hub.call.opened_on[0].hand_over[-1]
+        assert isinstance(briefed, SpokenBrief)
+        # What the row still says, and what the Stop's own reading says instead.
+        # The codex lane reads a turn that ended without a final answer as a
+        # decision (#166 B2); what matters here is that it is not `running`.
+        assert briefed.state == "waiting for your decision"
+        assert "port the log" in briefed.name
+
+    def test_the_session_a_stop_dialled_about_is_briefed_exactly_once(self) -> None:
+        """Whether or not the roster briefed it itself, it appears once.
+
+        The roster's reading is the one that travels when there is one — this
+        wait needs the user, so the row moved to `WAITING` and `handover` briefed
+        it from there. The notice's copy is added only in the other case, so a
+        Session is never announced twice on the same call.
+        """
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+
+        briefs = [item for item in hub.call.opened_on[0].hand_over if isinstance(item, SpokenBrief)]
+        assert len(briefs) == 1
+        assert briefs[0].state == "waiting for your decision"
+
     def test_a_hub_that_generated_no_house_rules_opens_no_call(self) -> None:
         """The refusal comes from the interlock, which is the one door.
 
@@ -1131,7 +1407,7 @@ class TestTheOneCallInvariantEndToEnd:
         """
         hub = Hub(instructions=False)
 
-        with pytest.raises(VoiceInstructionsMissing):
+        with pytest.raises(CallInstructionsMissing):
             hub.toggle()
 
         assert hub.call.calls_started == 0
@@ -1269,11 +1545,11 @@ class TestTheOneCallInvariantEndToEnd:
         hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
-        assert hub.call.spoken == []
+        assert handed_over(hub.call) == ""
 
         asyncio.run(hub.core.discover())
 
-        assert [notice for notice in hub.call.spoken if "Which base?" in notice]
+        assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
 
 
@@ -1785,6 +2061,87 @@ class TestEventsThatDecideNothing:
 
         assert [("  asked: first" in sent) for sent in hub.channel.sent] == [True, False]
         assert "  asked: second" in hub.channel.sent[1]
+
+
+class TestWhatTheUserHearsAtEachEndOfACall:
+    """The two cues that have callers, played from the arms that already existed.
+
+    Bridge Core says which *moment* it is and never which sound; the fake opens
+    no device and records the moments in order, which is what lets the ordering
+    be graded with no audio anywhere (#186). The Call Keeper takes these calls
+    over later (#195), and `EVENT` is the cue that waits for it.
+    """
+
+    def test_a_call_coming_up_is_heard(self) -> None:
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        assert hub.call.cues == [Cue.CONNECTED]
+
+    def test_a_call_ending_as_asked_is_heard(self) -> None:
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(CallEnded(call_id=started.call_id))
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_a_call_that_went_away_by_itself_is_heard_the_same_way(self) -> None:
+        """The user is owed the same news either way: what they hear is that the
+        call is over, not whose idea it was."""
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+        hub.emit(CallStarted(call_id=started.call_id))
+
+        hub.emit(CallDropped(call_id=started.call_id, detail="the far side left"))
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_a_call_that_dropped_the_moment_it_came_up_is_heard_in_order(self) -> None:
+        """Both ends of a call inside one cue's wall time, and the order holds.
+
+        Bridge Core asks in order and the adapter keeps that order (#186); this
+        is the hub's half of the claim, with no audio and no threads in it.
+        """
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(
+            CallStarted(call_id=started.call_id),
+            CallDropped(call_id=started.call_id, detail="the far side left"),
+        )
+
+        assert hub.call.cues == [Cue.CONNECTED, Cue.ENDED]
+
+    def test_the_mid_call_cue_has_no_caller_yet(self) -> None:
+        """`EVENT` ships implemented and unrung. The three sounds were chosen as
+        one set (#174), and the Call Keeper is what will use the third (#170)."""
+        hub = Hub()
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        hub.emit(CallStarted(call_id=started.call_id), CallEnded(call_id=started.call_id))
+        hub.now += 600.0
+        hub.tick()
+
+        assert Cue.EVENT not in hub.call.cues
+
+    def test_a_cue_that_raises_never_stops_the_arm_it_was_asked_from(self) -> None:
+        """The interlock still hears about the call. A sound is commentary, and
+        commentary may not take down the thing it is commenting on."""
+        hub = Hub(call=DeafCall())
+        started = hub.toggle()
+        assert started.call_id is not None
+
+        assert hub.emit(CallStarted(call_id=started.call_id)) == 1
+        assert hub.emit(CallEnded(call_id=started.call_id)) == 1
 
 
 class TestWhatDiscoveryCallsAnEnding:

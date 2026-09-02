@@ -162,3 +162,50 @@ def delegated_script(
         return {"turn": {"id": "turn-1"}}
 
     server.answers("turn/start", start_turn)
+
+
+class FakeCueOutput:
+    """An output device a test can read back. Opens nothing and makes no sound.
+
+    The third thing CI cannot have, after the app-server and the microphone: a
+    speaker. It records the buffers it was handed and the spans that went with
+    them, and it can be told to fail the way a missing device fails — which is
+    the case that matters, because a cue that cannot be played may not take down
+    the call it was only commenting on (#186).
+    """
+
+    def __init__(self, *, device: int | None = None, fails: str = "") -> None:
+        self._device = device
+        #: Non-empty makes every `play` raise it, the way an unplugged device does.
+        self.fails = fails
+        self.buffers: list[bytes] = []
+        self.spans: list[Any] = []
+        #: What `playing` said from *inside* the write, one entry a call. The
+        #: span a capture gate would have read (#145) — unreadable afterwards,
+        #: because a finished cue is holding nothing.
+        self.seen_playing: list[Any] = []
+        #: Called at the top of `play`, before anything is recorded. A test that
+        #: needs the write to still be running when it looks blocks in here.
+        self.while_playing: Any = None
+        self._playing: Any = None
+
+    @property
+    def device(self) -> int | None:
+        return self._device
+
+    @property
+    def playing(self) -> Any:
+        return self._playing
+
+    def play(self, pcm: bytes, *, span: Any = None) -> None:
+        self._playing = span
+        try:
+            self.seen_playing.append(self._playing)
+            if self.while_playing is not None:
+                self.while_playing()
+            if self.fails:
+                raise TransportError(self.fails)
+            self.buffers.append(pcm)
+            self.spans.append(span)
+        finally:
+            self._playing = None

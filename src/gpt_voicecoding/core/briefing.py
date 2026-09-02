@@ -1,11 +1,20 @@
 """Briefing — the one source of words about what a Session is doing.
 
 Pure, in-process, and fed the roster rows Bridge Core has already folded: no
-I/O, no clock, no lane. Three functions and nothing else —
+I/O, no clock, no lane. Six functions and nothing else —
 
-    briefing.roster(sessions, focus) -> RosterBrief
-    briefing.session(session)        -> SessionBrief
-    briefing.text(brief)             -> str
+    briefing.roster(sessions, focus)  -> RosterBrief
+    briefing.session(session)         -> SessionBrief
+    briefing.omitting_newest(brief)   -> SessionBrief
+    briefing.text(brief)              -> str
+    briefing.spoken(brief)            -> SpokenBrief
+    briefing.handover(sessions, ...)  -> tuple[HandoverItem, ...]
+
+`spoken` and `handover` are the Live Call's two: the first hands one brief across
+the Call seam as the seam's own carrier (no Core type crosses a seam, ADR 0001),
+the second builds everything a system-dialled call opens holding. Both are still
+only words about Sessions — the carriers are filled with the wording below, and
+the adapter that puts them on the wire chooses none of it.
 
 `text` is the **only** text renderer for Session state. The Companion Channel,
 the engine log and ``bridgectl brief`` all print what it returns, so there is
@@ -40,7 +49,7 @@ the caller writes `briefing.roster(...)`, which reads the same as `#166`'s
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -56,6 +65,14 @@ from gpt_voicecoding.seams.agent import (
     SessionState,
     WaitingKind,
     derive_reply_window,
+)
+from gpt_voicecoding.seams.call import (
+    HANDOVER_BUDGET_BYTES,
+    MAX_HANDOVER_ITEMS,
+    DialReason,
+    HandoverItem,
+    SpokenBrief,
+    SpokenRosterBrief,
 )
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
@@ -275,6 +292,106 @@ def omitting_newest(brief: SessionBrief) -> SessionBrief:
     the one place that puts words to a message that is absent.
     """
     return replace(brief, newest=Newest(state=NewestState.OVERSIZE))
+
+
+def spoken(brief: SessionBrief) -> SpokenBrief:
+    """One Session Brief as the Call seam carries it, in this module's own words.
+
+    The Core type may not cross a seam (ADR 0001), so what crosses is the seam's
+    `SpokenBrief` — and it is filled with the wording tables above rather than
+    with raw values, so that the Voice hears the same five state words the
+    Companion Channel and the log print. An adapter downstream assembles these
+    strings into a wire item and chooses none of them.
+
+    The address does not travel. A `SessionTarget` is how *this* process names a
+    Session; the Voice names it the way the user does, which is the Session Name
+    where there is one and the address only where there is not
+    (`core/sessions.py::spoken_name`, the same rule `_headline` follows).
+    """
+    return SpokenBrief(
+        name=str(brief.name) if brief.name is not None else str(brief.target),
+        agent=str(brief.agent),
+        state=STATE_WORDING[brief.state],
+        newest=brief.newest.words,
+        decision=tuple(line.strip() for line in _decision_lines(brief)),
+        answerable_here=_answer_wording(brief.answerable_here),
+        last_activity_at=_when(brief.last_activity_at),
+    )
+
+
+def handover(
+    sessions: Sequence[Session],
+    focus: SessionTarget | None,
+    *,
+    reason: str,
+    answerable: Collection[SessionTarget] = (),
+    stopped: tuple[SessionTarget, SpokenBrief] | None = None,
+) -> tuple[HandoverItem, ...]:
+    """Everything a system-dialled call opens holding, inside the wire's ceilings.
+
+    Three kinds of item, in one order the Voice can read down: why the call was
+    dialled, then the Roster Brief, then the full brief of every Session that
+    needs the user — Focus first, because the roster it is taken from is ordered
+    Focus first (#165 Q6). **A running Session gets its header row and nothing
+    more:** it is in the roster, and there is nothing it is asking of anybody.
+
+    **Over budget, bodies go and words stay.** The newest message is dropped
+    from the *back* — the Sessions the roster ordered last — and each one that
+    goes is named as omitted rather than left absent (`omitting_newest`, ADR
+    0016): the user is told a message exists and could not be carried, never
+    handed half of it. The header and the whole decision stay, because they are
+    what the user acts on and they are small.
+
+    **Then the roster's header rows go, before any brief does.** A Session that
+    has a full brief is already named in it, so its header row is the one thing
+    in a hand-over that says nothing twice — and a ladder that spent briefs
+    first bought header rows with decisions. Measured: two hundred waiting
+    Sessions used to come out as one hundred and fifty-four header rows and no
+    briefs at all, which is every decision in the roster dropped to keep a list
+    of names. Whole briefs go last, from the back, and `stopped`'s brief after
+    them.
+
+    **The counts never go, at any scale.** They are the summary ADR 0016 asks
+    for: with them, a hand-over that could carry thirty-five of two hundred
+    waiting Sessions still says two hundred are waiting, so what it could not
+    carry is *named* rather than silently absent — and named without a fourth
+    kind of item on the seam #195 and #196 build on. The reason never goes
+    either.
+
+    Both ceilings are the wire's, and both are hard rejections there rather than
+    truncations (`seams/call.py`), so this returns a hand-over that fits and
+    `Dial` asserts that it does.
+
+    **Which Sessions are briefed is the roster's answer, and `stopped` is the
+    one thing the roster cannot answer for.** An earlier draft let the caller
+    name the Session a call was dialled about and briefed it whatever the row
+    said: it put that Session ahead of the Focus Session, and — because
+    `sessions.set_stop_reading` leaves a row `RUNNING` unless the wait needs the
+    user (#209) — it could produce a brief reading "running" among the Sessions
+    that need the user. Both rules hold here. `stopped` is the target a Stop
+    dialled this call about together with the brief that Stop itself read —
+    already worded, and already in the state `bridge.stop_brief` derived from the
+    wait, so it can never read "running" — and it is added **only when the
+    roster's own rows did not brief that target**, and **last**, after every
+    Session the roster did brief. A call whose reason says a Session needs the
+    user and whose hand-over never mentions that Session is what this closes.
+    The stale row is still wrong where it is written, and #209 is where.
+
+    `answerable` is the one fact a row cannot carry, as in `session`: the targets
+    whose question the lane can still route an Answer Relay into. A live adapter
+    reading, so the hub passes it in and the default is the safe one.
+    """
+    summary = roster(sessions, focus)
+    by_target = {live.target: live for live in sessions}
+    briefs = [
+        session(by_target[row.target], question_answerable=row.target in answerable)
+        for row in summary.rows
+        if row.state is not BriefState.RUNNING and row.target in by_target
+    ]
+    trailing: tuple[SpokenBrief, ...] = ()
+    if stopped is not None and not any(brief.target == stopped[0] for brief in briefs):
+        trailing = (stopped[1],)
+    return _fitted(DialReason(text=reason), summary, briefs, trailing)
 
 
 def text(brief: SessionBrief | RosterBrief) -> str:
@@ -533,6 +650,121 @@ def _answerable_here(session: Session, *, question_answerable: bool) -> bool:
 
 
 # ----------------------------------------------------------------------
+# Fitting a hand-over into the wire's two ceilings.
+# ----------------------------------------------------------------------
+
+
+def _fitted(
+    reason: DialReason,
+    summary: RosterBrief,
+    briefs: list[SessionBrief],
+    trailing: tuple[SpokenBrief, ...] = (),
+) -> tuple[HandoverItem, ...]:
+    """Give things back, in the order the docstring of `handover` names, until it fits.
+
+    Four rungs, in the order `handover` states — every newest body from the back,
+    then the roster's header rows from the back, then whole briefs from the back,
+    then the trailing brief the roster could not supply. The loop stops at the
+    first arrangement that fits, so a hand-over that already does is returned
+    untouched: the common case, and the one where every body is carried whole.
+
+    A header row is given up before a brief because it is the only thing here
+    that repeats something already said. A brief is given up after it because it
+    is the only thing that carries a decision. The trailing one is given up last
+    of all, because it is the Session this call was dialled about.
+
+    **The reason and the counts are never given up**, at any scale: they are what
+    is left when everything else has gone, and the counts are what still say how
+    many Sessions the call could not carry (ADR 0016).
+    """
+    carried = list(briefs)
+    rows = list(summary.rows)
+    last = list(trailing)
+    while True:
+        items = _handover_items(reason, summary, rows, carried, last)
+        if _within_ceilings(items):
+            return items
+        if _one_body_less(carried):
+            continue
+        if _one_row_less(rows, carried):
+            continue
+        if carried:
+            carried.pop()
+            continue
+        if last:
+            last.pop()
+            continue
+        # The reason and the counts alone. Nothing here is the caller's to trim,
+        # and both are bounded by their own writers.
+        return items
+
+
+def _one_row_less(rows: list[RosterRow], briefs: list[SessionBrief]) -> bool:
+    """Give up one header row, the ones a brief already names first.
+
+    From the back within each group, so the Focus Session's row is the last to
+    go — and a row whose Session is briefed goes before any row whose Session is
+    not, because the brief says everything the row does and more.
+    """
+    if not rows:
+        return False
+    briefed = {brief.target for brief in briefs}
+    for index in reversed(range(len(rows))):
+        if rows[index].target in briefed:
+            rows.pop(index)
+            return True
+    rows.pop()
+    return True
+
+
+def _handover_items(
+    reason: DialReason,
+    summary: RosterBrief,
+    rows: list[RosterRow],
+    briefs: list[SessionBrief],
+    trailing: list[SpokenBrief],
+) -> tuple[HandoverItem, ...]:
+    return (
+        reason,
+        _spoken_roster(summary, rows),
+        *(spoken(brief) for brief in briefs),
+        *trailing,
+    )
+
+
+def _within_ceilings(items: tuple[HandoverItem, ...]) -> bool:
+    if len(items) > MAX_HANDOVER_ITEMS:
+        return False
+    return sum(item.size_in_bytes for item in items) <= HANDOVER_BUDGET_BYTES
+
+
+def _one_body_less(briefs: list[SessionBrief]) -> bool:
+    """Name the last carried newest message as omitted. False when none is left.
+
+    From the back, because the roster ordered these by what the user is most
+    likely to be asked about first, and a hand-over that gave up the Focus
+    Session's message to keep the last row's would be answering the wrong
+    question with the bytes it has.
+    """
+    for index in reversed(range(len(briefs))):
+        if briefs[index].newest.text is not None:
+            briefs[index] = omitting_newest(briefs[index])
+            return True
+    return False
+
+
+def _spoken_roster(brief: RosterBrief, rows: list[RosterRow]) -> SpokenRosterBrief:
+    """The Roster Brief as the Call seam carries it — the same words `text` prints."""
+    listed = [row for row in rows if not row.focus]
+    focus = next((row for row in rows if row.focus), None)
+    return SpokenRosterBrief(
+        counts=_counts_line(brief),
+        rows=tuple(_row_line(row) for row in listed),
+        focus=_row_line(focus) if focus is not None else None,
+    )
+
+
+# ----------------------------------------------------------------------
 # The one renderer.
 # ----------------------------------------------------------------------
 
@@ -541,10 +773,19 @@ def _session_lines(brief: SessionBrief) -> list[str]:
     lines = [_headline(brief.name, brief.target, brief.state)]
     lines.append(f"  newest: {brief.newest.words}")
     lines.extend(_decision_lines(brief))
-    lines.append(f"  answer: {'from here' if brief.answerable_here else 'at the terminal'}")
-    when = brief.last_activity_at.isoformat() if brief.last_activity_at is not None else "not read"
-    lines.append(f"  last activity: {when}")
+    lines.append(f"  answer: {_answer_wording(brief.answerable_here)}")
+    lines.append(f"  last activity: {_when(brief.last_activity_at)}")
     return lines
+
+
+def _answer_wording(answerable_here: bool) -> str:
+    """Where the user answers this, in the two phrases both carriers use."""
+    return "from here" if answerable_here else "at the terminal"
+
+
+def _when(last_activity_at: datetime | None) -> str:
+    """The last activity stamp, or the admission that nobody read one."""
+    return last_activity_at.isoformat() if last_activity_at is not None else "not read"
 
 
 def _decision_lines(brief: SessionBrief) -> list[str]:
@@ -601,8 +842,7 @@ def _roster_lines(brief: RosterBrief) -> list[str]:
     if rows and rows[0].focus:
         lines.append(f"focus: {_row_line(rows[0])}")
         rows = rows[1:]
-    heading = "the others" if brief.focus is not None else "sessions"
-    lines.append(f"{heading}: {_counts(brief.counts)}")
+    lines.append(_counts_line(brief))
     lines.extend(f"  {_row_line(row)}" for row in rows)
     return lines
 
@@ -623,6 +863,17 @@ def _headline(name: SessionName | None, target: SessionTarget, state: BriefState
 
 def _row_line(row: RosterRow) -> str:
     return _headline(row.name, row.target, row.state)
+
+
+def _counts_line(brief: RosterBrief) -> str:
+    """The counts, under the heading that says which Sessions they are.
+
+    **The others**, whenever there is a Focus Session (#165 Q6). One function, so
+    the rendered roster and the one the Live Call is handed cannot disagree about
+    whether the Focus Session was counted.
+    """
+    heading = "the others" if brief.focus is not None else "sessions"
+    return f"{heading}: {_counts(brief.counts)}"
 
 
 def _counts(counts: Mapping[BriefState, int]) -> str:

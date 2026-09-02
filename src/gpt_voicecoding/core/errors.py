@@ -188,19 +188,24 @@ class SecondCallRefused(BridgeCoreError):
         self.call_id = call_id
 
 
-class VoiceInstructionsMissing(BridgeCoreError):
-    """Something asked to open a voice surface on an engine that generated no rules.
+class CallInstructionsMissing(BridgeCoreError):
+    """A call was asked for on an engine that generated no rules for it to run on.
 
-    Raised at the one door a call can be opened through, so the rule lives in
-    exactly one place and every caller meets the same refusal. An engine with no
-    instruction context has no house rules to start a voice thread on, and
-    starting one anyway would put a model on the user's speakers with nothing
-    telling it what it may say — which is the one thing the generated
-    instructions exist to prevent.
+    **It names which half is missing.** A call addresses two audiences — prose
+    for the Voice and rules for the Call Agent (ADR 0018) — and the error this
+    replaced was called `VoiceInstructionsMissing` while being raised on the
+    Agent's set, because that was the half the one string `ensure_call` took
+    reached (#193's deferred note). A `Dial` carries both, so a refusal that did
+    not say which one was absent would send a reader to the wrong generator.
+
+    Raised where Bridge Core builds the `Dial`, which is the one place that knows
+    what it generated. The blank check that used to live in the interlock is gone
+    with it: a `Dial` refuses its own empty halves at construction, so by the time
+    one exists there is nothing left to check.
     """
 
-    def __init__(self) -> None:
-        super().__init__("this engine generated no voice instructions, so it cannot start a call")
+    def __init__(self, missing: str) -> None:
+        super().__init__(f"this engine generated no {missing}, so it cannot dial a call")
 
 
 class LaneUnreadable(BridgeCoreError):

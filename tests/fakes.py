@@ -37,7 +37,18 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
 )
-from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
+from gpt_voicecoding.seams.call import (
+    CallSnapshot,
+    CallState,
+    Cue,
+    DelegatedReply,
+    Dial,
+    DialReason,
+    HandoverItem,
+    SpokenBrief,
+    SpokenRosterBrief,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
@@ -253,11 +264,13 @@ class FakeCall:
             outcome=VerifyOutcome.PASS, loaded="tests.fakes.FakeCall"
         )
         self.sink = sink
-        self.spoken: list[str] = []
+        self.spoken: list[SpokenBrief] = []
         self.delegated: list[tuple[str, str]] = []
-        #: The house rules every call was opened on, in order. Bridge Core is
-        #: the only source of these, so a test can prove they came from it.
-        self.opened_on: list[str] = []
+        #: The `Dial` every call was opened on, in order — both audiences' texts
+        #: and the hand-over. Bridge Core is the only source of these, so a test
+        #: can prove addressing through the seam rather than through the wire
+        #: (#194): the fake knows no slot names, and neither does the hub.
+        self.opened_on: list[Dial] = []
         #: The same, for the threads Delegated Turns run on.
         self.delegated_on: list[str] = []
         self._snapshot = CallSnapshot(state=CallState.DOWN)
@@ -265,11 +278,15 @@ class FakeCall:
         #: on it to prove the one-call invariant stopped a second one.
         self.calls_started = 0
         self.calls_ended = 0
+        #: Every cue this adapter was asked to play, in the order it was asked
+        #: (#186). Moments, not sounds: the fake opens no device and makes no
+        #: noise, which is exactly what lets a hub test grade the order.
+        self.cues: list[Cue] = []
 
-    async def ensure_call(self, instructions: str) -> CallSnapshot:
+    async def ensure_call(self, dial: Dial) -> CallSnapshot:
         if self._snapshot.is_up:
             return self._snapshot
-        self.opened_on.append(instructions)
+        self.opened_on.append(dial)
         if not self.reachable:
             self._snapshot = CallSnapshot(state=CallState.CONNECTING)
             return self._snapshot
@@ -285,14 +302,14 @@ class FakeCall:
     async def call_state(self) -> CallSnapshot:
         return self._snapshot
 
-    async def speak(self, text: str, *, request_id: RequestId) -> DeliveryReceipt:
+    async def speak(self, brief: SpokenBrief, *, request_id: RequestId) -> DeliveryReceipt:
         if not self._snapshot.is_up:
             return DeliveryReceipt(
                 request_id=request_id,
                 outcome=Delivery.FAILED,
                 reason="no call is up to speak into",
             )
-        self.spoken.append(text)
+        self.spoken.append(brief)
         return DeliveryReceipt(
             request_id=request_id, outcome=Delivery.DELIVERED, reason="spoken into the call"
         )
@@ -304,8 +321,64 @@ class FakeCall:
         self.delegated_on.append(instructions)
         return DelegatedReply(text=self.delegated_text, model=model)
 
+    async def play_cue(self, cue: Cue) -> None:
+        self.cues.append(cue)
+
     async def verify(self) -> VerifyResult:
         return self.verify_result
+
+    def voice_speech(self, *, speaking: bool) -> None:
+        """Raise one edge of the call's own Voice, with no audio anywhere.
+
+        Not a verb on the seam — a way for a test above the seam to make the
+        adapter say what a real one says when the Voice starts or stops (#184).
+        """
+        if self.sink is not None:
+            self.sink.emit(VoiceSpeech(speaking=speaking))
+
+
+def handed_over(call: FakeCall) -> str:
+    """Every word the calls this fake was opened holding, as one block to search.
+
+    A hand-over is typed carriers rather than text — that is the point of #194 —
+    and a test that wants to know *whether the user was told something* should
+    not have to know which carrier it landed in. Assembling it for the wire is
+    the adapter's job and looks nothing like this; this is only for reading.
+    """
+    return "\n".join(word for item in _items(call) for word in _words(item))
+
+
+def spoken_words(call: FakeCall) -> str:
+    """Every word this fake was asked to speak, as one block to search.
+
+    The companion of `handed_over`, for the other half of the same rule: a brief
+    goes into a call that is already up through `speak`, and into a call this
+    system dials through the hand-over. Both are briefs and neither is a
+    sentence, so neither can be searched with `in` on its own.
+    """
+    return "\n".join(word for brief in call.spoken for word in _words(brief))
+
+
+def _items(call: FakeCall) -> list[HandoverItem]:
+    return [item for dialled in call.opened_on for item in dialled.hand_over]
+
+
+def _words(item: HandoverItem) -> tuple[str, ...]:
+    match item:
+        case DialReason():
+            return (item.text,)
+        case SpokenRosterBrief():
+            return (item.counts, item.focus or "", *item.rows)
+        case SpokenBrief():
+            return (
+                item.name,
+                item.agent,
+                item.state,
+                item.newest,
+                *item.decision,
+                item.answerable_here,
+                item.last_activity_at,
+            )
 
 
 class UnreachableFarSide(Exception):
@@ -369,10 +442,18 @@ class FakeCompanionChannel:
         return self.verify_result
 
 
-#: What a test passes where Bridge Core would pass generated house rules. Any
-#: non-empty string will do: what the Call seam promises about instructions is
-#: that they arrive from the hub at the call site, not what they say.
-HOUSE_RULES = "the voice thread's house rules"
+#: What a test passes where Bridge Core would pass the generated sets a call
+#: opens on. Any non-empty string will do: what the Call seam promises about
+#: instructions is that they arrive from the hub at the call site, not what they
+#: say. Two of them, because a `Dial` addresses two audiences (ADR 0018) — a
+#: fake with one string would be a fake teaching the wrong half.
+CALL_AGENT_INSTRUCTIONS = "the call agent's rules"
+CALL_VOICE_PROSE = "the voice speaks plainly and waits to be asked"
+
+
+def dial(*hand_over: HandoverItem) -> Dial:
+    """A `Dial` for a test that is about something other than what a dial says."""
+    return Dial(voice=CALL_VOICE_PROSE, agent=CALL_AGENT_INSTRUCTIONS, hand_over=tuple(hand_over))
 
 
 def instruction_context(

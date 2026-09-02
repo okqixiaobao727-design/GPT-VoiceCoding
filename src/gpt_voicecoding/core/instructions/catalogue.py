@@ -1,4 +1,4 @@
-"""Every rule that survived the old skill, with a stable id and one owner.
+"""Every rule this engine still owes, with a stable id and one owner.
 
 This is the requirements list of the migration inventory's line-by-line
 disposition tables, carried into code so it can be tested. The old `skill/`
@@ -12,16 +12,28 @@ rule, or quietly move one into a set that was never meant to carry it. The
 generators tag each block they emit with the ids it discharges, the catalogue
 says which set each id belongs to, and the two are compared.
 
-**One id, one audience.** The inventory's tables are full of rows reading
-"voice + Core" or "Core + voice + delegated", because one row number can wear
-two obligations: a fact Bridge Core must hold, and the way the voice thread is
-told to speak it. Those are split here, one id each, both keeping the same
-`source` so the audit trail back to the table survives the split.
+**Three audiences, because a codex realtime call is two models.** `VOICE` is
+the half the user hears and `AGENT` the half that holds the tools (ADR 0018);
+`DELEGATED` is the coding model a Delegated Turn hands work to. The boundary is
+#173's: a rule naming a control-plane verb, a Session identity or a read is the
+Call Agent's; a rule about wording, order, tone, silence or when to stop is the
+Voice's. A rule wearing both obligations is split into two ids. **The Voice is
+never told a verb exists** — a Voice handed something it cannot do invents
+rather than refuses (#179), so an acting rule in its set is an invitation to
+fabricate, while the Call Agent hearing no tone rule costs nothing.
 
-**A dropped rule is recorded, not omitted.** An id with `Audience.DROPPED` is
-how "this must not come back" becomes a thing the suite can fail on. Silence
-would prove nothing — a rule nobody wrote and a rule deliberately deleted look
-identical when both are absent.
+**One id, one audience, and the id says which.** The inventory's tables are full
+of rows reading "voice + Core", because one row number can wear two obligations:
+a fact Bridge Core must hold, and the way it is spoken. Those are split here, one
+id each, both keeping the same `source` so the audit trail back to the table
+survives the split. The prefix is the audience, so a rule that changes hands
+changes name with it (#190).
+
+**A retired rule is a deleted row.** #173 read all twenty-one `voice.*` rules
+against the 0901 flow one by one and deleted eleven of them; git history and
+#173's own table are their record. Nothing is parked and nothing is kept as a
+tombstone: a `DROPPED` row was a claim about a rule nobody was writing any more,
+and a test that read one's line numbers was a seam into this file's layout.
 
 **Nothing here proves enforcement.** A `CORE` or `ADAPTER` rule names where it
 really lives in `enforced_by`, as words for a human. An import test would prove
@@ -40,23 +52,24 @@ from enum import StrEnum
 class Audience(StrEnum):
     """Who carries a rule. Exactly one of these per rule id."""
 
-    #: House rules for the voice thread, generated into `realtimeStartInstructions`.
+    #: How the speaking half of a Live Call talks — the half the user hears.
     VOICE = "voice"
+    #: What the acting half of a Live Call may do — the only half with tools
+    #: (ADR 0018). Which of them a wire field reaches is the adapter's to know.
+    AGENT = "agent"
     #: Action discipline for a Delegated Turn, generated into its thread instructions.
     DELEGATED = "delegated"
     #: Enforced as code and state in Bridge Core. Never trusted to prose.
     CORE = "core"
     #: Owned by one adapter — panes, workspaces, child terminals. Core must not
-    #: know these, and neither instruction set may state them: an adapter-specific
+    #: know these, and no instruction set may state them: an adapter-specific
     #: rule in a shared prompt is a rule for whichever adapter is not loaded.
     ADAPTER = "adapter"
-    #: Deleted on purpose. Must appear in no instruction set, ever.
-    DROPPED = "dropped"
 
     @property
     def is_spoken(self) -> bool:
         """Whether a rule with this audience becomes prose at all."""
-        return self in (Audience.VOICE, Audience.DELEGATED)
+        return self in (Audience.VOICE, Audience.AGENT, Audience.DELEGATED)
 
     @property
     def is_code(self) -> bool:
@@ -64,7 +77,7 @@ class Audience(StrEnum):
 
         Asked in three places — the rule's own validation, the coverage mapping
         and the tests — so it is one question with one answer here, rather than
-        a tuple literal that a fifth audience would have to be added to in each.
+        a tuple literal that a sixth audience would have to be added to in each.
         """
         return self in (Audience.CORE, Audience.ADAPTER)
 
@@ -86,6 +99,11 @@ class Rule:
     def __post_init__(self) -> None:
         if not self.id.strip():
             raise ValueError("a rule without an id cannot be covered or audited")
+        if not self.id.startswith(f"{self.audience}."):
+            raise ValueError(
+                f"{self.id} is carried by {self.audience}, so its id has to say so; an id "
+                "naming one audience under another is the mismatch #190 deferred"
+            )
         if not self.source.strip():
             raise ValueError(f"{self.id} must name its source")
         if not self.gist.strip():
@@ -105,15 +123,6 @@ def _rules() -> tuple[Rule, ...]:
     """The disposition tables, one rule at a time. Built in table order."""
     return (
         # --- skill/SKILL.md ------------------------------------------------
-        Rule(
-            id="voice.orientation.no-screen",
-            audience=Audience.VOICE,
-            source="skill/SKILL.md:9-15",
-            gist=(
-                "The user is listening, not looking. Bridge Core is the only authority on "
-                "what exists and what state it is in; nothing is answered from memory."
-            ),
-        ),
         Rule(
             id="delegated.cli.one-generated-command",
             audience=Audience.DELEGATED,
@@ -141,16 +150,6 @@ def _rules() -> tuple[Rule, ...]:
             enforced_by="the Session registry's exact-target lookup — core/sessions.py",
         ),
         Rule(
-            id="voice.target.disambiguate-or-ask",
-            audience=Audience.VOICE,
-            source="skill/SKILL.md:32-45",
-            gist=(
-                "A spoken name acts only when a freshly read roster narrows it to exactly "
-                "one row. Zero or several means ask, and act on nothing until one matches. "
-                "An identity a command already returned needs no lookup."
-            ),
-        ),
-        Rule(
             id="core.roster.rejects-stale-or-ambiguous",
             audience=Audience.CORE,
             source="skill/SKILL.md:32-45",
@@ -165,8 +164,9 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/SKILL.md:46-49",
             gist=(
-                "Spoken words ramble; what reaches a Session is one clean instruction in "
-                "the user's own language, with no decision in it the user did not make."
+                "The user's decision goes back in their own words, tidied of the false "
+                "starts and nothing else: no decision they did not make, and no elaboration "
+                "unless they authorised one."
             ),
         ),
         Rule(
@@ -174,8 +174,9 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/SKILL.md:50-55",
             gist=(
-                "A Session's options and recommendations are announced as that Session's "
-                "own judgement; the decision carried back is the user's."
+                "Always the third person. A conclusion or a recommendation belongs to the "
+                "Session that produced it and is spoken as its opinion; what travels back is "
+                "the user's."
             ),
         ),
         Rule(
@@ -183,9 +184,8 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/SKILL.md:56-62",
             gist=(
-                "Sessions are spoken about by Session Name. A position — 'the third one' — "
-                "refers to the row just read out, and is resolved to that row's identity "
-                "before anything acts."
+                "A Session is spoken about by its project and its task, the way a person "
+                "would say it in a sentence. Machine identities are never said out loud."
             ),
         ),
         Rule(
@@ -208,18 +208,13 @@ def _rules() -> tuple[Rule, ...]:
             ),
         ),
         Rule(
-            id="voice.conversation.no-action",
-            audience=Audience.VOICE,
-            source="skill/SKILL.md:71-72",
-            gist="Pure conversation performs no control-plane action.",
-        ),
-        Rule(
-            id="voice.authority.no-identity-from-the-screen",
-            audience=Audience.VOICE,
-            source="skill/SKILL.md:73-83",
+            id="agent.outcome.only-a-successful-call-is-success",
+            audience=Audience.AGENT,
+            source="skill/SKILL.md:63-68",
             gist=(
-                "Session identity and status come from Bridge Core alone — never from a "
-                "screen capture, OCR, the clipboard, a terminal listing or a keystroke."
+                "Nothing happened until the exact command returned successfully. On a "
+                "refusal or a failure, report it and stop: no retry, no substitute, no "
+                "second route tried behind the user's back."
             ),
         ),
         Rule(
@@ -231,35 +226,14 @@ def _rules() -> tuple[Rule, ...]:
                 "recognises what was asked and calls the control plane with exact fields."
             ),
         ),
-        Rule(
-            id="dropped.skill.frontmatter-and-trigger",
-            audience=Audience.DROPPED,
-            source="skill/SKILL.md:1-8",
-            gist="Installed-skill identity, frontmatter and its read-this-first trigger.",
-        ),
-        Rule(
-            id="dropped.skill.spoken-duty-toggle",
-            audience=Audience.DROPPED,
-            source="skill/SKILL.md:69-70",
-            gist=(
-                "The spoken Duty-toggle phrase, and the idea that a switch is anything "
-                "other than a control-plane action that is never gated."
-            ),
-        ),
-        Rule(
-            id="dropped.skill.file-router-choreography",
-            audience=Audience.DROPPED,
-            source="skill/SKILL.md:84-96",
-            gist="Branch tables pointing at other files, and read-this-skill-first ordering.",
-        ),
         # --- skill/announcing.md -------------------------------------------
         Rule(
             id="voice.notice.is-natural-speech",
             audience=Audience.VOICE,
             source="skill/announcing.md:1-11",
             gist=(
-                "A Stop Notice is spoken as ordinary sentences in the user's language, "
-                "naming the Session by its name and the task it is on."
+                "A Session Brief is spoken as ordinary sentences in the language the user is "
+                "speaking, naming the Session and what it is on. Terse, and slowly."
             ),
         ),
         Rule(
@@ -297,9 +271,9 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/announcing.md:26-53",
             gist=(
-                "Speak only the facts that came back. A missing recommendation means the "
-                "Session recommended nothing; a missing detail is said to be missing, "
-                "never reconstructed from older material."
+                "You relay what the engine handed you; what it did not hand you, you do not "
+                "have, and you say so. The one sentence standing between this half and an "
+                "invented answer (#179)."
             ),
         ),
         Rule(
@@ -316,7 +290,7 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/announcing.md:54-63",
             gist=(
-                "Announce from what did come back and say plainly which part could not be "
+                "Speak from what did come back and say plainly which part could not be "
                 "read, rather than presenting a partial answer as a whole one."
             ),
         ),
@@ -325,27 +299,9 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/announcing.md:64-94",
             gist=(
-                "Name and state first, then the newest assistant progress, then the question "
-                "and described options, whose recommendation it is, and what is needed from "
-                "the user — and when the detail is stale, say the gap out loud."
-            ),
-        ),
-        Rule(
-            id="voice.notice.reads-progress-when-asked-for-more",
-            audience=Audience.VOICE,
-            source="issue/151",
-            gist=(
-                "When the user asks what else a stopped Session said, read its canonical "
-                "progress observation and report the recent entries."
-            ),
-        ),
-        Rule(
-            id="voice.notice.asks-for-no-decision-nobody-awaits",
-            audience=Audience.VOICE,
-            source="skill/announcing.md:95-109",
-            gist=(
-                "When the Reply Window is closed or the stop was superseded, say so instead "
-                "of asking for a decision no Session is waiting on."
+                "The 0901 order for one Session: project and task, the agent, its state, one "
+                "sentence of conclusion, and — when it is asking something — the question and "
+                "whose recommendation it is."
             ),
         ),
         Rule(
@@ -367,23 +323,7 @@ def _rules() -> tuple[Rule, ...]:
                 "Answer Relay, with no roster lookup standing between the two."
             ),
         ),
-        Rule(
-            id="dropped.announcing.cross-file-pointers",
-            audience=Audience.DROPPED,
-            source="skill/announcing.md:120-121",
-            gist="Pointers to sibling skill files; the generated sets carry their rules directly.",
-        ),
         # --- skill/checking-and-talking.md ---------------------------------
-        Rule(
-            id="voice.roster.withheld-sessions-are-real",
-            audience=Audience.VOICE,
-            source="skill/checking-and-talking.md:1-33",
-            gist=(
-                "Sessions the roster holds back are running and are counted when the user "
-                "asks what is going on; each is described by why it cannot be pointed at, "
-                "and none of them can be acted on."
-            ),
-        ),
         Rule(
             id="core.roster.is-the-registry",
             audience=Audience.CORE,
@@ -437,9 +377,10 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/checking-and-talking.md:76-107",
             gist=(
-                "Only a delivered attempt is reported as arrived. Held means it is parked "
-                "in front of a human, unknown means unknown — and when a resend risks the "
-                "Session seeing the words twice, say that risk and let the user decide."
+                "The three sentences Round 1 settled, and then silence: 已转达 only when the "
+                "receipt says delivered, 收到，等它这轮结束送进去 when it is queued, and one "
+                "clause of reason when it is held, unknown or failed. No checking on it "
+                "afterwards unless asked."
             ),
         ),
         Rule(
@@ -456,8 +397,9 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.VOICE,
             source="skill/checking-and-talking.md:108-119",
             gist=(
-                "Report a refusal in its own words, about that exact Session and that exact "
-                "attempt — no substitute target, and no earlier success standing in for it."
+                "A refusal is spoken as the answer it is — one clause of the reason the "
+                "receipt carried, about that exact attempt, and nothing invented to soften "
+                "it or stand in for it."
             ),
         ),
         Rule(
@@ -482,15 +424,6 @@ def _rules() -> tuple[Rule, ...]:
             enforced_by="the escalation pipeline's notice states — core/escalation.py",
         ),
         Rule(
-            id="voice.retry.failed-delivery-is-not-a-retry",
-            audience=Audience.VOICE,
-            source="skill/retrying.md:1-10",
-            gist=(
-                "Say that a notice failed to reach the user; a replay happens because they "
-                "asked for one, not because the failure invited it."
-            ),
-        ),
-        Rule(
             id="delegated.retry.only-a-retryable-notice",
             audience=Audience.DELEGATED,
             source="skill/retrying.md:11-33",
@@ -510,29 +443,11 @@ def _rules() -> tuple[Rule, ...]:
             enforced_by="the escalation pipeline over one BridgeState — core/state.py",
         ),
         Rule(
-            id="voice.retry.queued-is-not-delivered",
-            audience=Audience.VOICE,
-            source="skill/retrying.md:34-45",
-            gist=(
-                "A requeued notice is queued for another attempt, and saying it was "
-                "delivered is a lie the user cannot check."
-            ),
-        ),
-        Rule(
             id="core.retry.requeues-exactly-one",
             audience=Audience.CORE,
             source="skill/retrying.md:34-45",
             gist="A retry puts exactly the named notice back, and grades its own delivery.",
             enforced_by="the escalation pipeline's requeue path — core/escalation.py",
-        ),
-        Rule(
-            id="voice.retry.no-compensating-action",
-            audience=Audience.VOICE,
-            source="skill/retrying.md:46-57",
-            gist=(
-                "Say the refusal's own reason. A refused retry is not retried, and a "
-                "different notice is never replayed to make up for it."
-            ),
         ),
         Rule(
             id="core.retry.refusals-name-their-reason",
@@ -545,15 +460,6 @@ def _rules() -> tuple[Rule, ...]:
             enforced_by="the closed error set and Bridge Core's refusals — core/errors.py",
         ),
         # --- skill/starting.md ---------------------------------------------
-        Rule(
-            id="voice.start.an-empty-read-is-not-a-failed-read",
-            audience=Audience.VOICE,
-            source="skill/starting.md:25-41",
-            gist=(
-                "A read that succeeded and found nothing is a fact about the machine; a "
-                "read that failed is no reading at all, and the two are never spoken alike."
-            ),
-        ),
         Rule(
             id="delegated.start.distinguishes-empty-from-unread",
             audience=Audience.DELEGATED,
@@ -574,25 +480,6 @@ def _rules() -> tuple[Rule, ...]:
             enforced_by="the Session registry's name-independent targets — core/sessions.py",
         ),
         Rule(
-            id="dropped.starting.duty-gated-reads",
-            audience=Audience.DROPPED,
-            source="skill/starting.md:139-148",
-            gist=(
-                "A read refused because voice coordination was switched off, and the "
-                "spoken toggle that undid it. The control plane is never gated, so this "
-                "failure no longer exists to report."
-            ),
-        ),
-        Rule(
-            id="voice.start.no-substitute-after-a-failure",
-            audience=Audience.VOICE,
-            source="skill/starting.md:149-151",
-            gist=(
-                "After a reported failure there is no automatic retry and no substitute "
-                "action — no second workspace, no other agent, nothing to compensate."
-            ),
-        ),
-        Rule(
             id="core.start.no-automatic-retry-after-a-terminal-failure",
             audience=Audience.CORE,
             source="skill/starting.md:149-151",
@@ -603,19 +490,86 @@ def _rules() -> tuple[Rule, ...]:
             ),
             enforced_by="the escalation and Relay pipelines' terminal outcomes — issue #2",
         ),
+        # --- the Call Agent's own rules (#173 §4) ---------------------------
         Rule(
-            id="dropped.starting.the-removed-roster-read",
-            audience=Audience.DROPPED,
-            source="skill/starting.md:97-107",
+            id="agent.cli.one-generated-command",
+            audience=Audience.AGENT,
+            source="issue/173",
             gist=(
-                "The historical explanation of a roster read that was removed; it is not "
-                "runtime discipline."
+                "One control-plane CLI, its location and the engine's version generated "
+                "rather than remembered, and its arguments passed as given rather than "
+                "assembled into shell text."
+            ),
+        ),
+        Rule(
+            id="agent.verbs.only-the-six-forms",
+            audience=Audience.AGENT,
+            source="issue/173",
+            gist=(
+                "Six forms and no others, one line each on what they answer. The voice call "
+                "neither queries the engine's switches nor flips them, so the actions that "
+                "do are not given to this half at all."
+            ),
+        ),
+        Rule(
+            id="agent.identity.copies-the-address-unchanged",
+            audience=Audience.AGENT,
+            source="issue/173",
+            gist=(
+                "An address comes from the roster the engine returned and is copied into "
+                "the next call unchanged; an address assembled from speech is a guess."
+            ),
+        ),
+        Rule(
+            id="agent.read.now-every-time",
+            audience=Audience.AGENT,
+            source="issue/173",
+            gist=(
+                "Read now, every time, and report what came back and nothing more. An "
+                "earlier answer is not this answer."
+            ),
+        ),
+        Rule(
+            id="agent.history.pages-older-on-request",
+            audience=Audience.AGENT,
+            source="issue/151",
+            gist=(
+                "When the user wants more than the newest message, ask for that exact "
+                "Session's History page, and for the entries before a page already given by "
+                "the smallest ordinal on it."
+            ),
+        ),
+        Rule(
+            id="agent.relay.carries-the-users-words",
+            audience=Audience.AGENT,
+            source="issue/173",
+            gist=(
+                "A relay carries the user's instruction as the speaking half handed it "
+                "over, with no decision added on the way."
+            ),
+        ),
+        Rule(
+            id="agent.live.ends-the-call",
+            audience=Audience.AGENT,
+            source="issue/179",
+            gist=(
+                "A request to end the call is the Live Toggle, run. The engine ends a call "
+                "off a command it can see, never off a claim to have ended one (ADR 0018)."
+            ),
+        ),
+        Rule(
+            id="agent.output.returns-it-whole",
+            audience=Audience.AGENT,
+            source="issue/173",
+            gist=(
+                "The engine's answer goes back whole. Condensing it is the speaking half's "
+                "job, and a summary made here is a summary made without the rules for it."
             ),
         ),
     )
 
 
-#: Every surviving rule, and every deliberately dropped one. The requirements list.
+#: Every rule this engine still owes. The requirements list.
 RULES: tuple[Rule, ...] = _rules()
 
 

@@ -17,8 +17,12 @@ which it reports upward as a dropped call. Reconnection is Bridge Core's
 decision to make, and Bridge Core is where the one-call invariant lives.
 
 **Two threads, both bridge-owned, both told what they are.** A Live Call runs on
-a thread started for it, whose `realtimeStartInstructions` are the voice house
-rules Bridge Core generated. A Delegated Turn runs on a thread of its own,
+a thread started for it, and **this module is the only one that knows which wire
+slot addresses which half of it**: the `Dial` Bridge Core hands over names its
+audiences — prose for the Voice, rules for the Call Agent, and the Briefing's
+dial-time hand-over — and `_realtime_start_parameters` is where those become
+`prompt`, `realtimeStartInstructions` and `initialItems` (ADR 0018, proved by
+slot-swap in #175 Q4). A Delegated Turn runs on a thread of its own,
 started with the caller's model — the cost lever, which is a user-facing setting
 and is never defaulted here — and with the delegated action discipline as its
 developer instructions. Both run `approvalPolicy: "never"` in
@@ -32,19 +36,39 @@ never goes near them.
 gone, on every path including the failing ones. Keeping one alive per model
 would be a second ledger of which thread is the real one, and nothing in the
 locked decisions asks for continuity between delegated turns.
+
+**The cue player is this adapter's, not a call's.** The user hears the call
+connect and hears it end (#186), and the second of those has to play when the
+call's own audio path has already closed — so the thing that plays it outlives
+any one call, which a per-call transport does not. It opens its own short-lived
+output stream on the same `output_device` the call uses, one per cue.
+
+**Cues go out on one worker thread, in the order they were asked for.** The
+write blocks and `stop` drains after it, and the caller is Bridge Core's
+dispatch loop, which is not a thing to hold for a third of a second over a
+noise — so `play_cue` hands the cue to a queue and returns. One worker rather
+than a thread per cue, because *in order* is the promise: a call that drops
+within one cue's wall time of coming up would otherwise have two threads racing
+for the device, and the user would hear the call end before they heard it start.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
+from gpt_voicecoding.adapters.call.realtime import cues, webrtc
+from gpt_voicecoding.adapters.call.realtime.cues import CueSpan
 from gpt_voicecoding.adapters.call.realtime.settings import RealtimeCallSettings
 from gpt_voicecoding.adapters.call.realtime.transport import (
     CallTransport,
+    CueOutput,
     TransportError,
     TransportFactory,
 )
@@ -56,8 +80,15 @@ from gpt_voicecoding.seams.call import (
     CallSnapshot,
     CallStarted,
     CallState,
+    Cue,
     DelegatedReply,
+    Dial,
+    DialReason,
+    HandoverItem,
+    SpokenBrief,
+    SpokenRosterBrief,
     UserSpeech,
+    VoiceSpeech,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import EventSink
@@ -79,9 +110,51 @@ REALTIME_VERSION = "v3"
 #: A voice call is audio out. `text` is the same route with the point removed.
 OUTPUT_MODALITY = "audio"
 
-#: Which side of a realtime transcript is the user speaking. The other side is
-#: this system's own speech coming back, which is not news to it.
+#: Which side of a realtime transcript is the user speaking.
 USER_ROLE = "user"
+
+#: The other side: this system's own Voice. The wire's word for it, translated
+#: here into the seam's `VoiceSpeech` and never carried upward as it is — above
+#: this adapter the glossary has no unqualified *assistant* (`CONTEXT.md`).
+ASSISTANT_ROLE = "assistant"
+
+#: Which role a hand-over item is added under. `developer` is what the probe put
+#: the dial-time facts in and read back, and the wire preserves it verbatim
+#: (`docs/research/2026-09-01-realtime-live-probe.md` Q5, and
+#: `2026-09-01-realtime-text-entry-and-end-call.md` §3a on `initialItems`).
+DEVELOPER_ROLE = "developer"
+
+#: The three dial-time switches, pinned here because no caller varies them
+#: (ADR 0018). They are the adapter's constants and not `Dial` fields for the
+#: same reason `APPROVAL_POLICY` is: nothing above this seam has an opinion.
+#:
+#: `delegationAckFiller` off — the backend's own " 好,等我看一下啊。" filler is the
+#: wordiness Round 1 Q9 removed, and it is a dial parameter rather than the model
+#: improvising (probe, "the ack filler is the backend's").
+DELEGATION_ACK_FILLER = False
+
+#: `codexResponsesAsItems` on, with a prefix. **It buys no observability, and
+#: nothing here may be built on it:** with it on and this prefix set, two live
+#: spoken calls produced no item carrying an agent answer at all — every item in
+#: both records is a `handoff_request`, while the answers came back invisibly and
+#: were spoken (ADR 0018 as amended by #179). It stays on because that is the
+#: recorded decision, not because it delivers what the decision expected.
+CODEX_RESPONSES_AS_ITEMS = True
+CODEX_RESPONSE_ITEM_PREFIX = "[AGENT] "
+
+#: `includeStartupContext` off. Its default is *on*, and what it includes is up
+#: to 5,300 tokens of thread history, a scan of the user's forty most recent
+#: local codex threads and a workspace map, appended to the **Voice's** prompt
+#: (`realtime_context.rs`, `realtime_conversation.rs:1356-1377`). On a call whose
+#: premise is that the Voice speaks only from what the Briefing handed it, that
+#: is noise and a disclosure surface both (ADR 0018, amended after #179).
+INCLUDE_STARTUP_CONTEXT = False
+
+#: The item type a hand-off from the Voice to the Call Agent arrives as, on
+#: `thread/realtime/itemAdded`. Logged and raised to nobody: the seam's event set
+#: is closed, and a voice hang-up is the Call Agent running `bridgectl live` off
+#: a request this engine can see (ADR 0018, "No `HandoffRequested` event").
+HANDOFF_REQUEST = "handoff_request"
 
 
 class _Abandoned(Exception):
@@ -111,6 +184,16 @@ class _LiveCall:
     #: Set when *this side* asked for the end, so the far side going quiet
     #: afterwards is not reported as a loss.
     ending: bool = False
+    #: Whether the Voice is in the middle of an utterance on *this* call. Per
+    #: attempt rather than per adapter, so a call that drops between the first
+    #: delta and the `done` that would have cleared it cannot leave the latch
+    #: set over the call that follows.
+    speaking: bool = False
+    #: The user's current utterance, as the deltas have spelled it so far, and
+    #: what was last raised upward from it. Per attempt for `speaking`'s reason:
+    #: half a sentence heard on a call that dropped is not the next call's.
+    heard: list[str] = field(default_factory=list)
+    said: str | None = None
 
     def fail(self, reason: str) -> None:
         """Stop anything waiting on this attempt, with a reason rather than a hang."""
@@ -153,10 +236,23 @@ class RealtimeCallAdapter:
         sink: EventSink | None = None,
         settings: RealtimeCallSettings | None = None,
         transport_factory: TransportFactory,
+        cue_player: CueOutput | None = None,
     ) -> None:
         self._sink = sink
         self._settings = settings or RealtimeCallSettings()
         self._new_transport = transport_factory
+        #: Where cues go. One per adapter and not one per call, because `ENDED`
+        #: plays after the call's own audio has closed. Handed in only by tests,
+        #: which cannot have an output device; production builds it here, on the
+        #: same `output_device` the call itself is given.
+        self._cues: CueOutput = cue_player or webrtc.CuePlayer(device=self._settings.output_device)
+        #: The cues asked for and not yet played, and the one worker that plays
+        #: them. Unbounded because the only producer is the dispatch loop and a
+        #: call has two cues in it; started on the first cue rather than here,
+        #: so an adapter that never marks a moment never starts a thread.
+        self._queued: queue.SimpleQueue[Cue] = queue.SimpleQueue()
+        self._cue_worker: threading.Thread | None = None
+        self._cue_worker_lock = threading.Lock()
         self._server: OwnedAppServer | None = None
         self._call: _LiveCall | None = None
         self._state = CallState.DOWN
@@ -210,21 +306,24 @@ class RealtimeCallAdapter:
 
     # -- the seam ---------------------------------------------------------
 
-    async def ensure_call(self, instructions: str) -> CallSnapshot:
-        """Start a Live Call on those house rules, or report the one already up."""
+    async def ensure_call(self, dial: Dial) -> CallSnapshot:
+        """Start a Live Call on that dial, or report the one already up.
+
+        A `Dial` refuses its own empty halves and its own over-budget hand-over at
+        construction (`seams/call.py`), so there is no blank check here: what
+        arrives is sendable, and the check this adapter used to make would have
+        been a second, later copy of a rule that already holds.
+        """
         async with self._opening:
             if self._call is not None:
                 return self.snapshot()
-            if not instructions.strip():
-                _log.warning("refusing to start a voice thread with no instructions")
-                return CallSnapshot(state=CallState.DOWN)
             try:
                 self._connection()
                 live = self._registered()
             except (AppServerError, TransportError) as unavailable:
                 _log.warning("no call could be started: %s", unavailable)
                 return CallSnapshot(state=CallState.DOWN)
-            return await self._opened(live, instructions)
+            return await self._opened(live, dial)
 
     async def end_call(self) -> CallSnapshot:
         """End the current call. Idempotent, and a call already gone is not an error.
@@ -240,6 +339,9 @@ class RealtimeCallAdapter:
 
         was_up = self._state is CallState.UP
         self._state = CallState.DOWN
+        # The last moment these words are still this side's to report: after
+        # this the transport is closed and no `done` can arrive for them.
+        self._user_finished(live)
         live.ending = True
         detail = ""
         if live.thread_id is not None:
@@ -274,15 +376,21 @@ class RealtimeCallAdapter:
             return CallSnapshot(state=CallState.CONNECTING)
         return self.snapshot()
 
-    async def speak(self, text: str, *, request_id: RequestId) -> DeliveryReceipt:
-        """Say something into the call, graded on this adapter's own audio path."""
+    async def speak(self, brief: SpokenBrief, *, request_id: RequestId) -> DeliveryReceipt:
+        """Hand the call one Session Brief, graded on this adapter's own audio path.
+
+        The brief is assembled into the one text the append path carries. Every
+        word in it is Briefing's; what happens here is labelling and ordering,
+        which is the same thing `_wire_item` does at dial time and is why the two
+        share it.
+        """
         live = self._call
         if live is None or self._state is not CallState.UP:
             return _failed(request_id, "no call is up to speak into")
         try:
             await self._request(
                 "thread/realtime/appendSpeech",
-                {"threadId": live.thread_id, "text": text},
+                {"threadId": live.thread_id, "text": _brief_text(brief)},
                 timeout=self._settings.request_timeout_seconds,
             )
         except RemoteError as refused:
@@ -323,6 +431,87 @@ class RealtimeCallAdapter:
             # Every path, including the failing ones. A thread left behind is a
             # thread nothing will ever close.
             await self._retire(thread_id)
+
+    async def play_cue(self, cue: Cue) -> None:
+        """Mark one moment of the call with a sound. Returns before it is heard.
+
+        **Queued, and played in the order it was asked for.** The write is a
+        device write and `stop` drains after it — 320-620 ms of wall time for
+        60-300 ms of sound, measured on this path (#174) — and the arm that asks
+        for a cue is Bridge Core's dispatch loop, which may not be held for a
+        third of a second to make a noise about something it has already
+        finished. So this hands the cue over and returns at once.
+
+        One worker rather than a thread a cue, because the order is the point:
+        the two cues mark the two ends of a call, and a call that drops within
+        one cue's wall time of coming up would have two threads racing for the
+        device and the user hearing it end before hearing it start. What that
+        costs is that `ENDED` can start up to one cue late, which is a third of
+        a second on a moment that has already happened.
+
+        A daemon thread, so an engine on its way out is never waiting on a tone.
+        """
+        self._queued.put(cue)
+        self._playing_cues()
+
+    def _playing_cues(self) -> threading.Thread:
+        """The one thread that drains the cue queue, started on the first cue."""
+        with self._cue_worker_lock:
+            worker = self._cue_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(target=self._draining, name="call-cues", daemon=True)
+                self._cue_worker = worker
+                worker.start()
+            return worker
+
+    def _draining(self) -> None:
+        """Play whatever has been asked for, one cue at a time, for ever.
+
+        Never exits and never raises: `play_now` swallows its own failures, and a
+        worker that ended on one would leave every later cue in a queue nothing
+        reads. It is a daemon, so the process is free to go without it.
+        """
+        while True:
+            self.play_now(self._queued.get())
+
+    def play_now(self, cue: Cue) -> CueSpan | None:
+        """Synthesise and play one cue on *this* thread, and say what went out.
+
+        The blocking half of `play_cue`, and the half that has an answer: the
+        span the cue occupied on the output device. Public because that span is
+        what a playback reference inherits (#145) — the seam verb returns
+        nothing, and this is where the answer is. `play_cue` reaches it through
+        the queue; a caller that wants the span calls it here and waits.
+
+        Never raises. A cue that could not be played is written down and
+        swallowed: there is no recovery to attempt, and this runs on a thread
+        where a raise would be a stack trace and nothing else.
+        """
+        pcm = cues.render(cue)
+        span = CueSpan(
+            cue=cue,
+            device=self._cues.device,
+            started=time.monotonic(),
+            frames=cues.frames_in(pcm),
+        )
+        try:
+            self._cues.play(pcm, span=span)
+        except Exception as unplayable:  # noqa: BLE001 - a cue may not end a call
+            _log.warning("the %s cue could not be played: %s", cue, unplayable)
+            return None
+        _log.info("%s", cues.played_line(span))
+        return span
+
+    @property
+    def cue_output(self) -> CueOutput:
+        """Where this adapter's cues go, and what is going out right now.
+
+        Exposed rather than private because the span a cue occupies is read from
+        outside this class: #145 gates capture on it, since the microphone stays
+        open through a cue and the mid-call one is deliberately loud enough to
+        carry over speech.
+        """
+        return self._cues
 
     async def verify(self) -> VerifyResult:
         """Report what is loaded, and whether the app-server this rides answers."""
@@ -368,7 +557,7 @@ class RealtimeCallAdapter:
         self._state = CallState.CONNECTING
         return live
 
-    async def _opened(self, live: _LiveCall, instructions: str) -> CallSnapshot:
+    async def _opened(self, live: _LiveCall, dial: Dial) -> CallSnapshot:
         """The whole handshake. Anything that goes wrong leaves nothing running."""
         deadline = self._settings.connect_timeout_seconds
         try:
@@ -384,18 +573,21 @@ class RealtimeCallAdapter:
 
             offer = await live.transport.offer()
             self._still_wanted(live)
+            # The one line a run has to read this call's hand-over off. The
+            # items themselves are `initialItems`, which the Voice holds
+            # silently and never repeats (#175 Q5), so a call that came up
+            # holding nothing looks exactly like one that came up holding a
+            # briefing — until this says how many items went and of what kind.
+            # Kinds and counts, never their words: the words are on the wire and
+            # in the Session Brief the log already carries.
+            _log.info(
+                "dialling a call holding %d hand-over item(s): %s",
+                len(dial.hand_over),
+                ", ".join(type(item).__name__ for item in dial.hand_over) or "none",
+            )
             await self._request(
                 "thread/realtime/start",
-                {
-                    "threadId": live.thread_id,
-                    "version": REALTIME_VERSION,
-                    # Top level, beside the version — not nested in a `session`
-                    # object. codex overrides its own default with this (#35).
-                    "model": self._settings.realtime_model,
-                    "outputModality": OUTPUT_MODALITY,
-                    "transport": {"type": "webrtc", "sdp": offer},
-                    "realtimeStartInstructions": instructions,
-                },
+                self._realtime_start_parameters(live.thread_id, offer, dial),
                 timeout=self._settings.request_timeout_seconds,
             )
             answer = await asyncio.wait_for(live.sdp, deadline)
@@ -462,6 +654,9 @@ class RealtimeCallAdapter:
         was_up = self._state is CallState.UP
         self._call = None
         self._state = CallState.DOWN
+        # Before the drop, because a caller reconciling on `CallDropped` should
+        # already have heard whatever the user managed to say on the way out.
+        self._user_finished(live)
         live.fail(reason)
         if was_up:
             self._emit(CallDropped(call_id=live.thread_id, detail=reason))
@@ -569,21 +764,138 @@ class RealtimeCallAdapter:
             case "thread/realtime/started":
                 if not live.started.done():
                     live.started.set_result(None)
+            case "thread/realtime/transcript/delta":
+                self._voice_started(live, params)
+                self._user_said_more(live, params)
             case "thread/realtime/transcript/done":
-                self._transcribed(params)
+                self._transcribed(live, params)
             case "thread/realtime/error":
                 self._drop(live, f"the realtime session failed: {params.get('message')}")
             case "thread/realtime/closed":
                 reason = params.get("reason") or "no reason given"
                 self._drop(live, f"the realtime session closed: {reason}")
+            case "thread/realtime/itemAdded":
+                self._item_added(live, params)
 
-    def _transcribed(self, params: Message) -> None:
-        """Raise what the user said. The other side of the transcript is our own voice."""
+    def _item_added(self, live: _LiveCall, params: Message) -> None:
+        """Write down the Voice handing work to the Call Agent, and raise no *event* for it.
+
+        A `handoff_request` is the one observable proof that the acting half was
+        reached — the model's own claim to have acted is trusted by nothing
+        (#175 run 3, and 8/8 false hang-up claims in #179). The hand-off itself
+        is **logged and not published**: the seam's event set is closed, and the
+        engine acts on the Call Agent's own `bridgectl` run rather than on a
+        request it saw go past (ADR 0018, "No `HandoffRequested` event").
+
+        What *is* published is the user's own sentence, which this item carries
+        and which the seam has always raised. See `_user_spoke`.
+
+        `input_transcript` carries that sentence only when the turn came from
+        speech; it is empty on a typed one (#179), which is why both halves of
+        the record are written rather than just the one, and why an empty one
+        raises nothing.
+        """
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != HANDOFF_REQUEST:
+            return
+        routed = item.get("input_transcript")
+        _log.info(
+            "the Voice handed work to the Call Agent: %s (spoken request: %r)",
+            item.get("handoff_id") or "no id given",
+            routed or "",
+        )
+        # The sentence the hand-off routed **is** what the user said, and on a
+        # spoken turn it is populated (#179; empty on a typed one, which this
+        # engine cannot produce). It is often the only carrier that arrives
+        # before the Call Agent ends the call, so it is read here rather than
+        # waited for on a `done` that may never come.
+        if isinstance(routed, str):
+            self._user_spoke(live, routed)
+
+    def _user_said_more(self, live: _LiveCall, params: Message) -> None:
+        """Keep the user's utterance as it is being spelled out, delta by delta.
+
+        **The engine cannot wait for `transcript/done` to learn what was said.**
+        That notification arrives only when the Voice takes a spoken turn, and
+        with `delegationAckFiller` off it often takes none: measured on this
+        machine, a request that routed produced ten user deltas, a
+        `handoff_request`, `bridgectl live` and a closed call in eleven seconds,
+        with no `done` at any point — the user's words reached nothing, and the
+        Silence Ceiling counted the whole exchange as silence. So the deltas are
+        kept here and one of the three paths below raises them.
+        """
         if params.get("role") != USER_ROLE:
             return
+        delta = params.get("delta")
+        if isinstance(delta, str) and delta:
+            live.heard.append(delta)
+
+    def _user_spoke(self, live: _LiveCall, text: str) -> None:
+        """Raise one whole utterance upward, once.
+
+        Three things can be the first to know what the user said — a
+        `handoff_request` carrying the sentence it routed, a `transcript/done`,
+        or the call ending on what the deltas had spelled — and they overlap.
+        Whichever arrives first raises it; the others recognise it and stay
+        quiet, because a Session announced twice is the defect this adapter's own
+        grading rules exist to avoid.
+
+        Recognised with the spaces taken out of both sides: the recogniser puts
+        word boundaries in different places in the two carriers for the same four
+        seconds of audio (#181 on the same audio read two ways), and the request
+        has no spaces in it, so a space is the recogniser's and never the
+        speaker's.
+        """
+        said = text.strip()
+        if not said:
+            return
+        if not live.heard and live.said is not None and _unspaced(said) == _unspaced(live.said):
+            return
+        live.heard.clear()
+        live.said = said
+        self._emit(UserSpeech(text=said))
+
+    def _user_finished(self, live: _LiveCall) -> None:
+        """Raise whatever the deltas spelled and nothing else has claimed.
+
+        Called where a call ends, which is the last moment the words are still
+        this side's to report. An utterance already raised leaves an empty
+        buffer behind it, so this is a no-op on the ordinary path.
+        """
+        if live.heard:
+            self._user_spoke(live, "".join(live.heard))
+
+    def _voice_started(self, live: _LiveCall, params: Message) -> None:
+        """The Voice began an utterance. Only the first delta of one is news.
+
+        A long answer is hundreds of these — 604 in the probe records — and the
+        seam publishes a *span*, so every delta after the first says nothing the
+        span does not already say.
+        """
+        if params.get("role") != ASSISTANT_ROLE or live.speaking:
+            return
+        live.speaking = True
+        self._emit(VoiceSpeech(speaking=True))
+
+    def _transcribed(self, live: _LiveCall, params: Message) -> None:
+        """Raise what was said, from whichever side of the transcript said it.
+
+        The Voice's half is raised as the end of a span rather than as words:
+        this system does not read its own speech back to itself. It is raised on
+        every assistant `done`, latch or no latch, because `done` is emitted
+        once per *turn* — an answer codex splits in two produces two of them,
+        and a `done` with no delta before it is still an utterance that ended.
+        """
+        role = params.get("role")
+        if role == ASSISTANT_ROLE:
+            live.speaking = False
+            self._emit(VoiceSpeech(speaking=False))
+            return
+        if role != USER_ROLE:
+            return
         text = params.get("text")
-        if isinstance(text, str) and text.strip():
-            self._emit(UserSpeech(text=text))
+        if isinstance(text, str):
+            self._user_spoke(live, text)
 
     def _turn_heard(self, turn: _DelegatedTurn, method: str, params: Message) -> None:
         if method == "item/completed":
@@ -602,6 +914,33 @@ class RealtimeCallAdapter:
                     turn.done.set_result(completed)
 
     # -- talking to the app-server ------------------------------------------
+
+    def _realtime_start_parameters(self, thread_id: str | None, offer: str, dial: Dial) -> Message:
+        """The one place the three payloads become three wire slots (ADR 0018).
+
+        `prompt` reaches the Voice (6/6 by slot-swap) and *replaces* codex's own
+        default voice prompt; `realtimeStartInstructions` reaches the Call Agent
+        and only it (0/6 on the Voice); `initialItems` reaches the Voice silently
+        and is retained (5/6). The seam named the audiences and never these three
+        names, which is the whole reason it exists — this method is the only code
+        in the system that knows both halves of that mapping.
+        """
+        return {
+            "threadId": thread_id,
+            "version": REALTIME_VERSION,
+            # Top level, beside the version — not nested in a `session`
+            # object. codex overrides its own default with this (#35).
+            "model": self._settings.realtime_model,
+            "outputModality": OUTPUT_MODALITY,
+            "transport": {"type": "webrtc", "sdp": offer},
+            "prompt": dial.voice,
+            "realtimeStartInstructions": dial.agent,
+            "initialItems": [_wire_item(item) for item in dial.hand_over],
+            "delegationAckFiller": DELEGATION_ACK_FILLER,
+            "codexResponsesAsItems": CODEX_RESPONSES_AS_ITEMS,
+            "codexResponseItemPrefix": CODEX_RESPONSE_ITEM_PREFIX,
+            "includeStartupContext": INCLUDE_STARTUP_CONTEXT,
+        }
 
     def _thread_parameters(
         self, *, model: str | None = None, developer_instructions: str | None = None
@@ -636,6 +975,49 @@ class RealtimeCallAdapter:
     def _emit(self, event: Any) -> None:
         if self._sink is not None:
             self._sink.emit(event)
+
+
+def _wire_item(item: HandoverItem) -> Message:
+    """One hand-over item as one `initialItems` entry, under the developer role.
+
+    One item per kind, never one per line: the wire counts items against a
+    ceiling of 128, and a brief split across a dozen entries would spend that
+    ceiling on layout. What this does is put the seam's already-worded strings in
+    an order and label them; it chooses no words (`seams/call.py`), which is why
+    every label here is a noun and not a sentence.
+    """
+    return {"role": DEVELOPER_ROLE, "text": _item_text(item)}
+
+
+def _item_text(item: HandoverItem) -> str:
+    match item:
+        case DialReason():
+            return item.text
+        case SpokenRosterBrief():
+            return "\n".join(_roster_text(item))
+        case SpokenBrief():
+            return _brief_text(item)
+
+
+def _roster_text(summary: SpokenRosterBrief) -> list[str]:
+    lines = [] if summary.focus is None else [f"focus: {summary.focus}"]
+    lines.append(summary.counts)
+    lines.extend(f"  {row}" for row in summary.rows)
+    return lines
+
+
+def _brief_text(brief: SpokenBrief) -> str:
+    """One Session Brief as one block of text, in the order its fields are named."""
+    lines = [f"{brief.name} — {brief.agent} — {brief.state}", f"  newest: {brief.newest}"]
+    lines.extend(f"  {line}" for line in brief.decision)
+    lines.append(f"  answer: {brief.answerable_here}")
+    lines.append(f"  last activity: {brief.last_activity_at}")
+    return "\n".join(lines)
+
+
+def _unspaced(text: str) -> str:
+    """One transcript with all whitespace removed. See `_user_spoke`."""
+    return "".join(text.split())
 
 
 def _thread_id_in(started: Message) -> str:

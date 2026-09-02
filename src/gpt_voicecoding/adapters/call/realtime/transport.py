@@ -17,7 +17,7 @@ away. Anything larger would be inventing a lifecycle framework for one caller.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 class TransportError(Exception):
@@ -68,3 +68,46 @@ class CallTransport(Protocol):
 #: returns — there is no pooling, because a peer connection that has been closed
 #: cannot be reopened.
 TransportFactory = Callable[[], CallTransport]
+
+
+@runtime_checkable
+class CueOutput(Protocol):
+    """Where a cue is played out, named here for the same reason `CallTransport` is.
+
+    A cue opens a real output device, and every decision worth grading about one
+    — which moment gets which sound, when it is played, what happens when it
+    cannot be — is on this side of that device. So the device goes behind an
+    interface a test can stand in for, and the rest stays testable in CI, which
+    never installs the voice extra.
+
+    Not a seam and nothing about it varies in production (ADR 0001, principle 2):
+    there is one player, and it lives in the audio module beside the call's own
+    speaker. It is **per adapter and not per call**, because the cue that most
+    needs playing is the one that marks a call that has already gone.
+    """
+
+    @property
+    def device(self) -> int | None:
+        """Which output index cues go to. `None` is the machine's own default."""
+        ...
+
+    @property
+    def playing(self) -> Any | None:
+        """The span going out right now, or `None`.
+
+        What #145 gates capture on: the microphone stays open through a cue, and
+        the mid-call one is deliberately loud enough to carry over speech — which
+        is the same thing as loud enough to be heard back.
+        """
+        ...
+
+    def play(self, pcm: bytes, *, span: Any = None) -> None:
+        """Play one buffer to the end, holding `span` while it goes out.
+
+        **Blocking, and says so.** The write is a device write and `stop` drains
+        after it — 60-300 ms of sound measured 320-620 ms of wall time on this
+        path (#174) — so the caller is the one that decides what thread this
+        runs on. Raises whatever the audio library raises: what a failed cue
+        must not take down is the caller's business, and the caller knows.
+        """
+        ...

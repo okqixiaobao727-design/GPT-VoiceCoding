@@ -47,13 +47,23 @@ SAMPLE_RATE = 48_000
 #: 20 ms at that rate — one Opus frame.
 FRAME_SAMPLES = 960
 
+#: The rest of the shape, named once. Every stream this module opens is the same
+#: mono 16-bit audio at `SAMPLE_RATE`, and so is every buffer handed to one — the
+#: microphone's frames, the speaker's playback and a cue's PCM. Spelled out at
+#: each `sounddevice` call it would be three chances to open one stream in a
+#: format the buffers feeding it are not in, and `bytes // 2` scattered around is
+#: the same fact written as arithmetic nobody can search for.
+CHANNELS = 1
+SAMPLE_FORMAT = "int16"
+SAMPLE_BYTES = 2
+
 #: How much captured audio is held before the oldest is dropped. Two seconds:
 #: long enough to ride out a scheduling hiccup, short enough that what is
 #: eventually sent is still a reply to what was said.
 MAX_CAPTURE_FRAMES = 100
 
 #: The same bound for playback, in bytes of 16-bit mono at `SAMPLE_RATE`.
-MAX_PLAYBACK_BYTES = SAMPLE_RATE * 2 * 2
+MAX_PLAYBACK_BYTES = SAMPLE_RATE * SAMPLE_BYTES * 2
 
 #: What to install when the import fails.
 INSTALL_HINT = "pip install 'gpt-voicecoding[voice]'"
@@ -117,6 +127,9 @@ class _WebRtcTransport:
         self._speaker = _Speaker(silent=silent, device=output_device)
         self._on_lost: LostHandler | None = None
         self._closing = False
+        #: Whether the loss has already been reported upward. Its own flag, and
+        #: not `_closing`: see `_note`.
+        self._reported = False
         self._connected: asyncio.Future[None] = asyncio.get_event_loop().create_future()
         self._connected.add_done_callback(_retrieved)
 
@@ -191,7 +204,16 @@ class _WebRtcTransport:
     # -- state ------------------------------------------------------------
 
     def _note(self, state: str) -> None:
-        """One connection-state reading, turned into the two things that matter."""
+        """One connection-state reading, turned into the two things that matter.
+
+        **Reporting a loss is not closing.** This once set `_closing` to keep
+        itself from reporting the same loss twice, and `_closing` is also what
+        makes `aclose` idempotent — so a connection that went away by itself was
+        marked closed without anything having been closed, and the `aclose` the
+        adapter then ran returned at the first line. The microphone and the
+        speaker stayed open on a dead call, which is a device held and a
+        microphone live with nothing listening. Two facts, two flags.
+        """
         if state == "connected" and not self._connected.done():
             self._connected.set_result(None)
             return
@@ -200,9 +222,9 @@ class _WebRtcTransport:
         reason = f"the call's audio connection is {state}"
         if not self._connected.done():
             self._connected.set_exception(TransportError(reason))
-        if self._closing:
-            return  # a close this side asked for is not a loss
-        self._closing = True
+        if self._closing or self._reported:
+            return  # a close this side asked for is not a loss, and once is enough
+        self._reported = True
         handler, self._on_lost = self._on_lost, None
         if handler is not None:
             handler(reason)
@@ -218,6 +240,85 @@ def _retrieved(waiting: asyncio.Future[None]) -> None:
     """
     if not waiting.cancelled():
         waiting.exception()
+
+
+class CuePlayer:
+    """A second output stream, opened for one cue and closed after it.
+
+    **Beside the call's own `_Speaker`, not inside it.** The cue that matters
+    most plays when there is no call left to play it through: `ENDED` goes out
+    after the peer connection and its speaker have already closed. Mixing cues
+    into the playback buffer would tie the two lifetimes together and lose
+    exactly that one. A stream per cue also costs nothing at all in between —
+    there is no device held open for a sound that plays three times an hour.
+
+    The stream's parameters are the speaker's own (48 kHz, mono, int16, 960-frame
+    blocks), so a cue needs no second opinion about what this machine's audio
+    path looks like, and it honours the same `output_device` the call does.
+
+    **It starts no thread.** `play` blocks — the write is a device write and
+    `stop` drains after it, which #174 measured at 320-620 ms of wall time for
+    60-300 ms of sound — and the caller decides where that runs and what a
+    failure means. This class knows about a device and nothing else.
+
+    **What is playing is a set, not a slot.** The adapter feeds this from a
+    single worker, so in practice the cues arrive one at a time — but `play_now`
+    is public and #145 may call it, so a second playback is something this class
+    cannot see coming. A single `_playing` slot cleared by whoever finishes gets
+    that wrong in one of the two orders: the later playback finishing first
+    would announce silence while the earlier one is still writing, and a capture
+    gate reading that opens the microphone into a live tone. So every playback
+    in flight is held, and `playing` answers from the newest of them.
+    """
+
+    def __init__(self, *, device: int | None = None) -> None:
+        self._device = device
+        self._lock = threading.Lock()
+        self._spans: list[Any] = []
+
+    @property
+    def device(self) -> int | None:
+        return self._device
+
+    @property
+    def playing(self) -> Any | None:
+        """The span going out right now, or None. Read by #145's capture gate.
+
+        The newest when more than one is in flight: what a gate asks is whether
+        a cue is sounding, and the newest is the one that has longest to run.
+        """
+        with self._lock:
+            return self._spans[-1] if self._spans else None
+
+    def play(self, pcm: bytes, *, span: Any = None) -> None:
+        """Open, write, stop, close. Blocking, and raises what the library raises."""
+        import sounddevice
+
+        stream = sounddevice.RawOutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=SAMPLE_FORMAT,
+            blocksize=FRAME_SAMPLES,
+            device=self._device,
+        )
+        # Held only once the stream exists: a cue that could not open a device
+        # never occupied one, and a gate reading `playing` would otherwise hold
+        # capture shut over a sound nobody made.
+        with self._lock:
+            self._spans.append(span)
+        try:
+            stream.start()
+            try:
+                stream.write(pcm)
+                stream.stop()
+            finally:
+                stream.close()
+        finally:
+            with self._lock:
+                # By identity: two cues of the same kind a moment apart are equal
+                # spans, and dropping "one that compares equal" is how a playback
+                # releases somebody else's.
+                self._spans[:] = [held for held in self._spans if held is not span]
 
 
 class _Microphone:
@@ -295,8 +396,8 @@ class _Microphone:
         try:
             self._stream = sounddevice.RawInputStream(
                 samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
+                channels=CHANNELS,
+                dtype=SAMPLE_FORMAT,
                 blocksize=FRAME_SAMPLES,
                 device=self._device,
                 callback=captured,
@@ -350,9 +451,9 @@ class _Speaker:
             if self._silent:
                 continue
             for out in resampler.resample(frame):
-                # Only the first `samples * 2` bytes are real audio; the rest of
-                # the plane is padding, and playing padding is audible static.
-                chunk = bytes(out.planes[0])[: out.samples * 2]
+                # Only the first `samples * SAMPLE_BYTES` bytes are real audio;
+                # the rest of the plane is padding, and padding is audible static.
+                chunk = bytes(out.planes[0])[: out.samples * SAMPLE_BYTES]
                 with self._lock:
                     self._buffer.extend(chunk)
                     overflow = len(self._buffer) - MAX_PLAYBACK_BYTES
@@ -364,7 +465,7 @@ class _Speaker:
         import sounddevice
 
         def wanted(outdata: Any, frames: int, _time: Any, _status: Any) -> None:
-            need = frames * 2
+            need = frames * SAMPLE_BYTES
             with self._lock:
                 available = bytes(self._buffer[:need])
                 del self._buffer[: len(available)]
@@ -375,8 +476,8 @@ class _Speaker:
         try:
             self._stream = sounddevice.RawOutputStream(
                 samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
+                channels=CHANNELS,
+                dtype=SAMPLE_FORMAT,
                 blocksize=FRAME_SAMPLES,
                 device=self._device,
                 callback=wanted,

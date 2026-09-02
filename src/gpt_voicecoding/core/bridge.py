@@ -21,9 +21,11 @@ one way to turn Duty back on from away from the computer would be gated too.
 Three things are recorded here rather than decided here. `UserSpeech` is the
 in-call transcript, and Bridge Core never parses one: spoken intent arrives as
 structured control-plane calls the voice thread makes, so the event is written
-to the log and nothing else. The control-plane command set and the Delegated
-Turn's execution belong to the surfaces that own them, so both arrive as
-injected handlers with honest defaults rather than being invented here.
+to the log and nothing else. `VoiceSpeech` is the other side of the same
+conversation and is treated the same way, except that the interlock is told —
+the Silence Ceiling counts both speakers (#184). The control-plane command set
+and the Delegated Turn's execution belong to the surfaces that own them, so both
+arrive as injected handlers with honest defaults rather than being invented here.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
+    CallInstructionsMissing,
     ChildSessionError,
     LaneUnreadable,
     ProgressUnavailable,
@@ -94,7 +97,12 @@ from gpt_voicecoding.seams.call import (
     CallEnded,
     CallSnapshot,
     CallStarted,
+    Cue,
+    Dial,
+    DialReason,
+    HandoverItem,
     UserSpeech,
+    VoiceSpeech,
 )
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.events import Event
@@ -111,6 +119,28 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 
 #: Answers an inbound delegation when no Delegated Turn handler is wired.
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
+
+#: The two lines a run is told the Voice held its call open by. Fixed strings
+#: rather than a formatted one, because the acceptance step matches them: an
+#: engine that says nothing when the ceiling is held leaves a whole-lane run no
+#: way to tell "the call outlived the ceiling" from "the ceiling never ran"
+#: (#184). One per edge, never per delta — a long answer is hundreds of those.
+VOICE_SPEAKING_LINE = "the call's own Voice started speaking"
+VOICE_QUIET_LINE = "the call's own Voice stopped speaking"
+
+#: Why a call the user opened exists, and the *whole* hand-over it gets (#167
+#: Q6). A user who pressed the toggle is about to say what they want; briefing
+#: them on the roster they were looking at when they pressed it would be the
+#: system talking first, on a call the user opened to talk.
+USER_OPENED = "The user opened this call. Wait to be spoken to, then act on what they ask for."
+
+#: Why a call the *system* dialled exists. The items after it are the roster and
+#: the Sessions waiting, so this says what they are for and nothing they say.
+SYSTEM_DIALLED = (
+    "This call was dialled because Sessions need the user. "
+    "What follows is the roster and each Session that is waiting; "
+    "speak from it, and do not invent anything it does not say."
+)
 
 
 def stop_brief(
@@ -288,10 +318,6 @@ class BridgeCore:
         #: engine it reaches. None until a root supplies them; a hub assembled
         #: for a test has no CLI to name and does not pretend to.
         self._instructions = generate(instruction_context) if instruction_context else None
-        #: The voice thread's house rules, as the one string a call starts with.
-        #: Empty when this hub generated none, and the interlock refuses to open
-        #: a call on an empty one rather than this being checked at each caller.
-        self._voice_instructions = self._instructions.voice.text if self._instructions else ""
         #: Durations are measured with `clock`; anything read outside this
         #: process is stamped with `stamp`. A Session's `first_seen` travels to
         #: every surface in the `sessions` payload, and a monotonic reading
@@ -307,7 +333,7 @@ class BridgeCore:
             channel=channel,
             interlock=self.interlock,
             adjudicator=self.adjudicator,
-            voice_instructions=self._voice_instructions,
+            system_dial=self._system_dial,
         )
         self.relays = RelayPipeline(
             agents=agents,
@@ -320,12 +346,15 @@ class BridgeCore:
 
     @property
     def instructions(self) -> Instructions | None:
-        """The voice and delegated-turn instruction sets, as plain data.
+        """All three instruction sets, as plain data.
 
         Generated once, from the catalogue and this engine's own installation.
-        The Call adapter starts its realtime thread with the voice set and the
-        Codex adapter starts a Delegated Turn with the delegated one; neither
-        rewrites them, and neither reads anything from disk to get them.
+        A Live Call is two audiences (ADR 0018): the Call adapter starts its
+        realtime thread with the **agent** set, which is the half that acts, and
+        the voice set waits for the Dial to give that seam a payload per
+        audience. The Codex adapter starts a Delegated Turn with the delegated
+        one. None of them rewrites a set, and none reads anything from disk to
+        get one.
         """
         return self._instructions
 
@@ -524,10 +553,68 @@ class BridgeCore:
             return await self.interlock.end_call()
         # Ending is always allowed; whether opening is, is the interlock's to
         # say — in both directions, and for both of its reasons.
-        snapshot = await self.interlock.open_call(self._voice_instructions)
+        snapshot = await self.interlock.open_call(self._dial((DialReason(text=USER_OPENED),)))
         if snapshot.is_up:
             self._owe_reconciliation()
         return snapshot
+
+    def _dial(self, hand_over: tuple[HandoverItem, ...]) -> Dial:
+        """What a call this hub opens is opened on: two audiences and a hand-over.
+
+        The one place a `Dial` is built, and therefore the one place that can say
+        which half is missing when this engine generated nothing. The refusal is
+        here rather than in the interlock because that is a door and this is a
+        source: the interlock decides *whether* a call may open, and only the hub
+        knows what it would be opened on (ADR 0018; #193's deferred note on the
+        error's old name).
+        """
+        instructions = self._instructions
+        if instructions is None:
+            raise CallInstructionsMissing("prose for the Voice or rules for the Call Agent")
+        if not instructions.voice.text.strip():
+            raise CallInstructionsMissing("prose for the Voice")
+        if not instructions.agent.text.strip():
+            raise CallInstructionsMissing("rules for the Call Agent")
+        return Dial(
+            voice=instructions.voice.text, agent=instructions.agent.text, hand_over=hand_over
+        )
+
+    def _system_dial(self, notice: Notice) -> Dial:
+        """What a call the *system* dials for one notice is opened on.
+
+        The hand-over is read from the roster **now**, not assembled from the
+        notice that provoked it: ADR 0017's rule is that a missed call is briefed
+        from a fresh reading and never from replayed events, and by the time the
+        matrix reaches this route the wait that started it may have been answered
+        at the terminal. So the notice names the moment and the roster supplies
+        the content.
+
+        **Except for the one row the roster is knowingly stale about.** A Stop
+        that merely ended a turn leaves its row in `RUNNING`
+        (`core/sessions.py::set_stop_reading`, deliberately, #209), and a hand-over
+        briefs no running Session — so a call dialled by that Stop would come up
+        saying a Session needs the user and never mention which. The notice
+        already carries the reading that is *not* stale: `stop_brief` derives the
+        state from the wait for exactly this reason, and `briefing.spoken` worded
+        it. So it is passed alongside, and `handover` places it last and only if
+        the roster did not brief that target itself — never ahead of the Focus
+        Session, and never twice.
+        """
+        sessions = self._state.sessions.live()
+        return self._dial(
+            briefing.handover(
+                sessions,
+                self._state.sessions.focus,
+                reason=SYSTEM_DIALLED,
+                answerable=tuple(
+                    session.target
+                    for session in sessions
+                    if session.waiting_for.kind is WaitingKind.QUESTION
+                    and self._question_answerable(session.target)
+                ),
+                stopped=((notice.target, notice.spoken) if notice.spoken is not None else None),
+            )
+        )
 
     async def outlets_changed(self) -> None:
         """An outlet the switches already allow became reachable again.
@@ -706,7 +793,21 @@ class BridgeCore:
         # Hang-up Switch off the ceiling is never measured, so the Keeper's one
         # ending attempt per call stays unspent and turning the switch back on
         # ends a call that has been silent all along.
-        if self.adjudicator.may_auto_hangup():
+        #
+        # **And never measured while unread call activity is waiting.** This runs
+        # on its own task and the dispatch loop runs on another
+        # (`engine/composition.py`), so a `VoiceSpeech` that has been emitted but
+        # not yet taken has not reached the interlock — and measuring silence
+        # then is how a call gets ended in the middle of the answer that was
+        # about to say it was not silent (#184). Waiting for the next pass costs
+        # a second on a sixty-second ceiling.
+        #
+        # The two kinds are named rather than the queue being asked whether it
+        # holds anything: this is the ceiling's own question — *was there
+        # activity on the call* — and a `SessionStopped` waiting to be read is
+        # not an answer to it. Asking the wider question let news about a
+        # Session hold a silent call open.
+        if self.adjudicator.may_auto_hangup() and not self.events.unread(UserSpeech, VoiceSpeech):
             try:
                 ended_silent_call = await self.interlock.end_silent_call(
                     self._policy.silence_end_seconds
@@ -785,8 +886,15 @@ class BridgeCore:
                 self._relay_receipt(event)
             case CallStarted():
                 self.interlock.note_started(event.call_id)
+                await self._cue(Cue.CONNECTED)
                 self._owe_reconciliation()
             case CallEnded() | CallDropped():
+                # The cue is not conditional on the interlock's answer the way
+                # the reconciliation below is: what the user is owed is the
+                # sound of the call they were on ending, and whether this hub
+                # was still holding that call is a bookkeeping question they
+                # cannot hear (#186).
+                await self._cue(Cue.ENDED)
                 # Only a release is an outlet transition. A late event about a
                 # call the system was not holding changes nothing, so it cannot
                 # justify another inspection and announcement.
@@ -794,6 +902,12 @@ class BridgeCore:
                     self._owe_reconciliation()
             case InboundText():
                 await self._inbound_text(event)
+            case VoiceSpeech():
+                # Both edges are activity, and the ceiling is held between them.
+                # Recorded, never read back: this system does not listen to
+                # itself, and the words are the Voice's own (#184).
+                self.interlock.note_voice_speech(speaking=event.speaking)
+                _log.info("%s", VOICE_SPEAKING_LINE if event.speaking else VOICE_QUIET_LINE)
             case UserSpeech():
                 self.interlock.note_activity()
                 # Recorded, never parsed. Spoken intent reaches Bridge Core as
@@ -883,6 +997,11 @@ class BridgeCore:
                 request_id=new_request_id(),
                 target=target,
                 text=briefing.text(brief),
+                # The same brief, twice, for the two kinds of surface: the
+                # Companion Channel and the log render words, and the Live Call
+                # is handed the brief itself and speaks from it (`CONTEXT.md`,
+                # *Stop Notice*). One reading, so the two can never disagree.
+                spoken=briefing.spoken(brief),
             )
         )
         return outcome
@@ -922,6 +1041,25 @@ class BridgeCore:
             return
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
+
+    async def _cue(self, cue: Cue) -> None:
+        """Ask the Call adapter to mark one moment with a sound.
+
+        The hub names the moment and never the sound: which notes, how loud and
+        how long were chosen by ear against one machine's speakers (#174), and
+        none of that is policy. The Call Keeper takes these two calls over when
+        it arrives (#195); until then the lifecycle arms are where the moments
+        are known.
+
+        A shipped adapter swallows its own playback failures, so this guard is
+        for a **defective** one — and a defective adapter may not stop the arm
+        it was called from. What follows a `CallEnded` is the interlock being
+        released, and a missing tone is not a reason to keep a call held.
+        """
+        try:
+            await self._call.play_cue(cue)
+        except Exception:  # noqa: BLE001 - a sound may not take down the call it marks
+            _log.exception("the Call adapter raised on the %s cue", cue)
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""

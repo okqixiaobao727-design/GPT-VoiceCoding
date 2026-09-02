@@ -68,3 +68,45 @@ def test_events_emitted_before_the_loop_starts_are_waiting_when_it_does() -> Non
         return await queue.next_event()
 
     assert asyncio.run(scenario()) == UserSpeech(text="said too early")
+
+
+def test_unread_answers_only_about_the_kinds_it_was_asked_about() -> None:
+    """A decision defers on the news it cannot be taken without, and nothing else.
+
+    Bridge Core's ceiling asks this before measuring silence, because its own
+    dispatch loop is a separate task (`engine/composition.py`) and an emitted
+    `UserSpeech` has not reached the interlock yet. Asking "is anything
+    waiting" instead let a queued Session event hold a silent call open (#184).
+    """
+    queue = EventQueue()
+    queue.emit(SessionStopped(target=CODEX))
+
+    assert queue.unread(SessionStopped) is True
+    assert queue.unread(UserSpeech) is False
+    assert queue.unread(UserSpeech, SessionStopped) is True
+
+
+def test_news_stops_being_unread_as_soon_as_it_is_taken() -> None:
+    """Taken, not finished: the dispatch loop records what an event means with
+    no await between taking it and recording it, so there is no third state."""
+
+    async def scenario() -> tuple[bool, bool]:
+        queue = EventQueue()
+        queue.emit(UserSpeech(text="are you there"))
+        before = queue.unread(UserSpeech)
+        await queue.next_event()
+        return before, queue.unread(UserSpeech)
+
+    before, after = asyncio.run(scenario())
+    assert before is True
+    assert after is False
+
+
+def test_draining_leaves_nothing_unread() -> None:
+    queue = EventQueue()
+    queue.emit(UserSpeech(text="first"))
+    queue.emit(SessionStopped(target=CODEX))
+
+    queue.drain()
+
+    assert queue.unread(UserSpeech, SessionStopped) is False

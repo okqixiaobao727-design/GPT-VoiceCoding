@@ -102,6 +102,29 @@ class Action(StrEnum):
     VERIFY = "verify"
 
 
+#: How each action is said on a command line, one form apiece. Vocabulary
+#: rather than mechanism, and here for the reason `Action` is: it is the one
+#: thing every surface shares. `bridgectl` prints it as its own help, the
+#: Companion Channel's `/` grammar refuses against it, and a Live Call's
+#: acting half is given its instructions from it (#193) — three surfaces that
+#: would otherwise each carry a spelling free to drift from the parser.
+#:
+#: A plain table with no imports of its own, so this module stays vocabulary:
+#: the flag words below are spelled out here rather than referenced, because a
+#: seam that reached into the parser for them would be the dependency this
+#: table exists to remove.
+USAGE: dict[Action, str] = {
+    Action.STATUS: "status",
+    Action.SWITCH: "switch <name> on|off",
+    Action.BRIEF: "brief [<agent>:<session id>[:<pid>]]",
+    Action.HISTORY: "history <agent>:<session id>[:<pid>] [--before <ordinal>]",
+    Action.LIVE: "live",
+    Action.RELAY: "relay <agent>:<session id>[:<pid>] [--supplement] <words>",
+    Action.APPROVE: "approve <approval id> allow|deny|ask",
+    Action.VERIFY: "verify",
+}
+
+
 class ErrorCode(StrEnum):
     """Why a request was refused. Closed, so a surface can branch on it.
 

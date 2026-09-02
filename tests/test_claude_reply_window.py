@@ -1206,4 +1206,8 @@ class TestDeathReachesBridgeCoreEndToEnd:
         assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
         assert hub.state.relays.pending() == ()
         assert hub.agent.calls == []
-        assert hub.call.spoken == ["state=reported_failed grade=none reason=session_ended"]
+        # A terminal Relay line is text and has no Session Brief behind it, so
+        # it takes the Companion Channel: the Live Call is handed briefs and
+        # reads no sentences (#194, `CONTEXT.md` *Stop Notice*).
+        assert hub.call.spoken == []
+        assert hub.channel.sent[-1] == "state=reported_failed grade=none reason=session_ended"

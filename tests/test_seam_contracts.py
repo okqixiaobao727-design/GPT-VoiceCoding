@@ -17,16 +17,19 @@ import asyncio
 import inspect
 from dataclasses import fields
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 
 from fakes import (
-    HOUSE_RULES,
+    CALL_AGENT_INSTRUCTIONS,
     FakeAgent,
     FakeCall,
     FakeCompanionChannel,
     RecordingSink,
+)
+from fakes import (
+    dial as _dial,
 )
 from gpt_voicecoding.seams.agent import (
     AgentAdapter,
@@ -39,11 +42,42 @@ from gpt_voicecoding.seams.agent import (
     ProgressRole,
     RelayRoute,
 )
-from gpt_voicecoding.seams.call import CallAdapter, CallState
+from gpt_voicecoding.seams.call import (
+    HANDOVER_BUDGET_BYTES,
+    MAX_HANDOVER_ITEMS,
+    CallAdapter,
+    CallDropped,
+    CallEnded,
+    CallEvent,
+    CallStarted,
+    CallState,
+    Cue,
+    Dial,
+    DialReason,
+    SpokenBrief,
+    UserSpeech,
+    VoiceSpeech,
+)
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.events import EventSink
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
+
+
+def _brief(**overrides: object) -> SpokenBrief:
+    """One `SpokenBrief`, filled the way Briefing fills it — words, not values."""
+    fields: dict[str, Any] = {
+        "name": "repo · task",
+        "agent": "claude",
+        "state": "waiting for your decision",
+        "newest": "it said something",
+        "decision": ("asked: which one?",),
+        "answerable_here": "from here",
+        "last_activity_at": "not read",
+    }
+    fields.update(overrides)
+    return SpokenBrief(**fields)  # type: ignore[arg-type]
+
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 CLAUDE = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
@@ -279,19 +313,19 @@ class TestTheAgentContract:
 class TestTheCallContract:
     def test_ensuring_a_call_twice_returns_the_same_call(self) -> None:
         call = FakeCall()
-        first = asyncio.run(call.ensure_call(HOUSE_RULES))
-        second = asyncio.run(call.ensure_call(HOUSE_RULES))
+        first = asyncio.run(call.ensure_call(_dial()))
+        second = asyncio.run(call.ensure_call(_dial()))
         assert first == second
         assert first.state is CallState.UP
 
     def test_speaking_with_no_call_up_fails_closed(self) -> None:
         call = FakeCall()
-        receipt = asyncio.run(call.speak("you are needed", request_id=new_request_id()))
+        receipt = asyncio.run(call.speak(_brief(), request_id=new_request_id()))
         assert receipt.is_delivered is False
 
     def test_ending_a_call_is_idempotent(self) -> None:
         call = FakeCall()
-        asyncio.run(call.ensure_call(HOUSE_RULES))
+        asyncio.run(call.ensure_call(_dial()))
         asyncio.run(call.end_call())
         assert asyncio.run(call.end_call()).state is CallState.DOWN
 
@@ -302,7 +336,7 @@ class TestTheCallContract:
             call.delegate(
                 "summarise the diff",
                 model="claude-sonnet-5",
-                instructions=HOUSE_RULES,
+                instructions=CALL_AGENT_INSTRUCTIONS,
                 request_id=new_request_id(),
             )
         )
@@ -318,16 +352,81 @@ class TestTheCallContract:
 
         Both verbs that start a thread take them, and neither has a default —
         an adapter that could fall back to instructions of its own would be a
-        second source for the one thing the hub is the only source of.
+        second source for the one thing the hub is the only source of. The two
+        verbs no longer take them under one name: `ensure_call` takes a `Dial`,
+        because a call addresses two audiences and a Delegated Turn addresses
+        one (ADR 0018). What is asserted is unchanged — the payload is the
+        caller's, and there is no default to fall back on.
         """
-        for verb in (CallAdapter.ensure_call, CallAdapter.delegate):
-            parameters = inspect.signature(verb).parameters
-            assert parameters["instructions"].default is inspect.Parameter.empty
+        assert (
+            inspect.signature(CallAdapter.ensure_call).parameters["dial"].default
+            is inspect.Parameter.empty
+        )
+        assert (
+            inspect.signature(CallAdapter.delegate).parameters["instructions"].default
+            is inspect.Parameter.empty
+        )
 
     def test_the_house_rules_a_call_opened_on_came_from_the_caller(self) -> None:
         call = FakeCall()
-        asyncio.run(call.ensure_call(HOUSE_RULES))
-        assert call.opened_on == [HOUSE_RULES]
+        asyncio.run(call.ensure_call(_dial()))
+        assert [dialled.agent for dialled in call.opened_on] == [CALL_AGENT_INSTRUCTIONS]
+
+    def test_the_voice_speaking_state_is_one_of_the_events_the_seam_raises(self) -> None:
+        """Both edges of the call's own voice cross the seam, as one state (#184).
+
+        A state rather than a tick, because the two readers want different
+        questions answered from it: the Silence Ceiling asks "was there
+        activity", and it also has to *hold* while the answer is still being
+        spoken — a span, which no bare edge describes.
+        """
+        assert set(get_args(CallEvent)) == {
+            UserSpeech,
+            VoiceSpeech,
+            CallStarted,
+            CallEnded,
+            CallDropped,
+        }
+        assert {field.name for field in fields(VoiceSpeech)} == {"speaking"}
+        assert VoiceSpeech(speaking=True).speaking is True
+
+    def test_an_adapter_can_raise_both_voice_edges_with_no_audio(self) -> None:
+        """The fake emits it, so every consumer above the seam is testable dry."""
+        sink = RecordingSink()
+        call = FakeCall(sink=sink)
+        asyncio.run(call.ensure_call(_dial()))
+
+        call.voice_speech(speaking=True)
+        call.voice_speech(speaking=False)
+
+        assert sink.events == [VoiceSpeech(speaking=True), VoiceSpeech(speaking=False)]
+
+    def test_the_seam_names_the_moment_a_cue_marks_and_never_the_sound(self) -> None:
+        """One verb, three moments (#186). The notes are the adapter's own.
+
+        `play_cue` rather than `play_tone` or three verbs: what varies between a
+        call coming up and a call going down is which moment it is, and an
+        adapter that could not make a sound at all still knows what happened.
+        """
+        assert "play_cue" in _members(CallAdapter)
+        assert set(Cue) == {Cue.CONNECTED, Cue.ENDED, Cue.EVENT}
+        assert [str(cue) for cue in Cue] == ["connected", "ended", "event"]
+
+    def test_a_cue_tells_the_caller_nothing_back(self) -> None:
+        """The span a cue occupies stays behind the seam, where #145 will read it.
+
+        A verb that handed a span upward would be Bridge Core holding a fact
+        about an audio device — and the one consumer of that fact is the capture
+        side, which is on the adapter's own side of this line.
+        """
+        assert inspect.signature(CallAdapter.play_cue).return_annotation == "None"
+
+    def test_the_fake_records_the_cues_it_was_asked_for_in_order(self) -> None:
+        """So a test above the seam can grade the order with no audio anywhere."""
+        call = FakeCall()
+        asyncio.run(call.play_cue(Cue.CONNECTED))
+        asyncio.run(call.play_cue(Cue.ENDED))
+        assert call.cues == [Cue.CONNECTED, Cue.ENDED]
 
 
 class TestTheCompanionChannelContract:
@@ -342,3 +441,68 @@ class TestTheCompanionChannelContract:
         receipt = asyncio.run(channel.send("you are needed", request_id=new_request_id()))
         assert receipt.is_delivered is False
         assert receipt.reason
+
+
+class TestTheDial:
+    """The three payloads one dial carries, and the two it refuses to go without."""
+
+    def test_a_dial_refuses_prose_the_voice_would_not_get(self) -> None:
+        with pytest.raises(ValueError):
+            Dial(voice="   ", agent=CALL_AGENT_INSTRUCTIONS)
+
+    def test_a_dial_refuses_rules_the_call_agent_would_not_get(self) -> None:
+        with pytest.raises(ValueError):
+            Dial(voice="speak plainly", agent="")
+
+    def test_a_dial_names_its_audiences_and_never_a_wire_slot(self) -> None:
+        assert {field.name for field in fields(Dial)} == {"voice", "agent", "hand_over"}
+
+    def test_a_spoken_brief_carries_the_session_briefs_own_fields(self) -> None:
+        assert {field.name for field in fields(SpokenBrief)} == {
+            "name",
+            "agent",
+            "state",
+            "newest",
+            "decision",
+            "answerable_here",
+            "last_activity_at",
+        }
+
+    def test_a_hand_over_over_the_item_cap_is_refused_here(self) -> None:
+        with pytest.raises(ValueError):
+            Dial(
+                voice="speak plainly",
+                agent=CALL_AGENT_INSTRUCTIONS,
+                hand_over=tuple(
+                    DialReason(text=f"item {n}") for n in range(MAX_HANDOVER_ITEMS + 1)
+                ),
+            )
+
+    def test_a_hand_over_over_the_byte_budget_is_refused_here(self) -> None:
+        with pytest.raises(ValueError):
+            Dial(
+                voice="speak plainly",
+                agent=CALL_AGENT_INSTRUCTIONS,
+                hand_over=(DialReason(text="x" * (HANDOVER_BUDGET_BYTES + 1)),),
+            )
+
+    def test_the_fake_records_the_dial_it_was_given(self) -> None:
+        call = FakeCall()
+        dial = Dial(
+            voice="speak plainly",
+            agent=CALL_AGENT_INSTRUCTIONS,
+            hand_over=(DialReason(text="opened by the user"),),
+        )
+
+        asyncio.run(call.ensure_call(dial))
+
+        assert call.opened_on == [dial]
+
+    def test_the_fake_records_the_brief_it_was_asked_to_speak(self) -> None:
+        call = FakeCall()
+        brief = _brief()
+        asyncio.run(call.ensure_call(_dial()))
+
+        asyncio.run(call.speak(brief, request_id=new_request_id()))
+
+        assert call.spoken == [brief]
