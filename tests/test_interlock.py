@@ -14,15 +14,26 @@ make when one is already there, and hiding that is how the loop got built.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 
 import pytest
 
-from fakes import CALL_AGENT_INSTRUCTIONS, FakeCall
-from gpt_voicecoding.core.errors import SecondCallRefused, VoiceInstructionsMissing
+from fakes import FakeCall, dial
+from gpt_voicecoding.core.errors import SecondCallRefused
 from gpt_voicecoding.core.interlock import CallInterlock
-from gpt_voicecoding.seams.call import CallState
+from gpt_voicecoding.seams.call import CallState, Dial, SpokenBrief
 from gpt_voicecoding.seams.identity import new_request_id
+
+STOPPED = SpokenBrief(
+    name="repo · task",
+    agent="claude",
+    state="finished",
+    newest="that session stopped",
+    decision=(),
+    answerable_here="from here",
+    last_activity_at="not read",
+)
 
 
 def interlock(call: FakeCall | None = None) -> tuple[CallInterlock, FakeCall]:
@@ -31,7 +42,7 @@ def interlock(call: FakeCall | None = None) -> tuple[CallInterlock, FakeCall]:
 
 
 async def open_and_report_started(guard: CallInterlock) -> None:
-    snapshot = await guard.open_call(CALL_AGENT_INSTRUCTIONS)
+    snapshot = await guard.open_call(dial())
     assert snapshot.call_id is not None
     guard.note_started(snapshot.call_id)
 
@@ -42,10 +53,10 @@ class YieldingSpeakCall(FakeCall):
         self.speak_entered = asyncio.Event()
         self.release_speak = asyncio.Event()
 
-    async def speak(self, text, *, request_id):
+    async def speak(self, brief, *, request_id):
         self.speak_entered.set()
         await self.release_speak.wait()
-        return await super().speak(text, request_id=request_id)
+        return await super().speak(brief, request_id=request_id)
 
 
 class TestOwnership:
@@ -58,7 +69,7 @@ class TestOwnership:
     def test_opening_a_call_takes_ownership_of_it(self) -> None:
         guard, call = interlock()
 
-        snapshot = asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        snapshot = asyncio.run(guard.open_call(dial()))
 
         assert snapshot.state is CallState.UP
         assert guard.owns_call() is True
@@ -66,7 +77,7 @@ class TestOwnership:
 
     def test_ending_a_call_releases_ownership(self) -> None:
         guard, _ = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
 
         asyncio.run(guard.end_call())
 
@@ -77,7 +88,7 @@ class TestOwnership:
         """CONNECTING is not UP. Claiming it would bar the retry that fixes it."""
         guard, call = interlock(FakeCall(reachable=False))
 
-        snapshot = asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        snapshot = asyncio.run(guard.open_call(dial()))
 
         assert snapshot.state is not CallState.UP
         assert guard.owns_call() is False
@@ -99,9 +110,7 @@ class TestTheSilenceCeiling:
             await open_and_report_started(guard)
             now = 160.0
 
-            speaking = asyncio.create_task(
-                guard.speak("that session stopped", request_id=new_request_id())
-            )
+            speaking = asyncio.create_task(guard.speak(STOPPED, request_id=new_request_id()))
             await call.speak_entered.wait()
             ending = asyncio.create_task(guard.end_silent_call(60.0))
             await asyncio.sleep(0)
@@ -168,10 +177,10 @@ class TestTheSilenceCeiling:
         asyncio.run(open_and_report_started(guard))
 
         now = 150.0
-        asyncio.run(guard.speak("that session stopped", request_id=new_request_id()))
+        asyncio.run(guard.speak(STOPPED, request_id=new_request_id()))
         now = 160.0
         assert asyncio.run(guard.end_silent_call(60.0)) is True
-        assert call.spoken == ["that session stopped"]
+        assert call.spoken == [STOPPED]
 
 
 class TestTheVoiceKeepsTheCallAlive:
@@ -247,20 +256,27 @@ class TestTheVoiceKeepsTheCallAlive:
         assert asyncio.run(guard.end_silent_call(60.0)) is True
 
 
-class TestTheOtherRefusal:
-    """A call is never started on nothing, and the rule lives here alone.
+class TestTheOtherRefusalHasLeftThisDoor:
+    """A call is still never started on nothing — one door earlier than this one.
 
     It has to be *one* place. The hub and the escalation pipeline both open
-    calls, and when each carried its own copy of this check the two wordings had
-    already drifted apart before anything noticed — which is how a rule becomes
-    two rules that disagree.
+    calls, and when each carried its own copy of the blank check the two wordings
+    had already drifted apart before anything noticed. That is still true, and
+    the one place is now the `Dial` itself (#194, ADR 0018): a caller cannot even
+    build the argument this door used to refuse, and the interlock is left with
+    the one rule it exists for.
     """
 
-    def test_opening_a_call_on_no_instructions_is_refused(self) -> None:
+    def test_this_door_no_longer_checks_what_a_call_is_opened_on(self) -> None:
+        """It could not: what it is handed has already refused its own blanks."""
+        source = Path(inspect.getsourcefile(CallInterlock.open_call) or "")
+        assert "cannot dial a call" not in source.read_text(encoding="utf-8")
+
+    def test_a_blank_half_is_refused_before_any_door_is_reached(self) -> None:
         guard, call = interlock()
 
-        with pytest.raises(VoiceInstructionsMissing):
-            asyncio.run(guard.open_call(""))
+        with pytest.raises(ValueError):
+            asyncio.run(guard.open_call(Dial(voice="", agent="rules")))
 
         assert call.calls_started == 0
         assert guard.owns_call() is False
@@ -268,15 +284,15 @@ class TestTheOtherRefusal:
     def test_whitespace_is_not_instructions(self) -> None:
         guard, call = interlock()
 
-        with pytest.raises(VoiceInstructionsMissing):
-            asyncio.run(guard.open_call("   \n  "))
+        with pytest.raises(ValueError):
+            asyncio.run(guard.open_call(Dial(voice="prose", agent="   \n  ")))
 
         assert call.calls_started == 0
 
     def test_the_refusal_is_worded_in_exactly_one_place(self) -> None:
         """Nothing else may restate it — a second copy is a second rule."""
         package = Path(__file__).resolve().parents[1] / "src" / "gpt_voicecoding"
-        wording = "generated no voice instructions"
+        wording = "so it cannot dial a call"
         holding = [
             path.relative_to(package)
             for path in sorted(package.rglob("*.py"))
@@ -289,29 +305,29 @@ class TestTheOtherRefusal:
 class TestTheInvariant:
     def test_opening_a_second_call_is_refused(self) -> None:
         guard, call = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
 
         with pytest.raises(SecondCallRefused) as refusal:
-            asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+            asyncio.run(guard.open_call(dial()))
 
         assert refusal.value.call_id == guard.call_id()
 
     def test_the_refusal_never_reaches_the_adapter(self) -> None:
         """The adapter neither knows nor enforces this rule (ADR 0001)."""
         guard, call = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
 
         with pytest.raises(SecondCallRefused):
-            asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+            asyncio.run(guard.open_call(dial()))
 
         assert call.calls_started == 1
 
     def test_ending_a_call_makes_opening_the_next_one_legal_again(self) -> None:
         guard, call = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
         asyncio.run(guard.end_call())
 
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
 
         assert call.calls_started == 2
 
@@ -328,7 +344,7 @@ class TestWhatTheCallSeamReportsUpward:
 
     def test_a_dropped_call_releases_ownership_so_escalation_may_open_one(self) -> None:
         guard, _ = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
         held = guard.call_id()
         assert held is not None
 
@@ -339,7 +355,7 @@ class TestWhatTheCallSeamReportsUpward:
     def test_an_end_reported_for_some_other_call_does_not_release_this_one(self) -> None:
         """A late event about a finished call must not unlock the live one."""
         guard, _ = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
 
         assert guard.note_ended("call-from-last-week") is False
         assert guard.owns_call() is True
@@ -353,7 +369,7 @@ class TestWhatTheCallSeamReportsUpward:
     def test_only_a_real_release_reports_the_transition(self) -> None:
         """Callers reconcile on this answer, so a stale event must not claim one."""
         guard, _ = interlock()
-        asyncio.run(guard.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(guard.open_call(dial()))
         held = guard.call_id()
         assert held is not None
 

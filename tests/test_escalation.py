@@ -15,10 +15,11 @@ this pipeline never replays a historical notice.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
-from fakes import CALL_AGENT_INSTRUCTIONS, FakeCall, FakeCompanionChannel
+from fakes import FakeCall, FakeCompanionChannel, dial
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
-from gpt_voicecoding.core.errors import VoiceInstructionsMissing
+from gpt_voicecoding.core.errors import CallInstructionsMissing
 from gpt_voicecoding.core.escalation import (
     EscalationPipeline,
     Notice,
@@ -28,14 +29,38 @@ from gpt_voicecoding.core.escalation import (
 from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.switches import Switchboard, SwitchName
+from gpt_voicecoding.seams.call import Dial, DialReason, SpokenBrief
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget, new_request_id
 
 CODEX = SessionTarget(agent=AgentKind.CODEX, session_id="abc")
 
 
+#: What Bridge Core hands this pipeline: how a call dialled for a notice would be
+#: opened. A hand-over of one item is enough here — what the items *say* is
+#: Briefing's, and this module is about which outlet a notice takes.
+def system_dial(notice: Notice) -> Dial:
+    return dial(DialReason(text=f"dialled about {notice.target}"))
+
+
+def refusing_dial(notice: Notice) -> Dial:
+    raise CallInstructionsMissing("prose for the Voice")
+
+
+def brief(text: str) -> SpokenBrief:
+    return SpokenBrief(
+        name="repo · task",
+        agent="codex",
+        state="finished",
+        newest=text,
+        decision=(),
+        answerable_here="at the terminal",
+        last_activity_at="not read",
+    )
+
+
 def notice(text: str = "that session stopped and may need you") -> Notice:
-    return Notice(request_id=new_request_id(), target=CODEX, text=text)
+    return Notice(request_id=new_request_id(), target=CODEX, text=text, spoken=brief(text))
 
 
 class Harness:
@@ -49,7 +74,7 @@ class Harness:
         message: bool = True,
         call: FakeCall | None = None,
         channel: FakeCompanionChannel | None = None,
-        call_agent_instructions: str = CALL_AGENT_INSTRUCTIONS,
+        dialling: Callable[[Notice], Dial] = system_dial,
     ) -> None:
         self.switches = Switchboard()
         self.switches.flip(SwitchName.DUTY, duty)
@@ -63,7 +88,7 @@ class Harness:
             channel=self.channel,
             interlock=self.interlock,
             adjudicator=SwitchAdjudicator(self.switches),
-            call_agent_instructions=call_agent_instructions,
+            system_dial=dialling,
         )
 
     def escalate(self, item: Notice, **kwargs: object) -> object:
@@ -81,7 +106,7 @@ class TestTheRouteMatrix:
 
     def test_with_no_call_up_escalation_may_open_one(self) -> None:
         assert route_matrix(call_is_up=False, may_touch_call=True, may_push=True) == (
-            NoticeRoute.OPEN_CALL_AND_SPEAK,
+            NoticeRoute.OPEN_CALL_WITH_BRIEFING,
             NoticeRoute.PUSH_TO_CHANNEL,
         )
 
@@ -106,7 +131,7 @@ class TestTheRouteMatrix:
 
     def test_with_no_call_and_message_off_the_open_call_is_the_only_route(self) -> None:
         assert route_matrix(call_is_up=False, may_touch_call=True, may_push=False) == (
-            NoticeRoute.OPEN_CALL_AND_SPEAK,
+            NoticeRoute.OPEN_CALL_WITH_BRIEFING,
         )
 
 
@@ -114,17 +139,17 @@ class TestSpeakingIntoTheCallThatIsUp:
     def test_a_stop_that_arrives_mid_call_opens_no_second_call(self) -> None:
         """The exact failure this pipeline exists to prevent."""
         harness = Harness()
-        asyncio.run(harness.interlock.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(harness.interlock.open_call(dial()))
 
         outcome = harness.escalate(notice("build finished"))
 
         assert harness.call.calls_started == 1
-        assert harness.call.spoken == ["build finished"]
+        assert harness.call.spoken == [brief("build finished")]
         assert outcome.state is Lifecycle.DELIVERED
 
     def test_a_delivered_notice_never_pushes_the_same_words_as_text(self) -> None:
         harness = Harness()
-        asyncio.run(harness.interlock.open_call(CALL_AGENT_INSTRUCTIONS))
+        asyncio.run(harness.interlock.open_call(dial()))
 
         harness.escalate(notice())
 
@@ -132,13 +157,20 @@ class TestSpeakingIntoTheCallThatIsUp:
 
 
 class TestOpeningACallToEscalateInto:
-    def test_with_no_call_up_escalation_opens_one_and_speaks(self) -> None:
+    def test_with_no_call_up_escalation_opens_one_holding_the_briefing(self) -> None:
+        """The hand-over *is* the announcement, so nothing is said after opening.
+
+        A `speak` on top of a call that came up already holding the brief would
+        hand the same brief twice — once as history and once as a thing to say —
+        which is a notice heard twice (#194; ADR 0018's third payload).
+        """
         harness = Harness()
 
         outcome = harness.escalate(notice("you are needed"))
 
         assert harness.call.calls_started == 1
-        assert harness.call.spoken == ["you are needed"]
+        assert harness.call.spoken == []
+        assert harness.call.opened_on[0].hand_over == (DialReason(text=f"dialled about {CODEX}"),)
         assert outcome.state is Lifecycle.DELIVERED
 
     def test_the_opened_call_becomes_the_one_the_system_owns(self) -> None:
@@ -165,7 +197,7 @@ class TestWithNoInstructionsToOpenOn:
         It is not raised out of the pipeline. Current-state reconciliation may
         create another notice when a later outlet transition occurs.
         """
-        harness = Harness(message=False, call_agent_instructions="")
+        harness = Harness(message=False, dialling=refusing_dial)
 
         outcome = harness.escalate(notice())
 
@@ -173,15 +205,39 @@ class TestWithNoInstructionsToOpenOn:
         assert harness.call.spoken == []
         assert outcome.state is Lifecycle.DROPPED
 
-    def test_the_reason_is_the_one_the_interlock_worded(self) -> None:
-        """Not this pipeline's own sentence — the same one, from the same door."""
-        harness = Harness(message=False, call_agent_instructions="")
+    def test_the_reason_is_the_one_the_hub_worded(self) -> None:
+        """Not this pipeline's own sentence — the one from where the dial is built."""
+        harness = Harness(message=False, dialling=refusing_dial)
 
         outcome = harness.escalate(notice())
 
-        assert [attempt.route for attempt in outcome.attempts] == [NoticeRoute.OPEN_CALL_AND_SPEAK]
+        assert [attempt.route for attempt in outcome.attempts] == [
+            NoticeRoute.OPEN_CALL_WITH_BRIEFING
+        ]
         assert outcome.attempts[0].outcome is Delivery.FAILED
-        assert str(VoiceInstructionsMissing()) == outcome.attempts[0].reason
+        assert str(CallInstructionsMissing("prose for the Voice")) == outcome.attempts[0].reason
+
+
+class TestANoticeWithNoBriefBehindIt:
+    """A terminal Relay line is text, and the Live Call reads no sentences.
+
+    `core/relays.py::terminal_line` is temporary until #197 and has no Session
+    Brief behind it. Since #194 the call takes a brief and not a sentence, so a
+    notice like that reaches the user through the Companion Channel.
+    """
+
+    def test_the_call_route_fails_and_the_channel_carries_it(self) -> None:
+        harness = Harness()
+        asyncio.run(harness.interlock.open_call(dial()))
+
+        outcome = harness.escalate(
+            Notice(request_id=new_request_id(), target=CODEX, text="relay expired: unknown")
+        )
+
+        assert harness.call.spoken == []
+        assert harness.channel.sent == ["relay expired: unknown"]
+        assert outcome.state is Lifecycle.DELIVERED
+        assert outcome.attempts[0].outcome is Delivery.FAILED
 
 
 class TestSwitchIndependence:
@@ -268,7 +324,7 @@ class TestOneReach:
 
         harness.escalate(notice("stopped"))
 
-        assert harness.call.spoken == ["stopped"]
+        assert harness.call.calls_started == 1
         assert harness.channel.sent == []
 
     def test_with_voice_off_the_channel_is_the_first_outlet(self) -> None:

@@ -161,12 +161,27 @@ def _sections() -> tuple[Section, ...]:
                         "same order as any other single session."
                     ),
                 ),
+                # **Told as an action, because a rule told as a prohibition made
+                # this Voice do nothing at all.** The first wording opened "that
+                # is not yours to do", and on the wire (#194, runs
+                # `20260902T212231Z` and `20260902T213650Z`) the Voice answered a
+                # spoken hang-up request with silence: the user's transcript
+                # deltas arrived, no hand-off followed, and the Silence Ceiling
+                # ended the call sixty seconds later. Replacing the whole prose
+                # with the probe's own — which carries no delegation sentence at
+                # all — routed nothing either (`20260902T214953Z`: the Voice
+                # spoke, and no `bridgectl` ran in 120s). So what the slot needed
+                # was never fewer words but the *general* instruction to pass a
+                # request on, which `scripts/realtime_text_entry_probe.py`'s
+                # `VOICE_PROMPT_DELEGATING` predicted would restore it and which
+                # the earlier text only ever gave for hanging up.
                 Block(
                     text=(
-                        "When they ask to hang up, that is not yours to do. Pass it to the "
-                        "half behind you, which has the means, and let it happen. Never "
-                        "announce that the call has ended, and never say goodbye as though "
-                        "you had ended it."
+                        "When they ask for something to be done rather than told — hang the "
+                        "call up, run something, change something — pass the request to the "
+                        "half behind you rather than answering it yourself. It has the means "
+                        "and you do not. Then let it happen: never announce that the call has "
+                        "ended, and never say goodbye as though you had ended it."
                     ),
                 ),
             ),
