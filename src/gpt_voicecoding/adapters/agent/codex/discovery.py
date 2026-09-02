@@ -1,42 +1,30 @@
-"""What Codex Sessions are running, from the shared daemon and from the machine.
+"""What Codex Sessions are running: the two readings, and where they meet.
 
-Two sources, and the merge between them is the whole module.
+**This module is the I/O half.** It dials the shared daemon, reads the process
+table, reads the rollouts on disk, and asks `codex/roster.py` — one pure
+function, no client, no clock — what all of that adds up to. The composition
+rule lived here until #201, inline across five branches of `discover`, unnamed
+and with no test surface of its own; it had been rewritten by #112, #113, #123
+and #144, and a wrong rule survived three tickets because nothing could ask it
+a question without a fake app-server and a fake process table.
 
-**The shared app-server daemon is the authority when it is up** (#82). It knows a
-thread's id, its name, its workspace and what it is doing, and it is the only
+**The shared app-server daemon is the authority when it is up** (#82). It knows
+a thread's id, its name, its workspace and what it is doing, and it is the only
 route a Relay or an Approval can take. Its roster is `thread/loaded/list`
 answering `{"data": [id, …]}`, and each id is described by `thread/read` as
-`{"thread": {"id", "name", "cwd", "status"}}` — measured on 0.149.1 by #82's
-prototype (`661d3d9`), not assumed.
+`{"thread": {"id", "name", "cwd", "status", "createdAt"}}` — measured on 0.149.1
+by #82's prototype (`661d3d9`), not assumed.
 
-**The process table supplies current liveness and, sometimes, exact identity.**
-A TUI that started while the daemon was down is never adopted by a daemon that
-starts later (#82, measured), so an exact `resume <UUID>` process may compose
-with its explicit user rollout even when the daemon does not hold it. A TUI
-whose argv carries no shared thread id is liveness evidence but not a confirmed
-main Session, so it has no roster row (#144).
+**The process table supplies liveness and place** (#201). A live interactive
+`codex` with a controlling terminal says a Session is being sat in; where it is
+running says which one it could be sitting in. It never says what a Session
+*is*: identity is the daemon's thread id and nothing else.
 
-**A loaded root is a roster row only when a live interactive process carries the
-same exact thread id as a native daemon thread or rollout** (#144). A workspace
-is a place, not an identity: another TUI in the same directory cannot keep a
-historical root alive. Daemon and process observations with the same thread id
-compose into one row. If more than one process observation names it, the logical
-Session remains one row and its pid is omitted rather than guessed. Nothing here
-unloads or stops a thread. This is **adapted** from legacy, where the wrapper
-waited on the TUI process and released its runtime after that process exited
-(`legacy@1d32845:bridge/codex.py:1922-1930,1947-1957`).
-
-**A native Child Process lives with its proven root's Session tree** (#144).
-`threadSource` classifies it, `parentThreadId` links it, and `sessionId` must name
-the same tree as one live root. A child from a historical tree is not kept alive
-by an unrelated TUI in the workspace, and a process observation that contradicts
-the daemon's child classification never promotes it to a main Session.
-
-**A Session whose live process exposes no exact id has no roster row.** Codex
-writes a rollout at its first *turn* (#73), but a rollout's workspace and time
-cannot prove which process owns it. The row appears only when the process argv
-and native evidence expose one shared id; PID-only evidence never enters the
-roster (#144).
+**The rollouts on disk supply one fact and one only**: whether an exact
+`resume <UUID>` process names a thread the user themselves rooted. That is what
+lets a TUI started while the daemon was down compose a row at all — #82 proved
+such a TUI is never adopted by a daemon that starts later, so it is not a corner
+case but the ordinary result.
 
 **Unreachability gets no row and no field.** #68 removed that vocabulary: a
 Relay into a Session the daemon cannot load returns the existing `FAILED` grade
@@ -57,113 +45,20 @@ from typing import Any, Final, Protocol
 from gpt_voicecoding.adapters.agent import _naming
 from gpt_voicecoding.adapters.agent._progress import source_degradation
 from gpt_voicecoding.adapters.agent._project import ProjectNames
-from gpt_voicecoding.adapters.agent.codex import rollouts, thread_tail
+from gpt_voicecoding.adapters.agent.codex import rollouts, roster, thread_tail
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate, enumerate_sessions
 from gpt_voicecoding.seams.agent import (
-    MAIN_SESSION,
-    ChildClassification,
-    ChildKind,
     LaneDiscovery,
     ProgressCapture,
     ProgressObservation,
     SessionInspection,
-    SessionLifecycle,
-    SessionState,
-    WaitingFor,
-    WaitingKind,
 )
-from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 
 _log = logging.getLogger(__name__)
 
 #: The daemon's roster, and the per-thread read.
 ROSTER_METHOD: Final = "thread/loaded/list"
 READ_METHOD: Final = "thread/read"
-
-#: What a thread's status is called while a turn is running. Named because two
-#: rules turn on it: the row reads as `RUNNING`, and the cadence does not read
-#: its turns.
-ACTIVE_STATUS: Final = "active"
-
-#: What a thread's `status.type` can be, as the Codex spoke has observed it.
-#: `systemError` is a thread whose turn ended badly — still reachable, still
-#: able to take the next Relay, which is why it reads as idle rather than as
-#: something that must be waited out.
-STATUS_TYPES: Final = {
-    "idle": SessionState.IDLE,
-    ACTIVE_STATUS: SessionState.RUNNING,
-    "systemError": SessionState.IDLE,
-}
-
-#: The fields the daemon uses to say a thread is its own errand rather than a
-#: person's, and the values of the second that leave a thread a Session (#112).
-#:
-#: **Both are on the cheap read already.** `Thread` is one struct — `ephemeral`
-#: is a plain `bool` and `thread_source` a plain optional string; only `turns`
-#: is gated on `includeTurns` (`rust-v0.149.1:codex-rs/app-server-protocol/src/
-#: protocol/v2/thread_data.rs:196-266`). So this costs no round trip: `_threads`
-#: already reads every id.
-#:
-#: **A keep-list, because the far side's is not a closed set.** `ThreadSource`
-#: parses any unrecognised word into `Feature(word)` — `FromStr`'s last arm,
-#: `rust-v0.150.0:codex-rs/protocol/src/protocol.rs:2604-2657` — so naming the
-#: one value seen so far would leave the next feature string to be found the way
-#: this one was: as a phantom Session in somebody's roster (#79's measurement).
-#: 0.150.0's title generation starts its thread with exactly `ephemeral: true`
-#: and `thread_source: Feature("system")` (`rust-v0.150.0:codex-rs/tui/src/
-#: temporary_structured_request.rs:103-104`), and it is the reason this exists.
-#:
-#: **`subagent` and `guardian_review` are kept on purpose, and this list is
-#: #79's vocabulary too** (Advisor, 2026-08-27). They are one delegate class
-#: split by a boolean (`rust-v0.150.0:codex-rs/core/src/codex_delegate.rs:111`),
-#: and they are #79's Child Process rows — which it cannot classify if this
-#: module deletes them first. The two rules meet here and nowhere else.
-#:
-#: **A thread that names no source is not called an errand**, because absent is
-#: not a claim. It remains unclassified when rows are projected: an explicit
-#: user rollout may still identify the live TUI, but daemon silence alone cannot
-#: confirm a native root (#144). `null` and omission are the same silence.
-#:
-#: **Legacy has no filter of this kind, and that is the citation.** Its Codex
-#: roster was the rollout index (`legacy@1d32845:bridge/codex.py:1020-1026`,
-#: `:1063-1129`), and an ephemeral thread writes no rollout — the phantom is a
-#: creature of *this* generation's daemon-first roster and could not have
-#: appeared there. What is **adapted** from legacy is the technique and not the
-#: rule: deciding what a thread is from its own `thread_source`, which
-#: `realtime_thread_ids` (`:1020-1026`) does as a keep-list of one value. The
-#: nearest legacy *rule*, `thread_source == "subagent"` blocking registration
-#: (`legacy@1d32845:bridge/__main__.py:893-898`), belongs to #79 rather than
-#: here — and it **excludes** `subagent`, which this keeps, which is exactly why
-#: the two are not the same behaviour.
-EPHEMERAL: Final = "ephemeral"
-THREAD_SOURCE: Final = "threadSource"
-SESSION_THREAD_SOURCES: Final = frozenset({"user", "subagent", "guardian_review"})
-
-#: **#79's half of the keep-list above, and derived from it rather than written
-#: out beside it.** The rule is one sentence — a thread that reaches the roster
-#: and is not the person's own is a Child Process — so the two constants cannot
-#: drift into disagreeing about a value: whatever #112 keeps, this classifies.
-#: Spelled the other way round, a source added to the keep-list one day would
-#: have had to be remembered here on the same day, and the day it was not, a
-#: subagent would have become addressable.
-#:
-#: The two values it currently yields are one delegate class split by a boolean
-#: (`rust-v0.150.0:codex-rs/core/src/codex_delegate.rs:111`), which is why one
-#: classification covers both. Neither is guessed from a thread's shape:
-#: `thread_source` is the daemon's own word for what started a thread.
-#:
-#: **Adapted from legacy** (ADR 0010). `legacy@1d32845:bridge/__main__.py:
-#: 876-899` read the same fact — `session_meta.thread_source` — and refused
-#: *registration* on it, so a child had no row at all. v1.0 keeps the safety
-#: outcome and drops the invisibility (#67 port table, P11, *adapt*).
-CHILD_THREAD_SOURCES: Final = SESSION_THREAD_SOURCES - {rollouts.USER_THREAD_SOURCE}
-PARENT_THREAD_ID: Final = "parentThreadId"
-SESSION_TREE_ID: Final = "sessionId"
-
-#: What the daemon calls the thread's first user message. On the cheap read like
-#: the ones above, and read for one question only: whether the name codex gave
-#: this thread is that message read back (#113, `_thread_name`).
-PREVIEW: Final = "preview"
 
 #: How much of that first message codex 0.150.0 makes a thread's **provisional**
 #: name out of: `THREAD_TITLE_MAX_CHARS`, `rust-v0.150.0:codex-rs/tui/src/app/
@@ -258,17 +153,9 @@ class ProcessEvidence:
     list_sessions: ProcessLister = enumerate_sessions
     home: Path | None = None
 
-    async def identities(self) -> tuple[ProcessIdentity, ...]:
-        """Live interactive runs carrying a thread id shared with native evidence."""
+    async def observations(self) -> tuple[roster.ProcessObservation, ...]:
+        """Every live interactive `codex`, with rollout-root evidence where there is any."""
         return _from_processes(await self.list_sessions(), home=self.home)
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessIdentity:
-    """One exact process-to-thread join and whether its rollout proves a user root."""
-
-    candidate: Candidate
-    rollout_root: bool
 
 
 class TurnCache:
@@ -316,7 +203,7 @@ class TurnCache:
         verb (#76, advisor ruling Q3).
         """
         thread_id = thread.get("id")
-        if not isinstance(thread_id, str) or _status_of(thread) == ACTIVE_STATUS:
+        if not isinstance(thread_id, str) or roster.status_of(thread) == roster.ACTIVE_STATUS:
             return ProgressObservation()
         stamp = thread.get(thread_tail.UPDATED_AT)
         cached = self._cache.get(thread_id)
@@ -374,136 +261,72 @@ async def discover(
 ) -> LaneDiscovery:
     """Every Codex Session on this machine, however well it can be described.
 
-    The process table is read first and always: it is the only source that sees
-    a Session the daemon has never heard of, and #82 proved that is not a corner
-    case but the ordinary result of starting a TUI while the daemon is down.
+    Four readings and one decision. The process table is read first and always:
+    it is the only source that sees a Session the daemon has never heard of, and
+    #82 proved that is not a corner case. The daemon is read next, for identity
+    and content. `roster.compose` then decides, from those two and nothing else,
+    what the rows are — and this function's remaining work is the two things
+    that cost I/O and so cannot be decided there: each row's progress and its
+    Session Name.
 
     `reported_non_sessions` holds the ids this lane has already said are not
     Sessions, and it is what makes that sentence one per thread rather than one
-    every five seconds. The caller keeps it across ticks; this call prunes it
+    every five seconds. The caller keeps it across ticks; `_threads` prunes it
     back to what the daemon still holds. Given nothing, each pass says it once,
     which is what a one-shot reading wants anyway.
 
-    Process identity is read first because only a thread id carried by both a
-    live TUI and native Codex evidence can prove which daemon root is current.
-    Workspace, time, and equal evidence counts never join identities. The
-    resulting `LaneDiscovery` contains logical Sessions, not one row per source
-    of evidence.
+    **A drop is logged like an errand, and for the same reason.** A daemon-held
+    user root that did not become a row leaves a stated reason (#201): the first
+    diagnosis of that bug was wrong precisely because the drop was silent, and
+    the engine log showed only the errands, which made the user root's absence
+    read as a daemon that never offered it.
     """
     try:
-        process_identities = await (evidence or ProcessEvidence()).identities()
+        terminals = await (evidence or ProcessEvidence()).observations()
     except (OSError, TimeoutError) as unreadable:
         return LaneDiscovery(error=f"the process table could not be read: {unreadable}")
 
     threads, daemon_error = await _threads(client, reported_non_sessions)
+    composed = roster.compose(threads, terminals)
+    _report(composed.drops, reported_non_sessions)
+
     names = projects or ProjectNames()
-    processes_by_thread: dict[str, list[ProcessIdentity]] = {}
-    for identity in process_identities:
-        thread_id = identity.candidate.session_id
-        if thread_id is not None:
-            processes_by_thread.setdefault(thread_id, []).append(identity)
-
-    classified: list[tuple[dict[str, Any], ChildClassification]] = []
-    for thread in threads:
-        thread_id = str(thread["id"])
-        classification = _child_of(thread)
-        matches = processes_by_thread.get(thread_id, [])
-        if classification is None and any(match.rollout_root for match in matches):
-            classification = MAIN_SESSION
-        if classification is not None:
-            classified.append((thread, classification))
-    live_roots = {
-        str(thread["id"]): (thread, processes_by_thread[str(thread["id"])])
-        for thread, child in classified
-        if child.is_main and str(thread["id"]) in processes_by_thread
-    }
-    live_tree_ids = {
-        tree_id
-        for thread, _matches in live_roots.values()
-        if (tree_id := _session_tree_id(thread)) is not None
-    }
-    daemon_child_ids = {str(thread["id"]) for thread, child in classified if not child.is_main}
     rows: list[SessionInspection] = []
-
-    for thread, child in classified:
-        thread_id = str(thread["id"])
-        if child.is_main:
-            live = live_roots.get(thread_id)
-            if live is None:
-                continue
-            matches = live[1]
-            pid = matches[0].candidate.pid if len(matches) == 1 else None
-        else:
-            if _session_tree_id(thread) not in live_tree_ids:
-                continue
-            pid = None
-        progress = (
-            await turns.progress_for(client, thread)
-            if turns is not None and client is not None
-            else ProgressObservation()
-        )
-        rows.append(
-            await _named(
-                _from_thread(thread, pid, progress, child),
-                names,
-                task=_thread_name(thread),
-            )
-        )
-    rows = _linked_to_their_parents(rows)
+    for row in composed.rows:
+        inspection, thread = row.inspection, row.thread
+        if thread is None:
+            rows.append(await _named(inspection, names))
+            continue
+        if turns is not None and client is not None:
+            inspection = replace(inspection, progress=await turns.progress_for(client, thread))
+        rows.append(await _named(inspection, names, task=_thread_name(thread)))
     if turns is not None:
         turns.retain({str(thread.get("id")) for thread in threads})
 
-    for thread_id, matches in processes_by_thread.items():
-        if thread_id in live_roots or thread_id in daemon_child_ids:
-            continue
-        if not any(match.rollout_root for match in matches):
-            continue
-        candidate = matches[0].candidate
-        pid = candidate.pid if len(matches) == 1 else None
-        rows.append(
-            await _named(
-                _from_process(candidate, session_id=thread_id, pid=pid),
-                names,
-            )
-        )
     projected = tuple(rows)
     return LaneDiscovery(
         rows=projected,
         degraded=source_degradation(
             projected,
-            _degraded(daemon_error, daemon_note),
+            _degraded(daemon_error, daemon_note, composed.note),
         ),
     )
 
 
-def _linked_to_their_parents(rows: list[SessionInspection]) -> list[SessionInspection]:
-    """Each child's parent named by the address that parent's own row carries.
+def _report(drops: tuple[roster.Drop, ...], reported_non_sessions: set[str] | None) -> None:
+    """Say once, per thread, why a thread the daemon holds is not a row.
 
-    `parentThreadId` names a thread, but a Session's address may also carry the
-    pid its exact process/rollout observation supplied, so a parent named from
-    the field alone can be an address no row in the roster holds. #79's
-    acceptance `child` step reads this link to say a child is listed under its
-    parent, and it failed on exactly that difference: the child pointed at
-    `codex:01a040cc-…` while the Session that spawned it was
-    `codex:01a040cc-…:36628`.
-
-    **After the loop, not inside it**, because the pid is joined as each thread
-    is read and the daemon lists a child before its parent as readily as after.
-    Inside the loop the answer would depend on that order; here it cannot.
-
-    A parent the roster does not hold keeps the thread-only address it was read
-    with. That is what was observed, and it is the honest answer: inventing a pid
-    for a row nobody is holding would be a worse address than one naming less.
+    Once rather than every pass, and through the same set `_threads` keeps for
+    the errand filter, because these are two spellings of one sentence — "the
+    daemon holds this and you will not see it" — and a reason repeated every
+    five seconds is a reason nobody reads.
     """
-    held = {row.target.session_id: row.target for row in rows}
-    linked = []
-    for row in rows:
-        parent = row.child.parent
-        address = held.get(parent.session_id) if parent is not None else None
-        if address is not None and address != parent:
-            row = replace(row, child=replace(row.child, parent=address))
-        linked.append(row)
-    return linked
+    reported = reported_non_sessions if reported_non_sessions is not None else set()
+    for drop in drops:
+        if drop.thread_id in reported:
+            continue
+        reported.add(drop.thread_id)
+        _log.info("thread %s is not a Session row: %s", drop.thread_id, drop.reason)
 
 
 def progress_from(thread: Mapping[str, Any], *, capture: ProgressCapture) -> ProgressObservation:
@@ -522,13 +345,16 @@ def progress_from(thread: Mapping[str, Any], *, capture: ProgressCapture) -> Pro
     )
 
 
-def _degraded(daemon_error: str | None, note: str) -> str | None:
-    """Why these rows are thinner than usual — from both things that can say so.
+def _degraded(
+    daemon_error: str | None, note: str, under_reporting: str | None = None
+) -> str | None:
+    """Why these rows are thinner than usual — from all three things that say so.
 
     A lane can be reading from the process table *and* joined to a daemon whose
-    version disagrees with the CLI's, and neither fact is allowed to hide the
-    other. There is deliberately no `error` path here: a missing daemon has
-    never been a reason to report no Sessions (#74).
+    version disagrees with the CLI's *and* holding a live terminal it cannot
+    match to any thread (#201), and no fact is allowed to hide another. There is
+    deliberately no `error` path here: a missing daemon has never been a reason
+    to report no Sessions (#74).
 
     **A dial that failed says why in its own words, once.** When there is no
     client and the dial left a reason, that reason replaces `NO_CLIENT` rather
@@ -537,8 +363,11 @@ def _degraded(daemon_error: str | None, note: str) -> str | None:
     roster that makes more claims than it observed costs to read.
     """
     if daemon_error == NO_CLIENT and note:
-        return f"{note}, {FROM_THE_MACHINE}"
-    reasons = [reason for reason in (daemon_error, note) if reason]
+        reasons = [f"{note}, {FROM_THE_MACHINE}"]
+    else:
+        reasons = [reason for reason in (daemon_error, note) if reason]
+    if under_reporting:
+        reasons.append(under_reporting)
     return "; ".join(reasons) or None
 
 
@@ -550,6 +379,12 @@ async def _threads(
     A daemon that is absent, refusing or answering nonsense all mean one thing
     to this lane: the rows will be thinner than usual. None of them is a reason
     to report no Sessions, because the process table has already been read.
+
+    **Errands are read and returned like everything else** (#201). Deciding
+    that a thread is the daemon's own is part of the composition rule, and the
+    rule lives in one place; a caller that filtered first would be a second
+    copy of it, and the version of this function that did exactly that is why
+    `roster.compose` could be handed a list whose shape it could not check.
 
     **There are three ways to end up thin here, and three sentences.** Nothing
     was dialled; the daemon was dialled and did not answer; the daemon answered
@@ -571,7 +406,6 @@ async def _threads(
         return [], UNREADABLE_ROSTER
 
     found: list[dict[str, Any]] = []
-    reported = reported_non_sessions if reported_non_sessions is not None else set()
     held: set[str] = set()
     for listed in ids:
         if not isinstance(listed, str) or not listed.strip():
@@ -579,37 +413,14 @@ async def _threads(
         thread_id = listed.strip()
         held.add(thread_id)
         reading = await read_thread(client, thread_id)
-        if reading.thread is None:
-            continue
-        described = reading.thread
-        errand = _errand_of(described)
-        if errand is None:
-            found.append(described)
-        elif thread_id not in reported:
-            reported.add(thread_id)
-            _log.info("thread %s is not a Session: %s", thread_id, errand)
-    reported &= held
+        if reading.thread is not None:
+            found.append(reading.thread)
+    # Every id the daemon still holds, so a thread it has let go stops being
+    # remembered as one this lane has already explained. `compose` decides what
+    # each of these documents is; this function only reads them.
+    if reported_non_sessions is not None:
+        reported_non_sessions &= held
     return found, None
-
-
-def _errand_of(thread: Mapping[str, Any]) -> str | None:
-    """Why this thread is the daemon's own errand, or `None` if it is a Session.
-
-    The reason is carried back rather than a bare `False` because a row that
-    stops appearing is a row somebody comes looking for, and "dropped" is not
-    an answer to that question. Read before evidence composition, so a daemon
-    errand cannot consume or be promoted by a process observation carrying the
-    same workspace.
-    """
-    if thread.get(EPHEMERAL) is True:
-        return f"{EPHEMERAL}, so the daemon will not even write it to disk"
-    # Only a word identifies an errand. `null`, a missing key, and a shape this
-    # build has never seen are all the daemon declining to classify it; row
-    # projection separately refuses to promote that silence into a native root.
-    source = thread.get(THREAD_SOURCE)
-    if isinstance(source, str) and source not in SESSION_THREAD_SOURCES:
-        return f"{THREAD_SOURCE} is {source!r}, which is codex's own errand"
-    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,90 +457,6 @@ async def read_thread(
         _log.info("%s", reason)
         return ThreadRead(reason=reason)
     return ThreadRead(thread=thread)
-
-
-def _session_tree_id(thread: Mapping[str, Any]) -> str | None:
-    """The native Session tree this daemon thread says it belongs to."""
-    tree_id = thread.get(SESSION_TREE_ID)
-    return tree_id.strip() if isinstance(tree_id, str) and tree_id.strip() else None
-
-
-def _status_of(thread: Mapping[str, Any]) -> str | None:
-    """What this thread says it is doing, in its own word."""
-    status = thread.get("status")
-    kind = status.get("type") if isinstance(status, Mapping) else None
-    return kind if isinstance(kind, str) else None
-
-
-def _from_thread(
-    thread: dict[str, Any],
-    pid: int | None,
-    progress: ProgressObservation | None = None,
-    child: ChildClassification = MAIN_SESSION,
-) -> SessionInspection:
-    """One daemon-held thread as the seam holds it.
-
-    `child` is passed in rather than read here because the caller has already
-    asked — the answer decides whether this row may take a pid at all, and
-    asking twice would be two readings of one field.
-    """
-    kind = _status_of(thread)
-    state = STATUS_TYPES.get(str(kind), SessionState.RUNNING)
-    cwd = thread.get("cwd")
-    return SessionInspection(
-        target=SessionTarget(agent=AgentKind.CODEX, session_id=str(thread["id"]), pid=pid),
-        workspace=Path(str(cwd)) if isinstance(cwd, str) and cwd.strip() else Path(),
-        lifecycle=SessionLifecycle.LIVE,
-        state=state,
-        # The status says whether a turn is running, never what a stopped thread
-        # stopped on. #75 reads that; a `systemError` is flagged for it to look.
-        waiting_for=(
-            WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
-            if kind == "systemError"
-            else WaitingFor()
-        ),
-        progress=progress or ProgressObservation(),
-        # Free on the cheap read, and honest for a thread mid-turn too: it is
-        # the thread's own account of when it last moved, which is exactly the
-        # case `last_activity` exists to answer when nothing was said (#76).
-        last_activity=thread_tail.last_activity(thread),
-        child=child,
-    )
-
-
-def _child_of(thread: Mapping[str, Any]) -> ChildClassification | None:
-    """Whether this is a proven root, a proven child, or unclassified (#79, #144).
-
-    Read off the same two fields `_errand_of` reads, on the same cheap
-    `thread/read`, and against `CHILD_THREAD_SOURCES` — the half of #112's
-    keep-list that exists for this rule. Everything else the daemon runs for
-    itself never reaches this function, having been dropped as an errand.
-
-    **A word decides; an absence does not.** `null`, a missing key and a shape
-    this build cannot read are all the daemon declining to classify a thread.
-    They return `None`: only an exact process identity with an explicit user
-    rollout may supply the missing root classification. PID-only evidence never
-    enters the roster.
-    """
-    source = thread.get(THREAD_SOURCE)
-    if source == rollouts.USER_THREAD_SOURCE:
-        return MAIN_SESSION
-    if not isinstance(source, str) or source not in CHILD_THREAD_SOURCES:
-        return None
-    # The parent is carried where the daemon names it and is `None` where it
-    # does not — which is ordinary, not malformed: `parentThreadId` is `null`
-    # on every thread the daemon recorded none for. The locked type settles
-    # what follows (`seams/agent.py`): a child whose parent could not be
-    # established is still a child, because demoting it over a missing link
-    # would open the very Relay this classification closes.
-    parent = thread.get(PARENT_THREAD_ID)
-    named = isinstance(parent, str) and parent.strip()
-    return ChildClassification(
-        kind=ChildKind.CHILD,
-        parent=(
-            SessionTarget(agent=AgentKind.CODEX, session_id=str(parent).strip()) if named else None
-        ),
-    )
 
 
 def _thread_name(thread: Mapping[str, Any]) -> str | None:
@@ -783,7 +510,7 @@ def _thread_name(thread: Mapping[str, Any]) -> str | None:
     name = thread.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
-    if _is_the_prompt_back(name, thread.get(PREVIEW)):
+    if _is_the_prompt_back(name, thread.get(roster.PREVIEW)):
         # Debug rather than info, and for `core.sessions._named_as`'s reason: this
         # is a decision taken again on every five-second tick for as long as the
         # daemon holds that name, and at info a thread whose generated title never
@@ -866,23 +593,27 @@ def _short_thread_id(thread_id: str | None) -> str | None:
 
 def _from_processes(
     candidates: tuple[Candidate, ...], *, home: Path | None
-) -> tuple[ProcessIdentity, ...]:
-    """Exact live process identities, with explicit rollout-root evidence.
+) -> tuple[roster.ProcessObservation, ...]:
+    """Every live terminal, with explicit rollout-root evidence where there is any.
 
-    A candidate without a thread id shared through its argv is absent. An exact
-    id remains useful when the daemon itself classifies that thread as `user`;
-    an exact matching rollout additionally lets discovery recover that root
-    classification from an older daemon that omitted `threadSource`.
+    **Every candidate is kept** (#201). A candidate with no thread id in its
+    argv used to be dropped right here, which is why no hand-started `codex`
+    could ever reach the roster: only `codex resume <UUID>` carries one, and the
+    acceptance harness — like every real user — starts `codex "<prompt>"`. Such
+    a candidate is liveness and place, which is exactly the half `roster.compose`
+    needs of this source.
 
-    The rollout override requires the same id in argv, filename and
-    `session_meta`, the same real workspace, and explicit `thread_source=user`.
-    No count, timestamp, or workspace-only observation can manufacture the
-    shared key (#144).
+    The rollout lookup answers one question about the other kind of candidate:
+    whether an exact argv id names a thread the user themselves rooted. It
+    requires the same id in argv, filename and `session_meta`, the same real
+    workspace, and explicit `thread_source=user`. No count, timestamp, or
+    workspace-only observation can manufacture the shared key (#144).
     """
-    identities: list[ProcessIdentity] = []
+    observed: list[roster.ProcessObservation] = []
     for candidate in candidates:
         thread_id = candidate.session_id
         if thread_id is None:
+            observed.append(roster.ProcessObservation(candidate=candidate))
             continue
         located = rollouts.locate(thread_id, home=home)
         meta = rollouts.session_meta(located) if isinstance(located, Path) else None
@@ -893,27 +624,5 @@ def _from_processes(
             and (workspace := rollouts.workspace_in(meta)) is not None
             and os.path.realpath(workspace) == os.path.realpath(candidate.workspace)
         )
-        identities.append(ProcessIdentity(candidate=candidate, rollout_root=rollout_root))
-    return tuple(identities)
-
-
-def _from_process(candidate: Candidate, *, session_id: str, pid: int | None) -> SessionInspection:
-    """One running TUI whose native root identity was independently proven.
-
-    **The state is `RUNNING` because nothing here can see one.** A process is
-    not evidence of a Reply Window, and `RUNNING` is the reading that holds a
-    Relay rather than delivering it into a Session that may be mid-turn. That
-    matters more here than anywhere: this Session's Relay would fail at the wire
-    anyway (#82), and a held Relay is one the user gets back.
-    """
-    return SessionInspection(
-        target=SessionTarget(
-            agent=AgentKind.CODEX,
-            session_id=session_id,
-            pid=pid,
-        ),
-        workspace=candidate.workspace,
-        lifecycle=SessionLifecycle.LIVE,
-        state=SessionState.RUNNING,
-        waiting_for=WaitingFor(),
-    )
+        observed.append(roster.ProcessObservation(candidate=candidate, rollout_root=rollout_root))
+    return tuple(observed)

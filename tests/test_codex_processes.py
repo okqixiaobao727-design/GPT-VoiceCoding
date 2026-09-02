@@ -13,10 +13,15 @@ from pathlib import Path
 
 from gpt_voicecoding.adapters.agent.codex.processes import (
     Candidate,
+    elapsed_seconds,
     enumerate_sessions,
     is_interactive,
     session_id_from_argv,
 )
+
+#: What `self.found` below pretends the clock says, so a start time computed
+#: from an elapsed reading is an exact number in an assertion.
+NOW = 1_787_700_000.0
 
 CODEX = "/Users/simon/.nvm/versions/node/v24.13.0/lib/node_modules/@openai/codex/bin/codex"
 
@@ -87,20 +92,66 @@ class TestReadingTheProcessTable:
         return run
 
     def found(self, listing: str, cwds: dict[int, str]) -> tuple[Candidate, ...]:
-        return asyncio.run(enumerate_sessions(run=self.build(listing, cwds)))  # type: ignore[arg-type]
+        return asyncio.run(
+            enumerate_sessions(run=self.build(listing, cwds), now=lambda: NOW)  # type: ignore[arg-type]
+        )
 
-    def test_a_session_is_reported_by_pid_and_workspace(self) -> None:
-        rows = self.found(f"  101 10 ttys001 {CODEX}\n", {101: "/tmp/workspace"})
+    def test_a_session_is_reported_by_pid_workspace_and_start_time(self) -> None:
+        rows = self.found(f"  101 10 ttys001 00:05 {CODEX}\n", {101: "/tmp/workspace"})
         assert rows == (
             Candidate(
                 pid=101,
                 workspace=Path("/tmp/workspace"),
+                started_at=NOW - 5,
             ),
         )
 
+    def test_a_bare_codex_carries_no_thread_id_and_is_still_a_candidate(self) -> None:
+        """#201: the ordinary hand-started TUI. It used to be read and thrown away."""
+        rows = self.found(f"  101 10 ttys001 00:05 {CODEX} fix the bug\n", {101: "/tmp/w"})
+        assert [(row.pid, row.session_id) for row in rows] == [(101, None)]
+
+    def test_the_clock_is_read_once_for_the_whole_pass(self) -> None:
+        """Every `etime` came out of one `ps`, so one moment has to date them all.
+
+        The `lsof` between two candidates is a subprocess and can take seconds.
+        A clock read per candidate would date the second one's elapsed reading
+        against a later moment and push its start forward by the whole lookup,
+        past the one second `START_TIME_RESOLUTION_SECONDS` allows — and a real
+        hand-started root would read as predating its own terminal and be
+        dropped, which is the bug this whole change exists to fix.
+
+        **The clock ticks here, and that is the whole point of the fixture.**
+        Every other test in this class injects a constant `now`, under which a
+        clock read once and a clock read per candidate answer identically — so
+        none of them can tell the two implementations apart, and the regression
+        would come back unseen. This one hands out a later moment on every call,
+        so the assertion is that the second candidate was dated by the first
+        call rather than by its own.
+        """
+        ticking = iter([NOW, NOW + 10, NOW + 20, NOW + 30])
+        listing = "\n".join(
+            (
+                f"  101 10 ttys001 00:05 {CODEX}",
+                f"  102 10 ttys002 00:05 {CODEX}",
+            )
+        )
+
+        rows = asyncio.run(
+            enumerate_sessions(
+                run=self.build(listing, {101: "/tmp/one", 102: "/tmp/two"}),  # type: ignore[arg-type]
+                now=lambda: next(ticking),
+            )
+        )
+
+        assert [row.started_at for row in rows] == [NOW - 5, NOW - 5]
+
+    def test_a_line_whose_elapsed_time_cannot_be_read_is_skipped(self) -> None:
+        assert self.found(f"  101 10 ttys001 later {CODEX}\n", {101: "/tmp/w"}) == ()
+
     def test_a_resumed_uuid_is_the_processes_exact_native_identity(self) -> None:
         rows = self.found(
-            f"  101 10 ttys001 {CODEX} resume {THREAD}\n",
+            f"  101 10 ttys001 00:05 {CODEX} resume {THREAD}\n",
             {101: "/tmp/workspace"},
         )
         assert rows[0].session_id == THREAD
@@ -115,8 +166,8 @@ class TestReadingTheProcessTable:
         """The detached shape captured by #144 is not a live interactive run."""
         listing = "\n".join(
             (
-                f"  101 10 ttys001 {CODEX}",
-                f"  102 1 ?? {CODEX}",
+                f"  101 10 ttys001 00:05 {CODEX}",
+                f"  102 1 ?? 00:05 {CODEX}",
             )
         )
 
@@ -127,10 +178,10 @@ class TestReadingTheProcessTable:
     def test_the_jobs_beside_it_are_left_out(self) -> None:
         listing = "\n".join(
             (
-                f"  101 10 ttys001 {CODEX}",
-                f"  102 10 ttys002 {CODEX} mcp-server",
-                f"  103 10 ttys003 {' '.join(CHATGPT_APP_SERVER)}",
-                "  104 10 ttys004 /usr/bin/python3 codex",
+                f"  101 10 ttys001 00:05 {CODEX}",
+                f"  102 10 ttys002 00:05 {CODEX} mcp-server",
+                f"  103 10 ttys003 00:05 {' '.join(CHATGPT_APP_SERVER)}",
+                "  104 10 ttys004 00:05 /usr/bin/python3 codex",
             )
         )
         rows = self.found(listing, {n: "/tmp" for n in (101, 102, 103, 104)})
@@ -138,10 +189,10 @@ class TestReadingTheProcessTable:
 
     def test_a_process_whose_cwd_cannot_be_read_is_left_out(self) -> None:
         """It ended between the listing and the lookup, or it is not ours."""
-        assert self.found(f"  101 10 ttys001 {CODEX}\n", {}) == ()
+        assert self.found(f"  101 10 ttys001 00:05 {CODEX}\n", {}) == ()
 
     def test_no_codex_at_all_is_an_empty_answer_not_a_failure(self) -> None:
-        assert self.found("  1 0 ?? /sbin/launchd\n", {}) == ()
+        assert self.found("  1 0 ?? 00:05 /sbin/launchd\n", {}) == ()
 
     def test_a_line_the_table_wrapped_or_mangled_is_skipped(self) -> None:
         assert self.found("not a process line\n\n", {}) == ()
@@ -158,3 +209,20 @@ class TestReadingTheProcessTable:
         except OSError:
             return
         raise AssertionError("a process table that cannot be read must not read as empty")
+
+
+class TestElapsedTime:
+    """`etime`'s POSIX form, `[[dd-]hh:]mm:ss`, and nothing else."""
+
+    def test_minutes_and_seconds(self) -> None:
+        assert elapsed_seconds("07:12") == 432.0
+
+    def test_hours_minutes_and_seconds(self) -> None:
+        assert elapsed_seconds("06:47:42") == 24462.0
+
+    def test_days_hours_minutes_and_seconds(self) -> None:
+        assert elapsed_seconds("2-06:47:42") == 197262.0
+
+    def test_a_shape_this_build_cannot_read_is_no_answer(self) -> None:
+        assert elapsed_seconds("Wed  2 Sep 08:52:06 2026") is None
+        assert elapsed_seconds("") is None

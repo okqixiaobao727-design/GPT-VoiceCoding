@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent._project import ProjectNames
-from gpt_voicecoding.adapters.agent.codex import discovery, rollouts
+from gpt_voicecoding.adapters.agent.codex import discovery, rollouts, roster
 from gpt_voicecoding.adapters.agent.codex.discovery import discover
 from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.seams.agent import (
@@ -38,18 +38,24 @@ OTHER_THREAD = "01a0385e-4872-7353-bdc5-8966c6165a8e"
 #: a Session that is over; ones written after it belong to the process reading.
 STARTED_AT = 1_787_700_000.0
 
+#: When the threads in this file were opened: a minute after the terminals that
+#: hold them started, which is what makes them those terminals' (#201).
+CREATED_AT = STARTED_AT + 60
+
 
 def running(
     pid: int,
     workspace: Path | str,
     *,
     session_id: str | None = None,
+    started_at: float | None = STARTED_AT,
 ) -> Candidate:
     """One TUI in the process table, with an exact native id only when observed."""
     return Candidate(
         pid=pid,
         workspace=Path(workspace),
         session_id=session_id,
+        started_at=started_at,
     )
 
 
@@ -78,6 +84,7 @@ def thread(
     status: str = "idle",
     name: str | None = None,
     preview: str | None = None,
+    created_at: float | None = CREATED_AT,
 ) -> dict:
     """One thread as the daemon describes it, with `preview` said only when asked.
 
@@ -91,6 +98,7 @@ def thread(
         "name": name,
         "threadSource": "user",
         "sessionId": thread_id,
+        "createdAt": created_at,
     }
     if preview is not None:
         described["preview"] = preview
@@ -198,8 +206,8 @@ def found_with_tuis(client: FakeDaemon, *, git: object = None) -> object:
             workspace = Path(str(described.get("cwd", "")))
             if (
                 described.get("ephemeral") is True
-                or source in discovery.CHILD_THREAD_SOURCES
-                or (isinstance(source, str) and source not in discovery.SESSION_THREAD_SOURCES)
+                or source in roster.CHILD_THREAD_SOURCES
+                or (isinstance(source, str) and source not in roster.SESSION_THREAD_SOURCES)
                 or workspace not in workspaces
                 or workspace in written_workspaces
             ):
@@ -250,7 +258,25 @@ class TestJoiningAThreadToItsProcess:
     def test_live_tui_without_a_shared_id_does_not_impersonate_an_exited_root(
         self, tmp_path: Path
     ) -> None:
-        """A historical rollout plus an unidentified live TUI is not a 1:1 identity join."""
+        """A root that was already there before this TUI started is not this TUI's.
+
+        #144 refused this by requiring an exact shared id, which also refused
+        every hand-started Session and made the codex lane inert (#201). What
+        keeps the ghost dead now is elimination rather than a manufactured key:
+        the terminal could not have opened a thread that predates it.
+        """
+        write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
+
+        lane = found(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", created_at=STARTED_AT - 3600)}),
+            running(101, "/tmp/w"),
+            home=tmp_path,
+        )
+
+        assert lane.rows == ()
+
+    def test_live_tui_without_a_shared_id_holds_the_root_it_opened(self, tmp_path: Path) -> None:
+        """#201's hand-started Session: `codex "<prompt>"` carries no id anywhere."""
         write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
 
         lane = found(
@@ -259,7 +285,7 @@ class TestJoiningAThreadToItsProcess:
             home=tmp_path,
         )
 
-        assert lane.rows == ()
+        assert [(row.target.session_id, row.target.pid) for row in lane.rows] == [(THREAD, 101)]
 
     def test_the_tui_running_a_thread_is_found_by_its_exact_rollout(self, tmp_path: Path) -> None:
         write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
@@ -312,7 +338,13 @@ class TestJoiningAThreadToItsProcess:
     def test_multiple_post_start_roots_fail_closed_to_the_live_process(
         self, tmp_path: Path
     ) -> None:
-        """One TUI cannot prove which of two roots is current, even in one workspace."""
+        """One TUI cannot prove which of two roots is current, even in one workspace.
+
+        #201 lets a terminal vouch for a root by workspace, and this is the
+        boundary of that: at most one of these two roots is the Session this
+        terminal is sitting in, so vouching for both would invent a row. The
+        roster under-reports here and says so through its degradation note.
+        """
         write_live_user_rollout(tmp_path, THREAD, "/tmp/w", written_at=STARTED_AT + 60)
         write_live_user_rollout(tmp_path, OTHER_THREAD, "/tmp/w", written_at=STARTED_AT + 120)
         roots = {
@@ -327,6 +359,7 @@ class TestJoiningAThreadToItsProcess:
         lane = found(FakeDaemon(roots), running(101, "/tmp/w"), home=tmp_path)
 
         assert lane.rows == ()
+        assert lane.degraded is not None and "101" in lane.degraded
 
     def test_unclassified_daemon_and_rollout_evidence_never_confirm_a_root(
         self, tmp_path: Path
@@ -346,7 +379,7 @@ class TestJoiningAThreadToItsProcess:
         assert lane.rows == ()
 
     def test_one_root_and_two_unidentified_live_tuis_fail_closed(self, tmp_path: Path) -> None:
-        """TTY liveness without a shared native key is not a confirmed main Session."""
+        """Two terminals could each be it, so the row names no pid — and is still a row."""
         write_live_user_rollout(tmp_path, THREAD, "/tmp/w")
         lane = found(
             FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}),
@@ -354,7 +387,7 @@ class TestJoiningAThreadToItsProcess:
             running(102, "/tmp/w"),
             home=tmp_path,
         )
-        assert lane.rows == ()
+        assert [(row.target.session_id, row.target.pid) for row in lane.rows] == [(THREAD, None)]
 
     def test_a_thread_with_no_process_is_not_a_session(self) -> None:
         lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}))
@@ -373,6 +406,38 @@ class TestJoiningAThreadToItsProcess:
                 home=tmp_path,
             ).rows
         ] == [THREAD]
+
+
+class TestSayingWhenTheRosterMayBeThin:
+    """#201's accepted cost, and the condition on which it was accepted."""
+
+    def test_a_terminal_that_matches_no_thread_is_reported(self) -> None:
+        """`codex --last` and the picker: no row, but never a silent one."""
+        lane = found(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", created_at=STARTED_AT - 3600)}),
+            running(101, "/tmp/w"),
+        )
+
+        assert lane.rows == ()
+        assert lane.degraded is not None
+        assert "101" in lane.degraded
+
+    def test_a_lane_whose_terminals_all_vouch_says_nothing_extra(self) -> None:
+        lane = found(FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w")}), running(101, "/tmp/w"))
+
+        assert lane.degraded is None
+
+    def test_the_note_rides_beside_the_daemons_own_reason(self) -> None:
+        """Two facts, and neither is allowed to hide the other."""
+        lane = found(
+            FakeDaemon({THREAD: thread(THREAD, cwd="/tmp/w", created_at=STARTED_AT - 3600)}),
+            running(101, "/tmp/w"),
+            daemon_note="the CLI and the daemon disagree about their version",
+        )
+
+        assert lane.degraded is not None
+        assert "version" in lane.degraded
+        assert "101" in lane.degraded
 
 
 class TestWhenTheDaemonIsNotThere:
@@ -968,9 +1033,7 @@ class TestThreadsTheDaemonRunsForItself:
 
     def test_the_keep_list_is_the_vocabulary_79_shares(self) -> None:
         """Named once, here, so the two rules cannot drift apart (#79's coordination)."""
-        assert discovery.SESSION_THREAD_SOURCES == frozenset(
-            {"user", "subagent", "guardian_review"}
-        )
+        assert roster.SESSION_THREAD_SOURCES == frozenset({"user", "subagent", "guardian_review"})
 
 
 class TestTheChildProcessRule:
@@ -1140,8 +1203,8 @@ class TestTheChildProcessRule:
         same day — and the day it was not, a subagent would have become
         addressable.
         """
-        assert discovery.CHILD_THREAD_SOURCES == discovery.SESSION_THREAD_SOURCES - {"user"}
-        assert "user" not in discovery.CHILD_THREAD_SOURCES
+        assert roster.CHILD_THREAD_SOURCES == roster.SESSION_THREAD_SOURCES - {"user"}
+        assert "user" not in roster.CHILD_THREAD_SOURCES
 
     def test_a_child_never_takes_the_roots_tui(self, tmp_path: Path) -> None:
         """Only the exact user rollout composes with the process; a child has no PID."""
@@ -1272,7 +1335,12 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
         assert any("compaction" in line for line in caplog.messages)
 
     def test_a_thread_the_daemon_has_let_go_is_forgotten(self) -> None:
-        """Roster-sized, like `TurnCache.retain`: this may not grow all day."""
+        """Roster-sized, like `TurnCache.retain`: this may not grow all day.
+
+        Both held threads are in it now and neither is the phantom's kind: the
+        errand is one, and the user root no live terminal vouches for is the
+        other (#201). The id from yesterday is what this pins, and it is gone.
+        """
         skipped = {"a-thread-from-yesterday"}
         asyncio.run(
             discover(
@@ -1284,4 +1352,26 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
                 projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
             )
         )
-        assert skipped == {str(RECORDED_PHANTOM["id"])}
+        assert skipped == {str(RECORDED_PHANTOM["id"]), str(RECORDED_SESSION["id"])}
+
+    def test_a_root_no_terminal_vouches_for_says_so_once(self, caplog) -> None:
+        """#201: this drop was silent, and that is why the bug was misdiagnosed."""
+        daemon = daemon_holding(thread(THREAD, cwd="/tmp/w"))
+        skipped: set[str] = set()
+
+        with caplog.at_level(logging.INFO, logger=discovery.__name__):
+            for _ in range(3):
+                asyncio.run(
+                    discover(
+                        daemon,  # type: ignore[arg-type]
+                        evidence=discovery.ProcessEvidence(
+                            list_sessions=listing()  # type: ignore[arg-type]
+                        ),
+                        reported_non_sessions=skipped,
+                        projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
+                    )
+                )
+
+        said = [line for line in caplog.messages if THREAD in line]
+        assert len(said) == 1
+        assert roster.NO_TERMINAL in said[0]
