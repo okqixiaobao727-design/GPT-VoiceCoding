@@ -47,15 +47,19 @@ start. What one engine owns on this machine:
   not the Codex lane's problem alone.
 * **the published approval address**, a fixed
   `~/Library/Application Support/GPT-VoiceCoding/engine/address.json`
-  (`locations.py:56`, written at `adapters/agent/claude/adapter.py:289` with no
-  `base_dir`). Per machine, **and there is no setting for it** — so with two
-  engines up, the last one to publish owns every Claude permission dialog on this
-  machine, and the first to stop withdraws the address the other is relying on.
-  That is [#202](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/202),
-  a product defect this harness cannot arrange around, and it is a **known
-  cross-lane hazard on the approval route**: a `relay` or `approval` red on
-  either lane of a two-lane run may be it rather than the step's own subject.
-  A single-lane run (`--lane`) is the way to tell them apart until it is fixed.
+  (`locations.py:56`). Per machine, and there is still no setting for it — but it
+  is no longer a race. [#202](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/202)
+  made publishing a **claim**: an engine dials whatever address is already there,
+  takes over a socket nobody answers, and stands down from a socket that answers.
+  A stood-down engine reaches no Claude Session at all — the `SessionStart`
+  registration hook reads the same address the `PermissionRequest` hook does — so
+  it says so in its log and goes **red** at `verify` rather than reporting an
+  empty roster as healthy. Withdrawal removes only the engine's own address. So the route
+  now belongs to one engine rather than to the last one to start, and this run
+  decides *which* engine that is rather than leaving it to the clock: the Codex
+  lane's derived config drops the Claude agent adapter (`support.derive_config`),
+  because that lane's journey never walks the approval route. The Claude lane is
+  the only claimant, and its config is the user's own.
 """
 
 from __future__ import annotations
@@ -72,6 +76,8 @@ from pathlib import Path
 from typing import Never
 
 import pytest
+
+from gpt_voicecoding.seams.identity import AgentKind
 
 pytest.importorskip(
     "telethon",
@@ -750,6 +756,10 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         project_name=f"acceptance-{lane.name}",
         token_variable=run.token_variable,
         codex_socket_directory=socket_root,
+        # #202: one engine per machine holds the Claude approval address, and the
+        # Codex lane's journey never walks that route. Dropping the adapter is
+        # what leaves exactly one claimant when both lanes are up.
+        dropped_agents=() if lane.agent == str(AgentKind.CLAUDE) else (AgentKind.CLAUDE,),
     )
     engine = support.Engine(
         config=config,

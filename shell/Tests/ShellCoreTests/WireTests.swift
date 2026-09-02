@@ -6,8 +6,16 @@ import Testing
 /// The shell's side of the contract in `docs/control-plane.md`. One JSON object
 /// per line, one reply per request, and a closed error set.
 @Suite struct WireTests {
-    @Test func protocolFiveNamesTheProgressVocabulary() {
-        #expect(controlPlaneProtocolVersion == 5)
+    /// The protocol version is deliberately **not** asserted here. A literal in
+    /// this file is a second place to change on a bump, and it is the place that
+    /// gets missed: it still read `5` after `53400b6` moved both declarations to
+    /// `6`, which is what kept the shell gate red. The agreement that matters is
+    /// the cross-language one — Swift's declaration against the engine's — and
+    /// `tests/test_app_bundle.py`'s
+    /// `test_the_shell_and_the_engine_speak_the_same_protocol_version` already
+    /// asserts exactly that, by reading `Wire.swift`. One owner, and a bump that
+    /// touches one side fails there rather than passing everywhere.
+    @Test func theWireNamesTheProgressVocabulary() {
         #expect(
             Set(ProgressAvailability.allCases.map(\.rawValue)) == [
                 "not_read", "unreadable", "readable",

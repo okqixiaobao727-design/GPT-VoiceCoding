@@ -267,10 +267,13 @@ class TestWhatTheHookIsInstalledAs:
             assert all(claude_hooks.is_ours(handler) for handler in group[0]["hooks"])
 
 
-def test_the_address_file_is_the_one_both_hooks_read() -> None:
-    """One published address, so one ingress — ADR 0011 and #86's file."""
-    published = publish_address(Path("/tmp/approvals.sock"), ClaudeSettings())
-    try:
-        assert published == address_path()
-    finally:
-        published.unlink(missing_ok=True)
+def test_the_address_file_is_the_one_both_hooks_read(tmp_path: Path) -> None:
+    """One published address, so one ingress — ADR 0011 and #86's file.
+
+    Under a `base_dir`, because the real one belongs to whatever engine this
+    developer has running and this test used to write and then unlink it — which
+    is #202's defect, committed by the test suite.
+    """
+    published = publish_address(Path("/tmp/approvals.sock"), ClaudeSettings(), base_dir=tmp_path)
+
+    assert published == address_path(tmp_path)
