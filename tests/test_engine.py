@@ -595,11 +595,13 @@ class TestTheInstructionsThisEngineGenerates:
     this root knows. So they are stated here, verified here, and refused here.
     """
 
-    def test_an_assembled_hub_carries_both_sets(self, home: Path) -> None:
+    def test_an_assembled_hub_carries_all_three_sets(self, home: Path) -> None:
         engine = Engine.assemble(load(configured(home)))
         instructions = engine.core.instructions
         assert instructions is not None
-        assert instructions.voice.text and instructions.delegated.text
+        assert instructions.voice.text
+        assert instructions.agent.text
+        assert instructions.delegated.text
 
     def test_the_sets_name_the_socket_this_engine_serves(self, home: Path) -> None:
         engine = Engine.assemble(load(configured(home)))
