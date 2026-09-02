@@ -88,6 +88,43 @@ class TestTheStopNoticePipelineEndToEnd:
         assert "The registry status is the root cause." in hub.call.spoken[0]
         assert hub.core.status().sessions[0].progress == observed
 
+    def test_a_stop_that_read_a_question_puts_it_on_the_roster_row(self) -> None:
+        """The Stop path reads the whole state and used to write back only half of it.
+
+        `_session_stopped` reads a Session at the moment it stopped — through the
+        adapter's overlay, which consults the dialog parked on the approval
+        socket — and that reading is the freshest the engine ever holds. It went
+        into the announcement and then to the announcement alone: `set_progress`
+        folded the progress in and the `waiting_for` beside it was dropped. So
+        `status` kept answering from whatever the last discovery pass had stored,
+        which in run `20260902T065340Z` was a reading that had not caught up
+        (#209), and a parked, answerable question read as `unknown` with a closed
+        Reply Window until the next cadence.
+
+        The Stop already waits until it is caught up (`window.py::_settle`, #150).
+        Writing what it read back is what makes that wait reach `status`.
+        """
+        hub = Hub()
+        question = WaitingFor(
+            kind=WaitingKind.QUESTION,
+            prompt="Which marker should be written?",
+            options=(Option(text="ALPHA"), Option(text="DELTA")),
+            approval_id="8664d1fc-dc6c-44eb-8800-fa8acf0e0c31",
+        )
+
+        # The window is derived with the lane's own answer to "do you still hold
+        # that exact question" (`derive_reply_window`), so the fake holds it: the
+        # roster kind alone never opens one.
+        hub.agent.answerable_questions.add(CODEX)
+
+        hub.emit(SessionStopped(target=CODEX, waiting_for=question))
+
+        status = hub.core.status()
+        assert status.sessions[0].waiting_for == question
+        # The surface's answer, which is the roster payload's own `reply_window`
+        # field: derived per read, with the lane's answer folded in.
+        assert status.reply_windows[CODEX] is ReplyWindow.OPEN
+
     def test_a_failed_stop_read_does_not_replace_a_readable_roster_observation(self) -> None:
         hub = Hub()
         observed = ProgressObservation.readable(
