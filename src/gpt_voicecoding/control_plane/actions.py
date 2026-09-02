@@ -81,7 +81,7 @@ class ControlPlane:
             Action.STATUS: self._status,
             Action.SWITCH: self._switch,
             Action.BRIEF: self._brief,
-            Action.PROGRESS: self._progress,
+            Action.HISTORY: self._history,
             Action.LIVE: self._live,
             Action.RELAY: self._relay,
             Action.APPROVE: self._approve,
@@ -148,24 +148,20 @@ class ControlPlane:
             document = payloads.brief_document(briefing.omitting_newest(brief))
         return document
 
-    async def _progress(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        """How far along one exact Session is, rendered as one roster row.
+    async def _history(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """One page of what an exact Session said and was told (#171).
 
-        The same document `status` renders each row as, deliberately: a surface
-        that had to learn a second shape to show one Session's progress would be
-        a second reader of the same facts. What this action adds is *when* — the
-        row comes back read at the moment it was asked for, rather than at the
-        last tick.
+        A separate read, published on its own shape rather than as a roster row:
+        a page is not a roster fact, and the row's `progress` summary keeps
+        saying what it said. The count comes from `[policy]
+        history_page_entries` and never from the caller, so no surface can ask
+        this engine for a page it did not size.
         """
-        session = await self._core.progress(payloads.read_target(payload))
-        reply_window = self._core.status().reply_windows.get(
-            session.target,
-            session.reply_window,
+        page = await self._core.history(
+            payloads.read_target(payload),
+            before=payloads.read_optional_ordinal(payload, "before"),
         )
-        return self._progress_publication.exact_document(
-            session,
-            reply_window=reply_window,
-        )
+        return self._progress_publication.history_document(page)
 
     async def _switch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         name = payloads.read_text(payload, "name")
@@ -191,14 +187,23 @@ class ControlPlane:
         return payloads.relay_document(outcome)
 
     async def _approve(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """An Approval Relay: the user's verdict on one pending permission.
+
+        Two refusals, and they read differently because the user acts on them
+        differently. Nothing on the roster carrying the handle means the hook
+        ended — the dialog went back to the screen, and that is where it is
+        answered now. A Child Process carrying it is refused in Bridge Core's
+        own words (`ChildSessionError`), which say why it is never spoken to.
+        """
         approval_id = payloads.read_text(payload, "approval_id")
         verdict = payloads.read_verdict(payload)
         outcome = await self._core.answer_approval(approval_id, verdict)
         if outcome is None:
             raise NothingPending(
-                f"nothing is waiting under {approval_id!r} — it was answered or it expired"
+                f"no live Session is waiting under {approval_id!r} — the dialog was answered "
+                "or its hook ended; if it is still on screen, answer it there"
             )
-        return payloads.approval_document(outcome)
+        return payloads.approval_document(approval_id, verdict, outcome)
 
     async def _verify(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return payloads.verification_document(await self._core.verify())

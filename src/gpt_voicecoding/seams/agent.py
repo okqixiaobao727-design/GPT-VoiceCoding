@@ -10,8 +10,14 @@ transition after that. The split is not redundancy — an event cannot bootstrap
 level, because registration happens before Bridge Core holds the Session and a
 report raised there is dropped as belonging to a Session nobody knows (#27).
 
-Events raised upward: Session stopped, Session ended, Session awaiting approval,
-Reply Window changed, and delivery receipts that arrive asynchronously.
+Events raised upward: Session stopped, Session ended, Reply Window changed, and
+delivery receipts that arrive asynchronously.
+
+**A pending permission is not an event of its own.** Both adapters fold the
+dialog's handle into the Stop's `WaitingFor`, so the Session's PERMISSION state
+is what travels and `as_approval_request` is how the Approval Relay addresses it
+(#191). A second event for the same dialog only ever asked Bridge Core to
+recognise two things as one.
 
 Reply-Window queueing is Bridge Core policy. Adapters deliver; they never queue.
 
@@ -254,35 +260,73 @@ class ProgressAvailability(StrEnum):
 
 
 class ProgressOmission(StrEnum):
-    """Why known history is absent from, or incomplete in, one progress view."""
+    """Why known history is absent from, or incomplete in, one progress view.
+
+    The first four are an *observation's* omission and describe a whole view.
+    `OVERSIZE` is the History page's and describes **one entry**: the page keeps
+    its slot with its ordinal and role and drops only its text (#171), so an
+    entry too large for the encoded Reply never blocks the entries before it. It
+    is refused on a `ProgressObservation` for that reason — one entry's omission
+    is not a reading's.
+    """
 
     NONE = "none"
     OLDER = "older"
     STATUS_SUMMARY = "status_summary"
     NEWEST_OVERSIZE = "newest_oversize"
+    OVERSIZE = "oversize"
 
 
 @dataclass(frozen=True, slots=True)
 class ProgressEntry:
     """One thing that was said in a Session, and by which side.
 
-    Deliberately just the two fields. Legacy carried `turn_id` and `turn_status`
-    beside them on the Codex lane (`legacy@1d32845:bridge/codex.py:1484-1492,
-    1516-1520`); **dropped, because** no v1.0 consumer reads them — the Live
-    Call, the Companion Channel and the Control Panel ask what a Session last
-    said and what it was last told, never which turn that was or how the turn
-    ended — and adding a field here later is additive rather than a second
-    widening of `ProgressObservation`.
+    Legacy carried `turn_id` and `turn_status` beside them on the Codex lane
+    (`legacy@1d32845:bridge/codex.py:1484-1492, 1516-1520`); **dropped, because**
+    no v1.0 consumer reads them — the Live Call, the Companion Channel and the
+    Control Panel ask what a Session last said and what it was last told, never
+    which turn that was or how the turn ended — and adding a field here is
+    additive rather than a second widening of `ProgressObservation`.
+
+    `phase` is that additive field (#188), and it is the source's own word
+    rather than a vocabulary of this seam's: Codex marks each `agentMessage`
+    `commentary` or `final_answer`
+    (`codex-rs/app-server-protocol/src/protocol/v2/item.rs:249-258`, serialised
+    `Option<MessagePhase>`), and a lane that marks nothing leaves it `None`. Not
+    an enum, deliberately: a phase a future build invents must read as *not the
+    answer* and cost the reading nothing, where an enum would raise on a roster
+    row the user is looking at. Who compares it to what is the reader's — the
+    tail readers carry it and never look at it, and Briefing is the one place
+    that asks whether a turn ended on its answer (`core/briefing.py`).
     """
 
+    #: Where this entry sits in the Session's visible record, counted **from
+    #: the oldest visible entry and starting at 0**, assigned by the lane at
+    #: read time (#171). Both sources are append-only for the entries this seam
+    #: keeps — a Claude transcript file, a Codex thread's turns — so an ordinal
+    #: names the same entry across reads while the Session lives, which is what
+    #: makes it usable as the History page's cursor. Required rather than
+    #: defaulted: both lanes build every entry before anything trims them, so
+    #: there is no reading in which one is unknown, and a default would let a
+    #: fixture ship a cursor that points nowhere.
+    ordinal: int
     role: ProgressRole
     text: str
+    #: Which part of the turn this was, in the source's own word, or `None`
+    #: when the source did not say.
+    phase: str | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int):
+            raise ValueError("a progress entry ordinal is its whole place in the record")
+        if self.ordinal < 0:
+            raise ValueError("a progress entry ordinal counts from the oldest entry, at 0")
         if not isinstance(self.role, ProgressRole):
             raise ValueError("a progress entry role must use the Agent seam vocabulary")
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("an entry with nothing said in it is not progress")
+        if self.phase is not None and not isinstance(self.phase, str):
+            raise ValueError("a progress entry phase is the source's own word, or nothing")
 
 
 class ProgressCapture(Protocol):
@@ -360,6 +404,8 @@ class ProgressObservation:
             raise ValueError("progress availability must use the Agent seam vocabulary")
         if not isinstance(self.omission, ProgressOmission):
             raise ValueError("progress omission must use the Agent seam vocabulary")
+        if self.omission is ProgressOmission.OVERSIZE:
+            raise ValueError("oversize names one History page entry, never a whole reading")
         if self.has_history is not None and type(self.has_history) is not bool:
             raise ValueError("progress history presence must be true, false or absent")
         if not isinstance(self.recent, tuple) or any(
@@ -404,6 +450,51 @@ class ProgressObservation:
                     ProgressOmission.NEWEST_OVERSIZE,
                 ):
                     raise ValueError(f"{self.omission} carries no progress entries")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryPage:
+    """One page of what a Session said and was told, older on request (#171).
+
+    The third publication of the one canonical observation (ADR 0016's
+    amendment), and a **separate read**: `inspect` still answers the newest tail
+    and folds into the roster, while this never touches the roster at all.
+
+    `entries` are newest-first and bounded by a **count**, not by bytes — the
+    encoded Reply's ceiling stays the wire's, applied by the publication, which
+    keeps an over-ceiling entry's slot rather than dropping it. `older` says
+    whether anything remains before the oldest entry on this page, so the next
+    request passes that entry's `ordinal` as `before`.
+
+    **`read_at=None` is a stated contract, not a missing value.** It means the
+    lane holds no record for this target to read — an unattached Codex thread,
+    or a Claude Session whose transcript this engine was never told about. Bridge
+    Core turns it into the same typed refusal `progress` gave that case, because
+    a Session nobody could read must never be published as one that said
+    nothing. A lane that could not be read *at all* raises `LaneUnavailable`
+    instead, which is a different fact about the lane rather than about this
+    Session. A read that found nothing before the cursor is neither: it is an
+    empty page with `older=False`, and that is an answer.
+    """
+
+    entries: tuple[ProgressEntry, ...] = ()
+    older: bool = False
+    read_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, ProgressEntry) for entry in self.entries
+        ):
+            raise ValueError("a history page carries an ordered tuple of whole entries")
+        if type(self.older) is not bool:
+            raise ValueError("whether older entries remain is true or false")
+        if self.read_at is not None and not isinstance(self.read_at, datetime):
+            raise ValueError("a history page read time is a datetime or absent")
+        if self.read_at is None and (self.entries or self.older):
+            raise ValueError("a page nothing read carries no entries and no promise of more")
+        ordinals = [entry.ordinal for entry in self.entries]
+        if ordinals != sorted(ordinals, reverse=True) or len(set(ordinals)) != len(ordinals):
+            raise ValueError("a history page is newest-first, and names each entry once")
 
 
 class ChildKind(StrEnum):
@@ -635,13 +726,6 @@ class SessionEnded(Event):
 
 
 @dataclass(frozen=True, slots=True)
-class AwaitingApproval(Event):
-    """A permission dialog is on screen. It blocks every other Relay until answered."""
-
-    request: ApprovalRequest
-
-
-@dataclass(frozen=True, slots=True)
 class ReplyWindowChanged(Event):
     """The Session's willingness to accept an inbound Relay as a user turn changed."""
 
@@ -658,7 +742,7 @@ class RelayReceipt(Event):
 
 
 #: The closed set of events this seam raises. Nothing else may appear.
-AgentEvent = SessionStopped | SessionEnded | AwaitingApproval | ReplyWindowChanged | RelayReceipt
+AgentEvent = SessionStopped | SessionEnded | ReplyWindowChanged | RelayReceipt
 
 
 @runtime_checkable
@@ -710,6 +794,39 @@ class AgentAdapter(Protocol):
         """
         ...
 
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page of this Session's own record, newest-first, older on request.
+
+        **A separate read, never folded into the roster** (ADR 0016's
+        amendment). `inspect` answers what a Session is doing now; this answers
+        what it said, `count` entries at a time, and Bridge Core publishes the
+        page without touching the row.
+
+        `before` is an `ordinal` this lane handed out on an earlier page: the
+        page returned holds the entries immediately before it. `None` asks for
+        the newest page, which **includes** the newest entry — every page is
+        complete on its own and the engine remembers no cursor between reads
+        (#171). A `before` larger than any ordinal is the newest page too, and a
+        `before` past the oldest entry is an empty page with `older=False` — an
+        answer, not a refusal.
+
+        **The same windowing on both lanes.** Each lane already builds the full
+        list of visible entries before anything trims it; the shared window
+        (`adapters/agent/_progress.py`) is applied to that list, so two lanes
+        cannot page differently over the same record.
+
+        **Raises `LaneUnavailable` when the lane cannot be read at all**, and
+        answers `HistoryPage(read_at=None)` when this lane holds no record for
+        this target — see `HistoryPage` for why those are two different facts.
+        """
+        ...
+
     def reply_window(self, target: SessionTarget) -> ReplyWindow:
         """Where one Session's Reply Window stands right now, asked rather than awaited.
 
@@ -753,19 +870,8 @@ class AgentAdapter(Protocol):
         This is the live half of the Reply Window rule. A roster can say that a
         Session is waiting on a question, but only the adapter knows whether the
         exact hook is still parked. False is the fail-closed answer for an
-        unknown target, a permission, an expired question, or a lane without
-        this route.
-        """
-        ...
-
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        """Release questions this lane held past the configured Core budget.
-
-        The budget value is supplied by Bridge Core, so adapters hold mechanism
-        and timestamps without importing policy. Each returned pair was popped
-        before release and therefore can be announced exactly once by Core.
+        unknown target, a permission, a question whose hook has ended, or a lane
+        without this route.
         """
         ...
 

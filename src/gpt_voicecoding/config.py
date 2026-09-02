@@ -377,11 +377,10 @@ def _prefixes(section: dict[str, Any], where: str) -> tuple[str, ...]:
 
 
 def _policy(section: dict[str, Any], where: str) -> CorePolicy:
-    """The locked durations, dialled. The pipelines own what they mean."""
-    numbers: dict[str, float] = {}
+    """The locked dials, dialled. The pipelines own what they mean."""
+    dials: dict[str, float | int] = {}
     for key in (
         "relay_ceiling_seconds",
-        "approval_budget_seconds",
         "silence_end_seconds",
     ):
         value = section.get(key)
@@ -389,8 +388,15 @@ def _policy(section: dict[str, Any], where: str) -> CorePolicy:
             continue
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ConfigError(f"[policy] {key}{where} must be a number of seconds")
-        numbers[key] = float(value)
+        dials[key] = float(value)
+    entries = section.get("history_page_entries")
+    if entries is not None:
+        # A count, and read as one: `5.0` is a duration's spelling and would
+        # reach `range` as a float. The page size is entries, not seconds.
+        if isinstance(entries, bool) or not isinstance(entries, int):
+            raise ConfigError(f"[policy] history_page_entries{where} must be a whole number")
+        dials["history_page_entries"] = entries
     try:
-        return CorePolicy(**numbers)
+        return CorePolicy(**dials)
     except ValueError as refusal:
         raise ConfigError(f"[policy]{where}: {refusal}") from None

@@ -7,7 +7,7 @@ public let maxRequestBytes = 65536
 
 /// The control-plane protocol this shell can interpret. Held to the engine's
 /// declaration by the cross-language agreement test in `tests/test_app_bundle.py`.
-public let controlPlaneProtocolVersion = 6
+public let controlPlaneProtocolVersion = 8
 
 /// Whether an Agent's authoritative progress source was read and answered.
 public enum ProgressAvailability: String, Sendable, CaseIterable {
@@ -22,6 +22,10 @@ public enum ProgressOmission: String, Sendable, CaseIterable {
     case older
     case statusSummary = "status_summary"
     case newestOversize = "newest_oversize"
+    /// One History page entry that could not be carried whole. It keeps its
+    /// slot, its ordinal and its role, and loses only its text, so a page always
+    /// advances past a message too large for the line.
+    case oversize
 }
 
 /// Every action this engine has. Eight, and the set is closed — adding one is a
@@ -36,13 +40,18 @@ public enum ProgressOmission: String, Sendable, CaseIterable {
 /// `sessions` was here until protocol 6 and retired with the Briefing verb: the
 /// roster it answered is `brief`'s now, and this panel reads `status`, which
 /// carries the same rows and the switches beside them.
+///
+/// `progress` was here until protocol 7. The Session Brief carries the newest
+/// entry whole and `history` carries everything before it, so the exact progress
+/// publication had no question left to answer.
 public enum Action: String, Sendable, CaseIterable {
     case status
     /// What the Sessions are doing, in the words the user is told. The whole
     /// roster with no address, one Session whole with one.
     case brief
-    /// How far along one exact Session is, read now. A question, never a turn.
-    case progress
+    /// One page of what an exact Session said and was told, newest first, with
+    /// an ordinal cursor for the entries before it. A question, never a turn.
+    case history
     case `switch`
     /// The Live Toggle. One action: it ends the call the system owns, or starts
     /// one if none is up. Bridge Core owns that policy; no surface holds call state.

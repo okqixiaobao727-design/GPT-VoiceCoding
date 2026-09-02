@@ -1,4 +1,4 @@
-"""The nine steps of the bridge journey, written once and walked by both lanes.
+"""The steps of the bridge journey, written once and walked by both lanes.
 
 ## What changed, and why
 
@@ -14,7 +14,7 @@ ordinary `claude` / `codex` binary, in a pty, no wrapper (`hand_started.py`).
 Steps `0c`, `1a`, `1b` and `8` are gone with the launcher. `0b` (the realtime
 contract probe) and the provenance compare stay where they were.
 
-## The nine names are a contract
+## The step names are a contract
 
 Every one of the build tickets #74–#80 cites a step name from `STEPS` verbatim in
 its "Red first" line. Renaming one here silently moves seven tickets' exit
@@ -55,7 +55,8 @@ notice land where `stop notice` is looking. Learned on run `20260826T213402Z`, w
 `stop notice` passed on a permission prompt belonging to a stale `/tmp/vcprobe`
 thread, and on a quieter machine would have failed for a reason equally
 unrelated to the lane (#109). The sibling lesson had already been learned once,
-one module over, for `pending_approvals` (`approval_effect.resolve`).
+one module over, for the pending dialogs `approval_effect.resolve` correlates —
+read off the roster's own PERMISSION rows since #191.
 
 ## The turns, and why there are five
 
@@ -87,8 +88,11 @@ from typing import TYPE_CHECKING
 
 import approval_effect
 import hand_started
+import live_call
 import support
 from support import LaneBlocked, StepFailed
+
+from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
 
 if TYPE_CHECKING:
     # Named for a type and never imported at runtime: telethon lives behind this
@@ -96,17 +100,20 @@ if TYPE_CHECKING:
     # the fast suite imports this file to test its attribution rule without it.
     import telegram_person
 
-#: The nine steps, in the order #73 fixed. Cited verbatim by #74–#80.
+#: Every step, in the order #73 fixed and #183 appended to. The first nine are
+#: cited verbatim by #74–#80; `live call` is #183's, and is last because a call
+#: holds the interlock and a whole-lane run wants the turn-driving steps behind it.
 STEPS = (
     "roster",
     "stable name",
-    "progress",
+    "brief",
     "stop notice",
     "relay",
     "approval",
     "companion inbound",
     "switches",
     "child",
+    "live call",
 )
 
 #: What each step needs to have run **before** it, so that a step selected on its
@@ -117,9 +124,10 @@ STEPS = (
 #: * everything needs `roster`, because `roster` is what sets `Walk.address` and
 #:   `Walk.truth`, and every later step either names the address or reads the
 #:   agent's own record through it;
-#: * `progress` needs `stable name`, because what it reads is history "after a
+#: * `brief` needs `stable name`, because what it reads is history "after a
 #:   turn" and `stable name` is the walk's first turn — the Claude lane launches
-#:   silent, so without it there is nothing for `bridgectl progress` to carry;
+#:   silent, so without it there is nothing for `bridgectl brief` to carry and
+#:   nothing for `bridgectl history` to page through;
 #: * `stop notice` needs `stable name` for the same turn seen from the other end:
 #:   the mark it waits behind is taken inside that step (`Walk.before_first_turn`)
 #:   and the Stop it looks for is that turn's;
@@ -131,18 +139,23 @@ STEPS = (
 PREREQUISITES: Mapping[str, tuple[str, ...]] = {
     "roster": (),
     "stable name": ("roster",),
-    "progress": ("roster", "stable name"),
+    "brief": ("roster", "stable name"),
     "stop notice": ("roster", "stable name"),
     "relay": ("roster",),
     "approval": ("roster", "relay"),
     "companion inbound": ("roster",),
     "switches": ("roster",),
     "child": ("roster",),
+    #: `live call` names no Session at all — it is the route from `bridgectl
+    #: live` through the voice surface and back, and nothing in it reads the
+    #: roster or the agent's own record. So it does not need `roster`, and
+    #: #183's blocker clause is explicit that it must be runnable alone.
+    "live call": (),
 }
 
 
 class UnknownStep(Exception):
-    """`--step` named something that is not one of the nine. It carries the nine."""
+    """`--step` named something that is not a step. It carries the ones there are."""
 
 
 @dataclass(frozen=True)
@@ -179,9 +192,9 @@ def select(names: Sequence[str] | None = None) -> Selection:
     """Resolve `--step` into what to walk and what to grade.
 
     No names is the full run: every step graded, nothing as setup. Any name is
-    matched against `STEPS` **exactly** — the nine spellings are the interface
+    matched against `STEPS` **exactly** — these spellings are the interface
     every build ticket's "Red first" line cites, so a near miss is a refusal that
-    carries the nine rather than a run that quietly walks eight of them.
+    carries them all rather than a run that quietly walks one fewer.
     """
     asked = tuple(dict.fromkeys(names or ()))
     if not asked:
@@ -228,18 +241,109 @@ DISCOVERY_SECONDS = 30.0
 #: measuring a Session with a turn still running underneath.
 BOOT_TURN_ALLOWANCE = 2.0
 
-#: The engine's own line for a Stop it announced (`core/bridge.py:_session_stopped`).
+#: The engine's own line for a Stop it announced (`core/bridge.py:_announce_waiting`).
 #: `stop notice` matches a looser pattern for its own purposes; `drain_boot_notice`
 #: wants the announcement itself, because "was a notice raised for the boot turn"
 #: is exactly the question it is asking.
+#:
+#: **The record is several lines now** (#189): the Stop Notice is a Session Brief
+#: and the log carries `Briefing.text` whole, so `Session stopped:` opens the
+#: first line and the brief's labelled lines follow. `support.matching_lines`
+#: greps line by line, so this still matches once per Stop — the header line.
 ENGINE_STOP_LINE = r"(?i)Session stopped:"
 
-#: What the escalated permission announcement says (`core/approvals.py:52-76`).
+#: What a Stop Notice about a permission says (`core/briefing.py::_decision_lines`).
+#: **There is one notice for a permission now** (#191): the dialog rides the
+#: Session's Stop like every other wait, so what this matches is the brief's own
+#: decision line rather than a retired announcement of its own.
+#:
 #: Matched rather than quoted whole: the tool name and the detail are the agent's,
 #: and this run does not get to predict them. **Which Session it is about is not
-#: this pattern's business either** — the sentence opens with the Session's name
-#: since #109, and the attribution rule is what reads it.
-APPROVAL_ANNOUNCEMENT = re.compile(r"waiting for your permission to use", re.IGNORECASE)
+#: this pattern's business either** — the brief's header names it, and the
+#: attribution rule is what reads that.
+APPROVAL_ANNOUNCEMENT = re.compile(r"^\s*permission:", re.IGNORECASE | re.MULTILINE)
+
+#: What a Session Brief says about where the user's reply can reach the Session
+#: (`core/briefing.py::_session_lines`). Quoted whole, because these two lines
+#: are the product's answer to the one question this harness asks of an
+#: announced wait: can the person act on it from here, or are they being sent to
+#: the keyboard?
+ANSWERABLE_HERE = "answer: from here"
+ANSWERABLE_AT_THE_TERMINAL = "answer: at the terminal"
+
+#: The engine's own line for what the user said (`core/bridge.py:796`). It is the
+#: only line either call event has: `CallStarted` and `CallEnded` are noted into
+#: the interlock and never logged (`core/bridge.py:777-785`), which is why the
+#: `live call` step reads those two off the control plane instead.
+USER_SPEECH_LINE = r"user speech, for the voice thread to act on"
+
+#: The fragment of the request the engine's line has to carry. A fragment rather
+#: than the sentence because ASR text is unstable (#181 finding 1), and this one
+#: because it is the request's own tail — every trial in the probe's record
+#: (`docs/research/probes/20260901T213252Z-agent-hangup.jsonl`) carried it.
+#:
+#: **Matched with every space taken out of both sides**, which is not tidying: on
+#: run `20260902T093755Z` the two lanes heard the same four seconds of audio and
+#: wrote it down differently — the Claude lane's engine logged `…结束通话` and the
+#: Codex lane's `…结束通 话`, a space inserted inside the word. The request has no
+#: spaces in it at all, so a space anywhere in the transcript is the recogniser's
+#: and never the speaker's, and a substring test that counted one was a test of
+#: which recogniser answered rather than of whether the words arrived.
+LIVE_CALL_HEARD_SUBSTRING = "结束通话"
+
+
+def _unspaced(text: str) -> str:
+    """One line with all whitespace removed — see `LIVE_CALL_HEARD_SUBSTRING`."""
+    return "".join(text.split())
+
+
+#: How the harness's Call adapter words a connection that went away by itself
+#: (`live_call.HarnessCallTransport.on_lost`). The engine raises `CallDropped`
+#: for that, not `CallEnded`.
+DROPPED_REASON = "went away by itself"
+
+
+def _ended_by(by_agent: bool, end_reason: str | None) -> str:
+    """Who ended the call — and `lost` is a third answer, not a shade of `agent`.
+
+    A connection that goes away by itself also leaves `bridgectl status` saying
+    `call: none`, so "the call was down when the step looked" cannot on its own
+    tell an ending from a loss. Reading only that clock attributed a dropped
+    call to the Call Agent, and the verdict then carried two sentences that
+    contradicted each other: an end reason saying the connection went away by
+    itself, beside a claim that the agent ended it. The audio path is the one
+    that knows, so it is asked first.
+    """
+    if end_reason and DROPPED_REASON in end_reason:
+        return "lost"
+    return "agent" if by_agent else "harness"
+
+
+#: How long `bridgectl live` gets to bring a call up. The adapter's own connect
+#: timeout is 45s (`realtime/settings.py` `DEFAULT_CONNECT_TIMEOUT_SECONDS`) and
+#: a `thread/start` precedes it, so this is that with room for the round trip —
+#: shorter would time the surface out on a handshake that is merely finishing.
+LIVE_CALL_OPEN_SECONDS = 120.0
+
+#: How long the utterance gets to reach the engine as speech. Derived from the
+#: probe's own timeline: the harness waits `live_call.SETTLE_SECONDS` after the
+#: peer connection comes up, the request is about four seconds of audio, and the
+#: user transcript landed at 20.7s from dial on run `20260901T213252Z`. Three
+#: times that, so a slow segmentation is never read as one that never happened.
+LIVE_CALL_HEARD_SECONDS = 90.0
+
+#: How long the hand-off gets after that. The Call Agent has to decide, then run
+#: a shell command; the probe saw the assistant answering 3.6s after the user
+#: transcript and the verb run within the same reply window.
+LIVE_CALL_HANDOFF_SECONDS = 120.0
+
+#: And how long the call then gets to actually go down.
+LIVE_CALL_END_SECONDS = 60.0
+
+#: How often those three are checked. Each poll is a `bridgectl status` or a log
+#: read, so it is cheap; frequent enough that the measured duration means
+#: something and rare enough not to be a load on the engine mid-call.
+LIVE_CALL_POLL_SECONDS = 2.0
 
 #: Preserve the former approval helper's observation cadence while #146 replaces
 #: its sequential waits. This is a cadence, not a deadline; all far-side ceilings
@@ -320,8 +424,46 @@ def writing_at(path: Path, content: str) -> Instruction:
 #: a permission would sit in `waiting` until something answered it, and nothing is
 #: supposed to answer one until `approval`. So the first turn is words only, it
 #: ends on its own, and the Stop it ends with is what `stop notice` observes.
+#: How many turns `brief` drives before it reads a page at all. #171's red line:
+#: "more than `history_page_entries` entries driven first (at least six turns)".
+#: Six two-entry turns is already more than twice a five-entry page, and driving
+#: them unconditionally is what makes the walk the step's own rather than the
+#: leftover of whatever the Session had said before it.
+HISTORY_TURNS_FLOOR = 6
+
+#: And how many it will drive before it calls a history that never grows past one
+#: page a failure rather than a slow start.
+HISTORY_TURNS_CEILING = 10
+
+#: One printed History page entry: its ordinal, which side spoke it, and what it
+#: said. An omitted entry prints its own words for the text and is read back the
+#: same way — the page's promise is that every slot is there.
+HISTORY_ENTRY = re.compile(r"^(?P<ordinal>\d+) (?P<role>user|assistant): (?P<text>.*)$")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryReading:
+    """One History page as a surface got it: its entries, and whether more remain."""
+
+    entries: tuple[tuple[int, str], ...]
+    older: bool
+
+
 ACKNOWLEDGE = Instruction(
     words="Reply with the single word READY. Do not use any tools, and do not ask anything."
+)
+
+#: The second turn `brief` drives, on the lane that has two turn endings to
+#: tell apart (`Lane.asking`). Words only, for `ACKNOWLEDGE`'s reasons — it must
+#: raise no permission — and the words it asks for are dictated rather than
+#: described, because what this turn has to produce is a *final answer* the
+#: promotion gate can read (#188): one interrogative, and no menu or code around
+#: it that would make the reading rest on something other than the question.
+ASK_A_QUESTION = Instruction(
+    words=(
+        "Reply with exactly this one line and nothing else: Should I continue? "
+        "Do not use any tools."
+    )
 )
 
 #: Turn 2 — arrives by Relay and raises a permission on the way. The file and the
@@ -471,6 +613,15 @@ class Lane:
     #: The fresh authority dialog `switches` leaves pending while Duty is off:
     #: a permission on both lanes.
     actionable: Callable[[Path], Instruction]
+    #: A turn whose final answer asks the user something, on the lane where that
+    #: changes the state the user is told — or None where it changes nothing.
+    #: #188 promotes a Codex turn end out of DECISION only when its final answer
+    #: shows no sign of an ask, so the Codex lane has two turn endings to measure
+    #: and `progress` measures both. The Claude lane carries none on purpose: its
+    #: question is a tool call the adapter reads, so a Claude turn that merely
+    #: *says* something interrogative is finished and driving one here would cost
+    #: a turn to measure nothing.
+    asking: Instruction | None
     #: #128's extra acceptance route. Claude carries it; Codex explicitly
     #: records the unsupported route without grading it.
     question: Callable[[Path], Instruction] | None
@@ -529,6 +680,7 @@ CLAUDE = Lane(
     boot=None,
     relayed=lambda workspace: writing(RELAY_FILE, RELAY_WORD),
     actionable=lambda workspace: writing(SWITCH_FILE, SWITCH_WORD),
+    asking=None,
     question=asking_the_claude_question,
     question_answer=CLAUDE_ANSWER,
     # The flag the harness passes *is* the whole policy on this lane, and Claude
@@ -612,6 +764,7 @@ CODEX = Lane(
     actionable=lambda workspace: writing_at(
         workspace.parent / OUTSIDE_THE_SANDBOX / SWITCH_FILE, SWITCH_WORD
     ),
+    asking=ASK_A_QUESTION,
     question=None,
     question_answer=None,
     policy_at=lambda record: hand_started.codex_turn_policy(record),
@@ -855,7 +1008,7 @@ class Walk:
         )
 
     def bound_steps(self) -> dict[str, Callable[[], str]]:
-        """The nine names bound to the nine methods, and the only place they are.
+        """Every name bound to its method, and the only place they are.
 
         `STEPS` is the contract every build ticket's "Red first" line cites; this
         is where a name becomes code. Written as a table rather than as nine
@@ -867,13 +1020,14 @@ class Walk:
         return {
             "roster": self.roster,
             "stable name": self.stable_name,
-            "progress": self.progress,
+            "brief": self.brief,
             "stop notice": self.stop_notice,
             "relay": self.relay,
             "approval": self.approval,
             "companion inbound": self.companion_inbound,
             "switches": self.switches,
             "child": self.child,
+            "live call": self.live_call,
         }
 
     def settle_boot_turn(self) -> int | None:
@@ -969,7 +1123,7 @@ class Walk:
         except StepFailed as unattributable:
             # Arrangement, not judgement: this method has no step to fail. A lane
             # whose messages cannot be told from another Session's is a lane none
-            # of the nine steps could read either, so it is blocked here rather
+            # of the steps could read either, so it is blocked here rather
             # than walked into nine reds with one cause.
             raise LaneBlocked(
                 f"the boot turn's notice could not be attributed, and neither could anything "
@@ -1140,85 +1294,27 @@ class Walk:
             f"({turn.seconds:.1f}s turn)"
         )
 
-    # --- progress ---------------------------------------------------------
+    # --- brief -------------------------------------------------------------
 
-    def progress(self) -> str:
-        """Progress is readable without costing a turn (#76).
+    def brief(self) -> str:
+        """A Session is briefed, and its history pages, without costing a turn.
 
-        Two things have to hold at once: there is something to read, and reading
-        it does not make the Session work. The second is checked the only way it
-        can be from outside — the agent's own record does not grow across the
-        read, and the roster's state does not leave `idle`.
+        Renamed from `progress` with the verb it exercised (#171). Three things
+        have to hold at once: the Session Brief carries the newest message
+        whole, the History page can be walked backwards through it, and neither
+        read makes the Session work — checked the only way it can be from
+        outside, which is that the agent's own record does not grow across them.
 
-        **Both publications are exercised.** `bridgectl progress <target>` is the
-        user-facing exact-detail verb. The following roster read must carry the
-        same availability, history presence and read time from the folded
-        observation, while deliberately carrying no chat body.
+        **The page is walked, not sampled.** Enough turns are driven first that
+        the newest page cannot hold the whole history, so `--before` has
+        somewhere to go; then the cursor is taken from the page the engine
+        handed over, never invented here. Past the oldest entry the page is
+        empty and `older` says `false`, which is an answer and not a refusal —
+        the distinction the whole verb is drawn around.
         """
         if self.address is None:
-            raise LaneBlocked("no Session to read progress from")
-        before_size = self._record_size()
-        before_state = self._roster_field("state")
+            raise LaneBlocked("no Session to brief")
 
-        answer = self.bridgectl("progress", self.address)
-        if not answer.ok:
-            raise StepFailed(f"`bridgectl progress {self.address}` refused: {answer.text}")
-        progress_lines = [line.strip() for line in answer.text.splitlines()]
-        said = support.flatten(
-            line for line in progress_lines if line.startswith(("user: ", "assistant: "))
-        )
-        if not said:
-            raise StepFailed(
-                f"`bridgectl progress {self.address}` carried no history after a turn: "
-                f"{answer.text[:200]!r}"
-            )
-        read_at = next(
-            (
-                line.removeprefix("read at ")
-                for line in progress_lines
-                if line.startswith("read at ")
-            ),
-            None,
-        )
-        if read_at is None:
-            raise StepFailed(
-                f"`bridgectl progress {self.address}` carried no observation time: "
-                f"{answer.text[:200]!r}"
-            )
-
-        row = self._roster_row()
-        if row is None:
-            raise StepFailed(f"{self.address} left the roster before progress could be read")
-        if "progress" not in row:
-            raise StepFailed(
-                f"the roster row carries no `progress`: #147 locks "
-                f"`ProgressObservation` on the inspection and exact progress is the verb "
-                f"that fills it; the row has keys {sorted(row)}"
-            )
-        reported = row["progress"]
-        if not isinstance(reported, dict):
-            raise StepFailed(f"roster progress for {self.address} is {reported!r}")
-        if (
-            reported.get("availability") != "readable"
-            or reported.get("has_history") is not True
-            or reported.get("read_at") != read_at
-        ):
-            raise StepFailed(
-                f"the bridgectl observation and roster summary disagree for {self.address}: "
-                f"command read at {read_at!r}, summary {reported!r}"
-            )
-        if reported.get("recent") != [] or reported.get("omission") != "status_summary":
-            raise StepFailed(
-                f"the roster carried chat body or lost history for {self.address}: {reported!r}"
-            )
-        time.sleep(2.0)
-        after_size = self._record_size()
-        after_state = self._roster_field("state")
-        if after_size != before_size:
-            raise StepFailed(
-                f"reading progress grew the Session's own record from {before_size} to "
-                f"{after_size} bytes — that is a turn, and #76 forbids one"
-            )
         brief = self.bridgectl("brief", self.address)
         if not brief.ok:
             raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
@@ -1236,22 +1332,193 @@ class Walk:
                 f"{brief.text[:300]!r}. #187 makes the Session Brief the one place the "
                 f"newest message is handed over, whole."
             )
-        # Compared on a prefix, and only after both sides are collapsed: a
-        # message with newlines in it is one rendered line to Briefing and
-        # several to `progress`, so an exact substring test would fail on the
-        # rendering rather than on the two readings disagreeing.
-        opening = " ".join(newest.split())[:60]
-        if opening not in " ".join(said.split()):
+        # #188: what the turn end is *called*. This one is `stable name`'s turn,
+        # which asked nothing (`ACKNOWLEDGE`), so both lanes owe FINISHED here —
+        # Claude because its question is structural and there was none, Codex
+        # because the promotion gate found no sign of an ask in its final answer.
+        finished = STATE_WORDING[BriefState.FINISHED]
+        called = self._briefed_state(brief.text)
+        if called != finished:
             raise StepFailed(
-                f"the Session Brief's newest message {newest[:120]!r} is not among the "
-                f"entries `bridgectl progress {self.address}` read ({said[:200]!r}) — two "
-                f"readings of one Session that disagree"
+                f"`bridgectl brief {self.address}` calls the Session {called!r} after a turn "
+                f"that asked nothing, where #188 requires {finished!r}: {brief.text[:300]!r}"
             )
+
+        driven = self._drive_until_history_pages()
+        before_size = self._record_size()
+        before_state = self._roster_field("state")
+
+        newest_page = self._history_page()
+        if not newest_page.entries:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` carried no entries after "
+                f"{driven} turns: the newest page is the one that includes the newest "
+                f"entry, and #171 makes every page complete on its own"
+            )
+        opening = " ".join(newest.split())[:60]
+        if not any(opening in " ".join(text.split()) for _, text in newest_page.entries):
+            raise StepFailed(
+                f"the Session Brief's newest message {newest[:120]!r} is not on the newest "
+                f"History page ({newest_page.entries!r}) — #171 amends ADR 0016 so that the "
+                f"newest page *includes* `newest`, and two readings of one Session that "
+                f"disagree is what one canonical observation exists to prevent"
+            )
+        if not newest_page.older:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` says nothing is older after {driven} "
+                f"turns, so there is no second page to prove the cursor with: "
+                f"{newest_page.entries!r}"
+            )
+
+        cursor = min(ordinal for ordinal, _ in newest_page.entries)
+        older_page = self._history_page(before=cursor)
+        if not older_page.entries:
+            raise StepFailed(
+                f"`bridgectl history {self.address} --before {cursor}` came back empty while "
+                f"the page before it said older entries remained"
+            )
+        above = [ordinal for ordinal, _ in older_page.entries if ordinal >= cursor]
+        if above:
+            raise StepFailed(
+                f"`--before {cursor}` answered with ordinals {above!r}, which are not before "
+                f"it — the cursor is exclusive (#171)"
+            )
+
+        oldest = min(ordinal for ordinal, _ in older_page.entries)
+        while older_page.older:
+            older_page = self._history_page(before=oldest)
+            if not older_page.entries:
+                raise StepFailed(
+                    f"`--before {oldest}` came back empty while the page before it said "
+                    f"older entries remained"
+                )
+            oldest = min(ordinal for ordinal, _ in older_page.entries)
+        past_the_oldest = self._history_page(before=oldest)
+        if past_the_oldest.entries or past_the_oldest.older:
+            raise StepFailed(
+                f"`--before {oldest}` is past the oldest entry and must be an empty page "
+                f"with no promise of more, not {past_the_oldest!r}"
+            )
+
+        time.sleep(2.0)
+        after_size = self._record_size()
+        after_state = self._roster_field("state")
+        if after_size != before_size:
+            raise StepFailed(
+                f"reading history grew the Session's own record from {before_size} to "
+                f"{after_size} bytes — that is a turn, and #171 forbids one"
+            )
+        asked = self._brief_a_turn_that_ends_on_a_question()
         return (
-            f"exact progress read without a turn, roster summary retained its facts, and "
-            f"the Session Brief carried the newest message whole: {newest[:120]!r}; "
-            f"record steady at {after_size} bytes; state {before_state!r} → {after_state!r}"
+            f"the Session Brief carried the newest message whole ({newest[:120]!r}) and "
+            f"{driven} turns of history paged back to ordinal {oldest} and then to an empty "
+            f"page; record steady at {after_size} bytes; state {before_state!r} → "
+            f"{after_state!r}; turn end called {called!r}, and {asked}"
         )
+
+    def _drive_until_history_pages(self) -> int:
+        """Drive turns until the history is longer than one page can hold.
+
+        **A floor and a ceiling, and the floor is the ticket's.** #171's red line
+        asks for more than `history_page_entries` entries driven *first*, at
+        least six turns of them — so six are driven whatever the Session already
+        said, and a lane that arrived with a long history is not allowed to skip
+        the walk the step is supposed to make. Past the floor the engine's own
+        `older` is what says the page has somewhere to go, because the page size
+        is the engine's dial and this harness deliberately does not read it.
+
+        Turns are words-only for `ACKNOWLEDGE`'s reason — one that raised a
+        permission would sit in `waiting` until `approval` answered it.
+        """
+        driven = 0
+        while driven < HISTORY_TURNS_FLOOR or not self._history_page().older:
+            if driven >= HISTORY_TURNS_CEILING:
+                raise StepFailed(
+                    f"{driven} turns did not produce more than one History page: either "
+                    f"nothing is being recorded or the page is unbounded"
+                )
+            self._drive_turn("fill the history", ACKNOWLEDGE)
+            driven += 1
+        return driven
+
+    def _history_page(self, *, before: int | None = None) -> HistoryReading:
+        """One page as `bridgectl history` printed it, read back off its own lines.
+
+        Parsed from the printed page rather than from a second request shape,
+        because what this run accepts is the surface a user gets.
+        """
+        assert self.address is not None
+        cursor = ["--before", str(before)] if before is not None else []
+        answer = self.bridgectl("history", self.address, *cursor)
+        if not answer.ok:
+            raise StepFailed(
+                f"`bridgectl history {self.address} {' '.join(cursor)}`".rstrip()
+                + f" refused: {answer.text}"
+            )
+        entries: list[tuple[int, str]] = []
+        older = False
+        for line in answer.text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("older entries remain"):
+                older = True
+                continue
+            match = HISTORY_ENTRY.match(stripped)
+            if match is not None:
+                entries.append((int(match.group("ordinal")), match.group("text")))
+        if "read at " not in answer.text:
+            raise StepFailed(
+                f"`bridgectl history {self.address}` carried no observation time: "
+                f"{answer.text[:200]!r}"
+            )
+        return HistoryReading(entries=tuple(entries), older=older)
+
+    def _brief_a_turn_that_ends_on_a_question(self) -> str:
+        """Drive a turn that ends on a question, and read what the brief calls it.
+
+        The other half of #188's rule, measured live rather than in the fast
+        suite because what is under test is the whole route: codex marks its own
+        final answer `final_answer`, the tail reader carries that phase through,
+        and Briefing reads the words behind it. Nothing short of a real turn
+        against a real daemon produces the phase, and the fast suite hands it to
+        Briefing already made.
+
+        A lane with one turn ending drives nothing and says so — see
+        `Lane.asking` for why the Claude lane is that lane.
+        """
+        if self.lane.asking is None or self.address is None:
+            return "this lane has one turn ending, so there is nothing else to call"
+        turn = self._drive_turn("ask a question", self.lane.asking)
+        if not turn.ended:
+            raise StepFailed(
+                f"the turn that had to end on a question never ended within "
+                f"{self.far_side.agent_turn_seconds:.0f}s, so there is no turn end to brief"
+            )
+        brief = self.bridgectl("brief", self.address)
+        if not brief.ok:
+            raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
+        decision = STATE_WORDING[BriefState.DECISION]
+        called = self._briefed_state(brief.text)
+        if called != decision:
+            raise StepFailed(
+                f"the Session ended a turn on a question and `bridgectl brief "
+                f"{self.address}` calls it {called!r}, where #188 requires {decision!r}. "
+                f"The brief reads {brief.text[:300]!r}"
+            )
+        return f"a turn ending on a question is called {called!r} ({turn.seconds:.1f}s turn)"
+
+    @staticmethod
+    def _briefed_state(brief: str) -> str:
+        """The state word off a Session Brief, read where Briefing writes it.
+
+        `<name> — <address> — <state>` is the header line
+        (`core/briefing.py::_headline`), so the state is what follows the last
+        separator of the first line. Taken from that one position rather than
+        searched for anywhere in the text, because every state word also appears
+        inside the message a brief carries, and a step that went looking would
+        pass on the Session quoting itself.
+        """
+        lines = brief.splitlines()
+        return lines[0].rsplit(" — ", 1)[-1].strip() if lines else ""
 
     # --- stop notice ------------------------------------------------------
 
@@ -1259,9 +1526,12 @@ class Walk:
         """The Stop `stable name` crossed reached the chat, and it says what it stopped on.
 
         #75's shape: the notice carries the question or the permission, not a
-        flattened sentence. What can be checked from the chat is that a message
-        arrived for that Stop and that it is not empty; whether it carries the
-        typed `WaitingFor` is #75's own exit and is read off the payload.
+        flattened sentence. Since #189 it is a **Session Brief published as
+        text** — `Briefing.text` and nothing wrapped around it — so what can be
+        checked from the chat is that a message arrived for that Stop, that it
+        has the brief's shape (a state word in the header, a `newest` line), and
+        that the roster corroborates what it says the Session stopped on, which
+        is #75's own exit and is read off the payload.
 
         **The message has to name this Session**, which is the module's
         attribution rule and not a nicety of this step: until #109 this took the
@@ -1283,6 +1553,25 @@ class Walk:
             )
         if not message.text.strip():
             raise StepFailed(f"the Stop reached the chat as an empty message ({message.id})")
+        # #189: the Stop Notice **is** a Session Brief published as text
+        # (`CONTEXT.md`), so what arrived has the brief's own shape — the header
+        # line's state word, and the `newest` line, which is what a Bridge Core
+        # sentence would not have. Read where Briefing writes them, never
+        # searched for loose in the message: every state word also occurs inside
+        # the message a brief carries.
+        called = self._briefed_state(message.text)
+        if called not in set(STATE_WORDING.values()):
+            raise StepFailed(
+                f"the Stop reached the chat as {message.text[:200]!r}, whose header line ends "
+                f"{called!r} — not one of Briefing's state words {sorted(STATE_WORDING.values())}. "
+                f"Since #189 the Stop Notice is `Briefing.text`, not a sentence Bridge Core "
+                f"composes"
+            )
+        if not any(line.startswith("  newest: ") for line in message.text.splitlines()):
+            raise StepFailed(
+                f"the Stop reached the chat calling the Session {called!r} but carries no "
+                f"`newest` line, which every Session Brief has: {message.text[:200]!r}"
+            )
         waiting = self._roster_field("waiting_for")
         kind = waiting.get("kind") if isinstance(waiting, dict) else None
         if not kind:
@@ -1299,8 +1588,8 @@ class Walk:
                 f"this engine's own Stop"
             )
         return (
-            f"bot message {message.id}, naming this Session: {message.text!r}; roster "
-            f"waiting_for kind {kind!r}; engine.log: {stop_lines[-1]!r}"
+            f"bot message {message.id}, naming this Session and briefing it as {called!r}: "
+            f"{message.text!r}; roster waiting_for kind {kind!r}; engine.log: {stop_lines[-1]!r}"
         )
 
     # --- relay ------------------------------------------------------------
@@ -1476,10 +1765,12 @@ class Walk:
 
         The interval before release is derived from `agent_turn_seconds` +
         `absence_window_seconds` + `DISCOVERY_SECONDS` +
-        `telegram_round_trip_seconds`; the acceptance configuration keeps that
-        sum below the Approval Relay budget. #146's required resolution grades
-        the announcement, Approval Relay answer and file effect together before
-        the Session proceeds to the question proof and `child`.
+        `telegram_round_trip_seconds`. Nothing on the engine side expires the
+        dialog while that runs — the wire alone bounds a held hook (#191, ADR
+        0015) — so the sum has only Claude Code's own hook timeout above it.
+        #146's required resolution grades the Stop Notice, Approval Relay answer
+        and file effect together before the Session proceeds to the question
+        proof and `child`.
 
         Both observations are about *this* Session, under the module's
         attribution rule. The silence one is where that matters most and reads
@@ -1598,7 +1889,7 @@ class Walk:
         ]
         if len(announcements) != 1:
             raise StepFailed(
-                f"Duty on produced {len(announcements)} permission announcements for "
+                f"Duty on produced {len(announcements)} permission Stop Notices for "
                 f"{approval_id}, not exactly one: {[message.text for message in announcements]!r}"
             )
         question_evidence = self._accept_question()
@@ -1659,18 +1950,28 @@ class Walk:
                 f"turn ended={turn.ended}, waiting_for={waiting!r}, options={options!r}, "
                 f"reply_window={self._roster_field('reply_window')!r}"
             )
-        question_status = support.control_plane_status(self.config.socket_path, self.journal)
-        if any(
-            isinstance(waiting, dict) and _address_of(waiting) == self.address
-            for waiting in question_status.get("pending_approvals", [])
-        ):
-            raise StepFailed("the question leaked into `pending_approvals`")
 
         def is_question_notice(seen) -> bool:
+            """A brief about *this question*, matched on the lines only it has.
+
+            The brief's own words for what a Session is waiting on and where the
+            user can answer it (`core/briefing.py::_decision_lines`,
+            `_session_lines`). It read "reply with your answer" until #189 made
+            the Stop Notice a Session Brief, which is what this harness must
+            mirror rather than remember.
+
+            **Matched on the decision lines, not on the words anywhere in the
+            text.** A brief also quotes the Session's newest message, so the
+            permission notice for the `Write` this question leads to carries the
+            question and both option labels inside `newest:` — measured on run
+            `20260902T133429Z`, where a looser match counted two notices for one
+            question. `asked:` and `option:` are the question brief's own; a
+            permission's decision line is `permission:`.
+            """
             return (
-                CLAUDE_QUESTION in seen.text
-                and all(option in seen.text for option in CLAUDE_OPTIONS)
-                and "reply with your answer" in seen.text
+                f"  asked: {CLAUDE_QUESTION}" in seen.text
+                and all(f"  option: {option}" in seen.text for option in CLAUDE_OPTIONS)
+                and ANSWERABLE_HERE in seen.text
             )
 
         announced = self._await_own_message(
@@ -1688,7 +1989,7 @@ class Walk:
             raise StepFailed(
                 f"the question notice did not name the Session first: {announced.text!r}"
             )
-        if "answer it in the terminal" in announced.text:
+        if ANSWERABLE_AT_THE_TERMINAL in announced.text:
             raise StepFailed(
                 f"the answerable question told the user to use the terminal: {announced.text!r}"
             )
@@ -1877,6 +2178,220 @@ class Walk:
             f"no notice naming it in {self.far_side.absence_window_seconds:.0f}s; "
             f"relay refused: {refused.text!r}; brief refused: {unbriefed.text!r}"
         )
+
+    # --- live call --------------------------------------------------------
+
+    def live_call(self) -> str:
+        """A Live Call with nobody at the microphone, v0: the route and no more (#183).
+
+        `bridgectl live` opens a real call against the real backend. The audio
+        the user would have spoken is synthesised and put on the track by the
+        harness's own Call adapter (`live_call.py`), which builds the production
+        WebRTC transport with `silent=True` and opens no device — so this runs
+        from an agent session, with no microphone grant anywhere.
+
+        **What is graded, and why each one is a lower bound.** #181's findings 1
+        and 2 are that a hand-off may happen more than once per request and may
+        arrive *before* the user transcript, so nothing here counts, orders, or
+        asserts an absence:
+
+        * the call came up — `bridgectl live` says so, and that is the engine's
+          own account of it. **Not the engine log**: `CallStarted` is an event
+          the hub notes into the interlock and never writes a line for
+          (`core/bridge.py:777-785`), and nothing under `src/` changes for this
+          ticket, so the control plane is where the engine says a call is up
+          (`control_plane/commands.py:181-186`);
+        * the words reached the engine as speech — `UserSpeech` *is* logged
+          (`core/bridge.py:796`), matched by **substring**, because ASR text is
+          unstable and this run does not get to predict it;
+        * the Call Agent acted through the control plane at least once — the
+          wrapper log, **whatever verb it ran**. The wrapper is what
+          `[delegate] cli` names, by absolute path, so a PATH shadow cannot
+          intercept the runs this counts. ADR 0018 makes a hang-up observable as
+          the Call Agent running `bridgectl`, and this line is that observation:
+          the `handoff_request` item the ticket names is not one the harness can
+          see, because the Call adapter surfaces no such notification
+          (`adapters/call/realtime/adapter.py:563-578`) and nothing under `src/`
+          changes here;
+        * the call is down when the step is over — `bridgectl status` stops
+          naming one, and the step ends it itself if the Call Agent has not.
+
+        **Which verb the Call Agent chose is recorded, never graded**, and that
+        is deliberate: the shipped Voice instructions name the CLI invocation
+        (`core/instructions/voice.py:80-88`) and carry no rule that `live` is
+        what ends a call, so the Call Agent guesses. Run `20260902T095448Z` had
+        it guess `live` on one lane and `call end` — not an action this engine
+        serves — on the other, from the same instructions. Grading the guess
+        would make this step a coin toss about a rule no ticket has shipped yet
+        (deferred, #195). The guess stays visible instead: every verb, in order,
+        into `verdict.json`.
+
+        Everything else this step learns is **recorded, never graded**: the
+        transport factory, the wav variant, the end reason the audio path saw,
+        and whether the agent or the harness ended the call.
+        """
+        if self.config.call_observations is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        opened = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
+        if not opened.ok or "is up" not in opened.text:
+            raise StepFailed(
+                f"`bridgectl live` did not open a call: {opened.text[:300]!r}. The engine's "
+                f"log tail: {self.engine.log_lines()[-5:]}"
+            )
+        self.journal("live.call.opened", lane=self.lane.name, answer=opened.text)
+        started = time.monotonic()
+        try:
+            heard = support.wait_for(
+                lambda: bool(self._user_speech_lines()),
+                deadline_seconds=LIVE_CALL_HEARD_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            ran = support.wait_for(
+                lambda: bool(support.cli_wrapper_runs(self.config.cli_wrapper_log)),
+                deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            by_agent = support.wait_for(
+                self._call_is_down,
+                deadline_seconds=LIVE_CALL_END_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # The agent had its window; the call is the run's to close either
+            # way. Ending it here is what keeps a green step from resting on
+            # which verb the Call Agent happened to guess, while `ended_by`
+            # keeps the guess visible.
+            if not by_agent:
+                self._end_any_live_call()
+            ended = self._call_is_down()
+        finally:
+            # The call is this run's to clean up whatever the step decided, and
+            # a call left up would hold the interlock over every later step and
+            # cost backend time until the engine is stopped. The toggle is
+            # idempotent in the direction that matters: `live` on a call that
+            # already ended opens one, so this only fires while one is up.
+            self._end_any_live_call()
+        seen = live_call.observed(self.config.call_observations)
+        ended_by = _ended_by(by_agent, seen.end_reason)
+        self.turns.append(self._measured("live call", started, ended))
+        runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)
+        verbs = self._verbs_run()
+        spoken = self._user_speech_lines()
+        self.journey.observe(
+            "live call transport",
+            f"factory {seen.transport_factory or 'none recorded'}; wav variant "
+            f"{seen.variant or 'none recorded'}; end reason "
+            f"{seen.end_reason or 'none recorded'}; ended by the {ended_by}; observations "
+            f"{self.config.call_observations}",
+        )
+        self.journey.observe(
+            "live call bridgectl runs",
+            f"{len(runs)} logged in {self.config.cli_wrapper_log}; verbs in order: "
+            f"{verbs or 'none'}; the call was ended by the {ended_by}",
+        )
+        if not heard:
+            raise StepFailed(
+                f"the engine never logged the user's speech within "
+                f"{LIVE_CALL_HEARD_SECONDS:.0f}s of the call coming up. The utterance the "
+                f"harness put on the track is {live_call.REQUEST!r} and the line looked for "
+                f"carries {LIVE_CALL_HEARD_SUBSTRING!r}; the adapter recorded "
+                f"{seen.variant or 'no'} wav variant and ended "
+                f"{seen.end_reason or 'without saying why'}. Engine log tail: "
+                f"{self.engine.log_lines()[-5:]}"
+            )
+        if not ran:
+            raise StepFailed(
+                f"the engine heard {spoken[-1]!r} and no `bridgectl` run at all reached "
+                f"{self.config.cli_wrapper_log} within {LIVE_CALL_HANDOFF_SECONDS:.0f}s — the "
+                f"words arrived and nothing was handed off. The wrapper is what "
+                f"`[delegate] cli` names, so a hand-off that ran anything would be here"
+            )
+        if not ended:
+            raise StepFailed(
+                f"the call was still up after the step asked it to end "
+                f"({self._call_line()!r}). Verbs the Call Agent ran: {verbs or 'none'}"
+            )
+        # The three observations the ticket asks `verdict.json` to carry. Graded
+        # rather than merely written down: a run that recorded none of them is a
+        # run whose Call adapter never wrote its file, and a green step that says
+        # `none recorded` three times has reported nothing about the call it held.
+        missing = [
+            name
+            for name, value in (
+                ("transport factory", seen.transport_factory),
+                ("wav variant", seen.variant),
+                ("end reason", seen.end_reason),
+            )
+            if not value
+        ]
+        if missing:
+            raise StepFailed(
+                f"the call ran and {self.config.call_observations} records no "
+                f"{', no '.join(missing)} — the step cannot report what the ticket asks it to "
+                f"observe. What it does hold: {seen.entries[-3:] or 'nothing at all'}"
+            )
+        return (
+            f"call up on `bridgectl live` ({opened.text!r}); engine heard {spoken[-1]!r}; "
+            f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; call down "
+            f"({self._call_line()!r}), ended by the {ended_by}; transport "
+            f"{seen.transport_factory}, wav variant {seen.variant!r}, ended {seen.end_reason!r}"
+        )
+
+    def _verbs_run(self) -> list[str]:
+        """Every verb the Call Agent put to the control plane, in order.
+
+        Recorded rather than graded (see `live_call`). The wrapper logs the whole
+        argv, and what identifies the verb is the first word that is not the
+        `--socket` the engine's own instructions put in front of it — so an
+        invented verb (`call end`, run `20260902T095448Z`) reads as itself rather
+        than being silently dropped for not matching anything known.
+        """
+        spoken: list[str] = []
+        for line in support.cli_wrapper_runs(self.config.cli_wrapper_log):
+            words = line.split()[1:]  # the UTC stamp is the harness's, not the agent's
+            while words and words[0].startswith("--"):
+                # `--socket <path>`, and any other option the instructions carry.
+                words = words[2:] if len(words) > 1 else []
+            if words:
+                spoken.append(" ".join(words))
+        return spoken
+
+    def _user_speech_lines(self) -> list[str]:
+        """Every engine line about what the user said, matched by substring.
+
+        ASR text is unstable, so the pattern is a fragment of the request rather
+        than the request: the probe's three trials came back verbatim
+        (`docs/research/probes/20260901T213252Z-agent-hangup.jsonl`), which is
+        exactly the kind of luck an assertion may not depend on — and run
+        `20260902T093755Z` is where it ran out, with one lane hearing `结束通话`
+        and the other `结束通 话` from the same audio.
+        """
+        return [
+            line
+            for line in support.matching_lines(self.engine.log_lines(), USER_SPEECH_LINE)
+            if _unspaced(LIVE_CALL_HEARD_SUBSTRING) in _unspaced(line)
+        ]
+
+    def _call_line(self) -> str:
+        """What `bridgectl status` says about the call, as the surface renders it."""
+        answer = self.bridgectl("status")
+        for line in answer.text.splitlines():
+            if line.startswith("call:"):
+                return line.strip()
+        return answer.text[:200]
+
+    def _call_is_down(self) -> bool:
+        """No call is up **right now**, in the engine's own words."""
+        return self._call_line() == "call: none"
+
+    def _end_any_live_call(self) -> None:
+        """Leave no call behind, and never open one doing it."""
+        if self._call_is_down():
+            return
+        answer = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
+        self.journal("live.call.cleanup", lane=self.lane.name, answer=answer.text)
 
     # --- plumbing ---------------------------------------------------------
 
@@ -2275,30 +2790,61 @@ class Walk:
         )
 
     def _pending_approvals(self) -> tuple[approval_effect.PendingApproval, ...]:
-        """Every pending dialog, with enough identity for the module to correlate it."""
+        """Every pending dialog, read off the roster rows that carry one (#191).
+
+        `status` retired its `pending_approvals` list at protocol 8, because a
+        pending permission is what the row is waiting on, and its `approval_id`
+        is the handle `bridgectl approve` answers with. A permission row whose
+        handle is gone is a dialog that went back to the keyboard, and it is
+        deliberately not offered here — correlating one would send the walk to
+        answer something no verdict can reach.
+
+        **The row's `state` is not read, and that is the Codex lane's whole
+        case.** A Codex thread stays `active` while its prompt is on screen —
+        the turn has not ended — so the row says `running` and carries the
+        dialog's handle at the same time, which is exactly the state a verdict
+        is wanted in. `answer_approval` reads the handle and not the state for
+        the same reason (`core/bridge.py::_dialog_on_the_roster`), and a filter
+        here that the product does not apply would make this harness answer a
+        different question from the one the product answers.
+        """
         data = support.control_plane_status(self.config.socket_path, self.journal)
         pending: list[approval_effect.PendingApproval] = []
-        for waiting in data.get("pending_approvals", []):
-            if not isinstance(waiting, dict):
+        for row in data.get("sessions", []):
+            if not isinstance(row, dict):
+                continue
+            waiting = row.get("waiting_for")
+            if not isinstance(waiting, dict) or waiting.get("kind") != "permission":
                 continue
             approval_id = waiting.get("approval_id")
+            if approval_id is None:
+                continue
             pending.append(
                 approval_effect.PendingApproval(
-                    approval_id=str(approval_id) if approval_id is not None else "",
-                    session_address=_address_of(waiting),
+                    approval_id=str(approval_id),
+                    session_address=_address_of(row),
                 )
             )
         return tuple(pending)
 
 
 def _address_of(row: dict) -> str:
-    """`agent:session_id[:pid]`, the way `control_plane/commands.py:116` writes it."""
+    """`agent:session_id[:pid]`, the way `seams/identity.py::address_of` writes it.
+
+    **The id half is written as nothing at all where there is none**, not as the
+    word `None` — that is the product's own rule (#73), and it is what
+    `commands.parse_address` reads back as "not named yet". This mirrored it
+    without that clause until #189, which is when the shape started being read
+    rather than only compared: `_naming_forms` names an unnamed Session by this
+    address, because that is what a Session Brief's header prints.
+    """
     target = row.get("target")
     if not isinstance(target, dict):
         return "<no target>"
+    session_id = target.get("session_id")
     pid = target.get("pid")
     tail = f":{pid}" if pid else ""
-    return f"{target.get('agent')}:{target.get('session_id')}{tail}"
+    return f"{target.get('agent')}:{session_id or ''}{tail}"
 
 
 def _first_child_of(rows: list[dict], agent: str, before: set[str]) -> dict | None:
@@ -2342,11 +2888,21 @@ def _naming_forms(row: dict) -> tuple[str, ...]:
     asked the product what it had said would agree with the product by
     construction, and the whole point of reading the chat is that it might not.
 
-    Both forms are kept because the product chooses between them by what it holds
+    Every form is kept because the product chooses between them by what it holds
     *at the moment it speaks* — `spoken_name` where the Session has a Session
     Name, `spoken_target` where it does not — and the roster read that answers
     this question is a different moment from the one the message was composed in.
     A Codex Session, in particular, has no name until its first turn.
+
+    **The address is the third form**, and it is what a Stop Notice uses since
+    the notice became a Session Brief (#189): `Briefing`'s header line is
+    `<name> — <address> — <state>`, and its address half is
+    `seams/identity.py::address_of`'s `agent:session_id[:pid]`, not the
+    space-separated `spoken_target`. A run whose Session has no name yet — every
+    Codex thread before its first turn — is named by that and by nothing else,
+    so a harness that did not know the shape could attribute none of its notices.
+    Written through `_address_of`, which is this module's one mirror of that
+    format: two spellings of one rule are two rules the moment either is edited.
     """
     target = row.get("target")
     target = target if isinstance(target, dict) else {}
@@ -2361,15 +2917,17 @@ def _naming_forms(row: dict) -> tuple[str, ...]:
         forms.append(f"{agent} {session_id}")
     elif agent and pid:
         forms.append(f"{agent} pid {pid}")
+    if agent and (session_id or pid):
+        forms.append(_address_of(row))
     return tuple(forms)
 
 
 def _named_in(text: str, forms: Sequence[str]) -> bool:
     """Does this message name one of these Sessions? The attribution rule's whole test.
 
-    Substring, not equality: the product's own words wrap the name in a sentence
-    it composes (`core/bridge.py:107-120`, `core/approvals.py:52-76`), and which
-    sentence is the product's business rather than this harness's.
+    Substring, not equality: the product's own words wrap the name in a brief it
+    composes (`core/briefing.py::_headline`), and what that brief says is the
+    product's business rather than this harness's.
     """
     return any(form in text for form in forms)
 

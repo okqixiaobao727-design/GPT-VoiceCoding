@@ -118,7 +118,17 @@ class TestTheAgentContract:
             ProgressOmission.OLDER,
             ProgressOmission.STATUS_SUMMARY,
             ProgressOmission.NEWEST_OVERSIZE,
+            ProgressOmission.OVERSIZE,
         }
+
+    def test_one_entrys_omission_is_never_a_whole_readings(self) -> None:
+        """`oversize` names one History page entry; a reading cannot wear it (#171)."""
+        with pytest.raises(ValueError, match="one History page entry"):
+            ProgressObservation.readable(
+                has_history=True,
+                read_at=datetime(2026, 9, 1, tzinfo=UTC),
+                omission=ProgressOmission.OVERSIZE,
+            )
 
     def test_readable_empty_history_is_the_only_nothing_said_state(self) -> None:
         read_at = datetime(2026, 8, 30, tzinfo=UTC)
@@ -175,8 +185,8 @@ class TestTheAgentContract:
     def test_a_readable_tail_keeps_roles_order_and_whole_text(self) -> None:
         read_at = datetime(2026, 8, 30, tzinfo=UTC)
         entries = (
-            ProgressEntry(role=ProgressRole.USER, text="do the thing"),
-            ProgressEntry(role=ProgressRole.ASSISTANT, text="done"),
+            ProgressEntry(ordinal=0, role=ProgressRole.USER, text="do the thing"),
+            ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text="done"),
         )
 
         observed = ProgressObservation.readable(
@@ -251,14 +261,19 @@ class TestTheAgentContract:
         )
         assert agent.calls[0].verdict is ApprovalVerdict.ALLOW
 
-    def test_a_budget_expiry_has_a_verdict_that_is_not_deny(self) -> None:
+    def test_handing_a_dialog_back_has_a_verdict_that_is_not_deny(self) -> None:
+        """`ask` is the one verdict said by saying nothing, and it stays."""
         assert ApprovalVerdict.ASK in set(ApprovalVerdict)
 
     def test_a_fake_holds_no_question_hook_unless_a_test_explicitly_scripts_one(self) -> None:
         agent = FakeAgent()
 
         assert agent.question_answerable(CLAUDE) is False
-        assert asyncio.run(agent.sweep_question_budget(600.0)) == ()
+
+    def test_the_seam_asks_no_adapter_to_keep_a_clock(self) -> None:
+        """The wire bounds a held hook, so no verb hands an adapter a budget (#191)."""
+        assert not hasattr(FakeAgent(), "sweep_question_budget")
+        assert not hasattr(AgentAdapter, "sweep_question_budget")
 
 
 class TestTheCallContract:

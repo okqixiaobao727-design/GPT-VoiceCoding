@@ -441,11 +441,12 @@ class TestReportingAStopTheMomentADialogGoesUp:
     transition. Before this, the only Stop arrived after the user had answered,
     when the transcript carried `tool_result` and `analyse` correctly said NONE.
 
-    The permission half already reached the user by the hook route
-    (`approval.py` → `AwaitingApproval`). **The question half had no
-    announcement route at all**, and `CONTEXT.md` names "the question with its
-    options" as Stop Notice content. Which of the two announces when both fire
-    is Bridge Core's policy, not this watcher's (`core/bridge.py`).
+    The permission half reached the user by the hook route until #191, which
+    folded it into this same Stop: the parked dialog's handle rides the wait
+    (`approval.py`), and there is one notice for both halves. **The question
+    half had no announcement route at all**, and `CONTEXT.md` names "the question
+    with its options" as Stop Notice content. What a Stop announces is Bridge
+    Core's policy, not this watcher's (`core/bridge.py`).
     """
 
     def test_a_dialog_going_up_is_reported_stopped(self, tmp_path: Path) -> None:

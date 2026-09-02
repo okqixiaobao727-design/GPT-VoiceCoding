@@ -279,6 +279,47 @@ class TestRenderingARelayReceipt:
         assert "no readback" not in rendered
 
 
+class TestRenderingAVerdict:
+    """`approve` prints the verdict and the same three codes a relay does (#191).
+
+    An Approval Relay is a Relay, so its receipt is the Relay's receipt, and the
+    closing sentence this line used to print retired with the loop it closed.
+    """
+
+    def reply(self, **data: object) -> Reply:
+        return Reply.answered(
+            Action.APPROVE,
+            {
+                "approval_id": "a1",
+                "verdict": "allow",
+                "request_id": "r-1",
+                "target": {"agent": "codex", "session_id": "abc", "pid": None},
+                "state": "delivered",
+                "route": "deliver",
+                "receipt": {"outcome": "delivered", "reason": ""},
+                "reason": "delivered",
+                **data,
+            },
+        )
+
+    def test_a_carried_verdict_prints_its_verdict_state_grade_and_reason(self) -> None:
+        rendered = render(self.reply())
+
+        assert rendered == "verdict=allow state=delivered grade=delivered reason=delivered"
+
+    def test_an_unproven_verdict_prints_the_grade_it_earned_and_no_sentence(self) -> None:
+        rendered = render(
+            self.reply(
+                state="reported_failed",
+                receipt={"outcome": "held", "reason": "the dialog kept it"},
+                reason="held_far_side",
+            )
+        )
+
+        assert rendered == "verdict=allow state=reported_failed grade=held reason=held_far_side"
+        assert "the dialog kept it" not in rendered
+
+
 class TestRenderingLaneDegradation:
     def test_status_says_when_progress_was_unreadable(self) -> None:
         """Where degradation is said, now that the roster verb is a Briefing.
@@ -296,7 +337,6 @@ class TestRenderingLaneDegradation:
                     "sessions": [],
                     "call_id": None,
                     "pending_relays": [],
-                    "pending_approvals": [],
                     "degraded_lanes": {"codex": "the daemon dropped the progress read"},
                 },
             )
@@ -386,13 +426,13 @@ class TestAnEngineThatTakesTooLong:
         assert waited == [DEFAULT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS]
 
 
-class TestAskingHowFarAlongOneSessionIs:
-    """#76's command. The rendering is here; the reading is the adapters'."""
+class TestAskingWhatOneSessionSaid:
+    """#171's command. The rendering is here; the reading is the adapters'."""
 
     def test_a_session_that_was_never_registered_cannot_be_asked(
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        code = main(["--config", str(engine_at), "progress", "codex:never-seen"])
+        code = main(["--config", str(engine_at), "history", "codex:never-seen"])
 
         assert code == 1
         assert "unknown Session" in capsys.readouterr().err
@@ -400,135 +440,107 @@ class TestAskingHowFarAlongOneSessionIs:
     def test_it_needs_an_address_and_says_how_to_write_one(
         self, engine_at: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert main(["--config", str(engine_at), "progress"]) == 2
-        assert "progress <agent>:<session id>" in capsys.readouterr().err
+        assert main(["--config", str(engine_at), "history"]) == 2
+        assert "history <agent>:<session id>" in capsys.readouterr().err
+
+    def test_the_cursor_is_a_flag_with_an_ordinal_beside_it(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A bare number after an address would read as a count of entries."""
+        assert main(["--config", str(engine_at), "history", "codex:abc", "--before"]) == 2
+        assert "--before <ordinal>" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "cursor",
+        ["newest", "\u00b2", "1" * 4_301, "12.5"],
+        ids=["a word", "a superscript digit", "past the int-conversion limit", "a fraction"],
+    )
+    def test_a_cursor_that_is_not_an_ordinal_is_refused_before_the_engine_is_asked(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str], cursor: str
+    ) -> None:
+        """The conversion is the test: a spelling test lets `int` raise behind it."""
+        code = main(["--config", str(engine_at), "history", "codex:abc", "--before", cursor])
+
+        assert code == 2
+        assert "not an entry's ordinal" in capsys.readouterr().err
+
+    def test_a_cursor_below_the_oldest_ordinal_there_could_be_is_refused(
+        self, engine_at: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main(["--config", str(engine_at), "history", "codex:abc", "--before", "-1"]) == 2
+        assert "counts from the oldest entry" in capsys.readouterr().err
 
 
-class TestRenderingWhatProgressCameBack:
-    """One reply, several shapes, and none of them may read as another."""
+class TestTheHistoryPageOnOneLine:
+    """One page, several shapes, and none of them may read as another."""
 
-    def reply(self, progress: object, last_activity: object = None) -> Reply:
-        return Reply.answered(
-            Action.PROGRESS,
-            {
-                "session": {
-                    "target": {"agent": "codex", "session_id": "abc", "pid": None},
-                    "name": "GPT-VoiceCoding · build it",
-                    "workspace": "/tmp/workspace",
-                    "state": "idle",
-                    "reply_window": "open",
-                    "progress": progress,
-                    "last_activity": last_activity,
-                }
-            },
-        )
-
-    def progress(
+    def reply(
         self,
+        entries: list[dict[str, object]],
         *,
-        availability: str = "readable",
-        has_history: bool | None = True,
-        omission: str = "none",
-        recent: list[dict[str, str]] | None = None,
+        older: bool = False,
         read_at: str | None = "2026-08-26T02:44:39+00:00",
-    ) -> dict[str, object]:
-        return {
-            "availability": availability,
-            "has_history": has_history,
-            "omission": omission,
-            "read_at": read_at,
-            "recent": recent or [],
-        }
+    ) -> Reply:
+        return Reply.answered(
+            Action.HISTORY,
+            {"entries": entries, "older": older, "read_at": read_at},
+        )
 
-    def test_each_entry_says_which_side_spoke_it(self) -> None:
+    def test_each_entry_says_its_place_and_which_side_spoke_it(self) -> None:
         rendered = render(
             self.reply(
-                self.progress(
-                    recent=[
-                        {"role": "user", "text": "do the thing"},
-                        {"role": "assistant", "text": "done"},
-                    ]
-                )
+                [
+                    {"ordinal": 4, "role": "assistant", "text": "done"},
+                    {"ordinal": 3, "role": "user", "text": "do the thing"},
+                ]
             )
         )
 
-        assert "user: do the thing" in rendered
-        assert "assistant: done" in rendered
+        assert "4 assistant: done" in rendered
+        assert "3 user: do the thing" in rendered
 
-    def test_the_reading_says_when_it_was_taken(self) -> None:
-        """A progress line's whole meaning is when it was true."""
-        rendered = render(
-            self.reply(
-                self.progress(has_history=False),
-                last_activity="2026-08-26T02:44:39+00:00",
-            )
-        )
+    def test_the_page_says_when_it_was_read(self) -> None:
+        """A page's whole meaning is when it was true."""
+        rendered = render(self.reply([{"ordinal": 0, "role": "user", "text": "hello"}]))
 
         assert "read at 2026-08-26T02:44:39+00:00" in rendered
-        assert "nothing said yet" in rendered
 
-    def test_a_dropped_tail_is_admitted_rather_than_implied(self) -> None:
+    def test_more_to_come_names_the_cursor_the_next_request_passes(self) -> None:
         rendered = render(
             self.reply(
-                self.progress(
-                    omission="older",
-                    recent=[{"role": "assistant", "text": "done"}],
-                )
+                [
+                    {"ordinal": 6, "role": "assistant", "text": "done"},
+                    {"ordinal": 5, "role": "user", "text": "again"},
+                ],
+                older=True,
             )
         )
 
-        assert "older entries dropped" in rendered
+        assert "--before 5" in rendered
 
-    def test_not_read_is_never_rendered_as_said_nothing(self) -> None:
+    def test_the_end_of_the_history_says_so_rather_than_offering_a_cursor(self) -> None:
+        rendered = render(self.reply([{"ordinal": 0, "role": "user", "text": "hello"}]))
+
+        assert "that is the whole history" in rendered
+        assert "--before" not in rendered
+
+    def test_an_empty_page_is_an_answer_rather_than_a_refusal(self) -> None:
+        """And it is said without a cursor in it: the same page answers both reads."""
+        rendered = render(self.reply([]))
+
+        assert "no entries on this page" in rendered
+        assert "read at 2026-08-26T02:44:39+00:00" in rendered
+
+    def test_an_omitted_entry_keeps_its_slot_and_says_it_was_not_carried(self) -> None:
+        """The page always advances: a vanished slot would misname the entry before it."""
         rendered = render(
             self.reply(
-                self.progress(
-                    availability="not_read",
-                    has_history=None,
-                    read_at=None,
-                )
+                [
+                    {"ordinal": 2, "role": "assistant", "omission": "oversize"},
+                    {"ordinal": 1, "role": "user", "text": "do the thing"},
+                ]
             )
         )
 
-        assert "progress: not read" in rendered
-        assert "nothing said yet" not in rendered
-
-    def test_unreadable_is_never_rendered_as_said_nothing(self) -> None:
-        rendered = render(
-            self.reply(
-                self.progress(
-                    availability="unreadable",
-                    has_history=None,
-                    read_at=None,
-                )
-            )
-        )
-
-        assert "progress: unreadable" in rendered
-        assert "nothing said yet" not in rendered
-
-    def test_an_oversize_newest_entry_is_history_that_could_not_be_carried(self) -> None:
-        rendered = render(
-            self.reply(
-                self.progress(
-                    omission="newest_oversize",
-                )
-            )
-        )
-
-        assert "history exists" in rendered
-        assert "newest entry is too large to carry" in rendered
-        assert "nothing said yet" not in rendered
-
-    def test_a_status_summary_is_history_without_chat_text(self) -> None:
-        rendered = render(
-            self.reply(
-                self.progress(
-                    omission="status_summary",
-                )
-            )
-        )
-
-        assert "history exists" in rendered
-        assert "this roster carries no chat text" in rendered
-        assert "nothing said yet" not in rendered
+        assert "2 assistant: (too large to carry)" in rendered
+        assert "1 user: do the thing" in rendered

@@ -25,8 +25,9 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeAgent, FakeCall, FakeCompanionChannel
-from gpt_voicecoding.config import load
+from gpt_voicecoding.config import ConfigError, load
 from gpt_voicecoding.control_plane.client import ask
+from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.control_plane.server import AlreadyServing
 from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.engine.composition import Engine, EngineAssemblyError
@@ -169,6 +170,25 @@ class TestAssembly:
 
         assert reply.ok
         assert reply.data["switches"]["duty"] is False
+
+    def test_a_history_page_the_wire_cannot_carry_refuses_to_assemble(self, home: Path) -> None:
+        """The dial and the ceiling meet at composition, and disagree here (#171).
+
+        A page dialled past what the line carries could only ever be published
+        with every entry marked `oversize` — which would say the messages were
+        too large when what was too large is the page. It is not a request that
+        failed, so it is not answered as one: the engine does not start.
+        """
+        with pytest.raises(ConfigError, match="entry slots"):
+            assembled(home, CONFIG + "\n[policy]\nhistory_page_entries = 5000\n")
+
+    def test_the_largest_page_the_wire_carries_still_assembles(self, home: Path) -> None:
+        """The bound is a real floor, not a round number picked to be safe."""
+        largest = ProgressPublication().largest_page
+
+        engine = assembled(home, CONFIG + f"\n[policy]\nhistory_page_entries = {largest}\n")
+
+        assert engine.core._policy.history_page_entries == largest  # noqa: SLF001
 
     def test_the_adapters_are_the_ones_the_file_named(self, home: Path) -> None:
         """Config-driven, not hard-coded: the engine reports what it loaded."""

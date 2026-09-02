@@ -24,7 +24,6 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from gpt_voicecoding.core import briefing
-from gpt_voicecoding.core.approvals import ApprovalOutcome, PendingApproval
 from gpt_voicecoding.core.bridge import Status
 from gpt_voicecoding.core.briefing import Decision, RosterBrief, SessionBrief
 from gpt_voicecoding.core.relay_queue import PendingRelay
@@ -50,10 +49,10 @@ class InvalidPayload(Exception):
 class NothingPending(Exception):
     """The request named something the hub is not holding — an answered dialog.
 
-    Bridge Core discards a verdict for a request that already resolved, on
-    purpose: its closing notice has already gone out. That is the right policy
-    and the wrong silence for a surface, whose user is owed the news that their
-    verdict landed on nothing.
+    Bridge Core answers `None` for a verdict no live roster row carries a handle
+    for, on purpose: the hook ended, and the dialog is the screen's again. That
+    is the right policy and the wrong silence for a surface, whose user is owed
+    the news that their verdict landed on nothing.
     """
 
 
@@ -74,6 +73,25 @@ def read_flag(payload: Mapping[str, Any], key: str) -> bool:
     value = payload.get(key)
     if not isinstance(value, bool):
         raise InvalidPayload(f"{key!r} is on or off; {value!r} is neither")
+    return value
+
+
+def read_optional_ordinal(payload: Mapping[str, Any], key: str) -> int | None:
+    """A cursor a surface read off an earlier page, or nothing at all.
+
+    Absent, or JSON `null`, asks for the newest page — the same reading `brief`
+    gives an absent target. A `bool` is refused before the number check because
+    `True` is an `int` in Python and would page from ordinal 1; a negative one is
+    refused because ordinals count from 0 and nothing lies before the oldest
+    entry (#171).
+    """
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidPayload(f"{key!r} is an entry's ordinal, or absent for the newest page")
+    if value < 0:
+        raise InvalidPayload("an ordinal counts from the oldest entry, at 0")
     return value
 
 
@@ -233,18 +251,6 @@ def pending_relay_document(pending: PendingRelay) -> dict[str, Any]:
     }
 
 
-def pending_approval_document(pending: PendingApproval) -> dict[str, Any]:
-    return {
-        "approval_id": pending.request.approval_id,
-        "target": target_document(pending.request.target),
-        "tool_name": pending.request.tool_name,
-        "detail": pending.request.detail,
-        "options": list(pending.request.options),
-        "opened_at": pending.opened_at,
-        "expires_at": pending.expires_at,
-    }
-
-
 def status_document(
     status: Status,
     *,
@@ -264,7 +270,6 @@ def status_document(
         "degraded_lanes": {str(agent): reason for agent, reason in status.degraded_lanes.items()},
         "call_id": status.call_id,
         "pending_relays": [pending_relay_document(item) for item in status.pending_relays],
-        "pending_approvals": [pending_approval_document(item) for item in status.pending_approvals],
     }
 
 
@@ -362,15 +367,17 @@ def relay_document(outcome: RelayOutcome) -> dict[str, Any]:
     }
 
 
-def approval_document(outcome: ApprovalOutcome) -> dict[str, Any]:
-    return {
-        "approval_id": outcome.request.approval_id,
-        "target": target_document(outcome.request.target),
-        "verdict": str(outcome.verdict),
-        "state": str(outcome.state),
-        "outcome": str(outcome.outcome),
-        "closing_notice": outcome.closing_notice,
-    }
+def approval_document(
+    approval_id: str, verdict: ApprovalVerdict, outcome: RelayOutcome
+) -> dict[str, Any]:
+    """The verdict that was carried, and the receipt for carrying it.
+
+    The receipt is `relay_document`'s, whole and by construction: an Approval
+    Relay is a Relay, and #192 settled that a Relay's receipt is a state, a
+    grade and a reason. What this adds is the one fact that document cannot
+    carry — which dialog, and which way the user decided.
+    """
+    return {"approval_id": approval_id, "verdict": str(verdict)} | relay_document(outcome)
 
 
 def verification_document(reports: tuple[SeamVerification, ...]) -> dict[str, Any]:

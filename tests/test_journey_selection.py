@@ -67,7 +67,7 @@ def _walk(chosen: journey.Selection, record: support.Verdict) -> support.Journey
 
 
 def test_every_step_declares_what_it_needs_behind_it() -> None:
-    """The table and the nine names are the same set, or a step has no answer."""
+    """The table and the step names are the same set, or a step has no answer."""
     assert tuple(journey.PREREQUISITES) == journey.STEPS
 
 
@@ -81,7 +81,7 @@ def test_no_step_needs_one_that_runs_after_it() -> None:
 
 
 def test_every_step_name_is_bound_to_a_method() -> None:
-    """`Walk.bound_steps` is where a name becomes code; it covers the nine exactly."""
+    """`Walk.bound_steps` is where a name becomes code; it covers them exactly."""
     walk = object.__new__(journey.Walk)
     assert tuple(walk.bound_steps()) == journey.STEPS
 
@@ -113,8 +113,8 @@ def test_the_closure_is_transitive() -> None:
 
 
 def test_a_step_that_reads_a_turn_brings_the_step_that_drove_one() -> None:
-    """`progress` wants history and `stop notice` wants a Stop; `stable name` is the turn."""
-    assert journey.select(("progress",)).setup == ("roster", "stable name")
+    """`brief` wants history and `stop notice` wants a Stop; `stable name` is the turn."""
+    assert journey.select(("brief",)).setup == ("roster", "stable name")
     assert journey.select(("stop notice",)).setup == ("roster", "stable name")
 
 

@@ -69,20 +69,40 @@ class TestACompleteConfiguration:
         config = load(written(tmp_path, COMPLETE))
 
         assert config.policy.relay_ceiling_seconds == 600.0
-        assert config.policy.approval_budget_seconds == 600.0
         # legacy@1d32845:config.plist:74-78 — one 60-second heartbeat.
         assert config.policy.silence_end_seconds == 60.0
+        # #171: five entries read out in one breath. Legacy's fixed 12/32 KB tail
+        # is dropped, because it cannot answer "the five before those".
+        assert config.policy.history_page_entries == 5
 
     def test_a_duration_may_be_dialled(self, tmp_path: Path) -> None:
         config = load(
             written(
                 tmp_path,
-                COMPLETE + "\n[policy]\napproval_budget_seconds = 90\nsilence_end_seconds = 12.5\n",
+                COMPLETE + "\n[policy]\nrelay_ceiling_seconds = 90\nsilence_end_seconds = 12.5\n",
             )
         )
 
-        assert config.policy.approval_budget_seconds == 90.0
+        assert config.policy.relay_ceiling_seconds == 90.0
         assert config.policy.silence_end_seconds == 12.5
+
+    def test_the_history_page_size_may_be_dialled(self, tmp_path: Path) -> None:
+        config = load(written(tmp_path, COMPLETE + "\n[policy]\nhistory_page_entries = 3\n"))
+
+        assert config.policy.history_page_entries == 3
+
+    def test_a_history_page_size_that_is_not_a_count_is_refused(self, tmp_path: Path) -> None:
+        """A page is entries, not seconds: `5.0` is a duration's spelling."""
+        with pytest.raises(ConfigError):
+            load(written(tmp_path, COMPLETE + "\n[policy]\nhistory_page_entries = 5.0\n"))
+
+        with pytest.raises(ConfigError):
+            load(written(tmp_path, COMPLETE + "\n[policy]\nhistory_page_entries = true\n"))
+
+    def test_a_history_page_that_holds_nothing_is_refused(self, tmp_path: Path) -> None:
+        """It would page through a history forever without ever reaching the end."""
+        with pytest.raises(ConfigError):
+            load(written(tmp_path, COMPLETE + "\n[policy]\nhistory_page_entries = 0\n"))
 
     def test_a_duration_that_would_expire_everything_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError):

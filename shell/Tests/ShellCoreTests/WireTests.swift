@@ -22,7 +22,7 @@ import Testing
             ])
         #expect(
             Set(ProgressOmission.allCases.map(\.rawValue)) == [
-                "none", "older", "status_summary", "newest_oversize",
+                "none", "older", "status_summary", "newest_oversize", "oversize",
             ])
     }
 

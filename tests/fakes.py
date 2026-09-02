@@ -19,20 +19,23 @@ adapter's issue.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
+from gpt_voicecoding.adapters.agent._progress import page as history_page
 from gpt_voicecoding.control_plane.progress_publication import ProgressPublication
 from gpt_voicecoding.core.instructions import ControlPlaneCli, InstructionContext
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
     ApprovalVerdict,
+    HistoryPage,
     LaneDiscovery,
+    ProgressEntry,
     RelayRoute,
     ReplyWindow,
     SessionInspection,
     SessionLifecycle,
     SessionState,
-    WaitingFor,
 )
 from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
@@ -100,10 +103,6 @@ class FakeAgent:
         self.asked_windows: list[SessionTarget] = []
         #: Exact questions this fake says its lane can still answer.
         self.answerable_questions: set[SessionTarget] = set()
-        #: Budget values Core passed to this seam, in call order.
-        self.question_budgets: list[float] = []
-        #: Releases the next budget sweep returns, then clears.
-        self.question_releases: list[tuple[SessionTarget, WaitingFor]] = []
         #: What this fake answers `discover` with. Empty and enumerated by
         #: default: a lane that really sees no Sessions, which is not the same
         #: as one that could not look.
@@ -117,6 +116,15 @@ class FakeAgent:
         #: one thing on this seam that raises, and a lane that could not look
         #: must not be answerable as a Session that said nothing.
         self.inspect_raises: Exception | None = None
+        #: Every visible entry this fake's lane holds per target, oldest first
+        #: and already numbered — what a real lane builds before anything trims
+        #: it. Absent means this lane holds no record for that target, which is
+        #: `read_at=None` and not an empty page.
+        self.records: dict[SessionTarget, tuple[ProgressEntry, ...]] = {}
+        #: Every `(target, before, count)` this fake was asked for, in order.
+        self.pages: list[tuple[SessionTarget, int | None, int]] = []
+        #: What `history` raises instead of answering.
+        self.history_raises: Exception | None = None
 
     def supported_routes(self) -> frozenset[RelayRoute]:
         return self._routes
@@ -168,16 +176,6 @@ class FakeAgent:
     def question_answerable(self, target: SessionTarget) -> bool:
         return target in self.answerable_questions
 
-    async def sweep_question_budget(
-        self, budget_seconds: float
-    ) -> tuple[tuple[SessionTarget, WaitingFor], ...]:
-        self.question_budgets.append(budget_seconds)
-        released = tuple(self.question_releases)
-        self.question_releases.clear()
-        for target, _ in released:
-            self.answerable_questions.discard(target)
-        return released
-
     async def discover(self) -> LaneDiscovery:
         """Whatever a test told this fake to see."""
         self.discoveries += 1
@@ -202,6 +200,31 @@ class FakeAgent:
             workspace=Path("/nowhere"),
             lifecycle=SessionLifecycle.ENDED,
             state=SessionState.IDLE,
+        )
+
+    async def history(
+        self,
+        target: SessionTarget,
+        *,
+        before: int | None,
+        count: int,
+    ) -> HistoryPage:
+        """One page over whatever record a test gave this fake.
+
+        It calls the same shared window both real lanes call, so a test that
+        pages this fake is testing the product's windowing and not a second
+        implementation of it.
+        """
+        self.pages.append((target, before, count))
+        if self.history_raises is not None:
+            raise self.history_raises
+        if target not in self.records:
+            return HistoryPage()
+        return history_page(
+            self.records[target],
+            before=before,
+            count=count,
+            read_at=datetime.now(UTC),
         )
 
     async def verify(self) -> VerifyResult:

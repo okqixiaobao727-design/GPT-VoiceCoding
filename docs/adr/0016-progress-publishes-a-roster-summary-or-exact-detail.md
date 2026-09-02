@@ -190,12 +190,17 @@ summary and the exact detail stand as decided. The third is the **History page**
   verb and is not a roster fact. A Session the lane cannot read answers with the same
   refusals the exact publication uses; a page past the oldest entry is empty with
   `older=false`, which is an answer, not a refusal.
+- **The newest page includes the newest entry.** Asked with no cursor, the page
+  carries the newest entry and the four before it. Every page is complete on its
+  own and the engine remembers no cursor between reads, so there is no reading in
+  which the first page a surface receives has a hole where `newest` should be.
 
 The exact `progress` publication and action are **retired** by this amendment: the
 Session Brief carries the newest entry whole (#166), and the History page carries
-everything before it. `sessions` retires with it — the Roster Brief is that surface.
+that entry and everything before it. `sessions` retires with it — the Roster Brief is that surface.
 Removing two actions and adding `brief` and `history` changes the Control Plane action
-set, so the protocol version moves again when this lands.
+set, so the protocol version moves again when this lands: protocol 6 retired
+`sessions` for `brief` (#187), and protocol 7 retires `progress` for `history`.
 
 **Legacy.** Legacy's `progress` was a fixed tail of 12 entries / 32 KB with a boolean
 `truncated` (`legacy@1d32845:config.plist:447-452`, `bridge/transcript.py:2841`) and no

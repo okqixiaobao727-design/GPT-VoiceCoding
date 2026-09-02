@@ -49,7 +49,6 @@ class Hub:
         call: FakeCall | None = None,
         channel_outcome: Delivery = Delivery.DELIVERED,
         channel_reason: str = "fake channel",
-        approval_budget_seconds: float = TEN_MINUTES,
         silence_end_seconds: float = 60.0,
     ) -> None:
         self.now = 1_000.0
@@ -83,10 +82,7 @@ class Hub:
             call=self.call,
             channel=self.channel,
             agents={AgentKind.CODEX: self.agent, AgentKind.CLAUDE: self.agent},
-            policy=CorePolicy(
-                approval_budget_seconds=approval_budget_seconds,
-                silence_end_seconds=silence_end_seconds,
-            ),
+            policy=CorePolicy(silence_end_seconds=silence_end_seconds),
             grammar=TextGrammar(control_commands=COMMANDS),
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]

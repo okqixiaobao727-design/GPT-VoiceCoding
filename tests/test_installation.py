@@ -189,10 +189,17 @@ def test_the_hook_command_names_the_interpreter_it_was_given(tmp_path: Path) -> 
     assert group["hooks"][0]["command"] == f"{INTERPRETER} -m {hooks.APPROVAL_MODULE}"
 
 
-def test_the_hook_timeout_is_not_below_the_approval_budget() -> None:
-    """Claude Code's ceiling must outlast Bridge Core's budget, or Claude Code
-    gives up on a dialog the engine is still holding open for the user."""
-    assert hooks.APPROVAL_TIMEOUT_SECONDS >= CorePolicy().approval_budget_seconds
+def test_the_installed_block_declares_the_only_clock_a_held_hook_has() -> None:
+    """The wire's timeout is the whole ceiling now (ADR 0015, amended by #191).
+
+    Bridge Core's budget used to sit under this number and had to stay under it.
+    Both engine-side clocks are gone, so what this asserts is that the one that
+    remains is still declared — a hook installed without a timeout would hold a
+    dialog on Claude Code's own default, which is not a number this product
+    chose.
+    """
+    assert hooks.APPROVAL_TIMEOUT_SECONDS > 0
+    assert not hasattr(CorePolicy(), "approval_budget_seconds")
 
 
 # -- refusals ------------------------------------------------------------

@@ -58,7 +58,6 @@ from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 from gpt_voicecoding.adapters.agent.claude.stop_analysis import QUESTION_TOOL
 from gpt_voicecoding.seams.agent import (
     ApprovalVerdict,
-    AwaitingApproval,
     ReplyWindow,
     ReplyWindowChanged,
     WaitingKind,
@@ -170,6 +169,37 @@ async def hook_in_flight(
         lambda: bool(listener.pending()) or listener.newest_question_for(TARGET) is not None
     )
     return task
+
+
+async def park_from_claude_code(
+    listener: ApprovalListener, payload: dict[str, Any]
+) -> asyncio.StreamWriter:
+    """Park one dialog and keep its socket, so the test can end it as the wire does.
+
+    The real hook process blocks in a worker thread and cannot be told to leave,
+    but what Claude Code does when it gives up on a held hook — at the installed
+    block's timeout, or because the human answered the dialog on screen — is
+    close this connection. The frame is the hook's own (`request_for`), so what
+    crosses the socket is what the product sends.
+    """
+    reader, writer = await asyncio.open_unix_connection(str(listener.path))
+    del reader
+    request = request_for(payload)
+    assert request is not None
+    writer.write(json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n")
+    await writer.drain()
+    await _until(
+        lambda: bool(listener.pending()) or listener.newest_question_for(TARGET) is not None
+    )
+    return writer
+
+
+async def end_the_hook(listener: ApprovalListener, writer: asyncio.StreamWriter) -> None:
+    """Close the hook's end, and wait until the listener has noticed."""
+    writer.close()
+    with contextlib.suppress(OSError, ConnectionError):
+        await writer.wait_closed()
+    await _until(lambda: not listener.question_answerable(TARGET) and not listener.pending())
 
 
 class TestWhatTheHookPrints:
@@ -329,19 +359,22 @@ class TestCarryingOneVerdict:
             await listener.start()
             try:
                 hook = await hook_in_flight(listener, socket_root)
-                announced = sink.of(AwaitingApproval)
+                parked = listener.pending()
                 receipt = await listener.answer(
-                    announced[0].request.approval_id,
+                    parked[0].approval_id,
                     ApprovalVerdict.ALLOW,
                     request_id=RequestId("r-1"),
                 )
-                return receipt, await hook, announced
+                return receipt, await hook, parked, sink.events
             finally:
                 await listener.aclose()
 
-        receipt, printed, announced = asyncio.run(scenario())
-        assert len(announced) == 1, "one displayed dialog raises exactly one event"
-        assert announced[0].request.target == TARGET
+        receipt, printed, parked, raised = asyncio.run(scenario())
+        assert len(parked) == 1, "one displayed dialog is parked exactly once"
+        assert parked[0].target == TARGET
+        # And nothing is raised for it: the dialog reaches the user on the
+        # Session's own Stop, which carries this handle (#191).
+        assert raised == []
         assert receipt.outcome is Delivery.DELIVERED
         assert printed is not None
         assert printed["hookSpecificOutput"]["decision"]["behavior"] == ALLOW_BEHAVIOR
@@ -359,7 +392,7 @@ class TestCarryingOneVerdict:
             try:
                 hook = await hook_in_flight(listener, socket_root)
                 await listener.answer(
-                    sink.of(AwaitingApproval)[0].request.approval_id,
+                    listener.pending()[0].approval_id,
                     ApprovalVerdict.DENY,
                     request_id=RequestId("r-1"),
                 )
@@ -393,7 +426,7 @@ class TestCarryingOneVerdict:
             await listener.start()
             try:
                 hook = await hook_in_flight(listener, socket_root)
-                approval_id = sink.of(AwaitingApproval)[0].request.approval_id
+                approval_id = listener.pending()[0].approval_id
                 expired = await listener.answer(
                     approval_id, ApprovalVerdict.ASK, request_id=RequestId("r-1")
                 )
@@ -813,12 +846,12 @@ class TestTheGradeFollowsTheBytes:
                     ApprovalVerdict.ALLOW,
                     request_id=RequestId("r-1"),
                 )
-                return await hook, sink.of(AwaitingApproval)
+                return await hook, sink.events
             finally:
                 await listener.aclose()
 
-        printed, announced = asyncio.run(scenario())
-        assert len(announced) == 1
+        printed, raised = asyncio.run(scenario())
+        assert raised == []
         assert printed is not None
         assert printed["hookSpecificOutput"]["decision"]["behavior"] == ALLOW_BEHAVIOR
 
@@ -1208,17 +1241,17 @@ class TestAQuestionRidesTheHeldHook:
                     question_dialog(group("Tabs or spaces?", "Spaces (recommended)", "Tabs")),
                 )
                 parked = listener.newest_question_for(TARGET)
-                announced = sink.of(AwaitingApproval)
+                permissions = listener.pending()
                 windows = sink.of(ReplyWindowChanged)
             finally:
                 # Releases the parked dialog to its human, which is what lets
                 # the hook thread finish: nothing here ever answers a question.
                 await listener.aclose()
             assert await hook is None, "no verdict was carried, so nothing was printed"
-            return parked, announced, windows
+            return parked, permissions, windows
 
-        parked, announced, windows = asyncio.run(scenario())
-        assert announced == []
+        parked, permissions, windows = asyncio.run(scenario())
+        assert permissions == ()
         assert windows[0] == ReplyWindowChanged(target=TARGET, window=ReplyWindow.OPEN)
         assert parked is not None
         assert parked.kind is WaitingKind.QUESTION
@@ -1228,71 +1261,74 @@ class TestAQuestionRidesTheHeldHook:
         # side and nothing errors. The projector's own test cannot see that.
         assert parked.approval_id == "p-1", "the dialog's correlator crossed the wire"
 
-    def test_a_question_past_the_budget_is_released_once_and_closes_the_window(
+    def test_the_hook_ending_releases_the_question_once_and_closes_the_window(
         self, socket_root: Path
     ) -> None:
+        """The wire keeps the only clock (ADR 0015, amended by #191).
+
+        Claude Code ends the held hook — at the installed block's timeout, or
+        because the human answered the dialog on screen — and this listener's
+        per-connection task is what notices. There is no engine-side sweep to
+        race it, so the end of the socket is the whole of the release.
+        """
+
         async def scenario():
-            now = 10.0
             sink = Sink()
             listener = ApprovalListener(
                 settings=settings_for(socket_root),
                 resolve=lambda _: TARGET,
                 emit=sink.emit,
                 pid=45,
-                clock=lambda: now,
             )
             await listener.start()
             try:
-                hook = await hook_in_flight(
-                    listener,
-                    socket_root,
-                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                writer = await park_from_claude_code(
+                    listener, question_dialog(group("Tabs or spaces?", "spaces", "tabs"))
                 )
-                now = 16.0
-                released = await listener.sweep_question_budget(5.0)
-                again = await listener.sweep_question_budget(5.0)
-                printed = await hook
-                return released, again, printed, sink.of(ReplyWindowChanged)
+                held = listener.question_answerable(TARGET)
+                await end_the_hook(listener, writer)
+                return (
+                    held,
+                    listener.question_answerable(TARGET),
+                    sink.of(ReplyWindowChanged),
+                    listener.released_question_reason(TARGET),
+                )
             finally:
                 await listener.aclose()
 
-        released, again, printed, windows = asyncio.run(scenario())
+        held, after, windows, reason = asyncio.run(scenario())
 
-        assert [(target, waiting.approval_id) for target, waiting in released] == [(TARGET, "p-1")]
-        assert again == ()
-        assert printed is None, "release writes ask, which prints no hook decision"
+        assert held is True, "a held hook is answerable for as long as it is held"
+        assert after is False
         assert [event.window for event in windows] == [ReplyWindow.OPEN, ReplyWindow.CLOSED]
+        # The one release wording a hook that ended without a verdict earns: the
+        # dialog left with it, and the person is the only one who can resolve it.
+        assert reason == "that question was answered elsewhere at the on-screen dialog"
 
-    def test_an_in_budget_question_remains_parked(self, socket_root: Path) -> None:
+    def test_a_held_question_is_never_released_by_this_engine(self, socket_root: Path) -> None:
+        """No timer, no ceiling, nothing to configure: only the wire can end it."""
+
         async def scenario():
-            now = 10.0
             listener = ApprovalListener(
                 settings=settings_for(socket_root),
                 resolve=lambda _: TARGET,
                 emit=Sink().emit,
                 pid=47,
-                clock=lambda: now,
             )
             await listener.start()
             try:
-                hook = await hook_in_flight(
-                    listener,
-                    socket_root,
-                    question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
+                await park_from_claude_code(
+                    listener, question_dialog(group("Tabs or spaces?", "spaces", "tabs"))
                 )
-                now = 14.0
-                released = await listener.sweep_question_budget(5.0)
-                answerable = listener.question_answerable(TARGET)
+                return listener.question_answerable(TARGET), listener.pending()
             finally:
                 await listener.aclose()
-            assert hook is not None
-            return released, answerable, await hook
 
-        released, answerable, printed = asyncio.run(scenario())
+        answerable, permissions = asyncio.run(scenario())
 
-        assert released == ()
         assert answerable is True
-        assert printed is None
+        assert permissions == (), "a question never enters the Approval Relay"
+        assert not hasattr(ApprovalListener, "sweep_question_budget")
 
     def test_a_released_question_refuses_a_late_answer_without_inbox_fallback(
         self, socket_root: Path
@@ -1306,34 +1342,31 @@ class TestAQuestionRidesTheHeldHook:
             adapter.register_session(TARGET, socket_root / "unused-inbox.sock")
             await adapter.connect()
             try:
-                hook = await hook_in_flight(
+                hook = await park_from_claude_code(
                     adapter._approvals,  # noqa: SLF001 - driving the real public adapter seam
-                    socket_root,
                     question_dialog(group("Tabs or spaces?", "spaces", "tabs")),
                 )
                 before = adapter.question_answerable(TARGET)
-                released = await adapter.sweep_question_budget(0.0)
+                await end_the_hook(adapter._approvals, hook)  # noqa: SLF001 - the wire's own end
                 after = adapter.question_answerable(TARGET)
                 late = await adapter.answer_relay(
                     TARGET,
                     "tabs",
                     request_id=RequestId("r-late"),
                 )
-                return before, released, after, late, await hook
+                return before, after, late
             finally:
                 await adapter.aclose()
 
-        before, released, after, late, printed = asyncio.run(scenario())
+        before, after, late = asyncio.run(scenario())
 
         assert before is True
-        assert len(released) == 1
         assert after is False
         assert late.outcome is Delivery.FAILED
-        assert "no longer answerable" in late.reason
-        assert printed is None
+        assert "answered elsewhere" in late.reason
 
-    def test_a_permission_still_raises_awaiting_approval(self, socket_root: Path) -> None:
-        """The control: nothing about the ordinary dialog changed."""
+    def test_a_permission_is_parked_and_is_not_a_question(self, socket_root: Path) -> None:
+        """The control: an ordinary dialog is held for the Approval Relay alone."""
 
         async def scenario():
             sink = Sink()
@@ -1346,15 +1379,16 @@ class TestAQuestionRidesTheHeldHook:
             await listener.start()
             try:
                 hook = await hook_in_flight(listener, socket_root)
-                announced = sink.of(AwaitingApproval)
+                parked = listener.pending()
                 question = listener.newest_question_for(TARGET)
             finally:
                 await listener.aclose()
             await hook
-            return announced, question
+            return parked, question, sink.events
 
-        announced, question = asyncio.run(scenario())
-        assert len(announced) == 1
+        parked, question, raised = asyncio.run(scenario())
+        assert len(parked) == 1
+        assert raised == [], "a permission raises nothing; it rides the Session's Stop (#191)"
         assert question is None, "a permission is not a question, whatever else is parked"
 
     def test_a_newer_permission_hides_an_older_question_route(self, socket_root: Path) -> None:

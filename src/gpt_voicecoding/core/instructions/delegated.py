@@ -39,7 +39,10 @@ ACTION_GIST: dict[Action, str] = {
         "what the sessions are doing, in the words the user is told — every "
         "session with no argument, one session whole with an address"
     ),
-    Action.PROGRESS: "how far along one exact session is, read now — never a turn",
+    Action.HISTORY: (
+        "one page of what an exact session said and was told, newest first — "
+        "add `--before <ordinal>` for the entries before a page you were given"
+    ),
     Action.LIVE: "the Live Toggle — end the call that is up, or start one when none is",
     Action.RELAY: "carry the user's own words into one exact session",
     Action.APPROVE: "carry the user's verdict on one pending permission request",

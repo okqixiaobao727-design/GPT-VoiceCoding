@@ -265,7 +265,8 @@ class TestVoiceBudget:
 
 
 class TestStopNoticeInstructions:
-    def test_asking_for_more_reads_progress_recent_entries(self) -> None:
+    def test_asking_for_more_reads_the_history_page(self) -> None:
+        """The action it names has to be one this engine has (#171)."""
         stop = next(
             section
             for section in voice_instructions(CONTEXT).sections
@@ -274,8 +275,8 @@ class TestStopNoticeInstructions:
         text = " ".join(block.text for block in stop.blocks)
 
         assert "most recently said" in text
-        assert "progress" in text
-        assert "recent entries" in text
+        assert "history" in text
+        assert "progress" not in text
 
 
 class TestTheDelegatedSetNamesTheRealCli:

@@ -6,7 +6,7 @@ The reference implementation let policy leak into mechanism: Stop Notice deliver
 
 ## Decision
 
-**`core` — Bridge Core — owns all policy**: Stop Notice escalation, Relay queueing against the Reply Window, the Approval budget and fallback, the one-call invariant, switch adjudication. Everything else is a deep module reached through a seam:
+**`core` — Bridge Core — owns all policy**: Stop Notice escalation, Relay queueing against the Reply Window, the one-call invariant, switch adjudication. (The Approval budget and its fallback were on this list until [#191](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/191) withdrew both — a held hook's life is the wire's, per ADR 0015 as amended — and the split itself is unchanged by that.) Everything else is a deep module reached through a seam:
 
 | Seam | Adapters |
 | --- | --- |
@@ -22,7 +22,7 @@ Splitting principles:
 
 1. **Policy in the hub, mechanism in the spokes.** Bridge Core imports no protocol library; it speaks seam verbs only.
 2. **Seams only where something varies** — each names two adapters, or one shipped plus one historical.
-3. **The hub may have internal components** (escalation, relay queue, approval budget, persistence) but no new external seams.
+3. **The hub may have internal components** (escalation, relay queue, persistence) but no new external seams.
 4. **The hub is fully testable against fakes** — no network, no audio.
 
 The engine is one Python asyncio process, a direct child of the menu-bar shell (ADR 0005). Bridge Core memory is the single source of truth; the durable subset is written by one internal storage component and read by nothing else.

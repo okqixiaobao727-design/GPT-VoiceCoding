@@ -49,7 +49,21 @@ from typing import Any
 #: under an unchanged number would be a gate that lies: a version-5 surface
 #: would send `sessions` and be answered `unknown_action` by an engine it had
 #: just agreed with.
-PROTOCOL_VERSION = 6
+#:
+#: 7 retires `progress` and adds `history`, the History page (#171). The exact
+#: progress publication is gone — the Session Brief carries the newest entry
+#: whole and `history` carries that entry and everything before it, five at a
+#: time with an ordinal cursor — so a version-6 surface would send an action this
+#: engine no longer has, and would have no way to ask for a second page of
+#: anything.
+#:
+#: 8 retires `pending_approvals` from `status` (#191). A pending permission is
+#: one of the three Session states, so the roster row in `permission` is the
+#: whole of what is waiting, and a second list beside it was a second answer to
+#: the same question. A version-7 surface would count an absent field as zero
+#: and show "0 pending approvals" over a dialog that is on screen — a silent
+#: wrong number, which is exactly what this gate exists to prevent.
+PROTOCOL_VERSION = 8
 
 #: The longest line either side will read. Generous for a roster, small enough
 #: that a peer cannot make the engine hold an unbounded buffer.
@@ -73,9 +87,11 @@ class Action(StrEnum):
     #: the surface `sessions` used to be: a roster of rendered rows was a second
     #: vocabulary for what Briefing now says once (#166, #171).
     BRIEF = "brief"
-    #: How far along one exact Session is, read now. A status query like every
-    #: other one here: it never starts a turn and never touches the Session.
-    PROGRESS = "progress"
+    #: One page of what an exact Session said and was told, newest-first, with
+    #: an ordinal cursor for the entries before it. A status query like every
+    #: other one here: it never starts a turn and never touches the Session, and
+    #: it is never folded into the roster (ADR 0016).
+    HISTORY = "history"
     #: The Live Toggle: end the call the system owns, or start one if none is up.
     LIVE = "live"
     #: An Answer Relay — the user's own words, for one exact Session.

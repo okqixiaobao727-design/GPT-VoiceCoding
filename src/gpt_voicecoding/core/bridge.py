@@ -31,11 +31,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Final
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
-from gpt_voicecoding.core.approvals import ApprovalOutcome, ApprovalPipeline, PendingApproval
 from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
@@ -50,11 +50,12 @@ from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOu
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
 from gpt_voicecoding.core.interlock import CallInterlock
+from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
-from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, terminal_line
+from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, reason_for, terminal_line
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session, spoken_name, spoken_target
+from gpt_voicecoding.core.sessions import Session
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -68,13 +69,12 @@ from gpt_voicecoding.core.verification import (
 )
 from gpt_voicecoding.seams.agent import (
     AgentAdapter,
+    ApprovalRequest,
     ApprovalVerdict,
-    AwaitingApproval,
+    HistoryPage,
     LaneUnavailable,
     ProgressAvailability,
     ProgressObservation,
-    ProgressOmission,
-    ProgressRole,
     RelayReceipt,
     RelayRoute,
     ReplyWindow,
@@ -113,57 +113,86 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
 
 
-def stop_notice_for(
+def stop_brief(
     session: Session | None,
     target: SessionTarget,
-    waiting_for: WaitingFor | None = None,
+    waiting_for: WaitingFor,
     *,
     progress: ProgressObservation | None = None,
-    answerable_here: bool = False,
-) -> str:
-    """The words a stopped Session is announced with.
+    question_answerable: bool = False,
+) -> SessionBrief:
+    """The Session Brief a Stop announces — this reading, on the row it is about.
 
-    Names the Session the way the user names it, because that is what they will
-    say back when they answer, and carries **what it stopped on** — the question
-    with its options and any recommendation, or the tool awaiting permission.
-    Rendering happens here rather than in the adapter because the words are
-    Bridge Core's policy; the adapter's job was to keep the structure.
+    **Bridge Core words nothing about a Session.** `CONTEXT.md`'s *Stop Notice*
+    is "a Session Brief published as text", so what a stop produces here is the
+    brief and `briefing.text` is what renders it — one vocabulary for the
+    channel, the log and `bridgectl brief`, which is the defect #166 named. The
+    five renderers that used to live here are gone: the composer, the "it said /
+    nothing said yet / oversize" line, the per-wait-kind sentence with its
+    options and recommendation, the "answer it in the terminal" constant, and
+    their use of a `spoken_reference` helper, which went with the approval
+    announcement that was its last caller (#191). The omission wording lives in
+    `briefing.NEWEST_WORDING` and the state wording in `briefing.STATE_WORDING`.
+
+    Legacy (ADR 0010): `legacy@1d32845:bridge/host.py:213-235` announced a
+    content-free notice — **adapted**, the notice now carries the brief. Naming
+    the Session on it (ported in #109) is carried by the brief's name field.
+
+    **The reading this path is announcing wins over the row's.** A Stop is read
+    at the moment the Session stopped, and the sweep and reconcile paths each
+    carry the wait they are about; the roster row supplies everything else — the
+    Session Name, the workspace, the last activity — that the reading itself does
+    not know.
+
+    **The state is derived from the wait, because a Stop is not a Session
+    running.** `SessionRegistry.set_stop_reading` deliberately leaves a row that
+    merely ended a turn in whatever state the last discovery pass found (#209),
+    which is right for a standing roster and wrong for a notice: it would brief a
+    Session that has just stopped as `running`. So a wait only the user can end —
+    and a wait nobody could read, which is not an answer either — reads as
+    `WAITING`, and a turn that ended asking nothing reads as `IDLE`, which is
+    exactly what `BriefState.FINISHED` means (#165 Q7).
     """
-    stopped_on = (
-        _stopped_on(waiting_for, answerable_here=answerable_here) if waiting_for is not None else ""
+    row = session if session is not None else _stand_in(target)
+    row = replace(
+        row,
+        state=(SessionState.IDLE if waiting_for.kind is WaitingKind.NONE else SessionState.WAITING),
+        waiting_for=waiting_for,
+        progress=progress if progress is not None else row.progress,
     )
-    detail = [one for one in (_progress_at_stop(progress), stopped_on) if one]
-    tail = f" — {'; '.join(detail)}" if detail else ""
-    return f"{spoken_reference(session, target)} stopped and may need you{tail}"
+    return briefing.session(row, question_answerable=question_answerable)
 
 
-def _progress_at_stop(progress: ProgressObservation | None) -> str:
-    """What the Session most recently said, from the Stop's own observation."""
-    if progress is None or progress.availability is not ProgressAvailability.READABLE:
-        return ""
-    if progress.has_history is False:
-        return "nothing said yet"
-    if progress.omission is ProgressOmission.NEWEST_OVERSIZE:
-        return "history exists, but the newest entry is too large to carry"
-    newest = next(
-        (entry for entry in reversed(progress.recent) if entry.role is ProgressRole.ASSISTANT),
-        None,
-    )
-    return f"it said: {newest.text}" if newest is not None else ""
+#: The two `Session` fields a brief never reads, for the one row nobody observed.
+#: `Session` is the roster's record and requires both; `briefing.session` reads
+#: neither (`core/briefing.py::session` takes `target`, `name`, `state`,
+#: `waiting_for`, `progress`, `last_activity`, `child`). Named here, once, and
+#: named as unobserved rather than spelled at the call site as a plausible-looking
+#: `Path("/")` and `0.0` — a stand-in that reads like a fact is the thing to
+#: avoid. Nothing consumes either: this row is never registered, never persisted
+#: and never answered from.
+UNOBSERVED_WORKSPACE: Final = Path()
+UNOBSERVED_FIRST_SEEN: Final = 0.0
 
 
-def spoken_reference(session: Session | None, target: SessionTarget) -> str:
-    """The string a notice refers to this Session by — its name, else its address.
+def _stand_in(target: SessionTarget) -> Session:
+    """A row for a Stop the roster holds no Session for, carrying only its address.
 
-    Third of the `spoken_*` family and the one that chooses between the other
-    two: what to call a Session is `core/sessions.py`'s answer, and its floor is
-    the address, because a notice that names nothing is a notice the user cannot
-    answer. Both notices Bridge Core composes ask this question — the Stop Notice
-    and, since #109, the Approval Relay's announcement — so it is one expression
-    rather than the same line twice, which is how one of them came to have it and
-    the other not.
+    A Stop can arrive for a Session no discovery pass has landed yet, and a
+    notice nobody receives is worse than one naming the Session by the address
+    the user can still answer it by — which is `spoken_name`'s own floor
+    (`core/sessions.py:773-785`) and the shape `Briefing` prints for a row with
+    no name. **Nothing a brief reads is invented**: there is no name, the
+    progress stays the default `NOT_READ` — Briefing's word for "nobody looked" —
+    and the wait is the one the Stop itself carried. The two fields `Session`
+    requires and no brief reads are the constants above, and they are unobserved
+    rather than assumed.
     """
-    return spoken_name(session) if session is not None else spoken_target(target)
+    return Session(
+        target=target,
+        workspace=UNOBSERVED_WORKSPACE,
+        first_seen=UNOBSERVED_FIRST_SEEN,
+    )
 
 
 def _as_read_now(read: Session, fresh: ProgressObservation) -> Session:
@@ -200,58 +229,6 @@ def _state_behind(window: ReplyWindow, held: SessionState) -> SessionState:
     return SessionState.IDLE if window is ReplyWindow.OPEN else SessionState.RUNNING
 
 
-#: What a notice says about something this engine can announce and cannot answer.
-#: One sentence, used by both such cases, because they are one fact: a notice the
-#: user tries to answer remotely and cannot is worse than no notice at all.
-ANSWER_IT_AT_THE_TERMINAL: Final = "answer it in the terminal; it cannot be answered from here"
-
-
-def _stopped_on(waiting_for: WaitingFor, *, answerable_here: bool) -> str:
-    """One line describing what a Session is waiting for, or nothing to add."""
-    match waiting_for.kind:
-        case WaitingKind.QUESTION:
-            parts = [waiting_for.prompt or "it asked you something"]
-            if waiting_for.options:
-                parts.append(
-                    "options: "
-                    + ", ".join(
-                        f"{option.text}: {option.description}"
-                        if option.description
-                        else option.text
-                        for option in waiting_for.options
-                    )
-                )
-            if waiting_for.recommendation:
-                parts.append(f"it recommends {waiting_for.recommendation}")
-            if answerable_here:
-                action = (
-                    "answer all of them in one reply"
-                    if "\n" in waiting_for.prompt
-                    else "reply with your answer"
-                )
-            else:
-                action = ANSWER_IT_AT_THE_TERMINAL
-            return "; ".join(parts) + f" — {action}"
-        case WaitingKind.PERMISSION:
-            named = waiting_for.tool_name or "a tool"
-            asked = f"{named} needs your permission" + (
-                f": {waiting_for.detail}" if waiting_for.detail else ""
-            )
-            if answerable_here:
-                return asked
-            # No handle means no Approval Relay: the roster saw `waiting` and
-            # nothing is parked on the approval socket to answer into. Saying so
-            # is the whole difference between a notice the user can act on and
-            # one they try to answer from their phone and cannot.
-            return f"{asked} — {ANSWER_IT_AT_THE_TERMINAL}"
-        case WaitingKind.UNKNOWN:
-            # The honest answer while the record has not flushed (#73): say that
-            # rather than invent a reason the Session never gave.
-            return "it has not said what it is waiting for yet"
-        case _:
-            return waiting_for.detail or ""
-
-
 @dataclass(frozen=True, slots=True)
 class Status:
     """Everything the control plane can ask for. Answered with any switch off."""
@@ -272,7 +249,6 @@ class Status:
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
     pending_relays: tuple[PendingRelay, ...]
-    pending_approvals: tuple[PendingApproval, ...]
     #: Reply Window levels include the lane's live question-route fact, which is
     #: deliberately not copied onto the roster row.
     reply_windows: Mapping[SessionTarget, ReplyWindow] = field(default_factory=dict)
@@ -340,12 +316,6 @@ class BridgeCore:
             policy=self._policy,
             clock=clock,
         )
-        self.approvals = ApprovalPipeline(
-            agents=agents,
-            escalation=self.escalation,
-            policy=self._policy,
-            clock=clock,
-        )
         self.router = InboundRouter(sessions=state.sessions, grammar=grammar)
 
     @property
@@ -377,7 +347,6 @@ class BridgeCore:
             degraded_lanes=self._state.sessions.lane_degradations(),
             call_id=self.interlock.call_id(),
             pending_relays=self._state.relays.pending(),
-            pending_approvals=self.approvals.pending(),
             reply_windows={
                 session.target: self._reply_window(session)
                 for session in self._state.sessions.all()
@@ -404,53 +373,58 @@ class BridgeCore:
             question_answerable=self._question_answerable(session.target),
         )
 
-    async def progress(self, target: SessionTarget) -> Session:
-        """How far along one exact Session is, read now. Never starts a turn.
+    async def history(self, target: SessionTarget, *, before: int | None = None) -> HistoryPage:
+        """One page of what an exact Session said and was told, read now (#171).
 
         A hub verb, and a *read*: it resolves one identity, asks that lane and
-        no other, and returns the same `Session` row `status` renders. The
-        reference implementation's own rule, ported —
-        `legacy@1d32845:bridge/daemon.py:2202-2271` resolved one exact registered
+        no other, and returns a page of `history_page_entries` entries
+        newest-first with `older` saying whether more remain. The reference
+        implementation's rule for its one-Session read, ported —
+        `legacy@1d32845:bridge/daemon.py:2202-2271` and
+        `legacy@1d32845:bridge/codex.py:1319-1348` resolved one exact registered
         identity, asked only that agent's own authority, and never fell back to
-        another lane, a terminal or a screen when its source could not answer.
+        another lane, a terminal or a screen. Legacy had **no paging**: its tail
+        was a fixed 12 entries / 32 KB (`legacy@1d32845:config.plist:449-452`,
+        `bridge/transcript.py:2841`), **dropped, because** a fixed tail cannot
+        answer "the five before those". The count-bounded page and the ordinal
+        cursor are new.
 
-        **It is not a Relay and it costs no turn.** The router says so of the
-        whole class (`core/router.py:31-32`) and the seam keeps it true:
-        `inspect` reads what the agent has already written down.
+        **It is not a Relay and it costs no turn**, and it is **not folded into
+        the roster** (ADR 0016's amendment). `inspect` keeps answering the
+        newest tail and folding; a page is a separate read and is not a roster
+        fact, so nothing here observes the row.
 
-        **Three more refusals, and each is a different fact** — #76 asks for an
-        honest error rather than an answer that says nothing:
+        **One lane read per page.** The registry's `resolve` supplies three of
+        the four refusals — an identity nobody registered, a stale one, and a
+        Child Process, which is seen and never spoken to (#68) — and the lane's
+        own read supplies the fourth. A second `inspect` for a fresher staleness
+        check would fold this read back into the cadence it is kept out of.
 
-        - *The lane could not be read.* `LaneUnreadable`, carrying the lane's own
-          words. The roster's row is left exactly as it stood: not being able to
-          look is not a sighting.
-        - *The Session has ended.* `StaleSessionError`. The row is **not** ended
-          here: `SessionRegistry.observe` is the one component that ends rows,
-          and the value an `inspect` returns for a Session it could not find
-          carries no workspace and no name — folding it in would strip the very
-          fields a surface needs to say what happened to it. The next discovery
-          ends it properly, within one cadence.
-        - *Nothing could read how far it has got.* `ProgressUnavailable` — an
-          unattached Codex Session, or one whose first turn has written no record
-          yet. A Session that *was* read and had said nothing is not this: it
-          answers normally, with an empty reading.
+        The fourth refusal is two facts under one code:
 
-        Two further refusals are the resolver's and are not restated here — an
-        identity nobody registered, and a Child Process, which is seen and never
-        spoken to (#68).
-
-        Whatever is read is folded back into the roster before it is answered, so
-        a surface that asks for progress and then asks for `status` cannot be
-        told two different things about one Session.
+        - *The lane could not be read.* `LaneUnreadable`, carrying the lane's
+          own words.
+        - *Nothing could read what it said.* `ProgressUnavailable` — a Codex
+          thread the shared daemon does not hold, or a Claude Session whose
+          transcript this engine was never told about. A Session that *was* read
+          and had nothing before the cursor is not this: it answers with an empty
+          page and `older=False`, which is an answer.
         """
-        row = await self._inspect_now(target)
-        if row.progress.availability is ProgressAvailability.UNREADABLE:
-            assert row.progress.reason is not None
-            raise LaneUnreadable(str(target.agent), row.progress.reason)
-        read = self._state.sessions.observed_one(row, now=self._stamp())
-        if read.progress.availability is ProgressAvailability.NOT_READ:
+        session = self._state.sessions.resolve(target)
+        adapter = self._agents.get(target.agent)
+        if adapter is None:
+            raise LaneUnreadable(str(target.agent), "this engine has no adapter for that agent")
+        try:
+            page = await adapter.history(
+                session.target,
+                before=before,
+                count=self._policy.history_page_entries,
+            )
+        except LaneUnavailable as unread:
+            raise LaneUnreadable(str(unread.agent), unread.reason) from None
+        if page.read_at is None:
             raise ProgressUnavailable(target)
-        return read
+        return page
 
     async def brief(self, target: SessionTarget | None = None) -> RosterBrief | SessionBrief:
         """The Roster Brief, or one Session Brief with Detail — read now.
@@ -471,10 +445,10 @@ class BridgeCore:
         not replying to one, and a read that moved the focus would let the Voice
         change what it speaks first merely by looking.
 
-        Its refusals are `progress`'s, minus two. An unknown identity, a stale
+        Its refusals are `history`'s, minus one. An unknown identity, a stale
         one, a Child Process and a lane that could not be read all refuse here
         exactly as they do there. What does **not** refuse is a Session whose
-        *progress* could not be read: `progress` exists to answer with a
+        *progress* could not be read: `history` exists to answer with a
         Session's own words and has nothing to say without them, while a brief
         still has a state, a wait and a name — so an unreadable reading becomes
         the UNREADABLE state or an unreadable `newest`, which is the honest
@@ -492,10 +466,11 @@ class BridgeCore:
     async def _inspect_now(self, target: SessionTarget) -> SessionInspection:
         """One exact Session, read now through its own lane and no other.
 
-        The shared half of `progress` and `brief`: resolve one identity, ask the
-        one lane that owns it, and refuse rather than answer from somewhere else.
-        The row is returned unfolded, because the two callers fold it on
-        different terms.
+        `brief`'s reading: resolve one identity, ask the one lane that owns it,
+        and refuse rather than answer from somewhere else. The row is returned
+        unfolded, because the caller folds it on its own terms. `history` does
+        not come through here — a page is a separate read that observes nothing
+        (ADR 0016).
         """
         session = self._state.sessions.resolve(target)
         adapter = self._agents.get(target.agent)
@@ -579,12 +554,7 @@ class BridgeCore:
             if session.target.agent not in fresh or not session.child.is_main:
                 continue
             if session.waiting_for.needs_the_user:
-                await self._announce_waiting(
-                    session,
-                    session.target,
-                    session.waiting_for,
-                    reconcile=True,
-                )
+                await self._announce_waiting(session, session.target, session.waiting_for)
 
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
@@ -606,17 +576,71 @@ class BridgeCore:
 
     async def answer_approval(
         self, approval_id: str, verdict: ApprovalVerdict
-    ) -> ApprovalOutcome | None:
-        """Carry the user's verdict. None when nothing is waiting under that id.
+    ) -> RelayOutcome | None:
+        """Carry the user's verdict. None when no live row carries that handle.
+
+        **The Approval Relay carries and nothing more** (#191). There is no
+        pending-approval ledger to consult: the roster's current reading is the
+        one truth about which dialogs are open, and the row that carries this
+        handle in its wait is the Session the verdict belongs to. A handle no
+        row carries is a hook that has ended — the dialog is the keyboard's
+        again — and the receipt for that is the refusal this None becomes.
+
+        **A spawned target is refused in its own words.** A Codex subagent
+        thread can raise a real permission prompt; answering it would carry the
+        user's authority into a Session `resolve` refuses to address a moment
+        later, so it stays the keyboard's — "never spoken to" includes never
+        answered (advisor, 2026-08-27). It reads differently from the refusal
+        above because the user acts on it differently.
 
         Answering a permission is replying to that Session, so it takes the
-        focus exactly as an Answer Relay does. A verdict that found nothing to
-        answer moves nothing: there was no Session to have replied to.
+        focus exactly as an Answer Relay does — whatever the receipt says.
+
+        The receipt is `RelayOutcome`, the same shape `relay` answers with
+        (#192): the state, the attempt's grade, and one reason code. `DELIVERED`
+        exactly when the adapter proved it; every other grade is terminal here,
+        because a verdict is never retried on this system's own authority and
+        the dialog on screen is still the thing that can resolve it.
         """
-        outcome = await self.approvals.answer(approval_id, verdict)
-        if outcome is not None:
-            self._state.sessions.set_focus(outcome.request.target)
-        return outcome
+        found = self._dialog_on_the_roster(approval_id)
+        if found is None:
+            _log.info("no live Session carries the dialog %s; the verdict is refused", approval_id)
+            return None
+        session, request = found
+        if not session.child.is_main:
+            raise ChildSessionError(session.target, session.child.parent)
+
+        adapter = self._agents.get(session.target.agent)
+        if adapter is None:
+            _log.info("no %s lane is loaded to carry the verdict", session.target.agent)
+            return None
+
+        request_id = new_request_id()
+        receipt = await adapter.approval_relay(request, verdict, request_id=request_id)
+        self._state.sessions.set_focus(session.target)
+        return RelayOutcome(
+            request_id=request_id,
+            target=session.target,
+            state=Lifecycle.DELIVERED if receipt.is_delivered else Lifecycle.REPORTED_FAILED,
+            route=RelayRoute.DELIVER,
+            reason=reason_for(receipt),
+            receipt=receipt,
+        )
+
+    def _dialog_on_the_roster(self, approval_id: str) -> tuple[Session, ApprovalRequest] | None:
+        """The live row whose current wait carries that handle, and the request for it.
+
+        Read off `WaitingFor.as_approval_request`, which is the one place a wait
+        becomes the request the Approval Relay addresses, so the roster row the
+        user was briefed from and the request the adapter is handed are the same
+        fact. Child rows are found here and refused by the caller: they are on
+        the roster, and a handle nobody could match would be the wrong refusal.
+        """
+        for session in self._state.sessions.live():
+            request = session.waiting_for.as_approval_request(session.target)
+            if request is not None and request.approval_id == approval_id:
+                return session, request
+        return None
 
     async def verify(self) -> tuple[SeamVerification, ...]:
         """What configuration named, against what this engine actually loaded.
@@ -658,31 +682,26 @@ class BridgeCore:
             await self.dispatch(event)
         return len(waiting)
 
-    async def tick(self) -> tuple[tuple[RelayOutcome, ...], tuple[ApprovalOutcome, ...]]:
+    async def tick(self) -> tuple[RelayOutcome, ...]:
         """Advance the time-driven ceilings. The composition root calls this on a timer.
 
-        Deliberately the only time-driven thing in the hub. Stop Notices are not
-        replayed here; current state is reconciled only on outlet transitions.
+        Deliberately the only time-driven thing in the hub, and there are two of
+        them left: the undelivered Relay ceiling and the Live Call's silence
+        ceiling. Stop Notices are not replayed here; current state is reconciled
+        only on outlet transitions.
+
+        **No clock runs on a held dialog** (ADR 0015, amended by #191). A parked
+        permission or question is bounded by the wire that holds it — Claude Code
+        ends its hook at the installed block's timeout, the listener releases the
+        entry when that socket closes, and a Codex dialog stays answerable from
+        the TUI — so an engine-side sweep here was a second clock racing the
+        first. What a release does is unchanged, and nothing is pushed on it: the
+        next brief reads a row with no handle and says `answer: at the terminal`
+        (ADR 0017, a fresh reading).
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
             await self._announce(outcome.target, terminal_line(outcome))
-        for adapter in self._agents.values():
-            released = await adapter.sweep_question_budget(self._policy.approval_budget_seconds)
-            for target, waiting_for in released:
-                await self.escalation.escalate(
-                    Notice(
-                        request_id=new_request_id(),
-                        target=target,
-                        text=stop_notice_for(
-                            self._known(target),
-                            target,
-                            waiting_for,
-                            answerable_here=False,
-                        ),
-                    )
-                )
-        approvals = await self.approvals.sweep_expired()
         # Asked before the Call Keeper is, and not inside it: with the Auto
         # Hang-up Switch off the ceiling is never measured, so the Keeper's one
         # ending attempt per call stays unspent and turning the switch back on
@@ -702,7 +721,7 @@ class BridgeCore:
                         "ended the Live Call after %g seconds without call activity",
                         self._policy.silence_end_seconds,
                     )
-        return expired, approvals
+        return expired
 
     async def discover(self) -> tuple[SessionTarget, ...]:
         """Ask every lane what Sessions exist, and make the roster agree.
@@ -760,16 +779,6 @@ class BridgeCore:
                 await self._session_stopped(event)
             case SessionEnded():
                 await self._session_ended(event)
-            case AwaitingApproval():
-                if self._spawned(event.request.target):
-                    # A Codex subagent thread can raise a real permission
-                    # prompt, and this is where it stops. Answering it would be
-                    # an Approval Relay carrying the user's authority into a
-                    # Session `resolve` refuses to address a moment later, so
-                    # the dialog stays the keyboard's — "never spoken to"
-                    # includes never answered (advisor, 2026-08-27).
-                    return
-                await self.approvals.opened(event.request, self._spoken_as(event.request.target))
             case ReplyWindowChanged():
                 await self._reply_window_changed(event)
             case RelayReceipt():
@@ -820,7 +829,6 @@ class BridgeCore:
             event.target,
             event.waiting_for,
             progress=event.progress,
-            reconcile=False,
         )
 
     async def _announce_waiting(
@@ -830,7 +838,6 @@ class BridgeCore:
         waiting_for: WaitingFor,
         *,
         progress: ProgressObservation | None = None,
-        reconcile: bool,
     ) -> NoticeOutcome | None:
         """Announce one current wait through the same producer as its live event.
 
@@ -843,9 +850,12 @@ class BridgeCore:
         where Bridge Core cannot see it, so any key Bridge Core computes goes
         stale unseen.
 
-        The current handle is still *read*, just below: it decides **who**
-        announces, the Approval Relay or a Stop Notice. Reading it is not
-        recording it.
+        **One wait, one notice, and the handle is not read here at all.** A
+        permission used to reach this method twice — once as the Stop, once as
+        the announcement its own pipeline made — and the tiebreak between them
+        lived here. Since #191 a dialog travels on the Stop alone, so what the
+        handle is for is `Briefing`'s question of whether the user can answer
+        from here, read off the row it is given.
 
         Legacy (ADR 0010) — **dropped, because** its record of what a Session was
         last announced on is `CurrentSessionStop`
@@ -854,60 +864,25 @@ class BridgeCore:
         of the durable ledgers #67's port table leaves behind, and the rule that
         replaces it is #80's — reconcile the current state and replay nothing.
         """
-        _log.info(
-            "Session stopped: %s waiting on %s%s",
+        brief = stop_brief(
+            session,
             target,
-            waiting_for.kind,
-            f" ({waiting_for.tool_name})" if waiting_for.tool_name else "",
+            waiting_for,
+            progress=progress,
+            question_answerable=(
+                waiting_for.kind is WaitingKind.QUESTION and self._question_answerable(target)
+            ),
         )
-        held = waiting_for.as_approval_request(target)
-        if held is not None:
-            if reconcile:
-                outcome = await self.approvals.reoffer(
-                    held.approval_id, spoken_reference(session, target)
-                )
-                if outcome is not None:
-                    return outcome
-            # One dialog, two events, one announcement. A Session entering
-            # `waiting` raises this Stop, and the same dialog reached
-            # `AwaitingApproval` through the hook that is holding it open — so
-            # announcing both would ask the user twice for one decision. The
-            # approval notice wins wherever it exists: it is the one carrying a
-            # budget, a never-deny fallback and a closing notice, so it is the
-            # one that can actually be answered, and `approvals.opened` already
-            # asks for `Reach.EVERY_OUTLET`, which is the wider reach of the two.
-            #
-            # Said out loud rather than dropped: a Stop that produced no notice
-            # is otherwise indistinguishable in the log from a Stop that failed
-            # to reach every outlet.
-            _log.info(
-                "the Stop on %s is the dialog %s, which the Approval Relay announces; "
-                "not announced twice",
-                target,
-                held.approval_id,
-            )
-            if not reconcile:
-                return None
+        # The log carries the brief's text too, so the one wording is what the
+        # run's own record shows (#166 B5/B6). `Session stopped:` opens it
+        # unchanged: `tests/acceptance/journey.py::ENGINE_STOP_LINE` greps the
+        # first line of the record, and `drain_boot_notice` reads that grep.
+        _log.info("Session stopped: %s", briefing.text(brief))
         outcome = await self.escalation.escalate(
             Notice(
                 request_id=new_request_id(),
                 target=target,
-                text=stop_notice_for(
-                    session,
-                    target,
-                    waiting_for,
-                    progress=(
-                        progress
-                        if progress is not None
-                        else session.progress
-                        if session is not None
-                        else None
-                    ),
-                    answerable_here=(
-                        waiting_for.kind is WaitingKind.QUESTION
-                        and self._question_answerable(target)
-                    ),
-                ),
+                text=briefing.text(brief),
             )
         )
         return outcome
@@ -1083,7 +1058,3 @@ class BridgeCore:
         except BridgeCoreError:
             return False
         return False
-
-    def _spoken_as(self, target: SessionTarget) -> str:
-        """What a notice refers to this Session by, whether or not the roster knows it."""
-        return spoken_reference(self._known(target), target)
