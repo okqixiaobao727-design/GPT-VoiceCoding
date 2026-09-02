@@ -21,9 +21,11 @@ one way to turn Duty back on from away from the computer would be gated too.
 Three things are recorded here rather than decided here. `UserSpeech` is the
 in-call transcript, and Bridge Core never parses one: spoken intent arrives as
 structured control-plane calls the voice thread makes, so the event is written
-to the log and nothing else. The control-plane command set and the Delegated
-Turn's execution belong to the surfaces that own them, so both arrive as
-injected handlers with honest defaults rather than being invented here.
+to the log and nothing else. `VoiceSpeech` is the other side of the same
+conversation and is treated the same way, except that the interlock is told —
+the Silence Ceiling counts both speakers (#184). The control-plane command set
+and the Delegated Turn's execution belong to the surfaces that own them, so both
+arrive as injected handlers with honest defaults rather than being invented here.
 """
 
 from __future__ import annotations
@@ -95,6 +97,7 @@ from gpt_voicecoding.seams.call import (
     CallSnapshot,
     CallStarted,
     UserSpeech,
+    VoiceSpeech,
 )
 from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundText
 from gpt_voicecoding.seams.events import Event
@@ -111,6 +114,14 @@ NO_CONTROL_SURFACE = "I recognised that command, but no control surface is wired
 
 #: Answers an inbound delegation when no Delegated Turn handler is wired.
 NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wired to answer it"
+
+#: The two lines a run is told the Voice held its call open by. Fixed strings
+#: rather than a formatted one, because the acceptance step matches them: an
+#: engine that says nothing when the ceiling is held leaves a whole-lane run no
+#: way to tell "the call outlived the ceiling" from "the ceiling never ran"
+#: (#184). One per edge, never per delta — a long answer is hundreds of those.
+VOICE_SPEAKING_LINE = "the call's own Voice started speaking"
+VOICE_QUIET_LINE = "the call's own Voice stopped speaking"
 
 
 def stop_brief(
@@ -706,7 +717,21 @@ class BridgeCore:
         # Hang-up Switch off the ceiling is never measured, so the Keeper's one
         # ending attempt per call stays unspent and turning the switch back on
         # ends a call that has been silent all along.
-        if self.adjudicator.may_auto_hangup():
+        #
+        # **And never measured while unread call activity is waiting.** This runs
+        # on its own task and the dispatch loop runs on another
+        # (`engine/composition.py`), so a `VoiceSpeech` that has been emitted but
+        # not yet taken has not reached the interlock — and measuring silence
+        # then is how a call gets ended in the middle of the answer that was
+        # about to say it was not silent (#184). Waiting for the next pass costs
+        # a second on a sixty-second ceiling.
+        #
+        # The two kinds are named rather than the queue being asked whether it
+        # holds anything: this is the ceiling's own question — *was there
+        # activity on the call* — and a `SessionStopped` waiting to be read is
+        # not an answer to it. Asking the wider question let news about a
+        # Session hold a silent call open.
+        if self.adjudicator.may_auto_hangup() and not self.events.unread(UserSpeech, VoiceSpeech):
             try:
                 ended_silent_call = await self.interlock.end_silent_call(
                     self._policy.silence_end_seconds
@@ -794,6 +819,12 @@ class BridgeCore:
                     self._owe_reconciliation()
             case InboundText():
                 await self._inbound_text(event)
+            case VoiceSpeech():
+                # Both edges are activity, and the ceiling is held between them.
+                # Recorded, never read back: this system does not listen to
+                # itself, and the words are the Voice's own (#184).
+                self.interlock.note_voice_speech(speaking=event.speaking)
+                _log.info("%s", VOICE_SPEAKING_LINE if event.speaking else VOICE_QUIET_LINE)
             case UserSpeech():
                 self.interlock.note_activity()
                 # Recorded, never parsed. Spoken intent reaches Bridge Core as

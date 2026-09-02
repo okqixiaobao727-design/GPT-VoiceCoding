@@ -84,10 +84,15 @@ class TestOwnership:
 
 
 class TestTheSilenceCeiling:
-    def test_speech_that_wins_the_race_refreshes_activity_before_silence_is_rechecked(
-        self,
-    ) -> None:
-        async def race() -> tuple[bool, int]:
+    def test_an_end_never_lands_in_the_middle_of_a_notice_being_spoken(self) -> None:
+        """Speaking and ending are one operation, so neither sees the other half-done.
+
+        The stamp is gone (#184) but the serialisation is not: a call ended
+        while `speak` is still inside the adapter is a notice delivered into a
+        surface that is being torn down under it.
+        """
+
+        async def race() -> tuple[bool, int, int]:
             now = 100.0
             call = YieldingSpeakCall()
             guard = CallInterlock(call, clock=lambda: now)
@@ -99,15 +104,18 @@ class TestTheSilenceCeiling:
             )
             await call.speak_entered.wait()
             ending = asyncio.create_task(guard.end_silent_call(60.0))
+            await asyncio.sleep(0)
+            ended_while_speaking = call.calls_ended
             call.release_speak.set()
 
             await speaking
-            return await ending, call.calls_ended
+            return await ending, ended_while_speaking, call.calls_ended
 
-        ended, attempts = asyncio.run(race())
+        ended, while_speaking, attempts = asyncio.run(race())
 
-        assert ended is False
-        assert attempts == 0
+        assert while_speaking == 0
+        assert ended is True
+        assert attempts == 1
 
     def test_an_owned_call_is_due_once_when_its_configured_silence_elapses(self) -> None:
         now = 100.0
@@ -147,7 +155,13 @@ class TestTheSilenceCeiling:
         now = 220.0
         assert asyncio.run(guard.end_silent_call(60.0)) is True
 
-    def test_system_speech_restarts_the_owned_calls_silence_window(self) -> None:
+    def test_a_delivered_notice_is_not_itself_call_activity(self) -> None:
+        """A `speak` receipt timestamps a text hand-over, not a voice (#184).
+
+        What actually keeps the call alive is the Voice saying it, which arrives
+        as `VoiceSpeech` — so counting the hand-over as well would restart the
+        window from before the answer instead of from the end of it.
+        """
         now = 100.0
         call = FakeCall()
         guard = CallInterlock(call, clock=lambda: now)
@@ -155,9 +169,82 @@ class TestTheSilenceCeiling:
 
         now = 150.0
         asyncio.run(guard.speak("that session stopped", request_id=new_request_id()))
-        now = 209.9
-        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        now = 160.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
         assert call.spoken == ["that session stopped"]
+
+
+class TestTheVoiceKeepsTheCallAlive:
+    """The ceiling counts both sides of the conversation, as legacy's did (#184).
+
+    `legacy@1d32845:bridge/livecall.py:102-105` counted "somebody is speaking:
+    the user, or the Realtime Voice Layer" with one regex over both roles. The
+    rewrite kept only the user half, so on headphones a long answer was hung up
+    in the middle of itself (#169, ADR 0010).
+    """
+
+    def test_the_ceiling_holds_for_as_long_as_the_voice_is_speaking(self) -> None:
+        """A span, not an edge: 75 s of audio generated in 10 s is still 75 s of call."""
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+
+        guard.note_voice_speech(speaking=True)
+        now = 1_000.0
+
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+
+    def test_both_edges_restart_the_window_and_the_last_one_is_what_counts(self) -> None:
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+
+        now = 150.0
+        guard.note_voice_speech(speaking=True)
+        now = 225.0
+        guard.note_voice_speech(speaking=False)
+
+        now = 284.9
+        assert asyncio.run(guard.end_silent_call(60.0)) is False
+        now = 285.0
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+    def test_a_call_that_clears_while_speaking_leaves_no_flag_behind(self) -> None:
+        """A start with no stop, then the call goes away: the next call is unheld."""
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        asyncio.run(open_and_report_started(guard))
+        guard.note_voice_speech(speaking=True)
+        held = guard.call_id()
+        assert held is not None
+
+        assert guard.note_ended(held) is True
+        guard.note_started("call-2")
+        now = 160.0
+
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+    def test_adopting_a_call_starts_it_unheld(self) -> None:
+        """The same hazard from the other direction — adoption is a fresh call."""
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+        guard.note_started("call-1")
+        guard.note_voice_speech(speaking=True)
+
+        guard.note_started("call-2")
+        now = 160.0
+
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
+
+    def test_a_voice_edge_on_no_owned_call_holds_nothing(self) -> None:
+        now = 100.0
+        guard = CallInterlock(FakeCall(), clock=lambda: now)
+
+        guard.note_voice_speech(speaking=True)
+        guard.note_started("call-1")
+        now = 160.0
+
+        assert asyncio.run(guard.end_silent_call(60.0)) is True
 
 
 class TestTheOtherRefusal:

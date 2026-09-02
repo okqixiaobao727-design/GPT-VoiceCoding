@@ -81,7 +81,8 @@ import os
 import re
 import time
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -92,7 +93,9 @@ import live_call
 import support
 from support import LaneBlocked, StepFailed
 
+from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
+from gpt_voicecoding.core.policy import DEFAULT_SILENCE_END_SECONDS
 
 if TYPE_CHECKING:
     # Named for a type and never imported at runtime: telethon lives behind this
@@ -101,8 +104,9 @@ if TYPE_CHECKING:
     import telegram_person
 
 #: Every step, in the order #73 fixed and #183 appended to. The first nine are
-#: cited verbatim by #74–#80; `live call` is #183's, and is last because a call
-#: holds the interlock and a whole-lane run wants the turn-driving steps behind it.
+#: cited verbatim by #74–#80; the two call steps are #183's and #184's, and they
+#: are last because a call holds the interlock and a whole-lane run wants the
+#: turn-driving steps behind it.
 STEPS = (
     "roster",
     "stable name",
@@ -114,7 +118,13 @@ STEPS = (
     "switches",
     "child",
     "live call",
+    "live call long",
 )
+
+#: The steps that dial. A run that walks either gets the harness's own Call
+#: adapter and the `bridgectl` wrapper; a run that walks neither keeps the Call
+#: adapter the user actually configured (`conftest.py`, #183).
+LIVE_CALL_STEPS = ("live call", "live call long")
 
 #: What each step needs to have run **before** it, so that a step selected on its
 #: own stands on the state the whole walk would have given it. Read off `Walk`'s
@@ -151,6 +161,10 @@ PREREQUISITES: Mapping[str, tuple[str, ...]] = {
     #: roster or the agent's own record. So it does not need `roster`, and
     #: #183's blocker clause is explicit that it must be runnable alone.
     "live call": (),
+    #: And neither does #184's, for the same reason and one more: it is about
+    #: one call's own clock, so a step run before it would only add minutes of
+    #: agent turns between dialling and the thing being measured.
+    "live call long": (),
 }
 
 
@@ -291,6 +305,63 @@ USER_SPEECH_LINE = r"user speech, for the voice thread to act on"
 #: which recogniser answered rather than of whether the words arrived.
 LIVE_CALL_HEARD_SUBSTRING = "结束通话"
 
+#: The same, for the long-answer variant (`live_call.LONG_REQUEST`), which has no
+#: hang-up in it to end with. Its own middle, for the same reason: a fragment,
+#: spaceless, and one the recogniser has no word boundary to insert inside.
+LIVE_CALL_LONG_HEARD_SUBSTRING = "一个数字"
+
+#: The engine's own two lines for the call's *other* speaker, imported rather
+#: than retyped: the long step's whole reading of "the Voice held the call open"
+#: is these strings, and a copy here would be a copy that can drift silently
+#: (`core/bridge.py`, #184).
+VOICE_SPEECH_LINES = (VOICE_SPEAKING_LINE, VOICE_QUIET_LINE)
+
+#: How the engine says its own Silence Ceiling ended a call. A pattern rather
+#: than an imported string because the line carries the configured number
+#: (`core/bridge.py`, `_log.info("ended the Live Call after %g seconds …")`), and
+#: what is being recognised is the sentence around it.
+CEILING_END_LINE = r"ended the Live Call after .* without call activity"
+
+
+@dataclass(frozen=True)
+class _VoiceWatch:
+    """What one call's Voice did, watched on the watching step's own clock.
+
+    **A long answer is not one span.** Run `20260902T163651Z` had the Voice
+    count to two hundred as a single two-hundred-and-twenty-eight-second
+    utterance; run `20260902T170324Z`, on the same request, broke it into
+    twenty-three turns with gaps between them. So "the answer has ended" is not
+    a shape the log can be asked for while the answer is still arriving, and a
+    step that waited for the first moment the spans balanced would call a gap
+    the end of the answer — which is what that second run did.
+
+    What a step *can* know at each poll is whether the Voice has said anything
+    since the last one. Both measurements are taken from that.
+    """
+
+    #: Whether the call went down before the step gave up waiting for it.
+    went_down: bool
+    #: The edges this call produced, as of the last poll.
+    edges: dict[bool, int]
+    #: When the Voice was first, and last, seen to have said anything.
+    first_voice_at: float | None
+    last_voice_at: float | None
+    #: When the call was seen to be down, or when the watch gave up.
+    down_at: float
+
+
+@dataclass(frozen=True)
+class _DialledCall:
+    """One Live Call a step opened, and the two marks it is read against."""
+
+    #: What `bridgectl live` answered — the engine's own account of the call.
+    answer: str
+    #: How many engine log lines there were before it. Everything this call
+    #: produced is after that, and everything the step before it produced is not.
+    mark: int
+    #: When it was opened, on this step's own clock.
+    started: float
+
 
 def _unspaced(text: str) -> str:
     """One line with all whitespace removed — see `LIVE_CALL_HEARD_SUBSTRING`."""
@@ -303,8 +374,8 @@ def _unspaced(text: str) -> str:
 DROPPED_REASON = "went away by itself"
 
 
-def _ended_by(by_agent: bool, end_reason: str | None) -> str:
-    """Who ended the call — and `lost` is a third answer, not a shade of `agent`.
+def _ended_by(*, end_reason: str | None, by_ceiling: bool, by_agent: bool) -> str:
+    """Who ended the call — and `lost` and `ceiling` are answers, not shades of `agent`.
 
     A connection that goes away by itself also leaves `bridgectl status` saying
     `call: none`, so "the call was down when the step looked" cannot on its own
@@ -313,9 +384,26 @@ def _ended_by(by_agent: bool, end_reason: str | None) -> str:
     contradicted each other: an end reason saying the connection went away by
     itself, beside a claim that the agent ended it. The audio path is the one
     that knows, so it is asked first.
+
+    **`ceiling` is the fourth, and #184 is what made it reachable.** The engine's
+    own Silence Ceiling closes the audio path from this side, exactly as a
+    `bridgectl live` the Call Agent ran does, so the end reason cannot tell them
+    apart either — run `20260902T162146Z` recorded `agent` for a call that the
+    ceiling ended sixty seconds after the Voice went quiet, with the Call Agent
+    having run nothing at all. The engine says so in its own log, and that line
+    is the only thing that does.
+
+    **Every answer is passed in as its own fact**, keyword by keyword, because
+    the one that was inferred is the one that was wrong: `by_agent` used to be
+    read off "the call was down when the step looked", which is true of a call
+    the ceiling ended, a call that dropped, and a call the step ended itself. A
+    caller that has no reason to believe the Call Agent ended anything says
+    `by_agent=False` and means it.
     """
     if end_reason and DROPPED_REASON in end_reason:
         return "lost"
+    if by_ceiling:
+        return "ceiling"
     return "agent" if by_agent else "harness"
 
 
@@ -339,6 +427,14 @@ LIVE_CALL_HANDOFF_SECONDS = 120.0
 
 #: And how long the call then gets to actually go down.
 LIVE_CALL_END_SECONDS = 60.0
+
+#: How long the long variant's answer can itself take. Measured, not guessed:
+#: the Voice counted to two hundred in 220s on run `20260902T162146Z` (its
+#: engine log, `the call's own Voice started speaking` 04:22:24 to `… stopped
+#: speaking` 04:26:04), and this is that with room for a slower count. Nothing
+#: waits this long on purpose — the step waits for the call to go down, and this
+#: only bounds how long it is willing to.
+LIVE_CALL_ANSWER_SECONDS = 300.0
 
 #: How often those three are checked. Each poll is a `bridgectl status` or a log
 #: read, so it is cheap; frequent enough that the measured duration means
@@ -1028,6 +1124,7 @@ class Walk:
             "switches": self.switches,
             "child": self.child,
             "live call": self.live_call,
+            "live call long": self.live_call_long,
         }
 
     def settle_boot_turn(self) -> int | None:
@@ -2181,6 +2278,47 @@ class Walk:
 
     # --- live call --------------------------------------------------------
 
+    @contextmanager
+    def _dialled(self, variant: str) -> Iterator[_DialledCall]:
+        """Open a Live Call on one utterance, and leave no call behind.
+
+        Everything both call steps do the same way, once: the refusal when this
+        run has no harness Call adapter, saying which utterance the next call
+        plays, `bridgectl live` and its answer, the mark the step reads its own
+        call's log lines against, and the cleanup.
+
+        **The mark is not decoration.** Two steps dial on one engine, so "the
+        Voice spoke" and "the ceiling ended a call" are both true of the log
+        from the step before. A step reads the lines its own call produced, and
+        the mark is where those start.
+        """
+        if self.config.call_observations is None or self.config.call_wav_directory is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        # Said by every step that dials, including the one that wants the
+        # default: the file the harness reads at dial time is otherwise
+        # whatever the call before it left there.
+        live_call.ask_for(self.config.call_wav_directory, variant)
+        mark = len(self.engine.log_lines())
+        opened = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
+        if not opened.ok or "is up" not in opened.text:
+            raise StepFailed(
+                f"`bridgectl live` did not open a call: {opened.text[:300]!r}. The engine's "
+                f"log tail: {self.engine.log_lines()[-5:]}"
+            )
+        self.journal("live.call.opened", lane=self.lane.name, answer=opened.text, variant=variant)
+        try:
+            yield _DialledCall(answer=opened.text, mark=mark, started=time.monotonic())
+        finally:
+            # The call is this run's to clean up whatever the step decided, and
+            # a call left up would hold the interlock over every later step and
+            # cost backend time until the engine is stopped. The toggle is
+            # idempotent in the direction that matters: `live` on a call that
+            # already ended opens one, so this only fires while one is up.
+            self._end_any_live_call()
+
     def live_call(self) -> str:
         """A Live Call with nobody at the microphone, v0: the route and no more (#183).
 
@@ -2230,22 +2368,9 @@ class Walk:
         transport factory, the wav variant, the end reason the audio path saw,
         and whether the agent or the harness ended the call.
         """
-        if self.config.call_observations is None:
-            raise LaneBlocked(
-                "this run's engine was not given the harness Call adapter, so there is no "
-                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
-            )
-        opened = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
-        if not opened.ok or "is up" not in opened.text:
-            raise StepFailed(
-                f"`bridgectl live` did not open a call: {opened.text[:300]!r}. The engine's "
-                f"log tail: {self.engine.log_lines()[-5:]}"
-            )
-        self.journal("live.call.opened", lane=self.lane.name, answer=opened.text)
-        started = time.monotonic()
-        try:
+        with self._dialled(live_call.PLAIN) as call:
             heard = support.wait_for(
-                lambda: bool(self._user_speech_lines()),
+                lambda: bool(self._user_speech_lines(since=call.mark)),
                 deadline_seconds=LIVE_CALL_HEARD_SECONDS,
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
@@ -2266,19 +2391,16 @@ class Walk:
             if not by_agent:
                 self._end_any_live_call()
             ended = self._call_is_down()
-        finally:
-            # The call is this run's to clean up whatever the step decided, and
-            # a call left up would hold the interlock over every later step and
-            # cost backend time until the engine is stopped. The toggle is
-            # idempotent in the direction that matters: `live` on a call that
-            # already ended opens one, so this only fires while one is up.
-            self._end_any_live_call()
         seen = live_call.observed(self.config.call_observations)
-        ended_by = _ended_by(by_agent, seen.end_reason)
-        self.turns.append(self._measured("live call", started, ended))
+        ended_by = _ended_by(
+            end_reason=seen.end_reason,
+            by_ceiling=self._ceiling_ended_the_call(since=call.mark),
+            by_agent=by_agent,
+        )
+        self.turns.append(self._measured("live call", call.started, ended))
         runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)
         verbs = self._verbs_run()
-        spoken = self._user_speech_lines()
+        spoken = self._user_speech_lines(since=call.mark)
         self.journey.observe(
             "live call transport",
             f"factory {seen.transport_factory or 'none recorded'}; wav variant "
@@ -2333,10 +2455,222 @@ class Walk:
                 f"observe. What it does hold: {seen.entries[-3:] or 'nothing at all'}"
             )
         return (
-            f"call up on `bridgectl live` ({opened.text!r}); engine heard {spoken[-1]!r}; "
+            f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; "
             f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; call down "
             f"({self._call_line()!r}), ended by the {ended_by}; transport "
             f"{seen.transport_factory}, wav variant {seen.variant!r}, ended {seen.end_reason!r}"
+        )
+
+    def live_call_long(self) -> str:
+        """A Live Call the system's own Voice keeps alive (#184).
+
+        The same route as `live call`, dialled on the other utterance: a request
+        for two hundred numbers, counted one at a time, and **no hang-up ask in
+        it** (`live_call.LONG_REQUEST`). Two steps rather than one sentence
+        carrying both asks, because run `20260902T162146Z` put both in one
+        sentence and the Call Agent then ran nothing at all — a long answer
+        leaves it nothing to do, and no shipped rule says it should end a call by
+        itself (#195, deferred). Folding them together would have cost #183 its
+        one proof that heard speech becomes an action.
+
+        **What is graded**, and each of these is one moment on this step's own
+        clock subtracted from another, never a stamp parsed out of the log:
+
+        * the call came up, the words reached the engine as speech, the right
+          utterance went on the track, and the call is down when the step is
+          over — the route, as v0 grades it;
+        * **the Voice spoke, and every span it opened closed.** At least one
+          `VoiceSpeech` start edge and no more starts than stops. A start with
+          no stop is precisely the bug (#169): the ceiling firing mid-answer
+          takes the call away before the `transcript/done` that would have
+          closed the span. Counted rather than paired off in time, because the
+          Voice may answer more than once and a `done` with no delta before it
+          is still an utterance that ended;
+        * **it went on answering for longer than the ceiling.** First edge to
+          last, watched across the whole call (`_VoiceWatch`) — not the call's
+          whole length, because a four-second answer followed by a full ceiling
+          of silence also makes a call outlast its ceiling and says nothing
+          about who kept it alive. What the ceiling had to survive is exactly
+          this stretch, and before #184 it did not: the only activity the engine
+          counted was the user's one transcript, so the call would have gone at
+          sixty seconds into it;
+        * **and then the call went down, but not before a full ceiling of
+          silence had passed.** The other half of the ticket's sentence — "ends
+          only after silence" — and the thing that says the ending was the
+          ceiling's rather than something else's.
+
+        **What is not graded here is the hold in isolation.** Whether a stretch
+        of answering survives because the ceiling *held* through one long span
+        or because both edges kept *restarting* it is the Voice's own choice of
+        turn structure, and it varies run to run on the same request
+        (`_VoiceWatch`). Both are #184, and a real call cannot be made to pick
+        one — so the hub tests pin the hold on its own (deltas for seventy-five
+        seconds with no stop edge, `tests/test_bridge.py`) and this step proves
+        the rule end to end.
+
+        Every one of those readings is taken from this call's own log lines
+        (`_DialledCall.mark`), because the step before this one dialled too.
+
+        **What ends it is the ceiling itself**, and that is the point rather than
+        an accident: nothing here asks for a hang-up, so the call ends when the
+        Voice has been quiet for the configured stretch — "ends only after
+        silence", which is the other half of the ticket's sentence. Who ended it
+        and whatever the Call Agent may have run are **recorded, never graded**,
+        for the reason `live_call` states about the verb guess.
+        """
+        ceiling = self._silence_ceiling_seconds()
+        with self._dialled(live_call.LONG) as call:
+            heard = support.wait_for(
+                lambda: bool(
+                    self._user_speech_lines(LIVE_CALL_LONG_HEARD_SUBSTRING, since=call.mark)
+                ),
+                deadline_seconds=LIVE_CALL_HEARD_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # Everything after this is measured on this step's own clock, from
+            # what the watch saw. Not the log's own stamps: its record format is
+            # a format and not a contract, and nothing downstream parses it
+            # (`engine/logfile.py`).
+            watch = self._watch_the_voice(
+                call.mark,
+                deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling + LIVE_CALL_END_SECONDS,
+            )
+            if not watch.went_down:
+                self._end_any_live_call()
+            ended = self._call_is_down()
+        seen = live_call.observed(self.config.call_observations)
+        edges = watch.edges
+        answered_for = (
+            0.0
+            if watch.first_voice_at is None or watch.last_voice_at is None
+            else watch.last_voice_at - watch.first_voice_at
+        )
+        silent_for = watch.down_at - (watch.last_voice_at or watch.down_at)
+        ended_by = _ended_by(
+            end_reason=seen.end_reason,
+            by_ceiling=self._ceiling_ended_the_call(since=call.mark),
+            # Nothing in this request asks the Call Agent to end anything, so
+            # the call going down is not evidence that it did. `went_down` says
+            # only that the call ended before the step gave up waiting.
+            by_agent=False,
+        )
+        runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)
+        self._measured("live call long", call.started, ended)
+        self.journey.observe(
+            "live call long transport",
+            f"factory {seen.transport_factory or 'none recorded'}; wav variant "
+            f"{seen.variant or 'none recorded'}; end reason "
+            f"{seen.end_reason or 'none recorded'}; ended by the {ended_by}; observations "
+            f"{self.config.call_observations}",
+        )
+        self.journey.observe(
+            "live call long silence ceiling",
+            f"ceiling {ceiling:.0f}s; the Voice was answering for {answered_for:.0f}s across "
+            f"{edges[True]} start / {edges[False]} stop edge(s); the call then went down "
+            f"{silent_for:.0f}s after it last said anything; {len(runs)} `bridgectl` run(s) "
+            f"logged, verbs {self._verbs_run() or 'none'}, all recorded and none graded",
+        )
+        spoken = self._user_speech_lines(LIVE_CALL_LONG_HEARD_SUBSTRING, since=call.mark)
+        if not heard:
+            raise StepFailed(
+                f"the engine never logged the user's speech within "
+                f"{LIVE_CALL_HEARD_SECONDS:.0f}s of the call coming up. The utterance the "
+                f"harness put on the track is {live_call.LONG_REQUEST!r} and the line looked "
+                f"for carries {LIVE_CALL_LONG_HEARD_SUBSTRING!r}; the adapter recorded "
+                f"{seen.variant or 'no'} wav variant and ended "
+                f"{seen.end_reason or 'without saying why'}. Engine log tail: "
+                f"{self.engine.log_lines()[-5:]}"
+            )
+        if seen.variant != live_call.LONG:
+            raise StepFailed(
+                f"the call played the {seen.variant or 'unrecorded'} utterance, not "
+                f"{live_call.LONG!r} — this step asked for the long one through "
+                f"{self.config.call_wav_directory / live_call.NEXT_VARIANT_FILE}, and what a "
+                f"four-second request proves about a {ceiling:.0f}-second ceiling is nothing"
+            )
+        if not edges[True]:
+            raise StepFailed(
+                f"the engine never wrote a {VOICE_SPEAKING_LINE!r} line: the words arrived and "
+                f"the Voice answered nothing, so there is no answer for the ceiling to have "
+                f"counted. Engine log tail: {self.engine.log_lines()[-5:]}"
+            )
+        if edges[False] < edges[True]:
+            raise StepFailed(
+                f"the Voice left a span open: {edges[True]} start and {edges[False]} stop "
+                f"edge(s). That is the bug itself — the ceiling firing mid-answer takes the "
+                f"call away before the `transcript/done` that would have closed the span. The "
+                f"Voice was answering for {answered_for:.0f}s against a {ceiling:.0f}s ceiling; "
+                f"ended by the {ended_by}"
+            )
+        if answered_for <= ceiling:
+            raise StepFailed(
+                f"the Voice was answering for {answered_for:.0f}s, which does not outlast this "
+                f"lane's own {ceiling:.0f}s Silence Ceiling — the request asks for two hundred "
+                f"numbers, so an answer this short is one the Voice cut rather than one the "
+                f"ceiling would ever have had to hold a call open through. Nothing about the "
+                f"both-sides rule is proven by it. Heard {spoken[-1]!r}"
+            )
+        if not ended:
+            raise StepFailed(
+                f"the call was still up {silent_for:.0f}s after the Voice last said anything, "
+                f"past this lane's {ceiling:.0f}s ceiling and the step's own patience "
+                f"({self._call_line()!r})"
+            )
+        # Both ends of that span are *observations* of a poll, so each is up to
+        # one poll interval late; the slack is that granularity and nothing
+        # more. Without it the step could call a ceiling that waited its full
+        # sixty seconds an early ending, on nothing but which poll saw what.
+        if silent_for < ceiling - LIVE_CALL_POLL_SECONDS:
+            raise StepFailed(
+                f"the call went down {silent_for:.0f}s after the Voice last said anything, "
+                f"inside the {ceiling:.0f}s of silence the ceiling is supposed to wait out "
+                f"(measured to {LIVE_CALL_POLL_SECONDS:.0f}s, the poll) — so it ended for some "
+                f"reason other than silence. Ended by the {ended_by}; {len(runs)} `bridgectl` "
+                f"run(s) logged, verbs {self._verbs_run() or 'none'}"
+            )
+        return (
+            f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; the "
+            f"Voice then answered for {answered_for:.0f}s against a {ceiling:.0f}s ceiling, "
+            f"across {edges[True]} start / {edges[False]} stop edge(s) with none left open; "
+            f"the call went down {silent_for:.0f}s after it last said anything "
+            f"({self._call_line()!r}), ended by the {ended_by}; transport "
+            f"{seen.transport_factory}, wav variant {seen.variant!r}, ended "
+            f"{seen.end_reason!r}; {len(runs)} `bridgectl` run(s) logged, recorded and not graded"
+        )
+
+    def _watch_the_voice(
+        self, mark: int, *, deadline_seconds: float, poll_seconds: float = LIVE_CALL_POLL_SECONDS
+    ) -> _VoiceWatch:
+        """Poll until the call is down, remembering when the Voice last spoke.
+
+        One loop rather than a sequence of `support.wait_for` calls, because the
+        two things being measured are not conditions that become true and stay
+        true: they are *when* the Voice first and last said anything, and only
+        something watching the whole call can say. See `_VoiceWatch` for the two
+        runs that settled the shape.
+
+        The poll is a parameter only so that a test of this loop is a test and
+        not a wait; every caller here takes the one the rest of the step uses.
+        """
+        edges = self._voice_speech_edges(since=mark)
+        first_voice_at = last_voice_at = time.monotonic() if edges[True] else None
+        expiry = time.monotonic() + deadline_seconds
+        while time.monotonic() < expiry:
+            if self._call_is_down():
+                break
+            time.sleep(poll_seconds)
+            seen = self._voice_speech_edges(since=mark)
+            if seen != edges:
+                edges = seen
+                last_voice_at = time.monotonic()
+                if first_voice_at is None:
+                    first_voice_at = last_voice_at
+        return _VoiceWatch(
+            went_down=self._call_is_down(),
+            edges=edges,
+            first_voice_at=first_voice_at,
+            last_voice_at=last_voice_at,
+            down_at=time.monotonic(),
         )
 
     def _verbs_run(self) -> list[str]:
@@ -2358,8 +2692,17 @@ class Walk:
                 spoken.append(" ".join(words))
         return spoken
 
-    def _user_speech_lines(self) -> list[str]:
+    def _log_since(self, mark: int) -> list[str]:
+        """The engine's log from a mark on — one call's worth, not the run's."""
+        return self.engine.log_lines()[mark:]
+
+    def _user_speech_lines(
+        self, carrying: str = LIVE_CALL_HEARD_SUBSTRING, *, since: int = 0
+    ) -> list[str]:
         """Every engine line about what the user said, matched by substring.
+
+        The fragment is a parameter because the two call steps put different
+        sentences on the track, and each one looks for its own.
 
         ASR text is unstable, so the pattern is a fragment of the request rather
         than the request: the probe's three trials came back verbatim
@@ -2370,9 +2713,54 @@ class Walk:
         """
         return [
             line
-            for line in support.matching_lines(self.engine.log_lines(), USER_SPEECH_LINE)
-            if _unspaced(LIVE_CALL_HEARD_SUBSTRING) in _unspaced(line)
+            for line in support.matching_lines(self._log_since(since), USER_SPEECH_LINE)
+            if _unspaced(carrying) in _unspaced(line)
         ]
+
+    def _voice_speech_edges(self, *, since: int = 0) -> dict[bool, int]:
+        """How many times the engine wrote each edge of its own Voice down (#184).
+
+        Counted rather than timed. The log's record format is a format and not a
+        contract — nothing downstream parses it (`engine/logfile.py`) — so a step
+        reads *whether* each edge happened out of the log and *when* off its own
+        clock.
+        """
+        lines = self._log_since(since)
+        return {
+            speaking: len(support.matching_lines(lines, re.escape(pattern)))
+            for speaking, pattern in ((True, VOICE_SPEAKING_LINE), (False, VOICE_QUIET_LINE))
+        }
+
+    def _voice_finished_speaking(self, mark: int) -> Callable[[], bool]:
+        """Whether every span this call opened has closed — the condition, to wait on.
+
+        Not "a stop edge exists": the Voice may answer more than once, and an
+        earlier closed span would then stand in for the open one this step is
+        waiting on. Not a pairing in time either, because a `done` with no delta
+        before it is a real utterance and makes stops legitimately outnumber
+        starts. At least one start, and no more starts than stops.
+        """
+
+        def finished() -> bool:
+            edges = self._voice_speech_edges(since=mark)
+            return edges[True] > 0 and edges[False] >= edges[True]
+
+        return finished
+
+    def _ceiling_ended_the_call(self, *, since: int = 0) -> bool:
+        """Whether the engine says its own Silence Ceiling was what ended this call."""
+        return bool(support.matching_lines(self._log_since(since), CEILING_END_LINE))
+
+    def _silence_ceiling_seconds(self) -> float:
+        """The Silence Ceiling this lane's engine is actually running.
+
+        Read out of the lane's own config, and only then off the shipped
+        default. A literal here would be a second copy of a policy value the
+        engine already owns, and it would go stale the first time a run set one.
+        """
+        document = tomllib.loads(self.config.path.read_text())
+        given = document.get("policy", {}).get("silence_end_seconds")
+        return DEFAULT_SILENCE_END_SECONDS if given is None else float(given)
 
     def _call_line(self) -> str:
         """What `bridgectl status` says about the call, as the surface renders it."""

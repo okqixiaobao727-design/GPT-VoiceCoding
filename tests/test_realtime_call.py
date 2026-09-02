@@ -45,6 +45,7 @@ from gpt_voicecoding.seams.call import (
     CallStarted,
     CallState,
     UserSpeech,
+    VoiceSpeech,
 )
 from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import RequestId
@@ -647,6 +648,97 @@ class TestWhatTheCallRaisesUpward:
                 await asyncio.sleep(0.05)
 
                 assert sink.of(UserSpeech) == []
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_voices_own_speech_goes_up_as_a_span_not_a_transcript(
+        self, socket_path: Path
+    ) -> None:
+        """One edge each way, from the only two unconditional assistant signals (#184).
+
+        `transcript/delta` and `transcript/done` are what v3 reaches
+        (`docs/research/2026-09-01-assistant-speaking-signal.md` §1d), and both
+        come from the app-server's unconditional path — unlike the `item/*`
+        family, whose existence depends on the operator's history mode.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(HOUSE_RULES)
+
+                for delta in ("that ", "session ", "stopped"):
+                    await server.notify_all(
+                        "thread/realtime/transcript/delta",
+                        {"threadId": THREAD, "role": "assistant", "delta": delta},
+                    )
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "assistant", "text": "that session stopped"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True, False]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_second_utterance_raises_its_own_start(self, socket_path: Path) -> None:
+        """`done` releases the latch, so the next answer is a span of its own."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(HOUSE_RULES)
+
+                for _ in range(2):
+                    await server.notify_all(
+                        "thread/realtime/transcript/delta",
+                        {"threadId": THREAD, "role": "assistant", "delta": "more"},
+                    )
+                    await server.notify_all(
+                        "thread/realtime/transcript/done",
+                        {"threadId": THREAD, "role": "assistant", "text": "more"},
+                    )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [
+                    True,
+                    False,
+                    True,
+                    False,
+                ]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_users_own_transcript_is_never_the_voice_speaking(self, socket_path: Path) -> None:
+        """The role is the wire's word and this adapter is the only translator of it."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(HOUSE_RULES)
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "user", "delta": "what is"},
+                )
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "user", "text": "what is codex doing"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert sink.of(VoiceSpeech) == []
+                assert [event.text for event in sink.of(UserSpeech)] == ["what is codex doing"]
                 await adapter.aclose()
 
         asyncio.run(scenario())

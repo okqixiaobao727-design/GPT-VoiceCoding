@@ -21,9 +21,18 @@ events the seam raises upward. A call the *user* started is adopted, because
 "one voice surface" means one regardless of who pressed the toggle.
 
 The same owner holds the call's last-activity stamp and serialises speech with
-ending. That makes "still silent, then end" one operation: a Stop Notice that
-wins the lock refreshes activity before an automatic end may be committed, as
-the reference implementation's Live-Toggle lock did.
+ending. That makes "still silent, then end" one operation, as the reference
+implementation's Live-Toggle lock did: a notice cannot be handed to a surface
+that is being torn down under it.
+
+**Activity is both sides of the conversation.** The user speaking and the
+call's own Voice speaking are equally reasons a call is not idle — legacy
+counted them with one regex over both roles (`legacy@1d32845:bridge/livecall.py:102-105`),
+and the rewrite kept only the user half. So the ceiling reads two things: a
+stamp, which both speakers restart, and a flag, which *holds* it while the
+Voice is still mid-answer. A stamp alone cannot do it, because an answer
+generated in ten seconds and spoken over seventy-five would still lose the call
+at seventy (#184).
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ class CallInterlock:
         self._operation_lock = asyncio.Lock()
         self._call_id: str | None = None
         self._last_activity_at: float | None = None
+        self._voice_speaking = False
         self._silence_end_attempted_for: str | None = None
 
     def owns_call(self) -> bool:
@@ -90,6 +100,10 @@ class CallInterlock:
         """Claim one silence-ending attempt for the current call when due."""
         if self._call_id is None or self._last_activity_at is None:
             return False
+        if self._voice_speaking:
+            # Not silence. The span is open, so there is no window to measure
+            # yet — measuring one from its start would cut the answer in half.
+            return False
         if self._silence_end_attempted_for == self._call_id:
             return False
         if self._last_activity_at + silence_end_seconds > self._clock():
@@ -102,13 +116,29 @@ class CallInterlock:
         if self._call_id is not None:
             self._last_activity_at = self._clock()
 
+    def note_voice_speech(self, *, speaking: bool) -> None:
+        """The Voice started or stopped speaking on the owned call.
+
+        Both edges are activity: the start says the call is not idle, and the
+        stop is what the window is then measured from — the end of the answer,
+        not the moment before it began.
+        """
+        if self._call_id is None:
+            return
+        self._voice_speaking = speaking
+        self.note_activity()
+
     async def speak(self, text: str, *, request_id: RequestId) -> DeliveryReceipt:
-        """Speak through the owned call and record only proven speech as activity."""
+        """Speak through the owned call, serialised with ending it.
+
+        The receipt is **not** activity. It says the words were handed to the
+        adapter, which is a text hand-over and not a voice; what keeps the call
+        alive is the Voice saying them, and that comes back on its own as
+        `VoiceSpeech` (#184). Stamping the hand-over as well would restart the
+        window from before the answer instead of from the end of it.
+        """
         async with self._operation_lock:
-            receipt = await self._call.speak(text, request_id=request_id)
-            if receipt.is_delivered:
-                self.note_activity()
-            return receipt
+            return await self._call.speak(text, request_id=request_id)
 
     async def end_call(self) -> CallSnapshot:
         """End the call the system owns. Idempotent when none is up."""
@@ -125,6 +155,7 @@ class CallInterlock:
         """Forget one call and every piece of state that belongs only to it."""
         self._call_id = None
         self._last_activity_at = None
+        self._voice_speaking = False
         self._silence_end_attempted_for = None
 
     def note_started(self, call_id: str) -> None:
@@ -133,6 +164,10 @@ class CallInterlock:
             return
         self._call_id = call_id
         self._last_activity_at = self._clock()
+        # A flag belongs to the call it was raised on. Carrying one across would
+        # pin the ceiling open on a call nobody is speaking into — the one real
+        # hazard the hold introduces, closed in the same place it is opened.
+        self._voice_speaking = False
         self._silence_end_attempted_for = None
 
     def note_ended(self, call_id: str) -> bool:

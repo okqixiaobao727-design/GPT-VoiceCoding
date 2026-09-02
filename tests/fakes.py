@@ -37,7 +37,7 @@ from gpt_voicecoding.seams.agent import (
     SessionLifecycle,
     SessionState,
 )
-from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply
+from gpt_voicecoding.seams.call import CallSnapshot, CallState, DelegatedReply, VoiceSpeech
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.events import Event, EventSink
 from gpt_voicecoding.seams.identity import RequestId, SessionTarget
@@ -306,6 +306,15 @@ class FakeCall:
 
     async def verify(self) -> VerifyResult:
         return self.verify_result
+
+    def voice_speech(self, *, speaking: bool) -> None:
+        """Raise one edge of the call's own Voice, with no audio anywhere.
+
+        Not a verb on the seam — a way for a test above the seam to make the
+        adapter say what a real one says when the Voice starts or stops (#184).
+        """
+        if self.sink is not None:
+            self.sink.emit(VoiceSpeech(speaking=speaking))
 
 
 class UnreachableFarSide(Exception):
