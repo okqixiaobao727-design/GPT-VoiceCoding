@@ -1,0 +1,388 @@
+"""Step selection, its prerequisite closure, and what the verdict says about both.
+
+The acceptance run itself never reaches CI — it needs this machine, these
+credentials and those two bots. The rules below are ordinary code, and #182 asks
+for them at CI speed for the same reason #109 asked for the attribution rule:
+the expensive walk is the worst place to discover that a pure decision was wrong.
+
+Three of those rules live here.
+
+* **A selected step brings its prerequisites as ungraded setup.** `--step "stable
+  name"` is not a claim that `roster` passed; it is a claim about one step, walked
+  on the state the whole lane would have given it.
+* **A failed setup step blocks the lane.** The verdict must never carry a graded
+  green for a step that stood on ground the run could not arrange.
+* **The verdict names both kinds**, so a green single step is never read as a
+  green lane.
+
+The second bot is here too: which variable each lane's engine is told to read
+(`token_env` in its derived config), and the chat-reachability preflight, because
+the one thing that must not do — send a message to prove a chat is open — is
+exactly what a test can pin.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import journey
+import pytest
+import support
+
+from gpt_voicecoding.adapters.companion_channel.telegram.api import refused_by
+
+A_LANE = "claude"
+
+
+def _nowhere(event: str, **fields: object) -> None:  # noqa: ARG001
+    """A journal that writes nowhere: these tests grade the verdict, not the log."""
+
+
+def _verdict(chosen: journey.Selection) -> support.Verdict:
+    return support.Verdict(
+        run_id="20260902T000000Z",
+        bundle="/Applications/GPT-VoiceCoding.app",
+        commit="0000000",
+        provenance="identical",
+        expected_lanes=(A_LANE,),
+        expected_steps=chosen.selected,
+        setup_steps=chosen.setup,
+    )
+
+
+def _walk(chosen: journey.Selection, record: support.Verdict) -> support.Journey:
+    return support.Journey(
+        lane=A_LANE,
+        verdict=record,
+        journal=_nowhere,
+        steps=chosen.steps,
+        setup=chosen.setup,
+    )
+
+
+# --- the prerequisite table -------------------------------------------------
+
+
+def test_every_step_declares_what_it_needs_behind_it() -> None:
+    """The table and the nine names are the same set, or a step has no answer."""
+    assert tuple(journey.PREREQUISITES) == journey.STEPS
+
+
+def test_no_step_needs_one_that_runs_after_it() -> None:
+    """The closure is walked in `STEPS` order, so every edge has to point backwards."""
+    order = {step: index for index, step in enumerate(journey.STEPS)}
+    for step, needed in journey.PREREQUISITES.items():
+        for one in needed:
+            assert one in order, f"{step} needs {one!r}, which is not a step"
+            assert order[one] < order[step], f"{step} needs {one!r}, which runs after it"
+
+
+def test_every_step_name_is_bound_to_a_method() -> None:
+    """`Walk.bound_steps` is where a name becomes code; it covers the nine exactly."""
+    walk = object.__new__(journey.Walk)
+    assert tuple(walk.bound_steps()) == journey.STEPS
+
+
+# --- selection --------------------------------------------------------------
+
+
+def test_no_selection_grades_the_whole_lane() -> None:
+    chosen = journey.select(())
+    assert chosen.selected == journey.STEPS
+    assert chosen.setup == ()
+    assert chosen.steps == journey.STEPS
+    assert chosen.whole_lane
+
+
+def test_a_selected_step_brings_its_prerequisite_as_ungraded_setup() -> None:
+    chosen = journey.select(("stable name",))
+    assert chosen.selected == ("stable name",)
+    assert chosen.setup == ("roster",)
+    assert chosen.steps == ("roster", "stable name")
+    assert chosen.graded("stable name")
+    assert not chosen.graded("roster")
+    assert not chosen.whole_lane
+
+
+def test_the_closure_is_transitive() -> None:
+    """`approval` observes the turn `relay` drives, and `relay` needs the roster's address."""
+    assert journey.select(("approval",)).setup == ("roster", "relay")
+
+
+def test_a_step_that_reads_a_turn_brings_the_step_that_drove_one() -> None:
+    """`progress` wants history and `stop notice` wants a Stop; `stable name` is the turn."""
+    assert journey.select(("progress",)).setup == ("roster", "stable name")
+    assert journey.select(("stop notice",)).setup == ("roster", "stable name")
+
+
+def test_a_prerequisite_that_was_also_asked_for_is_graded() -> None:
+    chosen = journey.select(("approval", "relay"))
+    assert chosen.selected == ("relay", "approval")
+    assert chosen.setup == ("roster",)
+    assert chosen.graded("relay")
+
+
+def test_the_selection_is_in_step_order_however_it_was_typed() -> None:
+    chosen = journey.select(("child", "roster", "child"))
+    assert chosen.selected == ("roster", "child")
+    assert chosen.steps == ("roster", "child")
+
+
+def test_an_unknown_step_refuses_and_lists_the_valid_ones() -> None:
+    """A typo is a refusal with the answer in it, never a run that quietly walks nothing."""
+    with pytest.raises(journey.UnknownStep) as refusal:
+        journey.select(("rooster", "roster"))
+    said = str(refusal.value)
+    assert "rooster" in said
+    for step in journey.STEPS:
+        assert step in said
+
+
+# --- what the verdict says about the two kinds ------------------------------
+
+
+def test_the_verdict_names_the_selected_steps_and_the_setup_steps(tmp_path: Path) -> None:
+    chosen = journey.select(("stable name",))
+    record = _verdict(chosen)
+    walked = _walk(chosen, record)
+    walked.run("roster", lambda: "one row against its own workspace")
+    walked.run("stable name", lambda: "'able-otter' across 3 reads")
+
+    written = json.loads(record.write(tmp_path / "verdict.json").read_text())
+    assert written["selection"] == {"selected": ["stable name"], "setup": ["roster"]}
+    rows = {row["step"]: row for row in written["lanes"][A_LANE]}
+    assert rows["roster"]["graded"] is False
+    assert rows["stable name"]["graded"] is True
+    assert written["result"] == "PASS"
+
+
+def test_a_single_step_run_promises_only_the_step_it_selected() -> None:
+    """The eight steps it never ran are not `missing`; the one it owes is."""
+    chosen = journey.select(("stable name",))
+    record = _verdict(chosen)
+    walked = _walk(chosen, record)
+    walked.run("roster", lambda: "one row")
+
+    assert record.missing == (f"{A_LANE}/stable name",)
+    assert record.result == support.FAIL
+
+
+def test_a_failed_setup_step_blocks_the_lane() -> None:
+    """The selected step is not graded on ground the run could not arrange."""
+    chosen = journey.select(("stable name",))
+    record = _verdict(chosen)
+    walked = _walk(chosen, record)
+
+    def refuse() -> str:
+        raise support.StepFailed("no row for this Session in the roster")
+
+    walked.run("roster", refuse)
+    walked.run("stable name", lambda: "never reached")
+
+    rows = {step.step: step for step in record.lanes[A_LANE]}
+    assert rows["roster"].result == support.FAIL
+    assert rows["roster"].graded is False
+    assert rows["stable name"].result == support.SKIPPED
+    assert rows["stable name"].graded is True
+    assert record.result == support.FAIL
+
+
+def test_the_run_is_decided_by_its_graded_rows_alone() -> None:
+    """Stated on the `Verdict` itself, because `Journey` will not produce this shape.
+
+    A failed setup step blocks the lane, so this pairing cannot arise from a walk.
+    The rule is still the verdict's: an ungraded row is evidence about the
+    arrangement, and only the steps the run *promised* decide what it says.
+    """
+    record = _verdict(journey.select(("stable name",)))
+    record.record(A_LANE, "roster", support.FAIL, "arranged badly", graded=False)
+    record.record(A_LANE, "stable name", support.PASS, "one name")
+    assert record.result == support.PASS
+
+
+def test_a_row_is_graded_unless_the_caller_says_otherwise() -> None:
+    """`test_realtime_probe.py` records `0b` with no selection behind it."""
+    record = _verdict(journey.select(()))
+    recorded = record.record("probe", "0b realtime contract probe", support.PASS, "441 frames")
+    assert recorded.graded is True
+
+
+# --- the two lanes' bots ----------------------------------------------------
+
+
+def test_the_second_lane_derives_its_token_variable_from_the_configured_one() -> None:
+    """Nothing is hard-coded: the config names the first, and the second is `_2` of it."""
+    configured = "GPTVOICECODING_TELEGRAM_TOKEN"
+    assert journey.CLAUDE.token_variable(configured) == configured
+    assert journey.CODEX.token_variable(configured) == f"{configured}_2"
+
+
+def test_no_two_lanes_read_the_same_token_variable() -> None:
+    """One bot, one engine — kept by giving each lane its own bot (#180 §2 decision 3)."""
+    variables = {lane.token_variable("ANY") for lane in journey.LANES}
+    assert len(variables) == len(journey.LANES)
+
+
+A_CONFIG = """
+[engine]
+socket_path = "/tmp/never.sock"
+state_path = "/tmp/never.json"
+
+[log]
+path = "/tmp/never.log"
+
+[adapters]
+call = "gpt_voicecoding.adapters.call.silent:build"
+companion_channel = "gpt_voicecoding.adapters.companion_channel.telegram:build"
+
+[adapters.settings.companion_channel]
+token_env = "GPTVOICECODING_TELEGRAM_TOKEN"
+chat_id = "8675309"
+"""
+
+
+def _derived(tmp_path: Path, lane: journey.Lane) -> support.DerivedConfig:
+    source = tmp_path / "config.toml"
+    source.write_text(A_CONFIG)
+    configured = "GPTVOICECODING_TELEGRAM_TOKEN"
+    return support.derive_config(
+        source=source,
+        run_directory=tmp_path / f"engine-{lane.name}",
+        workspace=tmp_path / f"workspace-{lane.name}",
+        socket_path=tmp_path / f"{lane.name}.sock",
+        project_name=f"acceptance-{lane.name}",
+        token_variable=lane.token_variable(configured),
+    )
+
+
+def test_each_lane_binds_its_own_token_variable_in_the_derived_config(tmp_path: Path) -> None:
+    """The engine is told which variable holds its bot's token — the shipped mechanism."""
+    import tomllib
+
+    variables = {}
+    for lane in journey.LANES:
+        derived = _derived(tmp_path, lane)
+        written = tomllib.loads(derived.path.read_text())
+        channel = written["adapters"]["settings"]["companion_channel"]
+        assert channel["token_env"] == lane.token_variable("GPTVOICECODING_TELEGRAM_TOKEN")
+        assert derived.token_variable == channel["token_env"]
+        variables[lane.name] = channel["token_env"]
+
+    assert len(set(variables.values())) == len(journey.LANES), variables
+
+
+def test_a_derived_config_keeps_the_configured_variable_when_no_lane_asks(tmp_path: Path) -> None:
+    source = tmp_path / "config.toml"
+    source.write_text(A_CONFIG)
+    derived = support.derive_config(
+        source=source,
+        run_directory=tmp_path / "engine",
+        workspace=tmp_path / "workspace",
+        socket_path=tmp_path / "one.sock",
+        project_name="acceptance",
+    )
+    assert derived.token_variable == "GPTVOICECODING_TELEGRAM_TOKEN"
+
+
+def test_the_engine_exports_the_token_under_its_own_lane_name(tmp_path: Path) -> None:
+    """The binding has to reach the engine's environment, or the lane runs on no bot."""
+    derived = _derived(tmp_path, journey.CODEX)
+    engine = support.Engine(
+        config=derived,
+        bundle=tmp_path / "bundle",
+        journal=_nowhere,
+        token="second-bot-token",
+        path_value="/usr/bin:/bin",
+    )
+    assert engine.environment[derived.token_variable] == "second-bot-token"
+    assert derived.token_variable == "GPTVOICECODING_TELEGRAM_TOKEN_2"
+
+
+def test_two_lanes_on_one_bot_is_a_refusal_that_names_both_variables() -> None:
+    """One token in both variables answers `getMe` twice and breaks both lanes."""
+    same = {"id": 42, "username": "only_one_bot"}
+    refusal = support.duplicate_bot_refusal(
+        {"claude": same, "codex": dict(same)},
+        variables={"claude": "TOKEN", "codex": "TOKEN_2"},
+    )
+    assert refusal is not None
+    assert "only_one_bot" in refusal
+    assert "TOKEN" in refusal and "TOKEN_2" in refusal
+
+
+def test_a_bot_each_is_no_refusal() -> None:
+    assert (
+        support.duplicate_bot_refusal(
+            {"claude": {"id": 1, "username": "first"}, "codex": {"id": 2, "username": "second"}},
+            variables={"claude": "TOKEN", "codex": "TOKEN_2"},
+        )
+        is None
+    )
+
+
+def test_one_lane_is_never_two_lanes_on_one_bot() -> None:
+    """A `--lane` run of one has nothing to collide with, and must not refuse."""
+    assert (
+        support.duplicate_bot_refusal(
+            {"codex": {"id": 2, "username": "second"}}, variables={"codex": "TOKEN_2"}
+        )
+        is None
+    )
+
+
+# --- what a selection makes preflight refuse about --------------------------
+
+
+def test_the_codex_permission_ground_matters_to_the_steps_that_stand_on_it() -> None:
+    """`relay` writes it, `approval` grades it, `switches` leaves one pending."""
+    for step in journey.CODEX_PERMISSION_STEPS:
+        chosen = journey.select((step,))
+        assert journey.codex_permission_ground_matters(journey.LANES, chosen.steps), step
+
+
+def test_it_does_not_matter_to_a_lane_this_run_is_not_walking() -> None:
+    """`--lane claude` must not be refused over a Codex ground nothing will stand on."""
+    assert not journey.codex_permission_ground_matters((journey.CLAUDE,), journey.select(()).steps)
+
+
+def test_it_does_not_matter_to_a_selection_that_provokes_no_permission() -> None:
+    chosen = journey.select(("stable name",))
+    assert chosen.steps == ("roster", "stable name")
+    assert not journey.codex_permission_ground_matters(journey.LANES, chosen.steps)
+
+
+def test_it_matters_to_the_full_run() -> None:
+    assert journey.codex_permission_ground_matters(journey.LANES, journey.select(()).steps)
+
+
+def test_a_prerequisite_can_be_what_makes_it_matter() -> None:
+    """`approval` brings `relay`, and `relay` is a step the ground is about."""
+    chosen = journey.select(("approval",))
+    assert "relay" in chosen.setup
+    assert journey.codex_permission_ground_matters(journey.LANES, chosen.steps)
+
+
+def test_a_reachable_chat_is_no_refusal_and_costs_the_chat_nothing() -> None:
+    """`getChat` is a read. Proving reachability by *sending* would write into the chat."""
+    calls: list[tuple[str, dict]] = []
+
+    def transport(method: str, payload: dict, *, timeout_seconds: float) -> dict:  # noqa: ARG001
+        calls.append((method, payload))
+        return {"id": 8675309, "type": "private"}
+
+    assert support.chat_open_refusal(transport, chat_id="8675309", bot_username="second") is None
+    assert calls == [("getChat", {"chat_id": "8675309"})]
+
+
+def test_a_chat_the_account_never_opened_refuses_with_the_start_instruction() -> None:
+    """A bot cannot open a chat with a person, so the refusal has to name the human step."""
+
+    def transport(method: str, payload: dict, *, timeout_seconds: float) -> dict:  # noqa: ARG001
+        raise refused_by(method, 400, "Bad Request: chat not found")
+
+    refusal = support.chat_open_refusal(transport, chat_id="8675309", bot_username="second")
+    assert refusal is not None
+    assert "second" in refusal
+    assert "/start" in refusal
+    assert "chat not found" in refusal

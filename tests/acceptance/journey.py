@@ -20,6 +20,15 @@ Every one of the build tickets #74–#80 cites a step name from `STEPS` verbatim
 its "Red first" line. Renaming one here silently moves seven tickets' exit
 criteria, so the names are fixed and their spelling is the interface.
 
+Since #182 the names are also what `--step` takes, which makes the spelling an
+interface twice over: a build ticket's "Red first" line is now a command a
+developer runs. `PREREQUISITES` says what each step needs behind it, and
+`select` turns a `--step` list into the steps to walk (`Selection.steps`) and the
+subset of them to grade (`Selection.selected`). The rest run as **ungraded
+setup**: a walk with one selected step is a claim about that step, arranged on the
+state the whole lane would have given it, and the verdict says which rows are
+which so a green step is never read as a green lane.
+
 ## What the steps rest on, and what they never rest on
 
 Observations come from the agent's own roster or rollout, the filesystem, the
@@ -99,6 +108,101 @@ STEPS = (
     "switches",
     "child",
 )
+
+#: What each step needs to have run **before** it, so that a step selected on its
+#: own stands on the state the whole walk would have given it. Read off `Walk`'s
+#: own fields rather than guessed, and every edge points backwards through
+#: `STEPS` (`tests/test_journey_selection.py` holds both):
+#:
+#: * everything needs `roster`, because `roster` is what sets `Walk.address` and
+#:   `Walk.truth`, and every later step either names the address or reads the
+#:   agent's own record through it;
+#: * `progress` needs `stable name`, because what it reads is history "after a
+#:   turn" and `stable name` is the walk's first turn — the Claude lane launches
+#:   silent, so without it there is nothing for `bridgectl progress` to carry;
+#: * `stop notice` needs `stable name` for the same turn seen from the other end:
+#:   the mark it waits behind is taken inside that step (`Walk.before_first_turn`)
+#:   and the Stop it looks for is that turn's;
+#: * `approval` needs `relay`, which is the one turn two steps share — the words
+#:   arriving and the permission that turn raises (`Walk.approval_resolution`).
+#:
+#: `companion inbound`, `switches` and `child` drive their own turns and need
+#: nothing but a Session to name.
+PREREQUISITES: Mapping[str, tuple[str, ...]] = {
+    "roster": (),
+    "stable name": ("roster",),
+    "progress": ("roster", "stable name"),
+    "stop notice": ("roster", "stable name"),
+    "relay": ("roster",),
+    "approval": ("roster", "relay"),
+    "companion inbound": ("roster",),
+    "switches": ("roster",),
+    "child": ("roster",),
+}
+
+
+class UnknownStep(Exception):
+    """`--step` named something that is not one of the nine. It carries the nine."""
+
+
+@dataclass(frozen=True)
+class Selection:
+    """Which steps a run grades, and which it merely arranges to reach them.
+
+    A single-step run is not a lane. The two tuples are kept apart all the way
+    into `verdict.json` for that one reason: a reader who sees `stable name`
+    green must also see that `roster` ran ungraded beneath it, or a green step
+    reads as a green lane (#182).
+    """
+
+    #: Graded. What the run promised to observe, in `STEPS` order.
+    selected: tuple[str, ...]
+    #: Ungraded. The prerequisite closure of `selected`, minus anything selected.
+    setup: tuple[str, ...]
+
+    @property
+    def steps(self) -> tuple[str, ...]:
+        """Everything to walk, in `STEPS` order — the order is the walk's."""
+        chosen = set(self.selected) | set(self.setup)
+        return tuple(step for step in STEPS if step in chosen)
+
+    @property
+    def whole_lane(self) -> bool:
+        """Every step graded: the pre-merge full run, rather than a ticket's step."""
+        return self.selected == STEPS
+
+    def graded(self, step: str) -> bool:
+        return step in self.selected
+
+
+def select(names: Sequence[str] | None = None) -> Selection:
+    """Resolve `--step` into what to walk and what to grade.
+
+    No names is the full run: every step graded, nothing as setup. Any name is
+    matched against `STEPS` **exactly** — the nine spellings are the interface
+    every build ticket's "Red first" line cites, so a near miss is a refusal that
+    carries the nine rather than a run that quietly walks eight of them.
+    """
+    asked = tuple(dict.fromkeys(names or ()))
+    if not asked:
+        return Selection(selected=STEPS, setup=())
+    unknown = [name for name in asked if name not in PREREQUISITES]
+    if unknown:
+        raise UnknownStep(
+            f"no such acceptance step: {', '.join(repr(name) for name in unknown)}. "
+            f"The steps are: {', '.join(STEPS)}."
+        )
+    selected = tuple(step for step in STEPS if step in set(asked))
+    needed: set[str] = set()
+    pending = list(selected)
+    while pending:
+        for one in PREREQUISITES[pending.pop()]:
+            if one not in needed:
+                needed.add(one)
+                pending.append(one)
+    setup = tuple(step for step in STEPS if step in needed - set(selected))
+    return Selection(selected=selected, setup=setup)
+
 
 #: How many times `stable name` reads the roster. #73: "identical across three
 #: `status` calls and across a Stop".
@@ -332,6 +436,18 @@ class Lane:
     name: str
     agent: str
     binary: str
+    #: What this lane adds to the **configured** token variable name to reach its
+    #: own bot. One bot, one engine (`docs/app-bundle.md` § Cutover) is what
+    #: makes two lanes at once possible at all, and it is kept by giving each
+    #: lane a bot of its own rather than by serialising the lanes.
+    #:
+    #: A suffix rather than a name, because the first name is not this harness's
+    #: to choose: the engine's own config names it (`token_env`), and a lane that
+    #: spelled it out would accept an engine configured for some other variable.
+    #: The second bot's variable is that name with this suffix — the convention
+    #: the repo-root `.env` already follows — so the pair moves together if the
+    #: first is ever renamed.
+    token_env_suffix: str
     #: Arguments the *person* would not normally type, and why each is here.
     arguments: tuple[str, ...]
     #: What the lane's TUI is **launched with**, or None when it is launched
@@ -384,6 +500,10 @@ class Lane:
     #: `_drive_turn` decides a turn is over.
     record_now: Callable[[hand_started.GroundTruth, float], Path | None]
 
+    def token_variable(self, configured: str) -> str:
+        """This lane's bot token variable, given the one the engine's config names."""
+        return f"{configured}{self.token_env_suffix}"
+
 
 #: `--permission-mode default` is not the person's own flag, and it is the one
 #: place this harness overrides what the machine would do. It has to: measured
@@ -400,6 +520,8 @@ CLAUDE = Lane(
     name="claude",
     agent="claude",
     binary="claude",
+    # The first lane keeps the engine's own configured variable, untouched.
+    token_env_suffix="",
     arguments=("--permission-mode", "default"),
     # Launched silent. No boot gate of the Codex kind has been measured here —
     # `claude` boots into an empty composer — and a Session nobody has typed into
@@ -471,6 +593,8 @@ CODEX = Lane(
     name="codex",
     agent="codex",
     binary="codex",
+    # The second bot, which already exists and messages the same user chat.
+    token_env_suffix="_2",
     arguments=("--sandbox", "workspace-write"),
     boot=hand_started.BootPrompt(words=ACKNOWLEDGE.words, turn_over=hand_started.codex_turn_over),
     # Measured 2026-08-27 through the shared daemon with the product's own pin
@@ -571,6 +695,26 @@ def _codex_configured_writable_roots(
     return writable_roots, unverifiable
 
 
+#: The steps whose observation rests on a Codex write the sandbox **refuses**.
+#: `relay` drives that write, `approval` grades the permission it raises, and
+#: `switches` leaves a second one pending — every other step is silent about the
+#: sandbox. Named here because the preflight that validates the ground has to know
+#: when the ground matters: a run that selected none of these is a run the check
+#: would refuse for a reason it is not about (#182).
+CODEX_PERMISSION_STEPS = ("relay", "approval", "switches")
+
+
+def codex_permission_ground_matters(lanes: Sequence[Lane], steps: Sequence[str]) -> bool:
+    """Whether this run's selection rests on the Codex permission ground at all.
+
+    Two ways it does not, and both are ordinary since `--lane`/`--step` exist: the
+    Codex lane is not being walked, or it is and none of the steps that provoke a
+    Codex permission were selected. Refusing either would be preflight refusing on
+    a lane or a step this run never promised to observe.
+    """
+    return CODEX in tuple(lanes) and bool(set(steps) & set(CODEX_PERMISSION_STEPS))
+
+
 def codex_permission_ground_refusal(
     run_directory: Path, *, environment: Mapping[str, str]
 ) -> str | None:
@@ -649,8 +793,13 @@ class Walk:
         far_side: support.FarSideDeadlines,
         environment: dict[str, str],
         started_at: float,
+        selection: Selection | None = None,
     ) -> None:
         self.lane = lane
+        #: Which steps this walk grades, and which it walks to reach them. The
+        #: default is the full run, so a caller that has no `--step` to pass says
+        #: nothing rather than repeating `STEPS` back.
+        self.selection = selection if selection is not None else select(())
         self.session = session
         self.engine = engine
         self.config = config
@@ -661,7 +810,11 @@ class Walk:
         self.environment = environment
         self.started_at = started_at
         self.journey = support.Journey(
-            lane=lane.name, verdict=verdict, journal=journal, steps=STEPS
+            lane=lane.name,
+            verdict=verdict,
+            journal=journal,
+            steps=self.selection.steps,
+            setup=self.selection.setup,
         )
         self.truth: hand_started.GroundTruth | None = None
         self.address: str | None = None
@@ -692,20 +845,36 @@ class Walk:
         except LaneBlocked as unarmed:
             self.journey.skip_rest(str(unarmed))
             return
-        self.journey.run("roster", self.roster)
-        self.journey.run("stable name", self.stable_name)
-        self.journey.run("progress", self.progress)
-        self.journey.run("stop notice", self.stop_notice)
-        self.journey.run("relay", self.relay)
-        self.journey.run("approval", self.approval)
-        self.journey.run("companion inbound", self.companion_inbound)
-        self.journey.run("switches", self.switches)
-        self.journey.run("child", self.child)
+        walked = self.bound_steps()
+        for step in self.selection.steps:
+            self.journey.run(step, walked[step])
         self.journey.observe(
             "turns measured",
             "; ".join(f"{turn.what} {turn.seconds:.1f}s ended={turn.ended}" for turn in self.turns)
             or "no turn ran",
         )
+
+    def bound_steps(self) -> dict[str, Callable[[], str]]:
+        """The nine names bound to the nine methods, and the only place they are.
+
+        `STEPS` is the contract every build ticket's "Red first" line cites; this
+        is where a name becomes code. Written as a table rather than as nine
+        statements because the walk no longer runs all nine unconditionally —
+        `--step` selects, and the prerequisite closure decides what comes with it
+        (#182). The order is never taken from here: `Selection.steps` is in
+        `STEPS` order, and that is the walk's order.
+        """
+        return {
+            "roster": self.roster,
+            "stable name": self.stable_name,
+            "progress": self.progress,
+            "stop notice": self.stop_notice,
+            "relay": self.relay,
+            "approval": self.approval,
+            "companion inbound": self.companion_inbound,
+            "switches": self.switches,
+            "child": self.child,
+        }
 
     def settle_boot_turn(self) -> int | None:
         """Wait out the turn the *launch* started, and mark the chat behind it.

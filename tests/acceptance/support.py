@@ -42,6 +42,10 @@ from pathlib import Path
 from typing import Any
 
 from gpt_voicecoding.adapters.agent.claude.settings import DEFAULT_ACK_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.companion_channel.telegram.api import TelegramError, Transport
+from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+)
 from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, ask
 from gpt_voicecoding.seams.control_plane import Action, Request
 
@@ -370,6 +374,7 @@ def derive_config(
     workspace: Path,
     socket_path: Path,
     project_name: str,
+    token_variable: str | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
 
@@ -388,6 +393,13 @@ def derive_config(
     point an agent at one. `[adapters] session_launcher` goes with them because
     it names a module the parked tree no longer has. What is left is a config the
     engine under test could have been given.
+
+    One value is **rewritten** rather than copied, and only when the caller asks:
+    `[adapters.settings.companion_channel] token_env`. Two lanes run at once
+    (#182) and one bot serves one engine, so each lane's engine has to read its
+    own bot's token — which is the shipped mechanism doing exactly what it is
+    for: `token_env` is how the engine is told which variable holds the token.
+    `None` keeps the user's own name, which is what the first lane wants.
     """
     run_directory.mkdir(parents=True, exist_ok=True)
     document = tomllib.loads(source.read_text())
@@ -410,7 +422,10 @@ def derive_config(
     adapters["settings"] = settings
     document["adapters"] = adapters
 
-    channel = dict(document["adapters"]["settings"]["companion_channel"])
+    channel = dict(settings["companion_channel"])
+    if token_variable is not None:
+        channel["token_env"] = token_variable
+        settings["companion_channel"] = channel
 
     path = run_directory / "config.toml"
     path.write_text(_as_toml(document))
@@ -847,6 +862,11 @@ class StepVerdict:
     step: str
     result: str
     evidence: str
+    #: Whether this row is one of the steps the run **promised**. A run that
+    #: selected one step still walks that step's prerequisites, and those rows are
+    #: evidence about the arrangement rather than claims about the product — see
+    #: `Verdict.result`, which is decided by the graded rows alone.
+    graded: bool = True
 
 
 @dataclass
@@ -872,17 +892,31 @@ class Verdict:
     #: exactly the nine the build tickets cite, and kept out of nothing else.
     observations: list[dict[str, Any]] = field(default_factory=list)
     lanes: dict[str, list[StepVerdict]] = field(default_factory=dict)
-    #: What the run promised to observe. `missing` is the difference between this
-    #: and what it recorded, and `result` will not say PASS while any is outstanding.
+    #: What the run promised to observe: the **selected** steps, which is all nine
+    #: on a full run and one ticket's step on a single-step run. `missing` is the
+    #: difference between this and what it recorded, and `result` will not say
+    #: PASS while any is outstanding.
     expected_lanes: tuple[str, ...] = ()
     expected_steps: tuple[str, ...] = ()
+    #: The prerequisites those selected steps were walked on, ungraded. Written
+    #: beside them so `verdict.json` says which steps a green run actually judged.
+    setup_steps: tuple[str, ...] = ()
+    #: Two lanes write here at once (#182: one thread each), and every mutation
+    #: below is a read-modify-write of a list or a dict. One lock, rather than a
+    #: promise that two threads never interleave. `write` is not under it: it runs
+    #: once, from the fixture's teardown, after both lanes have been joined.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def observe(self, lane: str, what: str, detail: str) -> None:
-        self.observations.append({"lane": lane, "what": what, "detail": detail})
+        with self._lock:
+            self.observations.append({"lane": lane, "what": what, "detail": detail})
 
-    def record(self, lane: str, step: str, result: Result, evidence: str) -> StepVerdict:
-        recorded = StepVerdict(step=step, result=Result(result), evidence=evidence)
-        self.lanes.setdefault(lane, []).append(recorded)
+    def record(
+        self, lane: str, step: str, result: Result, evidence: str, *, graded: bool = True
+    ) -> StepVerdict:
+        recorded = StepVerdict(step=step, result=Result(result), evidence=evidence, graded=graded)
+        with self._lock:
+            self.lanes.setdefault(lane, []).append(recorded)
         return recorded
 
     def refuse(self, lane: str, reason: str) -> None:
@@ -908,15 +942,26 @@ class Verdict:
         """
         absent: list[str] = []
         for lane in self.expected_lanes:
-            recorded = {step.step for step in self.lanes.get(lane, [])}
+            recorded = {step.step for step in self.lanes.get(lane, []) if step.graded}
             absent.extend(f"{lane}/{step}" for step in self.expected_steps if step not in recorded)
         return tuple(absent)
 
     @property
     def result(self) -> Result:
-        results = [step.result for steps in self.lanes.values() for step in steps]
-        if not results:
+        """Decided by the graded rows alone.
+
+        A setup row is how the run *reached* the step it promised, not a claim
+        about the product, so it never decides what the run says. It cannot
+        quietly hide a red either: `Journey` blocks the lane on a failed setup
+        step, and the graded steps behind it are then `SKIPPED`, which is not PASS.
+        """
+        recorded = [step for steps in self.lanes.values() for step in steps]
+        if not recorded:
+            # Nothing at all was written down: the run refused before it could
+            # observe anything. A run that recorded only *setup* rows did start,
+            # and owes the step it promised — that is `missing`, and a FAIL.
             return REFUSED
+        results = [step.result for step in recorded if step.graded]
         if any(result == REFUSED for result in results):
             return REFUSED
         if self.missing:
@@ -930,6 +975,10 @@ class Verdict:
                     "run_id": self.run_id,
                     "result": str(self.result),
                     "missing": list(self.missing),
+                    "selection": {
+                        "selected": list(self.expected_steps),
+                        "setup": list(self.setup_steps),
+                    },
                     "bundle": self.bundle,
                     "commit": self.commit,
                     "provenance": self.provenance,
@@ -941,6 +990,7 @@ class Verdict:
                             {
                                 "step": step.step,
                                 "result": str(step.result),
+                                "graded": step.graded,
                                 "evidence": step.evidence,
                             }
                             for step in steps
@@ -1040,6 +1090,70 @@ def token_from_environment(variable: str) -> str:
     return token
 
 
+def chat_open_refusal(
+    transport: Transport,
+    *,
+    chat_id: str,
+    bot_username: str,
+    timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+) -> str | None:
+    """Why this bot cannot reach the chat it is configured for, or None when it can.
+
+    **A bot cannot open a chat with a person.** Telegram gives the first move to
+    the human: until the account has sent `/start`, every `sendMessage` from the
+    bot is refused, and a run that discovered that mid-journey would report it as
+    a product red on whichever step read the chat first. #182 adds a second bot,
+    which makes "the user never opened this one" an ordinary state of a fresh
+    machine rather than a hypothetical — so it is a preflight refusal naming the
+    human step, in the shape `docs/acceptance-design.md` § Preflight fixes.
+
+    Asked with `getChat`, which is a **read**. The obvious alternative — send
+    something and see whether it lands — would write a probe into the very chat
+    the run then reads for evidence, and every step's attribution rule would have
+    to know about it.
+    """
+    try:
+        transport("getChat", {"chat_id": chat_id}, timeout_seconds=timeout_seconds)
+    except TelegramError as refused:
+        return (
+            f"@{bot_username} cannot reach chat {chat_id}: {refused.detail}. A bot cannot open "
+            f"a chat with a person — send `/start` to @{bot_username} from the Telegram user "
+            f"account this acceptance drives, then run again."
+        )
+    return None
+
+
+def duplicate_bot_refusal(
+    bots: Mapping[str, Mapping[str, Any]], *, variables: Mapping[str, str]
+) -> str | None:
+    """Why two lanes are pointed at the same bot, or None when each has its own.
+
+    **Two lanes at once is two bots, and nothing but this check says so.** One bot
+    serves one engine (`docs/app-bundle.md` § Cutover), and the reason is
+    mechanical: the engine reaches Telegram by long-polling `getUpdates`, and two
+    engines polling one bot take each other's updates — an inbound message reaches
+    whichever asked first, at random. The lanes would then be neither isolated nor
+    reproducible, and every red would be somebody else's.
+
+    The variables are two names in one `.env`, so "both hold the same token" is a
+    copy-paste away and answers `getMe` perfectly on both. Only the identity the
+    two calls come back with can tell them apart.
+    """
+    together: dict[Any, list[str]] = {}
+    for lane, identity in bots.items():
+        together.setdefault(identity["id"], []).append(lane)
+    shared = {bot: lanes for bot, lanes in together.items() if len(lanes) > 1}
+    if not shared:
+        return None
+    return "; ".join(
+        f"the {' and '.join(sorted(lanes))} lanes resolve to the same bot "
+        f"@{bots[lanes[0]]['username']} (id {bot}) — "
+        f"{', '.join(variables[lane] for lane in sorted(lanes))} hold the same token, and two "
+        f"engines long-polling one bot take each other's updates"
+        for bot, lanes in shared.items()
+    )
+
+
 def matching_lines(lines: Sequence[str], pattern: str) -> list[str]:
     compiled = re.compile(pattern)
     return [line for line in lines if compiled.search(line)]
@@ -1081,14 +1195,34 @@ class Journey:
     when it reports the first — so an ordinary failure is recorded and the walk
     continues, and only a step that leaves nothing to observe (no Session, no
     engine) blocks the rest, which are then `SKIPPED` rather than silently absent.
+
+    **A step walked as setup is the one other thing that blocks.** `steps` is what
+    this walk runs and `setup` is the part of it the run did not promise — the
+    prerequisites a `--step` selection brought with it (#182). A setup step that
+    fails has not found a bug in the step the run is grading; it has failed to
+    arrange the ground that step needs. Grading the selection on that ground would
+    report the arrangement as the product's red, so the lane blocks instead and
+    what the run promised is `SKIPPED`.
     """
 
-    def __init__(self, *, lane: str, verdict: Verdict, journal: Journal, steps: Sequence[str]):
+    def __init__(
+        self,
+        *,
+        lane: str,
+        verdict: Verdict,
+        journal: Journal,
+        steps: Sequence[str],
+        setup: Sequence[str] = (),
+    ):
         self.lane = lane
         self._verdict = verdict
         self._journal = journal
         self._remaining = list(steps)
+        self._setup = set(setup)
         self._blocked: str | None = None
+
+    def graded(self, step: str) -> bool:
+        return step not in self._setup
 
     def run(self, step: str, action) -> Any:  # noqa: ANN001 - a zero-argument step
         """Run one step, record its verdict, and return whatever it observed."""
@@ -1097,7 +1231,7 @@ class Journey:
         if self._blocked is not None:
             self._record(step, SKIPPED, f"blocked by {self._blocked}")
             return None
-        self._journal("step.start", lane=self.lane, step=step)
+        self._journal("step.start", lane=self.lane, step=step, graded=self.graded(step))
         try:
             evidence = action()
         except LaneBlocked as blocking:
@@ -1106,6 +1240,8 @@ class Journey:
             return None
         except StepFailed as failure:
             self._record(step, FAIL, str(failure))
+            if not self.graded(step):
+                self._blocked = f"{step} (setup)"
             return None
         self._record(step, PASS, str(evidence))
         return evidence
@@ -1128,8 +1264,16 @@ class Journey:
             self._remaining.remove(step)
 
     def _record(self, step: str, result: Result, evidence: str) -> None:
-        self._verdict.record(self.lane, step, result, evidence)
-        self._journal("step.verdict", lane=self.lane, step=step, result=result, evidence=evidence)
+        graded = self.graded(step)
+        self._verdict.record(self.lane, step, result, evidence, graded=graded)
+        self._journal(
+            "step.verdict",
+            lane=self.lane,
+            step=step,
+            result=result,
+            graded=graded,
+            evidence=evidence,
+        )
 
 
 # --- the trust gate ---------------------------------------------------------
@@ -1141,6 +1285,15 @@ class Journey:
 CLAUDE_STATE = Path.home() / ".claude.json"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 CLAUDE_TRUST_KEY = "hasTrustDialogAccepted"
+
+#: Both lanes grant trust in the same two files, and both grants are a
+#: read-modify-write of a file **the user owns** — `~/.claude.json` is their whole
+#: Claude state. Two lanes running at once (#182) would interleave read, read,
+#: write, write, and the second write would be a copy of the file without the
+#: first lane's entry: the lane that lost the race then runs untrusted, and worse,
+#: the gate that wrote last removes an entry the other gate is still relying on.
+#: One process-wide lock, held across a whole grant and a whole revoke.
+_TRUST_LOCK = threading.Lock()
 
 
 class TrustGate:
@@ -1167,26 +1320,35 @@ class TrustGate:
     they differ, and both are revoked.
     """
 
-    def __init__(self, workspace: Path, *, run_directory: Path, journal: Journal) -> None:
+    def __init__(
+        self, workspace: Path, *, run_directory: Path, journal: Journal, label: str
+    ) -> None:
         self._workspace = workspace
         self._paths = sorted({str(workspace), os.path.realpath(workspace)})
         self._run_directory = run_directory
         self._journal = journal
+        #: Which lane this gate belongs to. It names the backup, because two gates
+        #: writing `.claude.json.before-trust` would have the second one copy a
+        #: file the first had already changed — and the pristine copy, which is
+        #: the whole point of a backup, would be gone.
+        self._label = label
         self._claude_granted: list[str] = []
         self._codex_block: str | None = None
 
     def __enter__(self) -> TrustGate:
-        self._trust_claude()
-        self._trust_codex()
+        with _TRUST_LOCK:
+            self._trust_claude()
+            self._trust_codex()
         return self
 
     def __exit__(self, *_: object) -> None:
-        self._untrust_claude()
-        self._untrust_codex()
+        with _TRUST_LOCK:
+            self._untrust_claude()
+            self._untrust_codex()
 
     def _backup(self, path: Path) -> None:
         if path.exists():
-            shutil.copy2(path, self._run_directory / f"{path.name}.before-trust")
+            shutil.copy2(path, self._run_directory / f"{path.name}.before-trust-{self._label}")
 
     def _trust_claude(self) -> None:
         if not CLAUDE_STATE.exists():
