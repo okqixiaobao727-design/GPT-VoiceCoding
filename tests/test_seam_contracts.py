@@ -43,8 +43,11 @@ from gpt_voicecoding.seams.agent import (
     RelayRoute,
 )
 from gpt_voicecoding.seams.call import (
+    CODEX_BYTES_PER_TOKEN,
     HANDOVER_BUDGET_BYTES,
     MAX_HANDOVER_ITEMS,
+    WIRE_INITIAL_ITEMS_TOKEN_CAP,
+    WIRE_LINE_OVERHEAD_BYTES,
     CallAdapter,
     CallDropped,
     CallEnded,
@@ -478,13 +481,61 @@ class TestTheDial:
                 ),
             )
 
-    def test_a_hand_over_over_the_byte_budget_is_refused_here(self) -> None:
+    def test_a_hand_over_one_byte_over_the_budget_is_refused_here(self) -> None:
+        """One byte over, counted the way the seam counts it — labels included.
+
+        A body of `HANDOVER_BUDGET_BYTES + 1` characters would overshoot by
+        twenty-five once `WIRE_LINE_OVERHEAD_BYTES` is charged on it, and an
+        off-by-one in the comparison would slip through that.
+        """
+        text = "x" * (HANDOVER_BUDGET_BYTES - WIRE_LINE_OVERHEAD_BYTES + 1)
+
         with pytest.raises(ValueError):
             Dial(
                 voice="speak plainly",
                 agent=CALL_AGENT_INSTRUCTIONS,
-                hand_over=(DialReason(text="x" * (HANDOVER_BUDGET_BYTES + 1)),),
+                hand_over=(DialReason(text=text),),
             )
+
+    def test_the_budget_is_the_wires_own_ceiling_converted_by_codexs_own_estimate(
+        self,
+    ) -> None:
+        """#215: the figure is derived, not chosen — so it is asserted as the product.
+
+        codex refuses the request itself, before the backend sees it, counting
+        `ceil(bytes / 4)` against a cap of 8,192 estimated tokens
+        (`realtime_conversation.rs:102,1374-1392` and `truncate.rs:4,71-74` at tag
+        `rust-v0.152.1`). A literal here would be the old allowance wearing a new
+        number; the product is the thing to re-read when codex is upgraded.
+        """
+        assert HANDOVER_BUDGET_BYTES == WIRE_INITIAL_ITEMS_TOKEN_CAP * CODEX_BYTES_PER_TOKEN
+
+    def test_a_hand_over_of_exactly_the_budget_is_accepted_here(self) -> None:
+        """The ceiling is inclusive, at the new figure as at the old one."""
+        text = "x" * (HANDOVER_BUDGET_BYTES - WIRE_LINE_OVERHEAD_BYTES)
+        dial = Dial(
+            voice="speak plainly",
+            agent=CALL_AGENT_INSTRUCTIONS,
+            hand_over=(DialReason(text=text),),
+        )
+
+        assert dial.hand_over_size_in_bytes == HANDOVER_BUDGET_BYTES
+
+    def test_a_chinese_hand_over_the_old_budget_refused_now_fits(self) -> None:
+        """The concrete loosening #215 exists for, in the language it was cited about.
+
+        Ten thousand Chinese characters are thirty thousand UTF-8 bytes and so
+        7,500 estimated tokens — inside the wire's cap all along, and four times
+        over the allowance that used to stand here.
+        """
+        dial = Dial(
+            voice="speak plainly",
+            agent=CALL_AGENT_INSTRUCTIONS,
+            hand_over=(DialReason(text="简" * 10_000),),
+        )
+
+        assert dial.hand_over_size_in_bytes > 8192
+        assert dial.hand_over_size_in_bytes <= HANDOVER_BUDGET_BYTES
 
     def test_the_fake_records_the_dial_it_was_given(self) -> None:
         call = FakeCall()

@@ -668,13 +668,19 @@ class TestTheHandover:
         assert _fits(items)
 
     def test_over_budget_the_newest_bodies_go_from_the_back_and_are_named(self) -> None:
-        """Named as omitted and never sliced (ADR 0016), and from the back (#166)."""
+        """Named as omitted and never sliced (ADR 0016), and from the back (#166).
+
+        Twelve bodies of a tenth of the budget apiece overrun it by enough that
+        some go and not all: the sizes are taken from the budget rather than
+        written out, so this keeps testing the rung and not a number (#215).
+        """
+        body = "x" * (HANDOVER_BUDGET_BYTES // 10)
         sessions = tuple(
             row(
                 SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
                 state=SessionState.WAITING,
                 waiting_for=QUESTION,
-                progress=said("x" * 900),
+                progress=said(body),
             )
             for index in range(12)
         )
@@ -712,6 +718,35 @@ class TestTheHandover:
         items = briefing.handover(sessions, focus=None, reason="dialled")
 
         assert len(items) <= MAX_HANDOVER_ITEMS
+        assert _fits(items)
+        Dial(voice="prose", agent="rules", hand_over=items)
+
+    def test_chinese_bodies_the_old_allowance_gave_up_now_go_whole(self) -> None:
+        """#215: the loosening, measured on the language it was raised about.
+
+        Six Sessions with six hundred Chinese characters apiece is about eleven
+        thousand UTF-8 bytes — over the 8,192-byte allowance that used to stand
+        here, which would have named every one of these newest messages as
+        omitted, and well inside the wire's real ceiling of 8,192 estimated
+        tokens at four bytes each. Nothing about the ladder changed; it simply
+        starts higher up.
+        """
+        sessions = tuple(
+            row(
+                SessionTarget(agent=AgentKind.CODEX, session_id=f"s{index}"),
+                state=SessionState.WAITING,
+                waiting_for=QUESTION,
+                progress=said("它" * 600),
+            )
+            for index in range(6)
+        )
+
+        items = briefing.handover(sessions, focus=None, reason="因为有会话在等你")
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert len(briefs) == 6
+        assert all(item.newest == "它" * 600 for item in briefs)
+        assert sum(item.size_in_bytes for item in items) > 8192
         assert _fits(items)
         Dial(voice="prose", agent="rules", hand_over=items)
 

@@ -42,6 +42,11 @@ attaches to the process that asks, so a call started from an agent or an IDE is
 silently muted, and a scenario whose whole content is a person speaking would
 record nothing. The script tells you what to say and when.
 
+Issue #215 added an eighth, which also needs no one in the room:
+
+    # Does the backend take a hand-over sized to codex's own 8,192-token ceiling?
+    .venv/bin/python scripts/realtime_text_entry_probe.py --scenario handover-budget
+
 Issues #179 and #181 added three more scenarios and a third way to put the
 request. `--by wav` synthesises the request with `say` and feeds it onto the
 media track from memory, so there is real audio on the wire and no device open
@@ -80,6 +85,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from gpt_voicecoding import __version__  # noqa: E402
+from gpt_voicecoding.adapters.call.realtime.adapter import _item_text  # noqa: E402
 from gpt_voicecoding.adapters.call.realtime.settings import RealtimeCallSettings  # noqa: E402
 from gpt_voicecoding.adapters.call.realtime.transport import CallTransport  # noqa: E402
 from gpt_voicecoding.adapters.call.realtime.webrtc import (  # noqa: E402
@@ -89,6 +95,14 @@ from gpt_voicecoding.adapters.call.realtime.webrtc import (  # noqa: E402
 )
 from gpt_voicecoding.adapters.codex_app_server.process import OwnedAppServer  # noqa: E402
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings  # noqa: E402
+from gpt_voicecoding.seams.call import (  # noqa: E402
+    CODEX_BYTES_PER_TOKEN,
+    HANDOVER_BUDGET_BYTES,
+    WIRE_INITIAL_ITEMS_TOKEN_CAP,
+    DialReason,
+    SpokenBrief,
+    SpokenRosterBrief,
+)
 
 #: What the adapter pins, restated here because this script bypasses it.
 REALTIME_VERSION = "v3"
@@ -1201,6 +1215,153 @@ async def agent_hangup(call: Call, recorder: Recorder, arguments: argparse.Names
     print("=" * 72 + "\n")
 
 
+#: --- issue #215 -------------------------------------------------------------
+#: The hand-over budget is codex's own arithmetic — `ceil(UTF-8 bytes / 4)` against
+#: a cap of 8,192 estimated tokens — read out of its source rather than measured
+#: (`seams/call.py`). Codex's source settles codex's half; it says nothing about
+#: whether the **backend** behind it takes a hand-over that large, and that is the
+#: one thing only a call can answer. This scenario dials one exactly at the wire's
+#: ceiling, all of it Chinese, and asks for a fact planted in the tail of the last
+#: and largest item — so a "yes" means both accepted *and* carried, not merely accepted.
+
+#: The planted fact. A number, because a number is either said or not said: a
+#: paraphrase cannot half-answer it the way a sentence could.
+HANDOVER_FACT_NUMBER = "6142"
+HANDOVER_FACT = f"本次交接的编号是 {HANDOVER_FACT_NUMBER}。"
+
+#: Asked through `appendSpeech`, the one asking route that works with no one in
+#: the room (Q1 of the `carriers` run came back "prompt", not "verbatim").
+HANDOVER_RECALL_PROBE = "刚才交接给你的资料里，最后一条写的本次交接编号是多少？只说那个数字。"
+
+#: The two audiences, in the shape ADR 0018 gives them, kept short: what is under
+#: test is the size of the third payload, and a long prompt would only move bytes
+#: from the slot being measured into one that is not.
+HANDOVER_VOICE_PROSE = (
+    "你是一个桌面助手的声音。你只根据交接给你的资料说话，"
+    "资料里没有的事情就说不知道，不要自己编。回答要短。"
+)
+HANDOVER_AGENT_RULES = "You are the acting half of a desk bridge. Run nothing unless asked."
+
+#: One filler sentence of Chinese, repeated to fill a brief's newest message.
+#: Chinese because the old allowance was called over-conservative for Chinese;
+#: prose rather than one repeated character because a repeated character is the
+#: one input a byte estimate and a real tokenizer would disagree about most.
+HANDOVER_FILLER = (
+    "这个会话正在等你确认一件事，它刚才把改动跑了一遍，测试全部通过，"
+    "现在停下来等你决定要不要继续往下走。"
+)
+
+
+def _chinese_brief(index: int, newest: str) -> SpokenBrief:
+    """One `SpokenBrief` in the shape Briefing hands the seam, worded in Chinese."""
+    return SpokenBrief(
+        name=f"会话 {index}",
+        agent="codex",
+        state="等你做决定",
+        newest=newest,
+        decision=("问：要不要合并这个分支？", "选项：合并", "选项：先不合并", "建议：合并"),
+        answerable_here="可以在这里回答",
+        last_activity_at="三分钟前",
+    )
+
+
+def _codex_estimated_token_count(text: str) -> int:
+    """codex's `approx_token_count`: `ceil(UTF-8 bytes / 4)` (`truncate.rs:71-74`)."""
+    return -(-len(text.encode("utf-8")) // CODEX_BYTES_PER_TOKEN)
+
+
+def handover_at_the_ceiling() -> tuple[list[dict[str, str]], dict[str, int]]:
+    """A hand-over sized to sit exactly on the wire's cap, assembled the real way.
+
+    Built from the seam's own carriers and run through the adapter's own
+    `_item_text`, so what goes on the wire is what a dial would put there — only
+    filled to the ceiling rather than to whatever the roster happened to hold.
+    The planted fact sits in the newest message of the last and largest item.
+
+    Codex rounds **each item** up on its own, so the sum of the per-item counts is
+    what it checks; this counts it the same way and grows the last item until one
+    more sentence would cross the cap.
+    """
+    reason = DialReason(text="这通电话是系统拨的：有几个会话停下来等你做决定。")
+    roster = SpokenRosterBrief(
+        counts="其他会话：6 个在等你做决定",
+        rows=("会话 0 — codex — 等你做决定", "会话 1 — codex — 等你做决定"),
+        focus="会话 0 — codex — 等你做决定",
+    )
+    carried = [reason, roster, *(_chinese_brief(index, HANDOVER_FILLER * 6) for index in range(5))]
+    texts = [_item_text(item) for item in carried]
+    spent = sum(_codex_estimated_token_count(text) for text in texts)
+
+    # The last item, grown one sentence at a time and then one character at a
+    # time, so the whole hand-over lands on the cap rather than near it.
+    filler = ""
+    while True:
+        candidate = _item_text(_chinese_brief(5, f"{filler}{HANDOVER_FILLER}\n{HANDOVER_FACT}"))
+        if spent + _codex_estimated_token_count(candidate) > WIRE_INITIAL_ITEMS_TOKEN_CAP:
+            break
+        filler += HANDOVER_FILLER
+    while True:
+        candidate = _item_text(_chinese_brief(5, f"{filler}填\n{HANDOVER_FACT}"))
+        if spent + _codex_estimated_token_count(candidate) > WIRE_INITIAL_ITEMS_TOKEN_CAP:
+            break
+        filler += "填"
+    last = _item_text(_chinese_brief(5, f"{filler}\n{HANDOVER_FACT}"))
+    texts.append(last)
+
+    items = [{"role": "developer", "text": text} for text in texts]
+    measured = {
+        "items": len(items),
+        "bytes": sum(len(text.encode("utf-8")) for text in texts),
+        "characters": sum(len(text) for text in texts),
+        "tokens_codex_counts": sum(_codex_estimated_token_count(text) for text in texts),
+        "token_cap": WIRE_INITIAL_ITEMS_TOKEN_CAP,
+        "largest_item_bytes": max(len(text.encode("utf-8")) for text in texts),
+        "seam_budget_bytes": HANDOVER_BUDGET_BYTES,
+    }
+    return items, measured
+
+
+async def handover_budget(call: Call, recorder: Recorder, arguments: argparse.Namespace) -> None:
+    """#215: does the backend take a hand-over sized to codex's own ceiling?"""
+    items, measured = handover_at_the_ceiling()
+    recorder.note("#215 hand-over built to the wire's ceiling", measured)
+    print(f"  probe  hand-over: {json.dumps(measured, ensure_ascii=False)}")
+    if measured["tokens_codex_counts"] > WIRE_INITIAL_ITEMS_TOKEN_CAP:
+        raise RuntimeError("built a hand-over codex would refuse; nothing to learn from dialling")
+
+    await call.dial(
+        instructions=HANDOVER_AGENT_RULES,
+        prompt=HANDOVER_VOICE_PROSE,
+        initial_items=items,
+        switches=switches(arguments),
+    )
+    accepted_at = mark(recorder, "#215 Q1: does a hand-over at the ceiling open a call at all?")
+    await asyncio.sleep(arguments.settle)
+
+    asked = mark(recorder, "#215 Q2: is the fact at the end of the last item retained?")
+    await call.speak(HANDOVER_RECALL_PROBE)
+    await asyncio.sleep(arguments.reply)
+
+    answers = recorder.transcripts(role="assistant", since=asked)
+    print("\n" + "=" * 72)
+    print(f"  #215 HAND-OVER BUDGET. Raw record: {recorder.path}")
+    print(
+        f"    sent {measured['items']} items, {measured['bytes']} bytes, "
+        f"{measured['tokens_codex_counts']}/{WIRE_INITIAL_ITEMS_TOKEN_CAP} estimated tokens"
+    )
+    print("    Q1  the call came up, so codex and the backend both accepted it")
+    print(
+        f"    said before anything was asked: "
+        f"{recorder.transcripts(role='assistant', since=accepted_at, until=asked) or 'nothing'}"
+    )
+    print(f"    Q2  asked: {HANDOVER_RECALL_PROBE}")
+    for line in answers:
+        print(f"        {line!r}")
+    hits = sum(1 for line in answers if HANDOVER_FACT_NUMBER in line)
+    print(f"    Q2  '{HANDOVER_FACT_NUMBER}' appears in {hits}/{len(answers)} answers")
+    print("=" * 72 + "\n")
+
+
 def _report(recorder: Recorder, *, q1: float, q2: float, q3: float, q4: float) -> None:
     """What the call recorded, arranged by question. The verdicts are a person's."""
     assistant = recorder.transcripts(role="assistant")
@@ -1253,6 +1414,8 @@ SCENARIOS = {
     "agent-rule": agent_rule,
     "voice-prompt": voice_prompt,
     "agent-hangup": agent_hangup,
+    # Issue #215.
+    "handover-budget": handover_budget,
 }
 
 #: The #179 scenarios that need the Call Agent to have a shell to run things in.
@@ -1285,7 +1448,9 @@ async def main(arguments: argparse.Namespace) -> int:
     # on the track. The two senses of the word part company here for the first
     # time, which is exactly what #181 exists to measure.
     silent = (
-        arguments.scenario.startswith("carriers") or arguments.by in ("text", "wav")
+        arguments.scenario.startswith("carriers")
+        or arguments.scenario == "handover-budget"
+        or arguments.by in ("text", "wav")
         if arguments.silent is None
         else arguments.silent
     )

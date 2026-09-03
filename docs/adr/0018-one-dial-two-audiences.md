@@ -30,12 +30,27 @@ this decision ends.
 `Audience.AGENT` the acting half; `generate()` produces three sets (voice, agent,
 delegated) and the coverage gate — every retained rule lands in exactly one set, or the
 engine refuses to boot — runs over all three. Two budgets, for two reasons: the agent set
-is capped at 8,192 bytes because codex caps that slot at 8,192 tokens and a byte is the
-floor of a token; the voice set keeps this engine's own 8,000-byte cap, which codex does
-not impose (the `prompt` slot is unbudgeted) and which stands as the measure of "terse".
-Which rule belongs to which audience, and what each says, is
+is capped at 8,192 bytes, well inside the 8,192 estimated tokens codex allows that slot
+(see the amendment below); the voice set keeps this engine's own 8,000-byte cap, which
+codex does not impose (the `prompt` slot is unbudgeted) and which stands as the measure of
+"terse". Which rule belongs to which audience, and what each says, is
 [#173](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/173)'s work,
 rule by rule against the 0901 flow — nothing is carried over unread.
+
+*Amended 2026-09-03 after [#215](https://github.com/okqixiaobao727-design/GPT-VoiceCoding/issues/215).*
+The byte budgets above were first justified as "a byte is the floor of a token". That
+over-states the margin, and it named the wrong counter. Nothing counts tokens on this
+path: codex's own app-server rejects an over-budget request before the backend sees it,
+estimating `ceil(UTF-8 bytes / 4)` — `approx_token_count`, `codex-rs/utils/string/src/truncate.rs:4,71-74`
+— against the caps in `codex-rs/core/src/realtime_conversation.rs:101-103,1338-1392`, read
+at tag `rust-v0.152.1`. So a slot capped at 8,192 estimated tokens accepts 32,768 bytes of
+**any** language, Chinese included: the estimator reads bytes, never characters. The
+hand-over budget on the Call seam is therefore that product and not a chosen figure
+(`seams/call.py`), and it was confirmed live against the backend, which codex's source
+cannot speak for (`docs/research/2026-09-03-handover-budget-probe.md`). The two instruction
+budgets are **unchanged** by this: 8,192 and 8,000 bytes are what this engine means by
+terse, which is a decision about the rules and not about the wire — they simply no longer
+claim the wire as their reason.
 
 **The Voice is addressed in natural language.** Its set is rendered as plain prose
 paragraphs — no headings, bullets, code or key-value text (Simon, 2026-09-01: 控制 voice

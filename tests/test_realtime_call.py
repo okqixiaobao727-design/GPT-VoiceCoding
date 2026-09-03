@@ -53,6 +53,7 @@ from gpt_voicecoding.adapters.call.realtime.adapter import _item_text
 from gpt_voicecoding.adapters.codex_app_server.process import AppServerError, attach
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
 from gpt_voicecoding.seams.call import (
+    CODEX_BYTES_PER_TOKEN,
     CallDropped,
     CallEnded,
     CallStarted,
@@ -100,6 +101,29 @@ def brief(newest: str) -> SpokenBrief:
         answerable_here="from here",
         last_activity_at="not read",
     )
+
+
+#: One of every hand-over kind, in shapes assembly labels differently. Seam
+#: carriers, not assembled text: the two budget invariants below run each of
+#: these through `_item_text` and measure the result against what it was charged.
+HANDOVER_ITEM_EXAMPLES = (
+    DialReason(text="dialled because Sessions need the user"),
+    SpokenRosterBrief(
+        counts="the others: 2 running, 1 finished",
+        rows=("build — codex:abc — running", "docs — claude:def:12 — finished"),
+        focus="voicecoding · the dial — codex:ghi — waiting for your decision",
+    ),
+    brief("it stopped on a question"),
+    SpokenBrief(
+        name="a",
+        agent="codex",
+        state="running",
+        newest="nothing said yet",
+        decision=(),
+        answerable_here="at the terminal",
+        last_activity_at="not read",
+    ),
+)
 
 
 _names = iter(range(10_000))
@@ -329,28 +353,28 @@ class TestBringingACallUp:
         review). Asserted against the real assembly rather than against a
         restatement of it, so a longer label fails here rather than on a call.
         """
-        items = (
-            DialReason(text="dialled because Sessions need the user"),
-            SpokenRosterBrief(
-                counts="the others: 2 running, 1 finished",
-                rows=("build — codex:abc — running", "docs — claude:def:12 — finished"),
-                focus="voicecoding · the dial — codex:ghi — waiting for your decision",
-            ),
-            brief("it stopped on a question"),
-            SpokenBrief(
-                name="a",
-                agent="codex",
-                state="running",
-                newest="nothing said yet",
-                decision=(),
-                answerable_here="at the terminal",
-                last_activity_at="not read",
-            ),
-        )
-
-        for item in items:
+        for item in HANDOVER_ITEM_EXAMPLES:
             assembled = len(_item_text(item).encode("utf-8"))
             assert assembled <= item.size_in_bytes, f"{type(item).__name__} overflows its budget"
+
+    def test_every_item_leaves_room_for_the_rounding_codex_does_on_it(self) -> None:
+        """The slack `HANDOVER_BUDGET_BYTES` spends on codex rounding each item up.
+
+        codex counts `ceil(bytes / 4)` **per item** and sums those, so a hand-over
+        of exactly the budget could still be refused if the seam's count were only
+        an upper bound: 128 items each rounded up would add ninety-six tokens the
+        total count never sees. It cannot, because `_bytes_of` charges
+        `WIRE_LINE_OVERHEAD_BYTES` for every carried string, which is far more
+        than the at-most three bytes each item's rounding costs. Asserted against
+        the real assembly for the same reason the test above is: a longer label
+        eats this margin, and it should fail here rather than on a call.
+        """
+        for item in HANDOVER_ITEM_EXAMPLES:
+            assembled = len(_item_text(item).encode("utf-8"))
+            spare = item.size_in_bytes - assembled
+            assert spare >= CODEX_BYTES_PER_TOKEN - 1, (
+                f"{type(item).__name__} has {spare} bytes of slack, too few to round up in"
+            )
 
     def test_a_user_opened_dial_carries_exactly_one_item(self, socket_path: Path) -> None:
         """#167 Q6: a call the user opened gets no hand-over, only why it exists."""

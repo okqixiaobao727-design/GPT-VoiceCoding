@@ -95,21 +95,44 @@ class Cue(StrEnum):
     EVENT = "event"
 
 
-#: How many bytes of hand-over one dial may carry, and the reason it is bytes.
-#: The wire caps the slot at 8,192 **tokens** (`REALTIME_INITIAL_ITEMS_MAX_TOKENS`,
-#: `docs/research/2026-09-01-realtime-live-probe.md` "the `initialItems` budget"),
-#: and a UTF-8 byte is the floor of a token, so a hand-over inside this many
-#: bytes can never exceed that cap (ADR 0018 measures the instruction budgets the
-#: same way). It is **over-conservative for Chinese** — where one character is
-#: three bytes and rather less than three tokens — and that is accepted: this
-#: ticket takes no live measurement, and loosening the figure is a later ticket
-#: that brings one.
-HANDOVER_BUDGET_BYTES: Final = 8192
+#: The wire's ceiling on the hand-over slot, in codex's estimated tokens.
+#: `REALTIME_INITIAL_ITEMS_MAX_TOKENS` in `codex-rs/core/src/realtime_conversation.rs:102`
+#: at tag `rust-v0.152.1`, the version this machine runs; enforced per item and
+#: over the total at `:1374-1392`, by refusing the request.
+WIRE_INITIAL_ITEMS_TOKEN_CAP: Final = 8192
+
+#: What codex counts a token as while enforcing that cap: `APPROX_BYTES_PER_TOKEN`
+#: in `codex-rs/utils/string/src/truncate.rs:4`, used by `approx_token_count` at
+#: `:71-74` as `ceil(bytes / 4)` over the string's **UTF-8 byte length**. It is an
+#: estimate and not a tokenizer, which is why matching it exactly is the whole
+#: answer: no real token count is ever taken on that path.
+CODEX_BYTES_PER_TOKEN: Final = 4
+
+#: How many bytes of hand-over one dial may carry — the wire's ceiling, converted,
+#: rather than a figure chosen for safety. A Chinese character costs three bytes
+#: and so three-quarters of an estimated token, exactly as three bytes of English
+#: do: the estimator reads bytes, never characters, so this budget is the same
+#: size in every language (#215; the earlier "a UTF-8 byte is the floor of a
+#: token" reading was four times tighter than the wire for all of them).
+#:
+#: The conversion is safe item by item as well as in total, though codex rounds
+#: each item up on its own: `_bytes_of` charges `WIRE_LINE_OVERHEAD_BYTES` per
+#: carried string, which leaves every item at least that many bytes of slack
+#: against what assembly actually writes, and that is more than the at-most
+#: `CODEX_BYTES_PER_TOKEN - 1` bytes each item's rounding can cost. The two
+#: ceilings are one number here because the wire's per-item cap *is* its total
+#: cap, so the total check covers both. `tests/test_realtime_call.py` holds the
+#: slack as an invariant against the real assembly.
+#:
+#: Confirmed live end to end — the one thing codex's source cannot say is whether
+#: the backend behind it agrees: `docs/research/2026-09-03-handover-budget-probe.md`.
+HANDOVER_BUDGET_BYTES: Final = WIRE_INITIAL_ITEMS_TOKEN_CAP * CODEX_BYTES_PER_TOKEN
 
 #: How many hand-over items one dial may carry. The wire's own count ceiling
-#: (`REALTIME_INITIAL_ITEMS_MAX_COUNT`, same probe), which it enforces by
-#: refusing the request rather than by truncating it — so the ceiling is kept on
-#: this side, where a brief that will not fit can be trimmed with words.
+#: (`REALTIME_INITIAL_ITEMS_MAX_COUNT`, `realtime_conversation.rs:101` at the same
+#: tag), which it enforces by refusing the request rather than by truncating it —
+#: so the ceiling is kept on this side, where a brief that will not fit can be
+#: trimmed with words.
 MAX_HANDOVER_ITEMS: Final = 128
 
 
@@ -258,8 +281,10 @@ class Dial:
 #: construction. It has to be: `HANDOVER_BUDGET_BYTES` is a promise that the
 #: wire cannot refuse what a `Dial` accepted, and a count that measured the words
 #: without the labels around them made that promise on 8,192 bytes of text that
-#: reached the wire as 8,242 (#194 review). `tests/test_realtime_call.py` holds
-#: the invariant: no assembled item is larger than the size it was budgeted at.
+#: reached the wire as 8,242 (#194 review). It stays an allowance and not a
+#: measurement; `tests/test_realtime_call.py` holds the invariant that keeps it
+#: honest — every assembled item is smaller than the size it was budgeted at, by
+#: more than the rounding `HANDOVER_BUDGET_BYTES` has to absorb.
 WIRE_LINE_OVERHEAD_BYTES: Final = 24
 
 
