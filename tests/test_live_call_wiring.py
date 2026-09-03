@@ -644,6 +644,56 @@ def test_a_call_whose_voice_never_speaks_is_watched_without_a_stretch(
     assert watch.last_voice_at is None
 
 
+def test_the_watch_can_stop_when_the_answer_closes_rather_than_when_the_call_does(
+    tmp_path: Path,
+) -> None:
+    """#198's stretch runs on a call the walk speaks into again afterwards.
+
+    So it cannot wait for the ending. `quiet_seconds` is the other stopping
+    condition: every span closed, and then no new edge for that long.
+    """
+    walk = _walk(tmp_path)
+    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)])
+    walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01, quiet_seconds=0.05)
+
+    assert watch.went_down is False
+    assert watch.edges == {True: 1, False: 1}
+    assert watch.first_voice_at is not None
+
+
+def test_a_span_still_open_does_not_stop_the_watch_early(tmp_path: Path) -> None:
+    """A start with no stop is #169's bug, and the phase has to see the whole stretch."""
+    walk = _walk(tmp_path)
+    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE)])
+    walk.bridgectl = lambda *_, **__: None
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=0.3, poll_seconds=0.01, quiet_seconds=0.05)
+
+    # It ran to its deadline rather than stopping on the quiet, because the span
+    # the Voice opened never closed.
+    assert watch.edges == {True: 1, False: 0}
+    assert watch.went_down is False
+
+
+def test_without_the_quiet_window_the_watch_is_the_one_the_long_step_wrote(
+    tmp_path: Path,
+) -> None:
+    """`quiet_seconds=None` runs until the call goes down, which is #184's watch."""
+    walk = _walk(tmp_path)
+    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)])
+    walk.bridgectl = lambda *_, **__: None
+    downs = iter([False] * 8 + [True] * 4)
+    walk._call_is_down = lambda: next(downs, True)  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01)
+
+    assert watch.went_down is True
+
+
 def test_the_engines_own_line_is_what_names_the_ceiling_as_the_ender(tmp_path: Path) -> None:
     """The number in it is configuration, so the sentence around it is matched."""
     walk = _walk(tmp_path, lines=[_said("ended the Live Call after 12.5 seconds")])

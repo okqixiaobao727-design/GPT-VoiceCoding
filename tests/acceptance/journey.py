@@ -429,12 +429,6 @@ LIVE_CALL_EARLIER_HEARD_SUBSTRING = "再往前"
 RELAY_RECEIPT_DELIVERED = "已转达"
 RELAY_RECEIPT_QUEUED = "收到"
 
-#: The engine's own two lines for the call's *other* speaker, imported rather
-#: than retyped: the long step's whole reading of "the Voice held the call open"
-#: is these strings, and a copy here would be a copy that can drift silently
-#: (`core/bridge.py`, #184).
-VOICE_SPEECH_LINES = (VOICE_SPEAKING_LINE, VOICE_QUIET_LINE)
-
 #: How the engine says its own Silence Ceiling ended a call. A pattern rather
 #: than an imported string because the line carries the configured number
 #: (`core/bridge.py`, `_log.info("ended the Live Call after %g seconds …")`), and
@@ -471,6 +465,28 @@ def _announced_after_the_voice_fell_silent(lines: list[str]) -> bool:
         elif VOICE_QUIET_LINE in line:
             speaking = False
     return speaking is not True
+
+
+def _history_reading(printed: str) -> HistoryReading:
+    """One History page as `bridgectl history` printed it, read back off its own lines.
+
+    Parsed from the printed page rather than from a second request shape, because
+    what this run accepts is the surface a user gets — and in one place, because
+    two readers ask for a page (`_history_page`, for which a refusal is a defect,
+    and `_history_read_yet`, for which it is an answer) and two parsers of one
+    surface are two things to keep in step.
+    """
+    entries: list[tuple[int, str]] = []
+    older = False
+    for line in printed.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("older entries remain"):
+            older = True
+            continue
+        match = HISTORY_ENTRY.match(stripped)
+        if match is not None:
+            entries.append((int(match.group("ordinal")), match.group("text")))
+    return HistoryReading(entries=tuple(entries), older=older)
 
 
 def _hand_over_kinds(line: str) -> list[str]:
@@ -635,19 +651,6 @@ class _VoiceWatch:
     last_voice_at: float | None
     #: When the call was seen to be down, or when the watch gave up.
     down_at: float
-
-
-@dataclass(frozen=True)
-class _DialledCall:
-    """One Live Call a step opened, and the two marks it is read against."""
-
-    #: What `bridgectl live` answered — the engine's own account of the call.
-    answer: str
-    #: How many engine log lines there were before it. Everything this call
-    #: produced is after that, and everything the step before it produced is not.
-    mark: int
-    #: When it was opened, on this step's own clock.
-    started: float
 
 
 def _unspaced(text: str) -> str:
@@ -828,7 +831,7 @@ LIVE_CALL_ANSWER_SECONDS = 300.0
 #: something and rare enough not to be a load on the engine mid-call.
 LIVE_CALL_POLL_SECONDS = 2.0
 
-#: How long a hand-off gets to appear before `live call briefed` grades that none
+#: How long a hand-off gets to appear before the walk's hand-over phase grades that none
 #: did. Measured rather than guessed: the Call Agent ran `bridgectl live` four to
 #: five seconds after each of three hand-offs (#179), and the wait runs *after*
 #: the Voice's answer has finished — so this is that span with room over, spent
@@ -2020,21 +2023,29 @@ class Walk:
                 f"`bridgectl history {wanted} {' '.join(cursor)}`".rstrip()
                 + f" refused: {answer.text}"
             )
-        entries: list[tuple[int, str]] = []
-        older = False
-        for line in answer.text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("older entries remain"):
-                older = True
-                continue
-            match = HISTORY_ENTRY.match(stripped)
-            if match is not None:
-                entries.append((int(match.group("ordinal")), match.group("text")))
         if "read at " not in answer.text:
             raise StepFailed(
                 f"`bridgectl history {wanted}` carried no observation time: {answer.text[:200]!r}"
             )
-        return HistoryReading(entries=tuple(entries), older=older)
+        return _history_reading(answer.text)
+
+    def _history_read_yet(self, address: str) -> HistoryReading | None:
+        """That Session's newest History page, or `None` if there is not one yet (#198).
+
+        **A refusal here is an answer, not a failure.** A Session that has just
+        entered the roster has a record the engine has not read — `history`
+        refuses with *nothing has read what … said: this engine reads a Session's
+        own record and never infers one* — and run `20260903T220718Z` is the
+        folded walk treating that as the step failing, on the first Session it
+        started. What the caller wants to know is whether there is a page to page
+        back through, and "not yet" is one of the answers to that.
+
+        Only for the Sessions the walk starts itself. Every read of the walk's
+        *own* Session goes through `_history_page`, where a refusal is a defect:
+        that Session has been driven through `roster` before anything asks.
+        """
+        answer = self.bridgectl("history", address)
+        return _history_reading(answer.text) if answer.ok else None
 
     def _brief_a_turn_that_ends_on_a_question(self) -> str:
         """Drive a turn that ends on a question, and read what the brief calls it.
@@ -3093,12 +3104,15 @@ class Walk:
         would be mid-call news a later phase is graded on.
         """
         driven = 0
-        while not self._history_page(address=self._extra_address(workspace, address)).older:
+        while True:
+            page = self._history_read_yet(self._extra_address(workspace, address))
+            if page is not None and page.older:
+                return driven
             if driven >= HISTORY_TURNS_CEILING:
                 raise LaneBlocked(
                     f"{driven} turns at {address} did not produce a second History page, so "
                     f"there is nothing for `再往前` to page back to. What one page holds: "
-                    f"{self._history_page(address=self._extra_address(workspace, address))}"
+                    f"{page if page is not None else 'no record the engine has read'}"
                 )
             self._drive_extra_session(extra, workspace, turn)
             support.wait_for(
@@ -3107,7 +3121,6 @@ class Walk:
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
             driven += 1
-        return driven
 
     def _the_engine_dials_about_a_session_that_stopped(self, mark: int, cool_down: float) -> str:
         """Phase 1: nobody presses anything, and a call comes up holding a briefing.
@@ -3425,7 +3438,9 @@ class Walk:
         row is re-keyed as the lane learns more about it, and this is polled
         across a turn, which is exactly when that happens.
         """
-        page = self._history_page(address=self._extra_address(workspace, fallback))
+        page = self._history_read_yet(self._extra_address(workspace, fallback))
+        if page is None:
+            return False
         return any(_unspaced(fragment) in _unspaced(text) for _, text in page.entries)
 
     def _detail_and_history_are_asked_for_by_voice(self, focus_at: Path, focus_address: str) -> str:
@@ -3631,8 +3646,10 @@ class Walk:
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
-        watch = self._watch_the_voice_finish(
-            asking, deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling
+        watch = self._watch_the_voice(
+            asking,
+            deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling,
+            quiet_seconds=LIVE_CALL_CUE_SECONDS,
         )
         edges = watch.edges
         answered_for = (
@@ -3687,50 +3704,6 @@ class Walk:
             f"the Voice answered for {answered_for:.0f}s against a {ceiling:.0f}s ceiling, "
             f"across {edges[True]} start / {edges[False]} stop edge(s) with none left open, "
             f"and the call is still up"
-        )
-
-    def _watch_the_voice_finish(
-        self, mark: int, *, deadline_seconds: float, poll_seconds: float = LIVE_CALL_POLL_SECONDS
-    ) -> _VoiceWatch:
-        """Poll until the Voice has finished answering — or the call goes down (#198).
-
-        `_watch_the_voice`'s loop, with the other stopping condition. The long
-        step ran on a call it expected the ceiling to take away, so it watched
-        until the call was down; the folded walk speaks into this call again
-        afterwards, so what it waits for is the answer *closing*: every span it
-        opened closed, and then no new edge for one settle window's worth of
-        quiet, because codex emits one `transcript/done` per turn and an answer
-        it splits in two has a real gap in the middle.
-
-        The call going down is still a reason to stop — it is the phase failing,
-        and `went_down` is what says so.
-        """
-        edges = self._voice_speech_edges(since=mark)
-        first_voice_at = last_voice_at = time.monotonic() if edges[True] else None
-        expiry = time.monotonic() + deadline_seconds
-        while time.monotonic() < expiry:
-            if self._call_is_down():
-                break
-            seen = self._voice_speech_edges(since=mark)
-            if seen != edges:
-                edges = seen
-                last_voice_at = time.monotonic()
-                if first_voice_at is None:
-                    first_voice_at = last_voice_at
-            elif (
-                edges[True] > 0
-                and edges[False] >= edges[True]
-                and last_voice_at is not None
-                and time.monotonic() - last_voice_at >= LIVE_CALL_CUE_SECONDS
-            ):
-                break
-            time.sleep(poll_seconds)
-        return _VoiceWatch(
-            went_down=self._call_is_down(),
-            edges=edges,
-            first_voice_at=first_voice_at,
-            last_voice_at=last_voice_at,
-            down_at=time.monotonic(),
         )
 
     def _cool_down_remaining(self) -> float:
@@ -4224,6 +4197,14 @@ class Walk:
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         hang_up_verbs = self._verbs_since(runs_before, Action.LIVE)
+        # **Read here, before the Cool-down's own call opens.** `observed` takes
+        # the newest value each field was ever written with, so an end reason
+        # read after the next call has ended would be that call's.
+        ended_by = _ended_by(
+            end_reason=live_call.observed(self.config.call_observations).end_reason,
+            by_ceiling=self._ceiling_ended_the_call(since=hanging),
+            by_agent=went_down,
+        )
         if not heard:
             raise StepFailed(
                 f"the hang-up utterance went on the track and the engine never logged the "
@@ -4248,6 +4229,17 @@ class Walk:
                 f"the call ended on the user's word and no ENDED cue was written within "
                 f"{LIVE_CALL_CUE_SECONDS:.0f}s. The user hears a call end however it ended "
                 f"(#186). Engine log tail: {self._log_since(hanging)[-8:]}"
+            )
+        # **The second of #193's two facts.** The Call Agent running `live` and
+        # the call ending *because* it ran it are graded separately, because they
+        # fail differently: a Call Agent that ran nothing and one that ran `call
+        # end` — the invention run `20260902T095448Z` recorded — both leave the
+        # call for something else to close, and only this says which happened.
+        if ended_by != "agent":
+            raise StepFailed(
+                f"the Call Agent ran {hang_up_verbs} and the call was ended by the {ended_by}: "
+                f"{live_call.observed(self.config.call_observations).end_reason or 'none'}. "
+                f"Verbs in order: {self._verbs_run(since=runs_before)}"
             )
         self._graded_the_two_cues(mark)
         # --- the Cool-down, and the Session that stops inside it --------------
@@ -4320,6 +4312,20 @@ class Walk:
                 f"window is for. This is the harness losing a race, not the Keeper breaking a "
                 f"rule"
             )
+        # **The missing owed line is asked about first, and the order is why.**
+        # `dialled_inside` is read after the `owed` wait, so a run where the
+        # engine never wrote that line spends the wait's whole budget — long
+        # enough for the Cool-down to elapse and its legitimately paid dial to
+        # land inside the window this reads. Complaining about the dial first
+        # would mis-state such a run as "it dialled inside the Cool-down" when
+        # what actually went wrong is the line that never came.
+        if not owed:
+            raise StepFailed(
+                f"a Session stopped with {remaining:.0f}s of Cool-down still to run and the "
+                f"engine neither dialled nor said it owed a dial. One event buys one attempt, "
+                f"and an event inside a Cool-down marks it owed. Engine log tail: "
+                f"{self._log_since(inside)[-8:]}"
+            )
         if dialled_inside:
             raise StepFailed(
                 f"a Session stopped with {remaining:.0f}s of the {cool_down:.0f}s Cool-down "
@@ -4327,13 +4333,6 @@ class Walk:
                 f"{support.matching_lines(self._log_since(inside), HAND_OVER_LINE)!r}. After "
                 f"any end of a call the system does not dial again until the Cool-down has "
                 f"elapsed (`CONTEXT.md`, *Cool-down*)"
-            )
-        if not owed:
-            raise StepFailed(
-                f"a Session stopped with {remaining:.0f}s of Cool-down still to run and the "
-                f"engine neither dialled nor said it owed a dial. One event buys one attempt, "
-                f"and an event inside a Cool-down marks it owed. Engine log tail: "
-                f"{self._log_since(inside)[-8:]}"
             )
         if not paid:
             raise StepFailed(
@@ -4369,9 +4368,10 @@ class Walk:
                 f"(#186), and the Keeper is what rings it now (#195)"
             )
         return (
-            f"the user hung up by voice, the Call Agent ran {hang_up_verbs} and the call went "
-            f"down with ENDED played; a Session stopped with {remaining:.0f}s of the "
-            f"{cool_down:.0f}s Cool-down still to run and nothing dialled; the owed dial was "
+            f"the user hung up by voice, the Call Agent ran {hang_up_verbs}, the call was "
+            f"ended by the {ended_by} and ENDED was played; a Session stopped with "
+            f"{remaining:.0f}s of the {cool_down:.0f}s Cool-down still to run and nothing "
+            f"dialled; the owed dial was "
             f"paid exactly once when it elapsed, carrying {paid_briefs} Session Brief(s) "
             f"against the ended call's {opened_briefs}; and the call nobody spoke on ended by "
             f"the {ceiling:.0f}s Silence Ceiling"
@@ -4493,15 +4493,30 @@ class Walk:
                 self.journal("switch.armed", lane=self.lane.name, switch=name, to=position)
 
     def _watch_the_voice(
-        self, mark: int, *, deadline_seconds: float, poll_seconds: float = LIVE_CALL_POLL_SECONDS
+        self,
+        mark: int,
+        *,
+        deadline_seconds: float,
+        poll_seconds: float = LIVE_CALL_POLL_SECONDS,
+        quiet_seconds: float | None = None,
     ) -> _VoiceWatch:
-        """Poll until the call is down, remembering when the Voice last spoke.
+        """Poll while the Voice answers, remembering when it first and last spoke.
 
         One loop rather than a sequence of `support.wait_for` calls, because the
         two things being measured are not conditions that become true and stay
         true: they are *when* the Voice first and last said anything, and only
-        something watching the whole call can say. See `_VoiceWatch` for the two
-        runs that settled the shape.
+        something watching the whole stretch can say. See `_VoiceWatch` for the
+        two runs that settled the shape.
+
+        **Two stopping conditions, and the caller picks the second one.** The
+        call going down always stops it. `quiet_seconds` adds the other: stop
+        once every span the Voice opened has closed and no new edge has arrived
+        for that long. The folded walk speaks into its call again after the long
+        answer, so it cannot wait for the ending — and it cannot stop at the
+        first moment the spans balance either, because codex emits one
+        `transcript/done` per turn and run `20260902T170324Z`'s two hundred
+        numbers arrived as twenty-three of them. Left `None`, the watch is the
+        one #184 wrote: it runs until something takes the call away.
 
         The poll is a parameter only so that a test of this loop is a test and
         not a wait; every caller here takes the one the rest of the step uses.
@@ -4519,6 +4534,14 @@ class Walk:
                 last_voice_at = time.monotonic()
                 if first_voice_at is None:
                     first_voice_at = last_voice_at
+            elif (
+                quiet_seconds is not None
+                and edges[True] > 0
+                and edges[False] >= edges[True]
+                and last_voice_at is not None
+                and time.monotonic() - last_voice_at >= quiet_seconds
+            ):
+                break
         return _VoiceWatch(
             went_down=self._call_is_down(),
             edges=edges,
@@ -4550,16 +4573,6 @@ class Walk:
             if words:
                 spoken.append(" ".join(words))
         return spoken
-
-    def _ran_the_hangup_verb(self) -> bool:
-        """Whether the Call Agent ran the verb #193's rule tells it to run.
-
-        The verb, not a prefix of a line: `_verbs_run` gives the whole argv tail,
-        so `call end` — the invention run `20260902T095448Z` recorded — reads as
-        itself and is not counted. The name comes from the closed action set, so
-        this cannot go on grading a word the control plane has stopped serving.
-        """
-        return any(verb.split()[:1] == [str(Action.LIVE)] for verb in self._verbs_run())
 
     def _log_since(self, mark: int) -> list[str]:
         """The engine's log from a mark on — one call's worth, not the run's."""
