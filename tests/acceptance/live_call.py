@@ -168,6 +168,25 @@ def relay_request(focus_workspace: str) -> str:
     return f"请你给{focus_workspace}那个会话回一句话，内容是可以继续。"
 
 
+def narrowing_request(focus_workspace: str) -> str:
+    """ "Just that one" — the second half of the hand-over question (#198).
+
+    The Voice's own rule is counts first and names only when narrowed: *"Asked
+    what is going on generally, give the counts rather than the list … When they
+    narrow it, by name or by state, speak each one that matches"*
+    (`core/instructions/voice.py`). `NEEDS_REQUEST` asks generally and is answered
+    with counts; this narrows, and is where a Session name belongs. Run
+    `20260903T222129Z` is the step asking generally and grading the absence of a
+    name, which is the product obeying its own instruction.
+
+    **No verb in it either.** The point of both questions is that the Call Agent
+    runs nothing for them: the counted roster and this one Session's whole brief
+    both rode `initialItems`, so a hand-off across either says the Voice went
+    looking for what it was already holding (#194).
+    """
+    return f"就说{focus_workspace}那个吧。"
+
+
 def detail_request(focus_workspace: str) -> str:
     """ "Tell me more" — the utterance that asks the Call Agent for `brief` (#198).
 
@@ -239,6 +258,9 @@ PLAIN = "plain"
 LONG = "long"
 NEEDS = "needs"
 RELAY = "relay"
+#: The second half of the hand-over question: the narrowing the Voice's own rule
+#: says a Session name belongs to (#198).
+NARROWING = "narrowing"
 #: #198's three: Detail, History and History's older page, each of which the
 #: Call Agent has to answer with a verb of its own.
 DETAIL = "detail"
@@ -326,6 +348,7 @@ class HarnessSettings:
             LONG: self.long_request,
             NEEDS: self.needs_request,
             RELAY: relay_request(self.focus_workspace),
+            NARROWING: narrowing_request(self.focus_workspace),
             DETAIL: detail_request(self.focus_workspace),
             HISTORY: history_request(self.focus_workspace),
             EARLIER: earlier_request(self.focus_workspace),

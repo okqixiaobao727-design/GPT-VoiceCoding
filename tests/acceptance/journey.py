@@ -334,6 +334,21 @@ LIVE_CALL_LONG_HEARD_SUBSTRING = "一个数字"
 #: boundary anywhere in a four-character question.
 LIVE_CALL_NEEDS_HEARD_SUBSTRING = "需要我"
 
+#: The same, for the narrowing that follows it (#198). Its own middle again: the
+#: Session's name is in this sentence, but the name is what the *Call Agent* and
+#: the Voice have to get right, and this line only asks whether the words landed.
+LIVE_CALL_NARROWING_HEARD_SUBSTRING = "那个吧"
+
+#: What a counted Roster Brief has to carry, as the Voice is told to say it:
+#: *"give the counts rather than the list … how many have finished, how many are
+#: still working"* (`core/instructions/voice.py`, #167 Q7-Q9). A **number**, and
+#: the numbers are Chinese numerals because the Voice answers this user in the
+#: language they are speaking — run `20260903T222129Z` heard `有六个已经结束,还有
+#: 一个停在无法读取的地方`. `个` is the measure word every one of those counts is
+#: said with, so what is looked for is a numeral followed by it, which is the
+#: smallest thing that separates a count from a list.
+ROSTER_COUNT_PATTERN = r"[一二三四五六七八九十两0-9]+\s*个"
+
 #: How the engine says a call it is opening is carrying a briefing (#194). The
 #: hand-over rides `initialItems`, which the Voice holds **silently** and never
 #: repeats, so a call that came up holding nothing is indistinguishable from one
@@ -624,6 +639,22 @@ def _no_call_is_up(call_line: str) -> bool:
     """
     head, _, _note = call_line.partition(" (")
     return head == CALL_DOWN_LINE
+
+
+@dataclass(frozen=True, slots=True)
+class _HandOverAnswer:
+    """One question put to a call that came up holding a briefing, and what came back.
+
+    The mark is the caller's to read the answer against — the two questions of
+    #198's phase 2 are graded on different things and each needs its own slice of
+    the log — and the two flags are lower bounds: the words arrived, and the
+    Voice opened a span. What it *said* is read by the caller off the mark,
+    because the two questions look for different things in it.
+    """
+
+    mark: int
+    heard: bool
+    answered: bool
 
 
 @dataclass(frozen=True)
@@ -3202,92 +3233,182 @@ class Walk:
         )
 
     def _the_voice_answers_out_of_the_hand_over(self, focus_name: str) -> str:
-        """Phase 2: a question only the dial can answer, answered with no verb (#194).
+        """Phase 2: two questions only the dial can answer, and no verb behind either (#194).
 
         `initialItems` is retained and never repeated (#175 Q5), so a Voice that
         was handed the roster and a Voice that was handed nothing sound identical
-        until one is asked something only the hand-over holds. `现在有哪些需要我的
-        事情?` is that question, and a Voice with nothing does not fall silent —
-        asked the time with no answer to hand, the probe's Voice invented one
-        eleven hours out and kept advancing it (ADR 0018).
+        until one is asked something only the hand-over holds. A Voice with
+        nothing does not fall silent either — asked the time with no answer to
+        hand, the probe's Voice invented one eleven hours out and kept advancing
+        it (ADR 0018).
 
-        **Three facts, and the third is the sharp one.**
+        **Two questions, because the Voice's own rule is two answers.** *"Asked
+        what is going on generally, give the counts rather than the list … When
+        they narrow it, by name or by state, speak each one that matches"*
+        (`core/instructions/voice.py`). So `现在有哪些需要我的事情?` is answered
+        with a counted Roster Brief and **no name in it**, and `就说二号工位那个吧`
+        is where the name belongs. Run `20260903T222129Z` is this step asking
+        only the first and grading the missing name — the product obeying its
+        instruction, called a failure.
 
-        * the words reached the engine as speech, by substring (#181);
-        * the Voice's own transcript **names the Session** the call was dialled
-          about. The name is the workspace's basename, which is the project half
-          of a Session Name (`adapters/agent/_project.py`) and which this harness
-          chose — so an answer carrying it came out of `initialItems`, and there
-          is nowhere else on this call it could have come from;
-        * **and the Call Agent ran nothing for it.** The wrapper log gains no run
-          across this question — the ticket's own sentence, and the half that
-          says the Voice was holding the answer rather than going to look for it.
-          An absence, so it is scoped to this phase's own window (#181): the
-          Voice's span is waited out first, and then watched a while longer,
-          because a hand-off can arrive after the answer has begun.
+        **What is graded:**
+
+        * both utterances reached the engine as speech, by substring (#181);
+        * the first answer carries a **count** — a numeral and its measure word,
+          which is the smallest thing that separates a counted roster from a
+          list. Nothing about *which* counts, because the states in a roster are
+          the roster's business and vary with what else this machine is running;
+        * the second answer **names the Session** the call was dialled about. The
+          name is the workspace's basename, which is the project half of a
+          Session Name (`adapters/agent/_project.py`) and which this harness
+          chose;
+        * **and the Call Agent ran nothing across either of them.** The wrapper
+          log gains no run from the first question to the end of the second.
+          That is the sharp one and the reason the phase exists: the counted
+          roster *and* one Session's whole brief both came out of the dial, and
+          the Voice went looking for neither. An absence, so it is scoped to this
+          phase's own window (#181) — the Voice's spans are waited out and then
+          watched a while longer, because a hand-off can arrive after an answer
+          has begun.
+
+        **Recorded and not graded:** whether the narrowed answer carries a
+        fragment of what that Session actually stopped on. The name alone is weak
+        evidence — the user just said it — and the *question* is the substring
+        that could only have come from the hand-over. Not pinned yet because the
+        Voice paraphrases and two lanes of transcripts should be read before a
+        fragment is chosen.
         """
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
-        live_call.ask_next(self.config.call_wav_directory, live_call.NEEDS)
-        heard = support.wait_for(
-            lambda: bool(self._user_speech_lines(LIVE_CALL_NEEDS_HEARD_SUBSTRING, since=asking)),
-            deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        counted = self._one_question_the_hand_over_answers(
+            variant=live_call.NEEDS,
+            heard=LIVE_CALL_NEEDS_HEARD_SUBSTRING,
+            request=live_call.NEEDS_REQUEST,
         )
-        # From this phase's own mark and not from the question's line: the Voice
-        # begins answering as the recogniser finalises the sentence, and on run
-        # `20260902T215924Z` its start edge was logged one line *before* the
-        # user-speech line (#181 finding 2, seen from the other side).
-        named = support.wait_for(
-            lambda: self._voice_said_something_carrying(focus_name, since=asking),
-            deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        narrowing = len(self.engine.log_lines())
+        named = self._one_question_the_hand_over_answers(
+            variant=live_call.NARROWING,
+            heard=LIVE_CALL_NARROWING_HEARD_SUBSTRING,
+            request=live_call.narrowing_request(focus_name),
         )
-        support.wait_for(
-            self._voice_finished_speaking(asking),
-            deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
-        )
+        # **The absence is read after both answers have closed**, and only then.
+        # A hand-off arrives four to five seconds after a request (#179), and
+        # sometimes after the Voice has begun answering — so the answer starting
+        # is not the end of the chance for one.
         support.wait_for(
             lambda: len(support.cli_wrapper_runs(self.config.cli_wrapper_log)) > runs_before,
             deadline_seconds=LIVE_CALL_NO_VERB_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)[runs_before:]
-        said = self._voice_said_lines(since=asking)
+        # **The general answer is the lines between the two marks**, so the
+        # narrowed one — which is supposed to carry the name — cannot be read as
+        # the general one having carried it.
+        answered_generally = [
+            line.strip()
+            for line in support.matching_lines(
+                self._log_since(asking)[: narrowing - asking], VOICE_SAID_PATTERN
+            )
+        ]
+        answered_narrowly = self._voice_said_lines(since=narrowing)
+        stopped_on = _spoken_fragment(ASK_A_QUESTION.words.split(":")[-1].strip())
         self.journey.observe(
             "live call the hand-over answered",
-            f"the Voice opened {self._voice_speech_edges(since=asking)[True]} span(s) for this "
-            f"question and said: {said or 'nothing recorded'}; `bridgectl` runs across it: "
-            f"{runs or 'none'}",
+            f"asked generally, the Voice said {answered_generally or 'nothing recorded'}; "
+            f"asked to narrow to {focus_name!r} it said "
+            f"{answered_narrowly or 'nothing recorded'}; `bridgectl` runs across both: "
+            f"{runs or 'none'}; whether the narrowed answer carried a fragment of what that "
+            f"Session stopped on ({stopped_on!r}) — recorded, not graded: "
+            f"{self._voice_said_something_carrying(stopped_on, since=narrowing)}",
         )
-        if not heard:
+        if not counted.heard:
             raise StepFailed(
                 f"the call came up holding the briefing and the engine never logged the "
                 f"question within {LIVE_CALL_HEARD_SECONDS:.0f}s. The utterance the harness "
                 f"put on the track is {live_call.NEEDS_REQUEST!r} and the line looked for "
-                f"carries {LIVE_CALL_NEEDS_HEARD_SUBSTRING!r}. Engine log tail: "
-                f"{self._log_since(asking)[-8:]}"
+                f"carries {LIVE_CALL_NEEDS_HEARD_SUBSTRING!r}. The call now: "
+                f"{self._call_line()!r}. Engine log tail: {self._log_since(asking)[-8:]}"
             )
-        if not named:
+        if not counted.answered:
             raise StepFailed(
-                f"the question reached the engine and the Voice never named {focus_name!r} — "
-                f"the Session this call was dialled about, whose brief rode `initialItems`. A "
-                f"Voice with nothing to say invents rather than going quiet (ADR 0018), so "
-                f"what it said instead is the answer: {said or 'nothing this call recorded'}. "
-                f"The call now: {self._call_line()!r}"
+                f"the question reached the engine and the Voice never answered within "
+                f"{LIVE_CALL_ANSWER_SECONDS:.0f}s. A Voice with nothing to say invents rather "
+                f"than going quiet (ADR 0018), so silence here is the call being gone rather "
+                f"than the hand-over being empty: {self._call_line()!r}"
+            )
+        if not any(re.search(ROSTER_COUNT_PATTERN, line) for line in answered_generally):
+            raise StepFailed(
+                f"asked what needed them, the Voice answered without a count in it: "
+                f"{answered_generally}. Asked generally the Voice "
+                f"gives the counts rather than the list (`core/instructions/voice.py`), and a "
+                f"counted answer is what says the roster it was handed at dial time arrived"
+            )
+        if any(focus_name in line for line in answered_generally):
+            raise StepFailed(
+                f"the *general* question was answered by naming {focus_name!r}: "
+                f"{answered_generally}. Counts rather than the list is the rule "
+                f"(`core/instructions/voice.py`), and the names come when the user narrows"
+            )
+        if not named.heard:
+            raise StepFailed(
+                f"the narrowing utterance went on the track and the engine never logged it "
+                f"within {LIVE_CALL_HEARD_SECONDS:.0f}s. It carries "
+                f"{live_call.narrowing_request(focus_name)!r} and the line looked for carries "
+                f"{LIVE_CALL_NARROWING_HEARD_SUBSTRING!r}. The call now: {self._call_line()!r}"
+            )
+        if not self._voice_said_something_carrying(focus_name, since=narrowing):
+            raise StepFailed(
+                f"the user narrowed to {focus_name!r} and the Voice never named it. When they "
+                f"narrow it, the Voice speaks each Session that matches "
+                f"(`core/instructions/voice.py`), and that Session's whole brief rode "
+                f"`initialItems`. What it said: "
+                f"{answered_narrowly or 'nothing this call recorded'}"
             )
         if runs:
             raise StepFailed(
-                f"the Voice answered, but the Call Agent ran {len(runs)} `bridgectl` "
-                f"command(s) for a question with no verb in it: {runs!r}. The whole point of "
-                f"the hand-over is that the answer was already in the call — a hand-off here "
-                f"says the Voice went looking for what it was holding (#194)"
+                f"the Voice answered both questions, and the Call Agent ran {len(runs)} "
+                f"`bridgectl` command(s) for two questions with no verb in either: {runs!r}. "
+                f"The whole point of the hand-over is that the answers were already in the "
+                f"call — a hand-off here says the Voice went looking for what it was holding "
+                f"(#194)"
             )
         return (
-            f"the user asked what needed them and the Voice answered out of the hand-over, "
-            f"naming {focus_name!r}, with no `bridgectl` run behind it"
+            f"asked what needed them the Voice answered with counts and no names; asked to "
+            f"narrow to {focus_name!r} it named it; and the Call Agent ran nothing for either"
         )
+
+    def _one_question_the_hand_over_answers(
+        self, *, variant: str, heard: str, request: str
+    ) -> _HandOverAnswer:
+        """Put one question on the track and wait for the Voice to finish answering it.
+
+        The half of phase 2 that is the same for both questions: queue, wait for
+        the engine to log the words, wait for the Voice to open a span, and then
+        wait for every span it opened to close — so that the caller's reading of
+        what was said is of a finished answer, and its reading of the wrapper log
+        is taken after the hand-off that never came would have arrived.
+
+        The span is waited for from **this question's own mark**, not from the
+        user-speech line: the Voice begins answering as the recogniser finalises
+        the sentence, and on run `20260902T215924Z` its start edge was logged one
+        line *before* the user's transcript (#181 finding 2, from the other side).
+        """
+        del request  # named by the caller's own complaint, which knows which one it is
+        mark = len(self.engine.log_lines())
+        live_call.ask_next(self.config.call_wav_directory, variant)
+        arrived = self._while_the_call_is_up(
+            lambda: bool(self._user_speech_lines(heard, since=mark)),
+            deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
+        )
+        answered = self._while_the_call_is_up(
+            lambda: self._voice_speech_edges(since=mark)[True] > 0,
+            deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
+        )
+        self._while_the_call_is_up(
+            self._voice_finished_speaking(mark),
+            deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
+        )
+        return _HandOverAnswer(mark=mark, heard=arrived, answered=answered)
 
     def _the_answer_is_relayed_and_receipted(
         self, focus_name: str, focus_at: Path, focus_address: str, turn: float
@@ -3327,10 +3448,9 @@ class Walk:
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         relaying = len(self.engine.log_lines())
         live_call.ask_next(self.config.call_wav_directory, live_call.RELAY)
-        heard = support.wait_for(
+        heard = self._while_the_call_is_up(
             lambda: bool(self._user_speech_lines(LIVE_CALL_RELAY_HEARD_SUBSTRING, since=relaying)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         relayed = support.wait_for(
             lambda: bool(self._verbs_since(runs_before, Action.RELAY)),
@@ -3338,13 +3458,12 @@ class Walk:
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         relays = self._verbs_since(runs_before, Action.RELAY)
-        receipted = support.wait_for(
+        receipted = self._while_the_call_is_up(
             lambda: any(
                 self._voice_said_something_carrying(wording, since=relaying)
                 for wording in (RELAY_RECEIPT_DELIVERED, RELAY_RECEIPT_QUEUED)
             ),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         # The Session's own next turn, through the surface a user reads it on.
         # Budget is one turn plus the Relay's own deadline: the words wait in the
@@ -3554,24 +3673,22 @@ class Walk:
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
         live_call.ask_next(self.config.call_wav_directory, variant)
-        arrived = support.wait_for(
+        arrived = self._while_the_call_is_up(
             lambda: bool(self._user_speech_lines(heard, since=asking)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         ran = support.wait_for(
             lambda: bool(self._verbs_since(runs_before, action)),
             deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
-        answered = support.wait_for(
+        answered = self._while_the_call_is_up(
             lambda: any(
                 self._voice_said_something_carrying(fragment, since=asking)
                 for fragment in wanted
                 if fragment
             ),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         verbs = self._verbs_since(runs_before, action)
         said = self._voice_said_lines(since=asking)
@@ -3641,10 +3758,9 @@ class Walk:
         """
         asking = len(self.engine.log_lines())
         live_call.ask_next(self.config.call_wav_directory, live_call.LONG)
-        heard = support.wait_for(
+        heard = self._while_the_call_is_up(
             lambda: bool(self._user_speech_lines(LIVE_CALL_LONG_HEARD_SUBSTRING, since=asking)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         watch = self._watch_the_voice(
             asking,
@@ -4174,6 +4290,9 @@ class Walk:
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         hanging = len(self.engine.log_lines())
         live_call.ask_next(self.config.call_wav_directory, live_call.PLAIN)
+        # **The one heard-wait that is not call-aware**, because this call ending
+        # is what the phase is about: giving up the moment it goes down would be
+        # giving up on the success case.
         heard = support.wait_for(
             lambda: bool(self._user_speech_lines(since=hanging)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
@@ -4598,6 +4717,43 @@ class Walk:
             for line in support.matching_lines(self._log_since(since), USER_SPEECH_LINE)
             if _unspaced(carrying) in _unspaced(line)
         ]
+
+    def _while_the_call_is_up(
+        self, condition: Callable[[], bool], *, deadline_seconds: float
+    ) -> bool:
+        """Wait for something the *call* has to produce, and give up when the call goes.
+
+        **A content wait can never be satisfied, and the ordinary one outlives the
+        call it is about.** `LIVE_CALL_ANSWER_SECONDS` is five minutes and a
+        Silence Ceiling is one, so a phase waiting on words the Voice is never
+        going to say waits out the ceiling, the call closes underneath it, and
+        every phase after it is graded against a call that had already gone. Run
+        `20260903T222129Z` is that: phase 2 waited five minutes for a name the
+        Voice had no reason to say and ended on `call: none`.
+
+        So the call being down ends the wait. It is not an answer either way —
+        the caller asks separately whether the thing arrived, and gets `False`
+        here for both "not yet" and "not ever" — but it turns five wasted minutes
+        into seconds and leaves the call for the phase after it.
+
+        Only for waits on what is *said or heard on a call*. A wait for the call
+        to end, or for a Cool-down to elapse, is a wait whose whole subject is
+        the call not being up, and those keep using `support.wait_for`.
+        """
+        support.wait_for(
+            lambda: condition() or self._call_is_down(),
+            deadline_seconds=deadline_seconds,
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        if condition():
+            return True
+        # **One more look, once.** The engine writes its log from a thread, so a
+        # line about the last thing said on a call can land after the call is
+        # already down — and this loop's other exit is exactly that moment.
+        # Without this the wait would answer "never said" about words that were
+        # in the log a poll later.
+        time.sleep(LIVE_CALL_POLL_SECONDS)
+        return condition()
 
     def _voice_said_lines(self, *, since: int = 0) -> list[str]:
         """Every line the realtime adapter wrote down of what the Voice said (#197).

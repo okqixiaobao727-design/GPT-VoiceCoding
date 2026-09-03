@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -815,6 +816,7 @@ def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
         live_call.DETAIL,
         live_call.HISTORY,
         live_call.EARLIER,
+        live_call.NARROWING,
     }
     assert settings.requests[live_call.PLAIN] == live_call.REQUEST
     assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST
@@ -931,6 +933,41 @@ def test_the_relay_utterance_asks_for_no_hang_up() -> None:
     assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
 
 
+def test_the_hand_over_question_is_asked_the_way_the_voice_is_told_to_answer_it() -> None:
+    """Counts first, names when narrowed — the Voice's own rule, so phase 2 asks twice.
+
+    Run `20260903T222129Z` asked only the general question and graded the missing
+    Session name: the Voice had answered `有六个已经结束…`, which is
+    `core/instructions/voice.py`'s counted Roster Brief, exactly as shipped.
+    """
+    spoken = voice_instructions(
+        InstructionContext(
+            cli=ControlPlaneCli(
+                command=Path("/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"),
+                version="1.4.2",
+                socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
+            )
+        )
+    ).text
+
+    assert "give the counts rather than the list" in spoken
+    assert "narrow it" in spoken
+    # The narrowing utterance says the name; the general one must not.
+    assert live_call.FOCUS_WORKSPACE_NAME in live_call.narrowing_request(
+        live_call.FOCUS_WORKSPACE_NAME
+    )
+    assert live_call.FOCUS_WORKSPACE_NAME not in live_call.NEEDS_REQUEST
+
+
+def test_a_counted_roster_brief_is_recognised_by_a_numeral_and_its_measure_word() -> None:
+    """What the Voice actually said on `20260903T222129Z`, and what a list is not."""
+    counted = "有六个已经结束,还有一个停在无法读取的地方。你想看哪一个?"
+    listed = "二号工位在等你,三号工位还在跑。"
+
+    assert re.search(journey.ROSTER_COUNT_PATTERN, counted)
+    assert not re.search(journey.ROSTER_COUNT_PATTERN, listed)
+
+
 def test_the_folded_walk_is_the_tenth_step_and_the_only_one_that_dials() -> None:
     """#198's fold, read off the contract every build ticket's "Red first" line cites.
 
@@ -972,6 +1009,7 @@ def test_the_walk_asks_for_every_variant_it_speaks_and_no_others() -> None:
     """
     spoken = (
         live_call.NEEDS,
+        live_call.NARROWING,
         live_call.RELAY,
         live_call.DETAIL,
         live_call.HISTORY,
