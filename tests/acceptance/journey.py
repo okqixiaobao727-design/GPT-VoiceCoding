@@ -452,7 +452,20 @@ LIVE_CALL_EARLIER_HEARD_SUBSTRING = "再往前"
 #: pinned: a walk whose relay neither arrived nor queued has lost its premise
 #: before this line reads anything.
 RELAY_RECEIPT_DELIVERED = "已转达"
+
+#: And the same fact as a pattern, for `UNDELIVERED_SPOKEN_PATTERN`'s reason:
+#: the wording varies where the meaning does not. Run `20260903T233723Z` had
+#: both lanes say `已转达` and then `已送达` of one relay — one verb apart, the
+#: same statement that the words went. Pinning the one spelling would grade the
+#: Voice's choice of synonym rather than whether the user was told.
+DELIVERED_SPOKEN_PATTERN = r"已[转送]达"
+
 RELAY_RECEIPT_QUEUED = "收到"
+
+#: The two a relay can earn, as the step looks for them. `收到` stays a word:
+#: #193 §Voice dictates it for a queued relay and no run has yet spelled it any
+#: other way.
+RECEIPT_SPOKEN_PATTERNS = (DELIVERED_SPOKEN_PATTERN, re.escape(RELAY_RECEIPT_QUEUED))
 
 #: How the engine says its own Silence Ceiling ended a call. A pattern rather
 #: than an imported string because the line carries the configured number
@@ -546,8 +559,15 @@ def _unaccounted_voice_turns(lines: list[str], receipts: tuple[str, ...]) -> int
     Voice going on by itself, which is what the ticket forbids.
 
     `None` when no line carrying a receipt is there at all: that is a different
-    failure and the caller has already asked about it. Matched spaceless on both
-    sides for `_user_speech_lines`' reason.
+    failure and the caller has already asked about it. `receipts` are patterns
+    rather than words (`DELIVERED_SPOKEN_PATTERN`), searched against the line
+    with its spaces taken out for `_user_speech_lines`' reason.
+
+    **The window this counts over starts at the relay, not at the utterance.**
+    A receipt spoken *before* the relay ran is #221's symptom — the Voice says
+    the delivered wording at hand-off and then again from the result — and
+    counting from it would make the real receipt one of the turns it forbids.
+    The caller passes the lines from the relay on.
 
     A module-level rule with no walk behind it, for `_cue_complaint`'s reason: an
     acceptance run is an expensive place to discover an arithmetic written the
@@ -558,7 +578,7 @@ def _unaccounted_voice_turns(lines: list[str], receipts: tuple[str, ...]) -> int
             index
             for index, line in enumerate(lines)
             if re.search(VOICE_SAID_PATTERN, line)
-            and any(_unspaced(wording) in _unspaced(line) for wording in receipts)
+            and any(re.search(pattern, _unspaced(line)) for pattern in receipts)
         ),
         None,
     )
@@ -3633,11 +3653,16 @@ class Walk:
         # words have gone — "no further `bridgectl` run … until" the next spoken
         # request — so the mark is taken once the relay is in the log.
         runs_at_relay = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
+        # **And the same mark in the engine's own log, which is where the receipt
+        # is read.** The receipt graded is the first Voice turn *after* the relay
+        # went out: run `20260903T233723Z` had both lanes say `已转达` **before**
+        # the relay's argv line — claude 23:42:14.8 against a relay at 23:42:15Z,
+        # codex 23:47:04.7 against 23:47:08Z — and then `已送达` from the result.
+        # The first is a receipt for something not yet delivered (#221); reading
+        # it as the receipt would make the real one a turn nobody asked for.
+        at_relay = len(self.engine.log_lines())
         receipted = self._while_the_call_is_up(
-            lambda: any(
-                self._voice_said_something_carrying(wording, since=relaying)
-                for wording in (RELAY_RECEIPT_DELIVERED, RELAY_RECEIPT_QUEUED)
-            ),
+            lambda: bool(self._voice_said_matching(RECEIPT_SPOKEN_PATTERNS, since=at_relay)),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
         )
         # The Session's own next turn, through the surface a user reads it on.
@@ -3652,10 +3677,14 @@ class Walk:
         )
         # Read after the Session's turn has landed, so the window this counts
         # over is the one the payment would have fallen in.
-        since_relay = self._log_since(relaying)
+        since_relay = self._log_since(at_relay)
         payments = support.matching_lines(since_relay, MID_CALL_SPOKEN_PATTERN)
-        unaccounted = _unaccounted_voice_turns(
-            since_relay, (RELAY_RECEIPT_DELIVERED, RELAY_RECEIPT_QUEUED)
+        unaccounted = _unaccounted_voice_turns(since_relay, RECEIPT_SPOKEN_PATTERNS)
+        # #221's symptom, recorded rather than graded: a receipt-worded turn
+        # between the utterance going out and the relay running. It is left out
+        # of the count above by where that window starts.
+        premature = self._voice_said_matching(
+            RECEIPT_SPOKEN_PATTERNS, since=relaying, until=at_relay
         )
         further = self._verbs_run(since=runs_at_relay)
         self.journey.observe(
@@ -3666,6 +3695,9 @@ class Walk:
             f"{self._voice_said_lines(since=relaying) or 'nothing recorded'}; "
             f"{len(payments)} engine payment(s) in the window, "
             f"{'no' if not unaccounted else unaccounted} Voice turn(s) unaccounted for; "
+            f"receipt(s) spoken before the relay ran, which #221 explains and this step "
+            f"does not grade: {premature or 'none'}, against the relay at "
+            f"{self._verbs_run(since=runs_before)[-1:] or 'nothing'}; "
             f"what the Call Agent ran before the relay: "
             f"{self._verbs_run(since=runs_before)[:-1] or 'nothing'}",
         )
@@ -3696,7 +3728,9 @@ class Walk:
                 f"the words reached the Session and the Voice never told the user so. #193 "
                 f"§Voice has it say {RELAY_RECEIPT_DELIVERED!r} for a delivered relay and "
                 f"{RELAY_RECEIPT_QUEUED!r} for one queued behind that Session's turn. What it "
-                f"said: {self._voice_said_lines(since=relaying) or 'nothing this call recorded'}"
+                f"said after the relay went out: "
+                f"{self._voice_said_lines(since=at_relay) or 'nothing this call recorded'}. "
+                f"Before it (#221, not this grade): {premature or 'nothing'}"
             )
         if further:
             raise StepFailed(
@@ -5034,6 +5068,26 @@ class Walk:
         return [
             line.strip()
             for line in support.matching_lines(self._log_since(since), VOICE_SAID_PATTERN)
+        ]
+
+    def _voice_said_matching(
+        self, patterns: tuple[str, ...], *, since: int, until: int | None = None
+    ) -> list[str]:
+        """The Voice's turns in a window that match any of `patterns` (#198, #221).
+
+        A pattern rather than a word for `UNDELIVERED_SPOKEN_PATTERN`'s reason,
+        and a window with two ends because phase 3 has two of them to tell apart:
+        what the Voice said after the relay ran, which is the receipt, and what
+        it said before, which is #221. Spaceless for
+        `_voice_said_something_carrying`'s reason.
+        """
+        window = self._log_since(since)
+        if until is not None:
+            window = window[: max(until - since, 0)]
+        return [
+            line.strip()
+            for line in support.matching_lines(window, VOICE_SAID_PATTERN)
+            if any(re.search(pattern, _unspaced(line)) for pattern in patterns)
         ]
 
     def _voice_said_something_carrying(self, fragment: str, *, since: int) -> bool:

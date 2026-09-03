@@ -696,7 +696,7 @@ def _said(words: str) -> str:
     )
 
 
-RECEIPTS = (journey.RELAY_RECEIPT_DELIVERED, journey.RELAY_RECEIPT_QUEUED)
+RECEIPTS = journey.RECEIPT_SPOKEN_PATTERNS
 RECEIPT = _said("好的，已转达给二号工位。")
 
 
@@ -752,6 +752,24 @@ def test_a_receipt_the_recogniser_put_a_space_inside_is_still_a_receipt() -> Non
 def test_a_window_with_no_receipt_in_it_is_not_this_rules_complaint() -> None:
     """A relay nobody was told about fails on the receipt line, before this one reads."""
     assert journey._unaccounted_voice_turns([_said("在的")], RECEIPTS) is None
+
+
+def test_the_other_spelling_of_delivered_is_the_same_receipt() -> None:
+    """Run `20260903T233723Z` said `已转达` and then `已送达` of one relay (#221).
+
+    One verb apart, the same statement that the words went. A window opening on
+    the second is a window opening on a receipt, or the step would read the real
+    receipt as a turn nobody asked for.
+    """
+    lines = [_said("已送达。"), _said("还有别的事吗")]
+
+    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 1
+
+
+def test_a_receipt_is_not_read_out_of_a_sentence_that_only_mentions_delivery() -> None:
+    """The pattern is the two verbs of *this* statement, not the word 送 anywhere."""
+    assert journey._unaccounted_voice_turns([_said("还没送到")], RECEIPTS) is None
+    assert journey._unaccounted_voice_turns([_said("我送你一句话")], RECEIPTS) is None
 
 
 # --- the two readings phase 3a compares the Voice against (#198) --------------
