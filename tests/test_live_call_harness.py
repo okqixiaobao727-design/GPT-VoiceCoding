@@ -37,7 +37,9 @@ import pytest
 
 from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.adapters.call.realtime.webrtc import FRAME_SAMPLES, SAMPLE_RATE
+from gpt_voicecoding.control_plane.commands import render
 from gpt_voicecoding.seams.call import Cue
+from gpt_voicecoding.seams.control_plane import Action, Reply
 
 
 class FakeTrack:
@@ -370,3 +372,73 @@ def test_a_thin_late_end_line_is_not_evidence_for_a_whole_early_one() -> None:
     """The mirror: the whole `ended` record is from before this call's speech."""
     lines = [played(Cue.CONNECTED), played(Cue.ENDED), SPOKE, "played the ended cue"]
     assert "that is not this call's ending" in journey._cue_complaint(lines, {SPOKE}, device=None)
+
+
+# --- the acceptance step's own "is a call up?" rule, graded at CI speed ------
+#
+# `bridgectl status` says whether a call is up and what Cool-down is running on
+# *one* line (#195), and the harness reads that line to decide when the ceiling
+# has released the call. The rule is a module-level function for the same reason
+# the cue rule above is: an acceptance run is an expensive place to discover a
+# string comparison written the wrong way round (#109, #218).
+
+
+def call_line(**data: object) -> str:
+    """The `call:` line as the control plane really renders it, not one typed here.
+
+    Built through `commands.render` so these cases move the day the surface
+    does. Run `20260903T060110Z` is what a harness holding its own copy of this
+    wording costs: the Cool-down suffix #195 added went unread for a whole
+    release cycle, and the step waited the window out instead of using it.
+    """
+    reply = Reply(
+        True,
+        Action.STATUS,
+        {
+            "switches": {"duty": True},
+            "sessions": [],
+            "lanes": {},
+            "degraded_lanes": {},
+            "call_id": None,
+            "cool_down_remaining": 0.0,
+            "dial_owed": False,
+            "pending_relays": [],
+            **data,
+        },
+    )
+    (line,) = [row for row in render(reply).splitlines() if row.startswith("call:")]
+    return line
+
+
+def test_a_quiet_line_reads_as_no_call_up() -> None:
+    assert journey._no_call_is_up(call_line()) is True
+
+
+def test_a_running_cool_down_is_still_no_call_up() -> None:
+    """The regression #218 is: the ceiling has released the call and the engine
+    is counting the window out, which is precisely when the step must act."""
+    assert journey._no_call_is_up(call_line(cool_down_remaining=28.0)) is True
+
+
+def test_a_cool_down_carrying_an_owed_dial_is_still_no_call_up() -> None:
+    assert journey._no_call_is_up(call_line(cool_down_remaining=12.0, dial_owed=True)) is True
+
+
+def test_an_owed_dial_past_the_windows_expiry_is_still_no_call_up() -> None:
+    """`_end_any_live_call` asks this same question, and an answer of "a call is
+    up" here would have it dial one to clean up after a call that never was."""
+    assert journey._no_call_is_up(call_line(dial_owed=True)) is True
+
+
+def test_a_line_naming_a_call_reads_as_a_call_up() -> None:
+    """A call id is never the word `none`, so the reading cannot be fooled."""
+    line = call_line(call_id="01a065e0-1a4f-7c10-9a9a-c2f3840f7953")
+
+    assert line == "call: 01a065e0-1a4f-7c10-9a9a-c2f3840f7953"
+    assert journey._no_call_is_up(line) is False
+
+
+def test_a_surface_that_answered_something_else_entirely_is_not_read_as_down() -> None:
+    """`_call_line` falls back to the head of whatever `status` printed when no
+    `call:` line is in it — a refusal must not read as a quiet keeper."""
+    assert journey._no_call_is_up("engine unreachable") is False
