@@ -36,6 +36,7 @@ import threading
 import time
 import tomllib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -50,6 +51,7 @@ from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
 )
 from gpt_voicecoding.control_plane.client import DEFAULT_TIMEOUT_SECONDS, ask
+from gpt_voicecoding.installation import claude_hooks
 from gpt_voicecoding.seams.control_plane import Action, Request
 from gpt_voicecoding.seams.identity import AgentKind
 
@@ -1505,12 +1507,60 @@ class Journey:
 # --- the trust gate ---------------------------------------------------------
 
 #: Where each agent records that a directory has been trusted. Both were read off
-#: this machine rather than remembered: `~/.claude.json` keeps a `projects` map
-#: whose entries carry `hasTrustDialogAccepted`, and `~/.codex/config.toml` keeps
-#: `[projects."<path>"] trust_level = "trusted"`.
-CLAUDE_STATE = Path.home() / ".claude.json"
+#: this machine rather than remembered: Claude Code's state file keeps a
+#: `projects` map whose entries carry `hasTrustDialogAccepted`, and
+#: `~/.codex/config.toml` keeps `[projects."<path>"] trust_level = "trusted"`.
+CLAUDE_STATE_NAME = ".claude.json"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
 CLAUDE_TRUST_KEY = "hasTrustDialogAccepted"
+
+
+def claude_state_path(environment: Mapping[str, str], home: Path | None = None) -> Path:
+    """Which Claude state file a Session launched with this environment will read.
+
+    **Not a constant, because it was one and that cost a lane** (#217). Run
+    `20260903T050619Z` granted trust in `~/.claude.json`, journalled
+    `trust.granted`, and still met the full-screen dialog: the shell that started
+    it exported `CLAUDE_CONFIG_DIR=~/.claude-b`, `hand_started.terminal_environment`
+    scrubs only the agent markers, so the Session read
+    `~/.claude-b/.claude.json` — a file the gate had never opened. `roster` failed
+    ungraded and the two graded steps behind it were SKIPPED, and nothing in the
+    journal said the arrangement had missed.
+
+    Measured on 2026-09-03 against `claude` 2.1.259, in a pty over a `git init`
+    workspace under the acceptance root: with the variable set, only an entry in
+    `$CLAUDE_CONFIG_DIR/.claude.json` clears the dialog; with it unset, only an
+    entry in `~/.claude.json`.
+
+    **The unset default is the home directory, not the default config
+    directory**, which is the whole reason this is its own rule rather than
+    `claude_hooks.default_config_directory(environment) / CLAUDE_STATE_NAME`. The
+    *named* case defers to that function anyway, so the harness and the engine
+    read one rule about what `CLAUDE_CONFIG_DIR` means — `bridgectl verify`
+    reports which directory it checked hooks under, and a run where those two
+    disagreed is what this whole function exists to stop.
+
+    **Legacy (ADR 0010).** *Dropped, because gen-1 never met this gate.* Its
+    acceptance is a person at a keyboard answering `pass`/`fail`
+    (`acceptance.sh:16-33` — `read -r -p "${title} [pass/fail]: "` at :20), so nothing
+    in it ever launched an agent into a directory the agent had not seen, and
+    there is no trust gate there to port. What gen-1 *does* have is the nearest
+    relative of the writing half, and it is ported rather than reinvented: its
+    preflight edits the user's own `~/.codex/config.toml` and is held to keeping
+    every unrelated line, `[projects."…"] trust_level = "trusted"` included
+    (`test_preflight.py:235-255`). That is the same promise `_trust_claude` and
+    `_untrust_claude` keep about the entries this run did not write. Gen-1 also
+    knew `CLAUDE_CONFIG_DIR` is the knob that isolates a Claude install
+    (`bridge/channelplugin.py:117-124`, measured against 2.1.222) — it had no
+    reader that could disagree with itself about which directory it meant, which
+    is the gap this function closes for the harness.
+    """
+    home = home or Path.home()
+    stated = environment.get(claude_hooks.CONFIG_DIRECTORY_VARIABLE)
+    if stated and stated.strip():
+        return claude_hooks.default_config_directory(environment, home) / CLAUDE_STATE_NAME
+    return home / CLAUDE_STATE_NAME
+
 
 #: Both lanes grant trust in the same two files, and both grants are a
 #: read-modify-write of a file **the user owns** — `~/.claude.json` is their whole
@@ -1544,10 +1594,23 @@ class TrustGate:
     today, so the two spellings coincide — but a gate that only holds while that
     stays true is a gate that fails once and confusingly. Both are granted when
     they differ, and both are revoked.
+
+    **The gate is told the environment its Session will be launched with**, and
+    resolves the Claude state file from it (`claude_state_path`). It used to
+    write a module constant built from `Path.home()`, which is #217: a run under
+    `CLAUDE_CONFIG_DIR` arranged trust in a file nobody read, reported
+    `trust.granted`, and lost its whole lane to the dialog it had just paid to
+    avoid. The journal now names the file, so the next such run says so.
     """
 
     def __init__(
-        self, workspace: Path, *, run_directory: Path, journal: Journal, label: str
+        self,
+        workspace: Path,
+        *,
+        run_directory: Path,
+        journal: Journal,
+        label: str,
+        environment: Mapping[str, str],
     ) -> None:
         self._workspace = workspace
         self._paths = sorted({str(workspace), os.path.realpath(workspace)})
@@ -1558,7 +1621,12 @@ class TrustGate:
         #: file the first had already changed — and the pristine copy, which is
         #: the whole point of a backup, would be gone.
         self._label = label
-        self._claude_granted: list[str] = []
+        self._claude_state = claude_state_path(environment)
+        #: What each granted spelling looked like before the grant: an entry to
+        #: put back, or `None` where there was none. A revoke that only deleted
+        #: would take an entry the user already had — the whole point of writing
+        #: into their file is that some of what is in it is theirs.
+        self._claude_restore: dict[str, dict[str, Any] | None] = {}
         self._codex_block: str | None = None
 
     def __enter__(self) -> TrustGate:
@@ -1577,31 +1645,53 @@ class TrustGate:
             shutil.copy2(path, self._run_directory / f"{path.name}.before-trust-{self._label}")
 
     def _trust_claude(self) -> None:
-        if not CLAUDE_STATE.exists():
-            self._journal("trust.absent", agent="claude", path=str(CLAUDE_STATE))
+        state_path = self._claude_state
+        if not state_path.exists():
+            self._journal(
+                "trust.absent", agent="claude", path=str(state_path), state=str(state_path)
+            )
             return
-        self._backup(CLAUDE_STATE)
-        state = json.loads(CLAUDE_STATE.read_text())
+        self._backup(state_path)
+        state = json.loads(state_path.read_text())
         projects = state.setdefault("projects", {})
-        granted = [path for path in self._paths if path not in projects]
-        for path in granted:
-            projects[path] = {CLAUDE_TRUST_KEY: True}
+        #: **Untrusted is not absent.** The question is whether this path is
+        #: trusted, and an entry that says `false` — or one that carries the
+        #: user's `allowedTools` and no verdict at all — answers no while being
+        #: present. Asking `path not in projects` reported `trust.already` and
+        #: granted nothing for both, which is the #217 failure by a second route
+        #: on any machine that has opened this directory once before.
+        granted = [
+            path for path in self._paths if not (projects.get(path) or {}).get(CLAUDE_TRUST_KEY)
+        ]
         if not granted:
-            self._journal("trust.already", agent="claude", workspaces=self._paths)
+            self._journal(
+                "trust.already", agent="claude", workspaces=self._paths, state=str(state_path)
+            )
             return
-        CLAUDE_STATE.write_text(json.dumps(state, indent=2))
-        self._claude_granted = granted
-        self._journal("trust.granted", agent="claude", workspaces=granted)
+        for path in granted:
+            existing = projects.get(path)
+            self._claude_restore[path] = deepcopy(existing) if existing is not None else None
+            projects[path] = {**(existing or {}), CLAUDE_TRUST_KEY: True}
+        state_path.write_text(json.dumps(state, indent=2))
+        self._journal("trust.granted", agent="claude", workspaces=granted, state=str(state_path))
 
     def _untrust_claude(self) -> None:
-        if not self._claude_granted or not CLAUDE_STATE.exists():
+        state_path = self._claude_state
+        if not self._claude_restore or not state_path.exists():
             return
-        state = json.loads(CLAUDE_STATE.read_text())
+        state = json.loads(state_path.read_text())
         projects = state.get("projects", {})
-        removed = [path for path in self._claude_granted if projects.pop(path, None) is not None]
-        if removed:
-            CLAUDE_STATE.write_text(json.dumps(state, indent=2))
-        self._journal("trust.revoked", agent="claude", workspaces=removed)
+        restored = []
+        for path, before in self._claude_restore.items():
+            if before is None:
+                if projects.pop(path, None) is None:
+                    continue
+            else:
+                projects[path] = before
+            restored.append(path)
+        if restored:
+            state_path.write_text(json.dumps(state, indent=2))
+        self._journal("trust.revoked", agent="claude", workspaces=restored, state=str(state_path))
 
     def _trust_codex(self) -> None:
         if not CODEX_CONFIG.exists():

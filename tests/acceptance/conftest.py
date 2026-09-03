@@ -21,8 +21,8 @@ here rather than in a second pytest process so that the run keeps **one** run
 directory, one journal and one verdict with a block per lane. Everything two
 threads reach is either per-lane by construction (engine, workspace, socket root,
 bot, chat) or locked where it is shared (`support.Journal`, `support.Verdict`,
-`support.TrustGate` — that last one read-modify-writes the user's own
-`~/.claude.json`, and puts back what it found).
+`support.TrustGate` — that last one read-modify-writes the user's own Claude
+state file, and puts back what it found).
 
 Both engines bridge **every** Session on the machine, so each lane's roster shows
 the other lane's Session. Nothing special is done about that: the journey's own
@@ -437,7 +437,7 @@ def person_session_lock(run_directory: Path) -> Iterator[telegram_person.PersonS
 
     `docs/acceptance-design.md` § Running it lists what two runs share and no
     `--lane` separates: the user-account session, which is SQLite backing one
-    client, and `support.TrustGate`'s writes to the user's own `~/.claude.json`
+    client, and `support.TrustGate`'s writes to the user's own Claude state file
     and `~/.codex/config.toml`, guarded by a thread lock that means nothing to a
     second pytest process. The rule was written down and kept by hand; this takes
     it.
@@ -762,8 +762,10 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
     The trust gate is arranged around **both** the engine and the Session: a fresh
     workspace is what the design requires, and a hand-started agent stops in one
     it has never seen with a full-screen dialog and never registers (re-measured
-    on `claude` 2.1.246, 2026-08-26). `support.TrustGate` grants it, backs up both
-    user files into the run directory and revokes on the way out.
+    on `claude` 2.1.259, 2026-09-03). `support.TrustGate` grants it, backs up both
+    user files into the run directory and revokes on the way out. It is handed the
+    **Session's** environment rather than this process's, because that is what says
+    which Claude state file the grant has to land in (#217).
 
     **The Session is started after the engine, and that is a choice with a
     reason.** #71 proved both of the Claude lane's routes are hot — the built-in
@@ -817,7 +819,13 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
     )
 
     with support.TrustGate(
-        workspace, run_directory=arrangement.run_directory, journal=journal, label=lane.name
+        workspace,
+        run_directory=arrangement.run_directory,
+        journal=journal,
+        label=lane.name,
+        # The Session's own environment, not this process's: it is the one that
+        # decides which Claude state file the trust entry has to land in (#217).
+        environment=arrangement.environment,
     ):
         engine.start()
         session: hand_started.HandStartedSession | None = None
