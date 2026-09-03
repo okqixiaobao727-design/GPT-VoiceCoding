@@ -147,8 +147,6 @@ class ErrorCode(StrEnum):
     STALE_SESSION = "stale_session"
     #: Nothing pending under that id — never queued, or already answered.
     UNKNOWN_PENDING = "unknown_pending"
-    #: Something asked to open a voice surface while the system owns one.
-    SECOND_CALL_REFUSED = "second_call_refused"
     #: Any other refusal Bridge Core raised. Still carries its own words.
     REFUSED = "refused"
     #: Raised by a *surface*, never by the engine: nothing answered the socket.

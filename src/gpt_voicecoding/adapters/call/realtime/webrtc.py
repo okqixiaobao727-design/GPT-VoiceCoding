@@ -57,6 +57,23 @@ CHANNELS = 1
 SAMPLE_FORMAT = "int16"
 SAMPLE_BYTES = 2
 
+#: One frame, as a duration. Derived from the two numbers above rather than
+#: written out, so the two things measured in frames below cannot drift from the
+#: frames they are counting.
+FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
+
+#: How many frames the speaker must go without a new inbound one before what it
+#: has is called the *last* one. Three: shorter than any pause a listener hears
+#: as the end of a sentence, and longer than the jitter between two frames of one
+#: continuous utterance. It bounds only the *recognition* of the end, never the
+#: playout itself — the buffer being empty is the other half of the answer, and
+#: both must hold.
+PLAYBACK_QUIET_FRAMES = 3
+
+#: How often `playback_drained` looks: one frame, because a poll finer than the
+#: thing it is measuring buys nothing but wake-ups.
+PLAYBACK_POLL_SECONDS = FRAME_SECONDS
+
 #: How much captured audio is held before the oldest is dropped. Two seconds:
 #: long enough to ride out a scheduling hiccup, short enough that what is
 #: eventually sent is still a reply to what was said.
@@ -183,6 +200,19 @@ class _WebRtcTransport:
     @property
     def is_connected(self) -> bool:
         return bool(self._pc.connectionState == "connected")
+
+    async def playback_drained(self, timeout_seconds: float) -> None:
+        """Wait out the speaker, within a bound. See `CallTransport.playback_drained`."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while not self._speaker.drained:
+            if asyncio.get_running_loop().time() >= deadline:
+                _log.info(
+                    "playout had not drained %gs after the Voice stopped generating; "
+                    "reporting the stop edge anyway",
+                    timeout_seconds,
+                )
+                return
+            await asyncio.sleep(PLAYBACK_POLL_SECONDS)
 
     def on_lost(self, handler: LostHandler) -> None:
         self._on_lost = handler
@@ -432,6 +462,26 @@ class _Speaker:
         self._lock = threading.Lock()
         self._frames = 0
         self._dropped = 0
+        #: When the last inbound frame arrived. `None` while none has, which
+        #: reads as drained: there is nothing playing that has not finished.
+        self._last_frame_at: float | None = None
+
+    @property
+    def drained(self) -> bool:
+        """Whether the last inbound frame has finished playing.
+
+        Two facts, and both are needed. Nothing has arrived for
+        `PLAYBACK_QUIET_SECONDS`, so what has arrived is the *last* frame; and
+        nothing is still queued for the device, so that frame has been written.
+        A silent run buffers nothing, which leaves the first fact answering on
+        its own — correctly, because there is no speaker for audio to trail in.
+        """
+        if self._last_frame_at is None:
+            return True
+        with self._lock:
+            if self._buffer:
+                return False
+        return time.monotonic() - self._last_frame_at >= PLAYBACK_QUIET_FRAMES * FRAME_SECONDS
 
     def attach(self, track: Any) -> None:
         if not self._silent and self._stream is None:
@@ -448,6 +498,7 @@ class _Speaker:
             except Exception:
                 return
             self._frames += 1
+            self._last_frame_at = time.monotonic()
             if self._silent:
                 continue
             for out in resampler.resample(frame):

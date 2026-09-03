@@ -58,6 +58,7 @@ from gpt_voicecoding.seams.call import (
     Dial,
     DialReason,
     SpokenBrief,
+    UserSpeaking,
     UserSpeech,
     VoiceSpeech,
 )
@@ -375,34 +376,50 @@ class TestTheCallContract:
         asyncio.run(call.ensure_call(_dial()))
         assert [dialled.agent for dialled in call.opened_on] == [CALL_AGENT_INSTRUCTIONS]
 
-    def test_the_voice_speaking_state_is_one_of_the_events_the_seam_raises(self) -> None:
-        """Both edges of the call's own voice cross the seam, as one state (#184).
+    def test_both_sides_speaking_states_are_events_the_seam_raises(self) -> None:
+        """Each side of the conversation crosses the seam as a state (#184, #195).
 
         A state rather than a tick, because the two readers want different
         questions answered from it: the Silence Ceiling asks "was there
-        activity", and it also has to *hold* while the answer is still being
+        activity", and it also has to *hold* while an utterance is still being
         spoken — a span, which no bare edge describes.
+
+        **Two of them, one per side.** The user's half used to arrive only as
+        the finished `UserSpeech(text)`, which since #194 often lands at hand-off
+        or teardown — so a user who talked for a whole ceiling without the Voice
+        answering was judged silent (#195). The transcript stays: it is what the
+        engine writes down, and a span carries no words.
         """
         assert set(get_args(CallEvent)) == {
             UserSpeech,
+            UserSpeaking,
             VoiceSpeech,
             CallStarted,
             CallEnded,
             CallDropped,
         }
         assert {field.name for field in fields(VoiceSpeech)} == {"speaking"}
+        assert {field.name for field in fields(UserSpeaking)} == {"speaking"}
         assert VoiceSpeech(speaking=True).speaking is True
+        assert UserSpeaking(speaking=True).speaking is True
 
-    def test_an_adapter_can_raise_both_voice_edges_with_no_audio(self) -> None:
-        """The fake emits it, so every consumer above the seam is testable dry."""
+    def test_an_adapter_can_raise_both_sides_edges_with_no_audio(self) -> None:
+        """The fake emits them, so every consumer above the seam is testable dry."""
         sink = RecordingSink()
         call = FakeCall(sink=sink)
         asyncio.run(call.ensure_call(_dial()))
 
         call.voice_speech(speaking=True)
         call.voice_speech(speaking=False)
+        call.user_speaking(speaking=True)
+        call.user_speaking(speaking=False)
 
-        assert sink.events == [VoiceSpeech(speaking=True), VoiceSpeech(speaking=False)]
+        assert sink.events == [
+            VoiceSpeech(speaking=True),
+            VoiceSpeech(speaking=False),
+            UserSpeaking(speaking=True),
+            UserSpeaking(speaking=False),
+        ]
 
     def test_the_seam_names_the_moment_a_cue_marks_and_never_the_sound(self) -> None:
         """One verb, three moments (#186). The notes are the adapter's own.

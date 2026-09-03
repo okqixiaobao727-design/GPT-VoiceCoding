@@ -63,6 +63,7 @@ from gpt_voicecoding.seams.call import (
     DialReason,
     SpokenBrief,
     SpokenRosterBrief,
+    UserSpeaking,
     UserSpeech,
     VoiceSpeech,
 )
@@ -1163,7 +1164,11 @@ class TestWhatTheCallRaisesUpward:
                         "thread/realtime/transcript/done",
                         {"threadId": THREAD, "role": "assistant", "text": "more"},
                     )
-                await asyncio.sleep(0.05)
+                    # Two *utterances*, which means the first one finished being
+                    # heard before the second began. A delta arriving while the
+                    # previous answer is still playing is one continuous stretch
+                    # of speech, and is proved separately below.
+                    await asyncio.sleep(0.05)
 
                 assert [event.speaking for event in sink.of(VoiceSpeech)] == [
                     True,
@@ -1171,6 +1176,194 @@ class TestWhatTheCallRaisesUpward:
                     True,
                     False,
                 ]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_stop_edge_waits_for_the_audio_to_finish_playing(self, socket_path: Path) -> None:
+        """`speaking=False` means finished *playing*, not finished generating (#195).
+
+        The lag between the two is the jitter prefetch, this transport's own
+        playback buffer and the device, and none of it is visible above the Call
+        seam — so publishing the generating edge made every gap-waiter add a
+        settle window computed from numbers it could not see (#184's shape).
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                audio = FakeTransport()
+                audio.playback_drained_now = False
+                adapter, _ = await riding(server, sink, transport=audio)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "assistant", "delta": "that "},
+                )
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "assistant", "text": "that session stopped"},
+                )
+                await asyncio.sleep(0.05)
+
+                # Generated, not yet heard: the span is still open, which is what
+                # holds the Silence Ceiling on a call somebody is listening to.
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True]
+
+                audio.playback_drained_now = True
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True, False]
+                assert audio.drain_waits == [quick().voice_playout_wait_seconds]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_delta_while_the_answer_is_still_playing_invents_no_gap(
+        self, socket_path: Path
+    ) -> None:
+        """Generating again over its own playout is one stretch of speech, not two (#195).
+
+        The seam publishes a span, and a gap in it is what the Silence Ceiling
+        and the mid-call gap-waiter act on. A stop-then-start published here
+        would be a gap the user never heard.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                audio = FakeTransport()
+                audio.playback_drained_now = False
+                adapter, _ = await riding(server, sink, transport=audio)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "assistant", "delta": "one "},
+                )
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "assistant", "text": "one"},
+                )
+                await asyncio.sleep(0.05)
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "assistant", "delta": "two "},
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True]
+
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "assistant", "text": "two"},
+                )
+                audio.playback_drained_now = True
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True, False]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_users_own_speech_is_a_span_as_well_as_a_transcript(
+        self, socket_path: Path
+    ) -> None:
+        """The user's counterpart of `VoiceSpeech`, raised from the deltas (#195).
+
+        Until this event the user's half reached the ceiling only as the finished
+        `UserSpeech(text)`, which since #194 often lands at hand-off or teardown
+        — so a user who talked for a whole ceiling without the Voice answering
+        was judged silent. The transcript still travels; it is what the engine
+        writes down, and a span carries no words.
+        """
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "user", "delta": "what is"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(UserSpeaking)] == [True]
+
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "user", "text": "what is codex doing"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(UserSpeaking)] == [True, False]
+                assert [event.text for event in sink.of(UserSpeech)] == ["what is codex doing"]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_the_voice_answering_closes_the_users_span(self, socket_path: Path) -> None:
+        """One of the four ends, and the one that needs no `done`: they are not talked over."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "user", "delta": "what is codex doing"},
+                )
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "assistant", "delta": "it is "},
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(UserSpeaking)] == [True, False]
+                assert [event.speaking for event in sink.of(VoiceSpeech)] == [True]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_a_hand_off_carrying_the_utterance_closes_the_users_span(
+        self, socket_path: Path
+    ) -> None:
+        """The carrier that arrives when no `done` ever does (#179, measured)."""
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/delta",
+                    {"threadId": THREAD, "role": "user", "delta": "end the call"},
+                )
+                await server.notify_all(
+                    "thread/realtime/itemAdded",
+                    {
+                        "threadId": THREAD,
+                        "item": {
+                            "type": "handoff_request",
+                            "handoff_id": "h1",
+                            "input_transcript": "end the call",
+                        },
+                    },
+                )
+                await asyncio.sleep(0.05)
+
+                assert [event.speaking for event in sink.of(UserSpeaking)] == [True, False]
                 await adapter.aclose()
 
         asyncio.run(scenario())
@@ -1457,6 +1650,26 @@ class TestWhatThisSpokeMayBeTold:
             RealtimeCallSettings.of({"conect_timeout_seconds": 1.0})
 
         assert "conect_timeout_seconds" in str(refusal.value)
+
+    def test_the_two_speaking_span_timings_are_settings(self) -> None:
+        """Neither is a measurement, so neither is pinned (#195).
+
+        `user_quiet_seconds` is the one end of the user's span this adapter
+        invents, and whether user deltas arrive during or after the speech is
+        what #212 settles — a value nobody can change without a release is a
+        value that measurement cannot correct. `voice_playout_wait_seconds`
+        bounds a wait on somebody else's audio path, which is exactly the kind
+        of number that differs by machine.
+        """
+        dialled = RealtimeCallSettings.of(
+            {"user_quiet_seconds": 2.5, "voice_playout_wait_seconds": 45.0}
+        )
+
+        assert dialled.user_quiet_seconds == 2.5
+        assert dialled.voice_playout_wait_seconds == 45.0
+        for name in ("user_quiet_seconds", "voice_playout_wait_seconds"):
+            with pytest.raises(SettingsError):
+                RealtimeCallSettings.of({name: 0})
 
     def test_neither_the_approval_policy_nor_the_sandbox_is_a_setting(self) -> None:
         """Both are pinned. A key for either would invite half the trade to be broken."""

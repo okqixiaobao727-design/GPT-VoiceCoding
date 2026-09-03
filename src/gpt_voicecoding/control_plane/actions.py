@@ -38,7 +38,6 @@ from gpt_voicecoding.core.bridge import BridgeCore
 from gpt_voicecoding.core.briefing import SessionBrief
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
-    SecondCallRefused,
     StaleSessionError,
     UnknownRelayError,
     UnknownSessionError,
@@ -54,7 +53,6 @@ _CODES: tuple[tuple[type[BridgeCoreError], ErrorCode], ...] = (
     (StaleSessionError, ErrorCode.STALE_SESSION),
     (UnknownSessionError, ErrorCode.UNKNOWN_SESSION),
     (UnknownRelayError, ErrorCode.UNKNOWN_PENDING),
-    (SecondCallRefused, ErrorCode.SECOND_CALL_REFUSED),
 )
 
 

@@ -382,6 +382,8 @@ def _policy(section: dict[str, Any], where: str) -> CorePolicy:
     for key in (
         "relay_ceiling_seconds",
         "silence_end_seconds",
+        "cool_down_seconds",
+        "speech_settle_seconds",
     ):
         value = section.get(key)
         if value is None:

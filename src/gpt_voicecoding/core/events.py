@@ -43,7 +43,7 @@ class EventQueue:
         Asked by anything that *measures* state the dispatch loop writes. The
         two run as separate tasks (`engine/composition.py`: `_dispatching` and
         `_ticking`), so a `VoiceSpeech` already emitted but not yet taken has
-        not reached the interlock, and a ceiling measured then is measured one
+        not reached the Call Keeper, and a ceiling measured then is measured one
         event out of date — which is a call ended while its own Voice was
         speaking (#184).
 

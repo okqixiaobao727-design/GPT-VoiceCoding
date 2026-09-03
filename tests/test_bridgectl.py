@@ -293,6 +293,56 @@ class TestRenderingARelayReceipt:
         assert "no readback" not in rendered
 
 
+class TestRenderingWhatTheCallKeeperIsWaitingOut:
+    """Cool-down is the one rule with no surface of its own (#195).
+
+    A call that does *not* happen leaves no cue, no snapshot and no wrapper run,
+    so `call: none` is the line an operator reads when they are asking why
+    nothing rang — and these are the only two facts that answer them.
+    """
+
+    def reply(self, **data: object) -> Reply:
+        return Reply(
+            True,
+            Action.STATUS,
+            {
+                "switches": {"duty": True},
+                "sessions": [],
+                "lanes": {},
+                "degraded_lanes": {},
+                "call_id": None,
+                "cool_down_remaining": 0.0,
+                "dial_owed": False,
+                "pending_relays": [],
+                **data,
+            },
+        )
+
+    def test_a_quiet_keeper_prints_the_ordinary_line(self) -> None:
+        assert "call: none\n" in render(self.reply()) + "\n"
+
+    def test_a_running_cool_down_is_said_beside_it(self) -> None:
+        rendered = render(self.reply(cool_down_remaining=30.0))
+
+        assert "call: none (cool-down 30s)" in rendered
+
+    def test_an_owed_dial_is_named_too(self) -> None:
+        rendered = render(self.reply(cool_down_remaining=12.0, dial_owed=True))
+
+        assert "call: none (cool-down 12s, one dial owed)" in rendered
+
+    def test_a_dial_owed_past_the_cool_downs_expiry_is_still_shown(self) -> None:
+        """The window between the Cool-down running out and the tick that pays it.
+
+        The two facts are read independently: gating the owed flag on the
+        remaining seconds hid exactly this state behind a bare `call: none`,
+        which is the operator asking why nothing rang and being told nothing.
+        """
+        rendered = render(self.reply(cool_down_remaining=0.0, dial_owed=True))
+
+        assert "call: none (one dial owed)" in rendered
+
+
 class TestRenderingAVerdict:
     """`approve` prints the verdict and the same three codes a relay does (#191).
 

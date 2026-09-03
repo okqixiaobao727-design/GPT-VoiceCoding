@@ -233,14 +233,15 @@ def test_an_existing_pythonpath_is_extended_rather_than_replaced(tmp_path: Path)
 def test_the_live_call_step_runs_alone(tmp_path: Path) -> None:  # noqa: ARG001
     """#183's blocker clause: this step must be runnable by itself.
 
-    It names no Session, so unlike every other step it brings no `roster` with
-    it — and a run that walked one would spend an agent turn to reach a claim
-    that does not rest on it.
+    Alone means *without a walk*, not without a setup step: v1's second phase
+    has the engine dial about a Session that stopped, so it brings `roster` and
+    nothing else (#195). One setup step is what gives it an address; the clause
+    is about not having to walk the other nine to reach the call.
     """
     chosen = journey.select(["live call"])
     assert chosen.selected == ("live call",)
-    assert chosen.setup == ()
-    assert chosen.steps == ("live call",)
+    assert chosen.setup == ("roster",)
+    assert chosen.steps == ("roster", "live call")
     assert not chosen.whole_lane
 
 

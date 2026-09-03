@@ -65,6 +65,12 @@ class FakeTransport:
         self.closed = False
         self._connected = False
         self._on_lost: LostHandler | None = None
+        #: Whether the speaker has finished playing what it was sent. A test
+        #: that wants to hold the Voice's stop edge open sets it False, which is
+        #: what a real transport reports while audio is still going out (#195).
+        self.playback_drained_now = True
+        #: Every bound `playback_drained` was called with, in order.
+        self.drain_waits: list[float] = []
 
     async def offer(self) -> str:
         if self.fail_offer:
@@ -83,6 +89,15 @@ class FakeTransport:
     @property
     def is_connected(self) -> bool:
         return self._connected and not self.closed
+
+    async def playback_drained(self, timeout_seconds: float) -> None:
+        """Return once the fake speaker says it is drained, or when the bound expires."""
+        self.drain_waits.append(timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while not self.playback_drained_now:
+            if asyncio.get_running_loop().time() >= deadline:
+                return
+            await asyncio.sleep(0.005)
 
     def on_lost(self, handler: LostHandler) -> None:
         self._on_lost = handler

@@ -35,8 +35,9 @@ the one renderer of Session state (`core/briefing.py`): an adapter that turned a
 state enum into a phrase would be a second place the user's vocabulary lives.
 What an adapter does with those words is assemble them; it picks none of them.
 
-Events raised upward: the user's speech transcript, whether the call's own
-Voice is speaking, and call started / ended / dropped.
+Events raised upward: the user's speech transcript, whether either side —
+the user or the call's own Voice — is speaking, and call started / ended /
+dropped.
 
 The one-call-at-a-time invariant lives *above* this seam, in Bridge Core, not in
 any adapter (ADR 0001). An adapter neither knows nor enforces it.
@@ -350,11 +351,40 @@ class VoiceSpeech(Event):
     seconds and spoken over seventy-five is seventy-five seconds of call, which
     no bare edge describes. "Wait for a gap" asks whether it is speaking now.
 
-    `speaking=False` means the Voice stopped **generating**, not that the
-    speaker stopped **playing**: playout trails it by the transport's jitter
-    buffer and this system's own playback buffer. A caller that waits for a gap
-    owes a settle window on top of this edge; the ceiling does not, because
-    trailing audio only makes a call it holds open longer.
+    **`speaking=False` means the Voice's audio has finished playing**, not that
+    the model finished generating. The generating edge is the one an adapter
+    sees first, and publishing that was the shallow shape: playout trails it by
+    the transport's jitter buffer and this system's own playback buffer, so
+    every caller that waited for a gap had to add a settle window of its own,
+    and each of them had to know a fact about the transport that nothing above
+    this seam can see. The drain is the realtime adapter's to observe — its
+    transport already owns the playback buffer — so the edge is raised once, on
+    this side of the seam, and a gap-waiter simply waits for it (#195).
+    """
+
+    speaking: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UserSpeaking(Event):
+    """Whether the *user* is producing speech right now — `VoiceSpeech`'s counterpart.
+
+    The same state, for the other half of the conversation, and it exists for
+    the same reason: the Silence Ceiling counts both sides and has to *hold*
+    while either of them is mid-utterance. Until this event the user's half
+    arrived only as the finished `UserSpeech(text)`, which since #194 often
+    lands at hand-off or at teardown — so a user who talked for a whole ceiling
+    without the Voice answering was judged silent (#195).
+
+    A state and not a tick, exactly as `VoiceSpeech` is, and the two are read
+    together: activity is either side's edge, and the ceiling holds while either
+    side is speaking.
+
+    How an adapter derives the edges is its own business behind the seam. The
+    realtime one starts on the first user-role transcript delta and ends on the
+    earliest of the user-role `done`, a `handoff_request` carrying the
+    utterance, the Voice's first reply delta, or its own quiet bound since the
+    last delta.
     """
 
     speaking: bool
@@ -382,7 +412,7 @@ class CallDropped(Event):
 
 
 #: The closed set of events this seam raises. Nothing else may appear.
-CallEvent = UserSpeech | VoiceSpeech | CallStarted | CallEnded | CallDropped
+CallEvent = UserSpeech | UserSpeaking | VoiceSpeech | CallStarted | CallEnded | CallDropped
 
 
 @runtime_checkable

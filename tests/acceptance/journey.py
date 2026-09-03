@@ -96,7 +96,8 @@ from support import LaneBlocked, StepFailed
 from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
-from gpt_voicecoding.core.policy import DEFAULT_SILENCE_END_SECONDS
+from gpt_voicecoding.core.call_keeper import COOL_DOWN_OWED_LINE, COOL_DOWN_PAID_LINE
+from gpt_voicecoding.core.policy import DEFAULT_COOL_DOWN_SECONDS, DEFAULT_SILENCE_END_SECONDS
 from gpt_voicecoding.seams.call import Cue
 from gpt_voicecoding.seams.control_plane import Action
 
@@ -160,11 +161,12 @@ PREREQUISITES: Mapping[str, tuple[str, ...]] = {
     "companion inbound": ("roster",),
     "switches": ("roster",),
     "child": ("roster",),
-    #: `live call` names no Session at all — it is the route from `bridgectl
-    #: live` through the voice surface and back, and nothing in it reads the
-    #: roster or the agent's own record. So it does not need `roster`, and
-    #: #183's blocker clause is explicit that it must be runnable alone.
-    "live call": (),
+    #: `live call` v0's phase names no Session — it is the route from `bridgectl
+    #: live` through the voice surface and back. **v1's second phase does**: the
+    #: engine dials about a Session that stopped, so the walk needs an address to
+    #: drive a turn on (#195). #183's "runnable alone" clause is satisfied by the
+    #: prerequisite rather than against it: `roster` is one step, not a walk.
+    "live call": ("roster",),
     #: And neither does #184's, for the same reason and one more: it is about
     #: one call's own clock, so a step run before it would only add minutes of
     #: agent turns between dialling and the thing being measured.
@@ -329,6 +331,14 @@ LIVE_CALL_NEEDS_HEARD_SUBSTRING = "需要我"
 #: that came up holding the whole roster — except for this line, which says how
 #: many items went and of what kind (`adapters/call/realtime/adapter.py`).
 HAND_OVER_LINE = r"dialling a call holding \d+ hand-over item"
+
+#: The two lines the Call Keeper writes about a Cool-down, as patterns. Cool-down
+#: is the one rule with no surface of its own — a call that does *not* happen
+#: leaves no cue, no snapshot and no wrapper run — so the engine's own account is
+#: the only witness. Built from the format strings themselves, so a wording
+#: change breaks the grep at the source rather than silently passing (#195).
+COOL_DOWN_OWED_PATTERN = re.escape(COOL_DOWN_OWED_LINE.split("%g")[0])
+COOL_DOWN_PAID_PATTERN = re.escape(COOL_DOWN_PAID_LINE)
 
 #: The engine's own two lines for the call's *other* speaker, imported rather
 #: than retyped: the long step's whole reading of "the Voice held the call open"
@@ -2655,12 +2665,194 @@ class Walk:
                 f"{', no '.join(missing)} — the step cannot report what the ticket asks it to "
                 f"observe. What it does hold: {seen.entries[-3:] or 'nothing at all'}"
             )
+        dialled = self._the_keeper_dials_and_paces_itself()
         return (
             f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; "
             f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; cues {cues_played}; "
             f"call down ({self._call_line()!r}), ended by the {ended_by}; transport "
-            f"{seen.transport_factory}, wav variant {seen.variant!r}, ended {seen.end_reason!r}"
+            f"{seen.transport_factory}, wav variant {seen.variant!r}, ended "
+            f"{seen.end_reason!r}. Then {dialled}"
         )
+
+    def _the_keeper_dials_and_paces_itself(self) -> str:
+        """v1's second phase: the engine dials for itself, and paces what follows (#195).
+
+        The step's first phase is the user pressing the toggle and the Call Agent
+        hanging up. This one presses nothing at all. A Session stops with Voice
+        on and Message off — the state in which the only outlet is a call — and
+        the whole of the Call Keeper's own behaviour is then read off one call:
+
+        * **it dialled, holding the Session Brief.** `HAND_OVER_LINE` names the
+          count, and a call the *system* dialled carries more than the one item a
+          user-opened call gets (#167 Q6);
+        * **CONNECTED was played**, on the dial the engine made rather than on a
+          toggle somebody pressed;
+        * **the Silence Ceiling ended it, and ENDED was played.** Nothing here
+          asks for a hang-up, so what closes the call is silence — read as the
+          engine's own `CEILING_END_LINE`, on this lane's own configured ceiling;
+        * **a wake inside the Cool-down does not dial again, and is paid when it
+          elapses.** Voice off and straight back on is one more `wake` (#195) and
+          the only one this harness can place inside a thirty-second window with
+          certainty: an agent turn takes an unpredictable share of it, so a
+          second Stop would grade a race rather than the rule. What the engine
+          writes down is the rule itself — one dial owed, then one dial paid from
+          a fresh reading — and the absence graded beside it is that no call came
+          up in between.
+
+        The two phases share the step because they share the sentence the ticket
+        wrote: this is `live call` v1, one call's worth longer.
+        """
+        if self.config.call_observations is None or self.config.call_wav_directory is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        if self.address is None:
+            raise LaneBlocked("no Session in the roster for the engine to dial about")
+        ceiling = self._silence_ceiling_seconds()
+        cool_down = self._cool_down_seconds()
+        live_call.ask_for(self.config.call_wav_directory, live_call.NEEDS)
+        mark = len(self.engine.log_lines())
+        started = time.monotonic()
+        with self._voice_route_only():
+            self._drive_turn("stop for a system dial", ACKNOWLEDGE)
+            opened = support.wait_for(
+                lambda: bool(support.matching_lines(self._log_since(mark), HAND_OVER_LINE)),
+                deadline_seconds=LIVE_CALL_OPEN_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            connected = support.wait_for(
+                lambda: bool(self._cue_lines(Cue.CONNECTED, since=mark)),
+                deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # Nothing asks for a hang-up, so the ceiling is what closes it. The
+            # budget is the answer plus a whole ceiling plus the ending itself.
+            went_down = support.wait_for(
+                self._call_is_down,
+                deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling + LIVE_CALL_END_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            by_ceiling = self._ceiling_ended_the_call(since=mark)
+            ended_cue = support.wait_for(
+                lambda: bool(self._cue_lines(Cue.ENDED, since=mark)),
+                deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # The Cool-down is running from the moment above. This is the wake
+            # inside it, and it is instant by construction.
+            inside = len(self.engine.log_lines())
+            for position in ("off", "on"):
+                answer = self.bridgectl("switch", "voice", position)
+                if not answer.ok:
+                    raise LaneBlocked(f"`switch voice {position}` refused: {answer.text}")
+            owed = support.wait_for(
+                lambda: bool(
+                    support.matching_lines(self._log_since(inside), COOL_DOWN_OWED_PATTERN)
+                ),
+                deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            dialled_inside = bool(support.matching_lines(self._log_since(inside), HAND_OVER_LINE))
+            paid = support.wait_for(
+                lambda: bool(
+                    support.matching_lines(self._log_since(inside), COOL_DOWN_PAID_PATTERN)
+                ),
+                deadline_seconds=cool_down + LIVE_CALL_OPEN_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            paid_dials = support.matching_lines(self._log_since(inside), HAND_OVER_LINE)
+            self._end_any_live_call()
+        self._measured("live call v1", started, self._call_is_down())
+        hand_over = support.matching_lines(self._log_since(mark), HAND_OVER_LINE)
+        self.journey.observe(
+            "live call v1 keeper",
+            f"ceiling {ceiling:.0f}s, cool-down {cool_down:.0f}s; {len(hand_over)} dial(s) in "
+            f"the whole phase, the first {hand_over[0].strip() if hand_over else 'never made'}; "
+            f"cues {self._cue_order(since=mark)}; ended by the ceiling: {by_ceiling}; a wake "
+            f"inside the Cool-down was owed: {owed}, paid: {paid}",
+        )
+        if not opened:
+            raise StepFailed(
+                f"a Session stopped with Voice on and Message off and the engine never dialled "
+                f"within {LIVE_CALL_OPEN_SECONDS:.0f}s — a call is the only outlet that state "
+                f"leaves. Engine log tail: {self._log_since(mark)[-8:]}"
+            )
+        if not _hand_over_of_more_than_one(hand_over[0]):
+            raise StepFailed(
+                f"the engine dialled, but the hand-over is {hand_over[0].strip()!r}. A call the "
+                f"*system* dialled carries the reason, the Roster Brief and every Session that "
+                f"needs the user (#194); one item is what a call the *user* opened gets"
+            )
+        if not connected:
+            raise StepFailed(
+                f"the engine dialled and no CONNECTED cue was written within "
+                f"{LIVE_CALL_CUE_SECONDS:.0f}s. The Keeper plays it when the dial comes up "
+                f"(#195), and the adapter's own line is the only witness a run that cannot "
+                f"hear has. Engine log tail: {self._log_since(mark)[-8:]}"
+            )
+        if not went_down:
+            raise StepFailed(
+                f"the call the engine dialled was still up after the answer, this lane's "
+                f"{ceiling:.0f}s ceiling and {LIVE_CALL_END_SECONDS:.0f}s more "
+                f"({self._call_line()!r}) — nothing in this phase asks for a hang-up, so the "
+                f"ceiling is what had to close it"
+            )
+        if not by_ceiling:
+            raise StepFailed(
+                f"the call went down and the engine never said the Silence Ceiling did it. "
+                f"Nothing here asks for a hang-up, so an ending from anywhere else is the "
+                f"phase's premise failing. Engine log tail: {self._log_since(mark)[-8:]}"
+            )
+        if not ended_cue:
+            raise StepFailed(
+                f"the ceiling ended the call and no ENDED cue was written within "
+                f"{LIVE_CALL_CUE_SECONDS:.0f}s. The user hears a call end however it ended "
+                f"(#186), and the Keeper is what rings it now (#195)"
+            )
+        if dialled_inside:
+            raise StepFailed(
+                f"a wake arrived inside the {cool_down:.0f}s Cool-down and the engine dialled "
+                f"anyway: {support.matching_lines(self._log_since(inside), HAND_OVER_LINE)!r}. "
+                f"After any end of a call the system does not dial again until the Cool-down "
+                f"has elapsed (`CONTEXT.md`, *Cool-down*)"
+            )
+        if not owed:
+            raise StepFailed(
+                f"Voice came back on inside the Cool-down and the engine neither dialled nor "
+                f"said it owed a dial. One event buys one attempt, and an event inside a "
+                f"Cool-down marks it owed. Engine log tail: {self._log_since(inside)[-8:]}"
+            )
+        if not paid:
+            raise StepFailed(
+                f"the engine owed a dial and never paid it within {cool_down:.0f}s of Cool-down "
+                f"plus {LIVE_CALL_OPEN_SECONDS:.0f}s. An owed dial is paid from a fresh reading "
+                f"when the Cool-down elapses (ADR 0017). Engine log tail: "
+                f"{self._log_since(inside)[-8:]}"
+            )
+        if len(paid_dials) != 1:
+            raise StepFailed(
+                f"the Cool-down elapsed and the engine dialled {len(paid_dials)} times, not "
+                f"once: {paid_dials!r}. One wake buys one dial, however many arrived"
+            )
+        return (
+            f"a Session stopped with Voice on and Message off; the engine dialled by itself "
+            f"holding {hand_over[0].split('holding', 1)[-1].strip()}, played CONNECTED, and the "
+            f"Silence Ceiling closed the call after {ceiling:.0f}s of silence with ENDED "
+            f"played; a wake inside the {cool_down:.0f}s Cool-down dialled nothing and was paid "
+            f"exactly once when it elapsed"
+        )
+
+    def _cool_down_seconds(self) -> float:
+        """The Cool-down this lane's engine is actually running.
+
+        Read out of the lane's own config and only then off the shipped default,
+        exactly as the Silence Ceiling is: a literal here would be a second copy
+        of a policy value the engine already owns.
+        """
+        document = tomllib.loads(self.config.path.read_text())
+        given = document.get("policy", {}).get("cool_down_seconds")
+        return DEFAULT_COOL_DOWN_SECONDS if given is None else float(given)
 
     def live_call_long(self) -> str:
         """A Live Call the system's own Voice keeps alive (#184).

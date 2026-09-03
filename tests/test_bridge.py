@@ -29,11 +29,11 @@ from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
-    USER_OPENED,
     VOICE_QUIET_LINE,
     VOICE_SPEAKING_LINE,
 )
 from gpt_voicecoding.core.briefing import BriefState
+from gpt_voicecoding.core.call_keeper import USER_OPENED
 from gpt_voicecoding.core.errors import CallInstructionsMissing, ChildSessionError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
@@ -417,7 +417,12 @@ class TestTheStopNoticePipelineEndToEnd:
         assert "port the log" in handed_over(hub.call)
 
     def test_a_stop_while_the_system_owns_a_call_opens_no_second_call(self) -> None:
-        """The reference implementation's loop, made unreachable."""
+        """The reference implementation's loop, made unreachable.
+
+        Nothing is spoken into the call either: with one up, a `wake` is nothing
+        on the voice side, because mid-call news is #196's. The text side is
+        unaffected, so the Stop still reaches the Companion Channel.
+        """
         hub = Hub()
         started = hub.toggle()
         assert started.call_id is not None
@@ -426,7 +431,8 @@ class TestTheStopNoticePipelineEndToEnd:
         hub.emit(SessionStopped(target=CODEX))
 
         assert hub.call.calls_started == 1
-        assert hub.call.spoken
+        assert hub.call.spoken == []
+        assert hub.channel.sent
 
     def test_with_no_call_and_message_on_the_channel_send_is_actually_invoked(self) -> None:
         hub = Hub(voice=False)
@@ -445,7 +451,8 @@ class TestTheStopNoticePipelineEndToEnd:
 
         hub.emit(SessionStopped(target=CODEX))
         hub.channel.outcome = Delivery.DELIVERED
-        asyncio.run(hub.core.outlets_changed())
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
         asyncio.run(hub.core.discover())
 
         assert len(hub.channel.sent) == 1
@@ -468,12 +475,12 @@ class TestTheStopNoticePipelineEndToEnd:
             )
         )
 
-        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
 
         assert hub.agent.inspections == []
         assert handed_over(hub.call) == ""
 
-        asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
 
         assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
@@ -673,7 +680,7 @@ class TestTheApprovalRelayCarriesAndNothingMore:
 
 class TestTheLiveCallSilenceCeiling:
     def test_tick_ends_an_owned_call_once_when_the_silence_threshold_arrives(self, caplog) -> None:
-        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.call_keeper")
         hub = Hub(silence_end_seconds=60.0)
         started = hub.toggle()
         assert started.call_id is not None
@@ -684,7 +691,7 @@ class TestTheLiveCallSilenceCeiling:
         hub.tick()
 
         assert hub.call.calls_ended == 1
-        assert hub.core.interlock.owns_call() is False
+        assert hub.core.keeper.status().call_id is None
         assert hub.call.spoken == []
         assert hub.channel.sent == []
         assert "ended the Live Call after 60 seconds without call activity" in [
@@ -707,12 +714,13 @@ class TestTheLiveCallSilenceCeiling:
         hub.tick()
         assert hub.call.calls_ended == 1
 
-    def test_a_notice_handed_to_the_call_does_not_by_itself_restart_the_window(self) -> None:
-        """The receipt says the words were handed over, not that anything was said.
+    def test_news_about_a_session_does_not_restart_the_owned_calls_window(self) -> None:
+        """A Stop is not activity *on the call*, and since #195 it is not spoken into one.
 
-        What keeps the call alive is the Voice speaking them, and that arrives
-        on its own as `VoiceSpeech` (#184). The stamp this test used to prove
-        was a text hand-over wearing a voice's clothes.
+        Mid-call news is #196's: with a call up, a `wake` is nothing on the
+        voice side, so the only thing a Stop does here is reach the Companion
+        Channel. What keeps the call alive is somebody speaking, which arrives
+        on its own as a speaking edge (#184).
         """
         hub = Hub(silence_end_seconds=60.0)
         started = hub.toggle()
@@ -724,7 +732,9 @@ class TestTheLiveCallSilenceCeiling:
         hub.now += 10.0
         hub.tick()
 
-        assert hub.call.spoken
+        assert hub.call.spoken == []
+        assert hub.call.calls_started == 1
+        assert hub.channel.sent
         assert hub.call.calls_ended == 1
 
     def test_the_voice_speaking_holds_the_ceiling_open(self) -> None:
@@ -742,8 +752,11 @@ class TestTheLiveCallSilenceCeiling:
 
         assert hub.call.calls_ended == 0
 
+        # The settle window sits between the stop edge and the ceiling: for
+        # `speech_settle_seconds` after the last speaker stops, the pause is
+        # still a pause (`core/policy.py::DEFAULT_SPEECH_SETTLE_SECONDS`).
         hub.emit(VoiceSpeech(speaking=False))
-        hub.now += 59.9
+        hub.now += 64.9
         hub.tick()
         assert hub.call.calls_ended == 0
 
@@ -760,7 +773,7 @@ class TestTheLiveCallSilenceCeiling:
 
         hub.now += 50.0
         hub.emit(VoiceSpeech(speaking=True), VoiceSpeech(speaking=False))
-        hub.now += 59.9
+        hub.now += 64.9
         hub.tick()
         assert hub.call.calls_ended == 0
 
@@ -883,7 +896,7 @@ class TestTheLiveCallSilenceCeiling:
         hub.tick()
 
         assert hub.call.calls_ended == 0
-        assert hub.core.interlock.owns_call() is True
+        assert hub.core.keeper.status().call_id is not None
 
     def test_turning_the_switch_back_on_ends_a_call_already_past_the_ceiling(self) -> None:
         """The one ending attempt per call is not spent while the switch is off."""
@@ -914,7 +927,7 @@ class TestTheLiveCallSilenceCeiling:
         assert hub.call.calls_ended == 0
 
     def test_an_end_failure_is_logged_and_not_retried_for_that_call(self, caplog) -> None:
-        caplog.set_level("ERROR", logger="gpt_voicecoding.core.bridge")
+        caplog.set_level("ERROR", logger="gpt_voicecoding.core.call_keeper")
         call = EndRefusingCall()
         hub = Hub(call=call, silence_end_seconds=60.0)
         started = hub.toggle()
@@ -932,8 +945,8 @@ class TestTheLiveCallSilenceCeiling:
 
         assert call.calls_ended == 2
         assert [record.getMessage() for record in caplog.records] == [
-            "could not end the silent Live Call; not trying again until the call changes",
-            "could not end the silent Live Call; not trying again until the call changes",
+            "the Call adapter refused an operation the Keeper asked for",
+            "the Call adapter refused an operation the Keeper asked for",
         ]
 
 
@@ -1015,7 +1028,14 @@ class TestAChildProcessIsNeverAnnounced:
 
         hub.emit(SessionStopped(target=SessionTarget(agent=AgentKind.CODEX, session_id="new")))
 
-        assert hub.call.calls_started == 1
+        # Announced as text, from the stand-in row the Stop itself carries. Not
+        # dialled: what a call comes up holding is the *roster*'s reading at the
+        # moment of dialling (ADR 0017), and no discovery pass has put this
+        # Session on it — so there is no brief for a call to be about, and the
+        # Keeper stays quiet rather than ringing about nothing.
+        assert hub.channel.sent
+        assert "codex:new" in hub.channel.sent[0]
+        assert hub.call.calls_started == 0
 
     def test_a_permission_a_child_raises_is_not_announced(self) -> None:
         """A Codex subagent thread can raise a real `requestApproval`.
@@ -1267,9 +1287,17 @@ class TestTheOneCallInvariantEndToEnd:
         snapshot = hub.toggle()
 
         assert snapshot.state is CallState.UP
-        assert hub.core.interlock.owns_call() is True
+        assert hub.core.keeper.status().call_id is not None
 
-    def test_a_live_toggle_that_opens_a_call_reconciles_current_stops(self) -> None:
+    def test_a_call_the_user_opened_announces_nothing_and_stays_silent(self) -> None:
+        """A user-opened call is not a reconciliation, and since #195 nothing is.
+
+        They pressed the toggle in order to talk. Briefing them on the roster
+        they were already looking at would be the system speaking first (#167
+        Q6), and speaking into the call afterwards is mid-call behaviour, which
+        is #196's. A discovery pass that follows changes none of it: the pass
+        announces nothing on its own.
+        """
         hub = Hub()
         hub.agent.discovery = LaneDiscovery(
             rows=(
@@ -1289,13 +1317,22 @@ class TestTheOneCallInvariantEndToEnd:
 
         assert snapshot.is_up
         assert hub.agent.inspections == []
-        assert "Which base?" not in spoken_words(hub.call)
+        assert "Which base?" not in handed_over(hub.call)
 
         asyncio.run(hub.core.discover())
 
-        assert "Which base?" in spoken_words(hub.call)
+        assert "Which base?" not in handed_over(hub.call)
+        assert spoken_words(hub.call) == ""
+        assert hub.channel.sent == []
 
-    def test_a_call_started_event_reconciles_current_stops(self) -> None:
+    def test_a_call_started_event_announces_nothing(self) -> None:
+        """A call coming up is not an outlet transition; it is a call coming up.
+
+        The reconciliation the interlock's release and adoption used to owe is
+        gone with the flag that carried it (#195): both surfaces read the roster
+        at the moment they act, and a call the user opened is not a moment the
+        system was asked to say anything at.
+        """
         hub = Hub(voice=False)
         hub.agent.discovery = LaneDiscovery(
             rows=(
@@ -1312,20 +1349,17 @@ class TestTheOneCallInvariantEndToEnd:
         )
 
         hub.emit(CallStarted(call_id="call-the-user-started"))
+        asyncio.run(hub.core.discover())
 
         assert hub.agent.inspections == []
         assert hub.channel.sent == []
-
-        asyncio.run(hub.core.discover())
-
-        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
 
     def test_the_live_toggle_ends_the_call_the_system_owns(self) -> None:
         hub = Hub()
         hub.toggle()
 
         assert hub.toggle().state is CallState.DOWN
-        assert hub.core.interlock.owns_call() is False
+        assert hub.core.keeper.status().call_id is None
 
     def test_a_call_opens_addressing_both_audiences_by_name(self) -> None:
         """Each half gets its own set, and the hub names the audience, not the slot.
@@ -1450,7 +1484,7 @@ class TestTheOneCallInvariantEndToEnd:
     def test_ending_a_call_never_needs_house_rules(self) -> None:
         """Opening is refusable; ending is not. A call that is up must be endable."""
         hub = Hub(instructions=False)
-        hub.core.interlock.note_started("call-1")
+        hub.emit(CallStarted(call_id="call-1"))
 
         assert hub.toggle().state is CallState.DOWN
 
@@ -1473,45 +1507,95 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.toggle().state is CallState.DOWN
         assert hub.call.calls_started == 1
 
-    def test_a_dropped_call_frees_escalation_to_open_the_next_one(self) -> None:
+    def test_a_dropped_call_paces_the_next_one_rather_than_barring_it(self) -> None:
+        """A drop is an end of a call, so what follows it is a Cool-down (#195).
+
+        The interlock used to free the next dial the moment it released; the
+        Keeper paces it instead. The event inside the Cool-down buys one dial,
+        and it is paid from a fresh reading when the Cool-down elapses.
+        """
         hub = Hub()
         hub.emit(CallStarted(call_id="call-1"))
         hub.emit(CallDropped(call_id="call-1", detail="the network went away"))
 
         hub.emit(SessionStopped(target=CODEX))
 
+        assert hub.call.calls_started == 0
+        assert hub.core.keeper.status().dial_owed is True
+
+        hub.now += 31.0
+        hub.tick()
+
         assert hub.call.calls_started == 1
 
-    def test_a_call_release_reconciles_current_stops(self) -> None:
-        hub = Hub(voice=False)
-        hub.core.interlock.note_started("call-the-user-started")
+    def test_the_control_plane_reads_all_three_facts_the_keeper_holds(self) -> None:
+        """`status()` is call id, Cool-down remaining and dial owed (#195).
+
+        Published rather than kept internal, because Cool-down is the one rule
+        with no surface of its own: a call that does *not* happen leaves no cue,
+        no snapshot and no wrapper run, so an operator asking why nothing rang
+        has nothing else to read.
+        """
+        hub = Hub()
+        hub.toggle()
+        hub.toggle()
+        hub.emit(SessionStopped(target=CODEX))
+
+        answered = hub.core.status()
+
+        assert answered.call_id is None
+        assert answered.cool_down_remaining == 30.0
+        assert answered.dial_owed is True
+
+    def test_the_message_switch_opening_pushes_text_and_rings_nothing(self) -> None:
+        """A wake is the *Voice* outlet opening. Message opening is a text route.
+
+        `wake` is named for "a Duty/Voice off→on transition" (#195). Turning the
+        Message Switch on opens a way to reach the user in text, and reaching
+        them in text is what the push does; ringing on it would dial a call the
+        user asked for messages instead of.
+        """
+        hub = Hub(voice=False, message=False)
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
                     target=CODEX,
                     workspace=Path("/tmp/workspace"),
                     state=SessionState.WAITING,
-                    waiting_for=WaitingFor(
-                        kind=WaitingKind.QUESTION,
-                        prompt="Which base?",
-                    ),
+                    waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
                 ),
             )
         )
+        asyncio.run(hub.core.discover())
+
+        hub.flip(SwitchName.MESSAGE, True)
+
+        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+        assert hub.call.calls_started == 0
+        assert hub.core.keeper.status().dial_owed is False
+
+    def test_a_call_release_starts_a_cool_down_and_announces_nothing(self) -> None:
+        """Releasing a call is not a moment the user is owed a report of the roster.
+
+        It used to be one: the interlock clearing set the reconciliation flag.
+        What replaces it is the Cool-down — the call ended, so the voice side is
+        paced — and an event arriving inside it, which is what buys the next
+        dial (#195, `CONTEXT.md` *Cool-down*).
+        """
+        hub = Hub(voice=False)
+        hub.emit(CallStarted(call_id="call-the-user-started"))
 
         hub.emit(CallDropped(call_id="call-the-user-started", detail="the network went away"))
+        asyncio.run(hub.core.discover())
 
         assert hub.agent.inspections == []
         assert hub.channel.sent == []
-
-        asyncio.run(hub.core.discover())
-
-        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+        assert hub.core.keeper.status().cool_down_remaining == 30.0
 
     def test_a_stale_call_event_re_offers_nothing(self) -> None:
         """Only the interlock actually clearing is an outlet transition."""
         hub = Hub(voice=False)
-        hub.core.interlock.note_started("current-call")
+        hub.emit(CallStarted(call_id="current-call"))
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -1530,33 +1614,7 @@ class TestTheOneCallInvariantEndToEnd:
 
         assert hub.agent.inspections == []
         assert hub.channel.sent == []
-        assert hub.core.interlock.call_id() == "current-call"
-
-    def test_a_channel_that_came_back_reconciles_what_is_actionable_now(self) -> None:
-        """The one outlet transition no event announces."""
-        hub = Hub(voice=False)
-        hub.agent.discovery = LaneDiscovery(
-            rows=(
-                SessionInspection(
-                    target=CODEX,
-                    workspace=Path("/tmp/workspace"),
-                    state=SessionState.WAITING,
-                    waiting_for=WaitingFor(
-                        kind=WaitingKind.QUESTION,
-                        prompt="Which base?",
-                    ),
-                ),
-            )
-        )
-
-        asyncio.run(hub.core.outlets_changed())
-
-        assert hub.agent.inspections == []
-        assert hub.channel.sent == []
-
-        asyncio.run(hub.core.discover())
-
-        assert [notice for notice in hub.channel.sent if "Which base?" in notice]
+        assert hub.core.keeper.status().call_id == "current-call"
 
     def test_switch_transitions_reconcile_current_waiting_state(self) -> None:
         hub = Hub(duty=False)
@@ -1576,13 +1634,14 @@ class TestTheOneCallInvariantEndToEnd:
         )
         hub.flip(SwitchName.VOICE, True)
         hub.flip(SwitchName.MESSAGE, False)
-
-        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
 
         assert hub.agent.inspections == []
         assert handed_over(hub.call) == ""
 
-        asyncio.run(hub.core.discover())
+        # Duty coming back on is one more `wake`, and the Keeper dials on a
+        # reading it takes at that moment (#195, ADR 0017).
+        hub.flip(SwitchName.DUTY, True)
 
         assert "Which base?" in handed_over(hub.call)
         assert hub.state.relays.pending() == ()
@@ -1602,9 +1661,10 @@ class TestSwitchAdjudicationEndToEnd:
         """A Session whose hook never ran has no other path to a Stop Notice."""
         hub = Hub(voice=False, sessions=((CLAUDE, "inspect the roster"),))
         hub.agent.discovery = claude_waiting_roster(CLAUDE, label)
-
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         (session,) = hub.core.status().sessions
         assert session.waiting_for.kind is WaitingKind.PERMISSION
@@ -1646,9 +1706,10 @@ class TestSwitchAdjudicationEndToEnd:
         hub.emit(SessionStopped(target=CLAUDE, waiting_for=waiting))
         assert hub.channel.sent == []
         hub.state.switches.flip(SwitchName.DUTY, True)
-
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         assert len(hub.channel.sent) == 1
         assert "  permission: Bash" in hub.channel.sent[0]
@@ -1672,16 +1733,19 @@ class TestSwitchAdjudicationEndToEnd:
             )
         )
 
-        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
 
         assert hub.agent.inspections == []
         assert hub.channel.sent == []
 
-        asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
         assert [notice for notice in hub.channel.sent if "Which base?" in notice]
 
+        # A discovery pass announces nothing on its own. Since #195 the reading
+        # is taken *at* the transition, so the pass that follows one is an
+        # ordinary pass — there is no deferred flag left for it to consume.
         asyncio.run(hub.core.discover())
 
         assert len(hub.channel.sent) == 1
@@ -1794,12 +1858,11 @@ class TestSwitchAdjudicationEndToEnd:
             ),
         )
         hub.agent.discovery = LaneDiscovery(rows=(pending,))
-
-        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
 
         assert hub.channel.sent == []
 
-        asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
 
         (announced,) = hub.channel.sent
         assert announced.startswith("GPT-VoiceCoding · port the log")
@@ -1811,7 +1874,6 @@ class TestSwitchAdjudicationEndToEnd:
         # the user coming back is told what is still waiting for them (#161).
         hub.flip(SwitchName.DUTY, False)
         hub.flip(SwitchName.DUTY, True)
-        asyncio.run(hub.core.discover())
 
         assert len(hub.channel.sent) == 2
         assert hub.channel.sent[1] == hub.channel.sent[0]
@@ -1825,12 +1887,14 @@ class TestSwitchAdjudicationEndToEnd:
                 ),
             )
         )
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         hub.agent.discovery = LaneDiscovery(rows=(pending,))
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         assert len(hub.channel.sent) == 3
         assert hub.channel.sent[2] == hub.channel.sent[0]
@@ -1855,11 +1919,11 @@ class TestSwitchAdjudicationEndToEnd:
             )
         )
 
-        hub.flip(SwitchName.DUTY, True)
+        asyncio.run(hub.core.discover())
 
         assert hub.channel.sent == []
 
-        asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
 
         assert len(hub.channel.sent) == 1
         assert "terminal" in hub.channel.sent[0]
@@ -1880,12 +1944,11 @@ class TestSwitchAdjudicationEndToEnd:
             )
         )
 
+        asyncio.run(hub.core.discover())
         hub.flip(SwitchName.DUTY, True)
-        asyncio.run(hub.core.discover())
-        # The second transition is the Companion Channel's far side coming back,
-        # so both notices are routed the same way and the wording is comparable.
-        asyncio.run(hub.core.outlets_changed())
-        asyncio.run(hub.core.discover())
+        # The second transition, on a roster nothing has moved.
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         # Nothing holds this wait, so it is answerable only at the terminal.
         # Each outlet transition reports it again, in the same words: a notice
@@ -1910,8 +1973,8 @@ class TestSwitchAdjudicationEndToEnd:
                 ),
             )
         )
-        hub.flip(SwitchName.DUTY, True)
         asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -1921,8 +1984,9 @@ class TestSwitchAdjudicationEndToEnd:
                 ),
             )
         )
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -1936,9 +2000,10 @@ class TestSwitchAdjudicationEndToEnd:
                 ),
             )
         )
-
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         assert hub.agent.inspections == []
         assert len(hub.channel.sent) == 2
@@ -1961,8 +2026,8 @@ class TestSwitchAdjudicationEndToEnd:
                 ),
             )
         )
-        hub.flip(SwitchName.DUTY, True)
         asyncio.run(hub.core.discover())
+        hub.flip(SwitchName.DUTY, True)
         hub.agent.discovery = LaneDiscovery(
             rows=(
                 SessionInspection(
@@ -1987,8 +2052,10 @@ class TestSwitchAdjudicationEndToEnd:
             )
         )
 
-        asyncio.run(hub.core.outlets_changed())
         asyncio.run(hub.core.discover())
+
+        hub.flip(SwitchName.DUTY, False)
+        hub.flip(SwitchName.DUTY, True)
 
         assert len(hub.channel.sent) == 2
         assert "Which release?" in hub.channel.sent[-1]
@@ -2053,22 +2120,30 @@ class TestSwitchAdjudicationEndToEnd:
         assert hub.channel.sent
         assert hub.call.spoken == []
 
-    def test_duty_flipping_off_mid_escalation_halts_but_keeps_answering(self) -> None:
-        """A Stop Notice tries one outlet at a time, so permission is re-read."""
+    def test_duty_going_off_while_a_dial_is_in_flight_loses_no_session(self) -> None:
+        """The route matrix is gone; what is left is one push and one wake (#195).
+
+        The two outlets are no longer tried in turn, so there is no "between
+        routes" left to re-read a switch at: the Companion Channel push is
+        adjudicated where it is made, and the call is the Keeper's, which reads
+        Duty ∧ Voice at the moment it dials. What this proves is what survives
+        the flip — a Session that is still on the roster and a hub that is still
+        answering — rather than an ordering that no longer exists.
+        """
         hub = Hub()
         hub.call.reachable = False
         original = hub.call.ensure_call
 
-        async def go_off_duty_while_connecting(instructions: str) -> object:
+        async def go_off_duty_while_connecting(dial: object) -> object:
             hub.state.switches.flip(SwitchName.DUTY, False)
-            return await original(instructions)
+            return await original(dial)
 
         hub.call.ensure_call = go_off_duty_while_connecting  # type: ignore[method-assign]
 
         handled = hub.emit(SessionStopped(target=CODEX))
 
-        assert hub.channel.sent == []
         assert handled == 1
+        assert len(hub.channel.sent) == 1
         assert hub.state.relays.pending() == ()
         assert hub.core.status().sessions
 

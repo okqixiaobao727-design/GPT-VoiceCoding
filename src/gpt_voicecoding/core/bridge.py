@@ -21,11 +21,23 @@ one way to turn Duty back on from away from the computer would be gated too.
 Three things are recorded here rather than decided here. `UserSpeech` is the
 in-call transcript, and Bridge Core never parses one: spoken intent arrives as
 structured control-plane calls the voice thread makes, so the event is written
-to the log and nothing else. `VoiceSpeech` is the other side of the same
-conversation and is treated the same way, except that the interlock is told —
-the Silence Ceiling counts both speakers (#184). The control-plane command set
-and the Delegated Turn's execution belong to the surfaces that own them, so both
-arrive as injected handlers with honest defaults rather than being invented here.
+to the log and nothing else. The two speaking spans are the same conversation's
+edges and are treated the same way. The control-plane command set and the
+Delegated Turn's execution belong to the surfaces that own them, so both arrive
+as injected handlers with honest defaults rather than being invented here.
+
+**Every call event is also handed to the Call Keeper** (`core/call_keeper.py`),
+which is where the call's *time* is kept: one call at a time, Cool-down, the
+Silence Ceiling and the two cues. This module dispatches to it and reads
+`status()` off it; it holds no call state of its own, because "the call is up"
+having two answers in core is the defect #195 closed.
+
+**What used to be the escalation pipeline is one Companion Channel push.** The
+route matrix, open-and-speak and the two call routes are gone: dialling is the
+Keeper's, and it dials from a fresh reading at the moment it acts rather than
+from the notice that provoked it (ADR 0017). What is left is `_push` — text,
+under the Message Switch — which is the half a Live Call was never a surface for
+(`CONTEXT.md`, *Stop Notice*).
 """
 
 from __future__ import annotations
@@ -37,8 +49,9 @@ from pathlib import Path
 from typing import Final
 
 from gpt_voicecoding.core import briefing
-from gpt_voicecoding.core.adjudication import SwitchAdjudicator
+from gpt_voicecoding.core.adjudication import Outlet, SwitchAdjudicator
 from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
+from gpt_voicecoding.core.call_keeper import CallKeeper
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
     BridgeCoreError,
@@ -49,16 +62,14 @@ from gpt_voicecoding.core.errors import (
     StaleSessionError,
     UnknownRelayError,
 )
-from gpt_voicecoding.core.escalation import EscalationPipeline, Notice, NoticeOutcome
 from gpt_voicecoding.core.events import EventQueue
 from gpt_voicecoding.core.instructions import InstructionContext, Instructions, generate
-from gpt_voicecoding.core.interlock import CallInterlock
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
 from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, reason_for, terminal_line
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, SessionRegistry
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -97,10 +108,10 @@ from gpt_voicecoding.seams.call import (
     CallEnded,
     CallSnapshot,
     CallStarted,
-    Cue,
     Dial,
-    DialReason,
     HandoverItem,
+    SpokenBrief,
+    UserSpeaking,
     UserSpeech,
     VoiceSpeech,
 )
@@ -127,12 +138,6 @@ NO_DELEGATE_HANDLER = "I can't take a delegated turn right now — nothing is wi
 #: (#184). One per edge, never per delta — a long answer is hundreds of those.
 VOICE_SPEAKING_LINE = "the call's own Voice started speaking"
 VOICE_QUIET_LINE = "the call's own Voice stopped speaking"
-
-#: Why a call the user opened exists, and the *whole* hand-over it gets (#167
-#: Q6). A user who pressed the toggle is about to say what they want; briefing
-#: them on the roster they were looking at when they pressed it would be the
-#: system talking first, on a call the user opened to talk.
-USER_OPENED = "The user opened this call. Wait to be spoken to, then act on what they ask for."
 
 #: Why a call the *system* dialled exists. The items after it are the roster and
 #: the Sessions waiting, so this says what they are for and nothing they say.
@@ -283,10 +288,78 @@ class Status:
     degraded_lanes: Mapping[AgentKind, str]
     #: The call the system owns, or None. One voice surface, so one id.
     call_id: str | None
+    #: Seconds of Cool-down left, or 0.0 when the system may dial right now.
+    #: Published rather than kept inside the Keeper because it is the one rule
+    #: with no surface of its own: a call that does *not* happen is invisible,
+    #: so an operator asking why nothing rang has nothing else to read (#195).
+    cool_down_remaining: float
+    #: Whether an event inside that Cool-down bought a dial not yet paid.
+    dial_owed: bool
     pending_relays: tuple[PendingRelay, ...]
     #: Reply Window levels include the lane's live question-route fact, which is
     #: deliberately not copied onto the roster row.
     reply_windows: Mapping[SessionTarget, ReplyWindow] = field(default_factory=dict)
+
+
+class RosterBriefer:
+    """The Call Keeper's Briefer, over the roster and `Briefing` (#167, ADR 0017).
+
+    The production half of the Keeper's one seam. It answers one question —
+    *who needs the user, right now* — and it answers it by reading the roster at
+    the moment it is asked, never from an event that was replayed to it. The
+    Keeper's own tests run against a fake with the same one verb, which is what
+    lets Cool-down and the Silence Ceiling be proved with no Sessions in sight.
+
+    Held as a named class rather than a closure so it has a docstring and a
+    place for the one fact the roster cannot carry: whether a lane can still
+    route an Answer Relay into a Session's question (#213). That fact is a live
+    adapter reading, so it arrives as a callable the hub supplies rather than as
+    a value read once and kept.
+    """
+
+    def __init__(
+        self, sessions: SessionRegistry, *, answerable: Callable[[SessionTarget], bool]
+    ) -> None:
+        self._sessions = sessions
+        self._answerable = answerable
+
+    def handover(self) -> tuple[HandoverItem, ...] | None:
+        """What a system-dialled call comes up holding, or None if nobody needs the user.
+
+        **Every row, including the one that just stopped.** Since #213 the
+        registry holds a just-stopped Session as stopped, so a fresh reading
+        covers the Session that provoked the dial like any other and nothing is
+        passed in beside the roster (`core/briefing.py::handover`).
+
+        **"Nobody needs the user" is read off the hand-over itself.** A call is
+        worth dialling when there is a Session Brief to carry — a Session that
+        stopped, whatever it stopped on — and the one place that decides which
+        rows earn a brief is `briefing.handover` (every live main row that is
+        not `RUNNING`). Asking it and then looking at what came back keeps that
+        rule in one place; re-deriving it here would be a second answer that
+        drifts, which is how a call came up saying a Session needed the user and
+        never mentioning which (#209).
+
+        `None` and not an empty tuple: a reason and a roster count with no brief
+        behind them is still a call, and the distinction is the one the Keeper
+        acts on — a Cool-down that elapses onto a machine where every wait has
+        since been answered at the terminal ends in silence.
+        """
+        sessions = self._sessions.live()
+        items = briefing.handover(
+            sessions,
+            self._sessions.focus,
+            reason=SYSTEM_DIALLED,
+            answerable=tuple(
+                session.target
+                for session in sessions
+                if session.waiting_for.kind is WaitingKind.QUESTION
+                and self._answerable(session.target)
+            ),
+        )
+        if not any(isinstance(item, SpokenBrief) for item in items):
+            return None
+        return items
 
 
 class BridgeCore:
@@ -328,17 +401,18 @@ class BridgeCore:
         #: every surface in the `sessions` payload, and a monotonic reading
         #: would name no moment on the far side.
         self._stamp = stamp
-        #: An outlet transition asks the next discovery pass to reconcile its
-        #: fresh rows. The transition itself performs no lane I/O (#80).
-        self._reconcile_owed = False
+        #: The same reading the Keeper measures its own ceilings with, so the
+        #: instant this hub calls "now" on a tick is the instant they are due at.
+        self._clock = clock
 
-        self.interlock = CallInterlock(call, clock=clock)
         self.adjudicator = SwitchAdjudicator(state.switches)
-        self.escalation = EscalationPipeline(
-            channel=channel,
-            interlock=self.interlock,
+        self.keeper = CallKeeper(
+            call=call,
+            briefer=RosterBriefer(state.sessions, answerable=self._question_answerable),
             adjudicator=self.adjudicator,
-            system_dial=self._system_dial,
+            dial_for=self._dial,
+            policy=self._policy,
+            clock=clock,
         )
         self.relays = RelayPipeline(
             agents=agents,
@@ -374,12 +448,15 @@ class BridgeCore:
 
     def status(self) -> Status:
         """What the system is doing. Consults no switch, so it always answers."""
+        keeping = self.keeper.status()
         return Status(
             switches=self._state.switches.snapshot(),
             sessions=self._state.sessions.all(),
             lanes=self._state.sessions.lane_errors(),
             degraded_lanes=self._state.sessions.lane_degradations(),
-            call_id=self.interlock.call_id(),
+            call_id=keeping.call_id,
+            cool_down_remaining=keeping.cool_down_remaining,
+            dial_owed=keeping.dial_owed,
             pending_relays=self._state.relays.pending(),
             reply_windows={
                 session.target: self._reply_window(session)
@@ -530,12 +607,21 @@ class BridgeCore:
         The Auto Hang-up Switch is the plain case: it opens no way to reach the
         user, so turning it on owes nobody a re-announcement of what they are
         already waiting on.
+
+        **A transition is one `wake`, and it is acted on now.** It used to set a
+        flag the next discovery pass consumed, which meant the announcement was
+        composed from rows read before the outlet existed. Since #195 the Keeper
+        reads the roster at the moment it dials (ADR 0017) and the text side
+        reads it here, so there is nothing left for a flag to defer — and one
+        wake for the transition, rather than one per Session, is what keeps
+        "Duty on" from ringing once per waiting row.
         """
-        opened_before = set(self.adjudicator.outlets())
+        opened_before = self.adjudicator.outlets()
         previous = self._state.switches.flip(name, on)
         self._state.persist()
-        if set(self.adjudicator.outlets()) - opened_before:
-            self._owe_reconciliation()
+        opened = self.adjudicator.outlets() - opened_before
+        if opened:
+            await self._an_outlet_opened(voice=Outlet.VOICE in opened)
         return previous
 
     async def live_toggle(self) -> CallSnapshot:
@@ -550,28 +636,24 @@ class BridgeCore:
         a call is up, and the user's explicit "end this call" is refused by the
         very switch that says the system should be quiet.
 
-        Only the interlock constrains it, in both directions: one call at a time.
-        There is one path here and every surface calls it — a surface holding its
-        own call state is how two toggles once opened two calls.
+        Only the Call Keeper constrains it, in both directions: one call at a
+        time, and Cool-down does not apply to the user's own toggle
+        (`CONTEXT.md`). There is one path here and every surface calls it — a
+        surface holding its own call state is how two toggles once opened two
+        calls.
         """
-        if self.interlock.owns_call():
-            return await self.interlock.end_call()
-        # Ending is always allowed; whether opening is, is the interlock's to
-        # say — in both directions, and for both of its reasons.
-        snapshot = await self.interlock.open_call(self._dial((DialReason(text=USER_OPENED),)))
-        if snapshot.is_up:
-            self._owe_reconciliation()
-        return snapshot
+        return await self.keeper.live_toggle()
 
     def _dial(self, hand_over: tuple[HandoverItem, ...]) -> Dial:
         """What a call this hub opens is opened on: two audiences and a hand-over.
 
         The one place a `Dial` is built, and therefore the one place that can say
         which half is missing when this engine generated nothing. The refusal is
-        here rather than in the interlock because that is a door and this is a
-        source: the interlock decides *whether* a call may open, and only the hub
-        knows what it would be opened on (ADR 0018; #193's deferred note on the
-        error's old name).
+        here rather than in the Call Keeper because that is a door and this is a
+        source: the Keeper decides *whether* a call may open and when, and only
+        the hub knows what it would be opened on (ADR 0018; #193's deferred note
+        on the error's old name). The Keeper is handed this method and calls it
+        at the moment it dials, so a set the hub regenerated is never stale.
         """
         instructions = self._instructions
         if instructions is None:
@@ -584,68 +666,43 @@ class BridgeCore:
             voice=instructions.voice.text, agent=instructions.agent.text, hand_over=hand_over
         )
 
-    def _system_dial(self, notice: Notice) -> Dial:
-        """What a call the *system* dials for one notice is opened on.
+    async def _an_outlet_opened(self, *, voice: bool) -> None:
+        """An outlet the switches now allow just became usable. Say what still waits.
 
-        The hand-over is read from the roster **now**, not assembled from the
-        notice that provoked it: ADR 0017's rule is that a missed call is briefed
-        from a fresh reading and never from replayed events, and by the time the
-        matrix reaches this route the wait that started it may have been answered
-        at the terminal. So the notice names the moment and the roster supplies
-        the content.
+        **One wake for the voice side, one fresh reading for the text side, and
+        each only when its own outlet is what opened.** The Keeper is told when
+        the *Voice* outlet opens — a Duty or Voice switch turning on is one more
+        `wake` (#195) — and it decides for itself whether that is a dial, an owed
+        dial or nothing, briefing from the roster at the moment it acts (ADR
+        0017). Turning the **Message** Switch on is not a reason to ring: it
+        opens a way to reach the user in text, and reaching them in text is what
+        the push below does. Waking on it would dial a call the user asked for
+        messages instead of.
 
-        **Every row, including the one that just stopped.** A Stop used to leave a
-        row that merely ended a turn in `RUNNING` (#209), and a hand-over briefs
-        no running Session — so a call dialled by that Stop came up saying a
-        Session needs the user without mentioning which, and this method passed
-        the notice's own brief alongside for `handover` to place last. Since #213
-        the roster holds a stopped Session as stopped, so the fresh reading
-        covers it like any other and the compensation is gone. Which leaves
-        `notice` naming the moment and nothing else: it stays in the signature
-        because it is the escalation's own callback contract for this route
-        (`core/escalation.py`), and reading nothing off it is exactly ADR 0017.
+        The Companion Channel has no component of its own, so its reading is
+        taken here and each live main row that still needs the user is pushed —
+        on either transition, because a row that still waits is news on whatever
+        outlet has just become available.
+
+        **Bridge Core keeps no memory of what it has already announced (#161).**
+        Whether to announce is a function of this reading alone, so a wait that
+        still needs the user is reported on every transition, in the same words.
+        A set of delivered waits used to suppress the repeat; it could not work,
+        because the action that invalidates it — an adapter handing an unanswered
+        dialog back to the terminal — happens where Bridge Core cannot see it.
+
+        What went with #195: the *deferral*. This used to set a flag that the
+        next discovery pass consumed, and only for lanes that pass had actually
+        read; both halves now read the roster at the moment of acting, so the
+        flag, the `outlets_changed` hook that set it and the lane filter that
+        qualified it are gone.
         """
-        sessions = self._state.sessions.live()
-        return self._dial(
-            briefing.handover(
-                sessions,
-                self._state.sessions.focus,
-                reason=SYSTEM_DIALLED,
-                answerable=tuple(
-                    session.target
-                    for session in sessions
-                    if session.waiting_for.kind is WaitingKind.QUESTION
-                    and self._question_answerable(session.target)
-                ),
-            )
-        )
-
-    async def outlets_changed(self) -> None:
-        """An outlet the switches already allow became reachable again.
-
-        The named entry point for the one transition no event describes: a
-        Companion Channel whose far side has come back, noticed by a liveness
-        check rather than announced. Call transitions and switch flips already
-        reconcile on their own events.
-
-        This is deliberately the *only* other reconciliation trigger. The next
-        ordinary discovery pass does the read; a failed notice attempt never
-        triggers another attempt.
-        """
-        self._owe_reconciliation()
-
-    def _owe_reconciliation(self) -> None:
-        """Ask the next discovery pass to act, when an outlet is effective now."""
-        if self.adjudicator.outlets():
-            self._reconcile_owed = True
-
-    async def _announce_current_stops(self, fresh: set[AgentKind]) -> None:
-        """Announce actionable main rows from lanes this pass actually read."""
         for session in self._state.sessions.live():
-            if session.target.agent not in fresh or not session.child.is_main:
+            if not session.child.is_main or not session.waiting_for.needs_the_user:
                 continue
-            if session.waiting_for.needs_the_user:
-                await self._announce_waiting(session, session.target, session.waiting_for)
+            await self._announce_waiting(session, session.target, session.waiting_for)
+        if voice:
+            await self.keeper.wake(focus=False)
 
     async def relay(
         self, target: SessionTarget, text: str, *, route: RelayRoute = RelayRoute.DELIVER
@@ -777,9 +834,10 @@ class BridgeCore:
         """Advance the time-driven ceilings. The composition root calls this on a timer.
 
         Deliberately the only time-driven thing in the hub, and there are two of
-        them left: the undelivered Relay ceiling and the Live Call's silence
-        ceiling. Stop Notices are not replayed here; current state is reconciled
-        only on outlet transitions.
+        them left: the undelivered Relay ceiling, which is this method's, and
+        the Call Keeper's own clock — Cool-down expiry, the Silence Ceiling and
+        the settle window — which is handed the same instant and decides for
+        itself what is due. Stop Notices are not replayed here.
 
         **No clock runs on a held dialog** (ADR 0015, amended by #191). A parked
         permission or question is bounded by the wire that holds it — Claude Code
@@ -789,43 +847,27 @@ class BridgeCore:
         first. What a release does is unchanged, and nothing is pushed on it: the
         next brief reads a row with no handle and says `answer: at the terminal`
         (ADR 0017, a fresh reading).
+
+        **The Keeper is not ticked while unread call activity is waiting.** This
+        runs on its own task and the dispatch loop runs on another
+        (`engine/composition.py`), so a speaking edge that has been emitted but
+        not yet taken has not reached the Keeper — and measuring silence then is
+        how a call gets ended in the middle of the answer that was about to say
+        it was not silent (#184). Waiting for the next pass costs a second on a
+        sixty-second ceiling, and the same second on a Cool-down.
+
+        The three kinds are named rather than the queue being asked whether it
+        holds anything: this is the ceiling's own question — *was there activity
+        on the call* — and a `SessionStopped` waiting to be read is not an answer
+        to it. Asking the wider question let news about a Session hold a silent
+        call open. The user's speaking span joins the pair the moment the seam
+        raises one (#195).
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
             await self._announce(outcome.target, terminal_line(outcome))
-        # Asked before the Call Keeper is, and not inside it: with the Auto
-        # Hang-up Switch off the ceiling is never measured, so the Keeper's one
-        # ending attempt per call stays unspent and turning the switch back on
-        # ends a call that has been silent all along.
-        #
-        # **And never measured while unread call activity is waiting.** This runs
-        # on its own task and the dispatch loop runs on another
-        # (`engine/composition.py`), so a `VoiceSpeech` that has been emitted but
-        # not yet taken has not reached the interlock — and measuring silence
-        # then is how a call gets ended in the middle of the answer that was
-        # about to say it was not silent (#184). Waiting for the next pass costs
-        # a second on a sixty-second ceiling.
-        #
-        # The two kinds are named rather than the queue being asked whether it
-        # holds anything: this is the ceiling's own question — *was there
-        # activity on the call* — and a `SessionStopped` waiting to be read is
-        # not an answer to it. Asking the wider question let news about a
-        # Session hold a silent call open.
-        if self.adjudicator.may_auto_hangup() and not self.events.unread(UserSpeech, VoiceSpeech):
-            try:
-                ended_silent_call = await self.interlock.end_silent_call(
-                    self._policy.silence_end_seconds
-                )
-            except Exception:  # noqa: BLE001 - the Call Keeper spends one attempt per call
-                _log.exception(
-                    "could not end the silent Live Call; not trying again until the call changes"
-                )
-            else:
-                if ended_silent_call:
-                    _log.info(
-                        "ended the Live Call after %g seconds without call activity",
-                        self._policy.silence_end_seconds,
-                    )
+        if not self.events.unread(UserSpeech, UserSpeaking, VoiceSpeech):
+            await self.keeper.tick(self._clock())
         return expired
 
     async def discover(self) -> tuple[SessionTarget, ...]:
@@ -855,10 +897,7 @@ class BridgeCore:
         that is sitting there waiting for them, so the question is asked of the
         one component that can tell a re-keying from a death.
         """
-        reconcile = self._reconcile_owed
-        self._reconcile_owed = False
         gone: list[SessionTarget] = []
-        fresh: set[AgentKind] = set()
         for kind, adapter in self._agents.items():
             try:
                 lane = await adapter.discover()
@@ -866,15 +905,11 @@ class BridgeCore:
                 _log.exception("the %s lane raised instead of reporting its trouble", kind)
                 continue
             gone.extend(self._state.sessions.observe(kind, lane, now=self._stamp()))
-            if lane.enumerated:
-                fresh.add(kind)
 
         for target in gone:
             _log.info("Session %s is no longer running", target)
             for outcome in self.relays.session_ended(target):
                 await self._announce(outcome.target, terminal_line(outcome))
-        if reconcile and self.adjudicator.outlets():
-            await self._announce_current_stops(fresh)
         return tuple(gone)
 
     async def dispatch(self, event: Event) -> None:
@@ -888,32 +923,24 @@ class BridgeCore:
                 await self._reply_window_changed(event)
             case RelayReceipt():
                 self._relay_receipt(event)
-            case CallStarted():
-                self.interlock.note_started(event.call_id)
-                await self._cue(Cue.CONNECTED)
-                self._owe_reconciliation()
-            case CallEnded() | CallDropped():
-                # The cue is not conditional on the interlock's answer the way
-                # the reconciliation below is: what the user is owed is the
-                # sound of the call they were on ending, and whether this hub
-                # was still holding that call is a bookkeeping question they
-                # cannot hear (#186).
-                await self._cue(Cue.ENDED)
-                # Only a release is an outlet transition. A late event about a
-                # call the system was not holding changes nothing, so it cannot
-                # justify another inspection and announcement.
-                if self.interlock.note_ended(event.call_id):
-                    self._owe_reconciliation()
+            case CallStarted() | CallEnded() | CallDropped():
+                # The Keeper owns every one of these: it adopts a call the user
+                # opened, releases the one it held, paces the Cool-down that
+                # follows any end, and plays the two cues. The hub records
+                # nothing here, because "the call is up" has one truth in core.
+                await self.keeper.heard(event)
             case InboundText():
                 await self._inbound_text(event)
+            case UserSpeaking():
+                await self.keeper.heard(event)
             case VoiceSpeech():
                 # Both edges are activity, and the ceiling is held between them.
                 # Recorded, never read back: this system does not listen to
                 # itself, and the words are the Voice's own (#184).
-                self.interlock.note_voice_speech(speaking=event.speaking)
+                await self.keeper.heard(event)
                 _log.info("%s", VOICE_SPEAKING_LINE if event.speaking else VOICE_QUIET_LINE)
             case UserSpeech():
-                self.interlock.note_activity()
+                await self.keeper.heard(event)
                 # Recorded, never parsed. Spoken intent reaches Bridge Core as
                 # structured control-plane calls the voice thread makes (#5),
                 # over the transport the Call adapter raises (#6) — the router's
@@ -928,7 +955,7 @@ class BridgeCore:
         """A Session stopped. Say so in the log, then announce it.
 
         **The log line is the run's only way to attribute a notice to this
-        engine.** Until #75 the escalation path wrote nothing when it *worked* —
+        engine.** Until #75 the announcement path wrote nothing when it *worked* —
         only its old retention and failure paths wrote — so a Stop Notice that
         reached the user left no trace at all, and the acceptance's
         `stop notice` step could satisfy its attribution check only on the
@@ -948,6 +975,11 @@ class BridgeCore:
             event.waiting_for,
             progress=event.progress,
         )
+        # **One wake per wake-worthy event, and it carries no content.** Whether
+        # this Session still needs the user is read again by the Briefer at the
+        # moment the Keeper acts (ADR 0017); `focus` says only whether the event
+        # concerns the Focus Session, which is #196's to read.
+        await self.keeper.wake(focus=self._state.sessions.focus == event.target)
 
     async def _announce_waiting(
         self,
@@ -956,7 +988,7 @@ class BridgeCore:
         waiting_for: WaitingFor,
         *,
         progress: ProgressObservation | None = None,
-    ) -> NoticeOutcome | None:
+    ) -> None:
         """Announce one current wait through the same producer as its live event.
 
         **Bridge Core keeps no memory of what it has already announced (#161).**
@@ -996,19 +1028,13 @@ class BridgeCore:
         # unchanged: `tests/acceptance/journey.py::ENGINE_STOP_LINE` greps the
         # first line of the record, and `drain_boot_notice` reads that grep.
         _log.info("Session stopped: %s", briefing.text(brief))
-        outcome = await self.escalation.escalate(
-            Notice(
-                request_id=new_request_id(),
-                target=target,
-                text=briefing.text(brief),
-                # The same brief, twice, for the two kinds of surface: the
-                # Companion Channel and the log render words, and the Live Call
-                # is handed the brief itself and speaks from it (`CONTEXT.md`,
-                # *Stop Notice*). One reading, so the two can never disagree.
-                spoken=briefing.spoken(brief),
-            )
-        )
-        return outcome
+        # **Text here; the voice side is the Keeper's `wake`.** The brief is not
+        # handed to a call from this path at all any more: what a call is opened
+        # holding is read fresh at the moment it is dialled, from the roster
+        # rather than from this reading (ADR 0017, #195). Which is why nothing
+        # is returned — there is no route matrix left to report which door the
+        # notice went through.
+        await self._push(briefing.text(brief))
 
     async def _session_ended(self, event: SessionEnded) -> None:
         try:
@@ -1046,25 +1072,6 @@ class BridgeCore:
             return
         if event.window is ReplyWindow.OPEN:
             await self.relays.reply_window_opened(event.target)
-
-    async def _cue(self, cue: Cue) -> None:
-        """Ask the Call adapter to mark one moment with a sound.
-
-        The hub names the moment and never the sound: which notes, how loud and
-        how long were chosen by ear against one machine's speakers (#174), and
-        none of that is policy. The Call Keeper takes these two calls over when
-        it arrives (#195); until then the lifecycle arms are where the moments
-        are known.
-
-        A shipped adapter swallows its own playback failures, so this guard is
-        for a **defective** one — and a defective adapter may not stop the arm
-        it was called from. What follows a `CallEnded` is the interlock being
-        released, and a missing tone is not a reason to keep a call held.
-        """
-        try:
-            await self._call.play_cue(cue)
-        except Exception:  # noqa: BLE001 - a sound may not take down the call it marks
-            _log.exception("the Call adapter raised on the %s cue", cue)
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
         """A receipt that arrived after the call returned. The ledger records it."""
@@ -1117,11 +1124,43 @@ class BridgeCore:
         await self._reply(outcome.line)
 
     async def _announce(self, target: SessionTarget, text: str) -> None:
-        """Tell the user something the pipelines decided they need to know."""
+        """Tell the user something the pipelines decided they need to know.
+
+        A failed Relay's terminal line, which is text and has no Session Brief
+        behind it (`core/relays.py::terminal_line`, temporary until #197). The
+        Live Call is not a surface that reads sentences out (`CONTEXT.md`, *Stop
+        Notice*), so this has only ever had one route, and since #195 that is
+        the only route there is.
+        """
+        del target  # the line names its own Session; the channel takes it whole
+        await self._push(text)
+
+    async def _push(self, text: str) -> None:
+        """One Companion Channel push, under the Message Switch. The only outlet left.
+
+        What remains of the escalation pipeline (#195). The route matrix,
+        open-and-speak and the two call routes went with it: opening a call is
+        the Call Keeper's and it briefs from a fresh reading, and speaking into
+        one is mid-call behaviour (#196). So there is one outlet here, one
+        attempt at it, and no replay — Stop-Notice no-loss is the current-state
+        reading `_an_outlet_opened` takes, never a historical notice re-sent.
+
+        **Adjudicated, unlike `_reply`.** This is the system reaching the user
+        unbidden, which is exactly what the Message Switch answers for; a reply
+        to text the user just sent is not (ADR 0002).
+        """
         if not text:
             return
-        await self.escalation.escalate(
-            Notice(request_id=new_request_id(), target=target, text=text)
+        if not self.adjudicator.may_push():
+            _log.info("the Message Switch is off; this notice reaches no outlet")
+            return
+        receipt = await self._channel.send(text, request_id=new_request_id())
+        if receipt.is_delivered:
+            return
+        _log.info(
+            "notice not delivered; this attempt is not replayed (%s: %s)",
+            receipt.outcome,
+            receipt.reason,
         )
 
     async def _reply(self, text: str) -> None:
