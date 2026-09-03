@@ -34,12 +34,18 @@ track (#180 §1).
 ## What is *not* ported, and why
 
 The probe drives its own handshake and decides mid-call which WAV variant to
-play next off what the backend has been heard to do (`:1000-1021`). This is
-v0 — "the route through the product, nothing more" — so it plays the plain
-utterance once, the moment the peer connection has been up for `settle_seconds`,
-and records which variant that was. The variant is written down rather than
-assumed because the step reports it as an observation and a later ticket
-(the Call Keeper's v1) is the one that gets to vary it.
+play next off what the backend has been heard to do (`:1000-1021`). Nothing here
+decides anything by ear: the **step** says what to play, in a file, and this side
+plays what it is told the moment the peer connection has been up for
+`settle_seconds`. The variant is written down rather than assumed because the
+step reports it as an observation.
+
+Since #196 the file is a **list** and the step may append to it while the call is
+up, which is the whole of what "several utterances per call" means here: every
+sentence is still synthesised before the engine starts, and what a step chooses
+at run time is only which of them goes out next, and when. Nothing is ever put on
+the track over an utterance already going out — the wire truncates an utterance a
+second one is appended to (#175), and the harness must not be what proves it.
 
 ## How the step on the other side of the process boundary reads this
 
@@ -118,6 +124,55 @@ LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,�
 #: installed. This one is 2 s and change, and asks the same thing.
 NEEDS_REQUEST = "现在有哪些需要我的事情?"
 
+#: What the Focus Session's workspace is called by default, and so — since the
+#: project half of a Session Name is the workspace directory's basename
+#: (`adapters/agent/_project.py`) — what the Voice knows that Session by. The
+#: harness picks it, which is what lets `relay_request` say it out loud.
+#:
+#: **A default, and every lane overrides it** (`journey.Lane`,
+#: `[adapters.settings.call] focus_workspace`). Two lanes sharing this name is
+#: two Sessions the sentence cannot tell apart: the Codex daemon is
+#: machine-wide, so the Claude lane's engine holds the Codex lane's Sessions
+#: too, and run `20260903T093813Z` had its Call Agent looking at two rows called
+#: `二号工位 · Reply READY` and answering with `brief` instead of relaying.
+FOCUS_WORKSPACE_NAME = "二号工位"
+
+#: And what the *ringing* Session's workspace is called. It exists so that the
+#: EVENT cue can be graded while a Focus Session exists: with only one extra
+#: Session, the ring and the announcement are the same Session either side of
+#: the relay, and "an event about **another** Session while a Focus Session
+#: exists rings and does not speak" — the rule #196 is for — is never put to the
+#: engine at all. Never named in any utterance: the run's proof is that nothing
+#: spoken ever names it. Per lane for `FOCUS_WORKSPACE_NAME`'s reason.
+RINGING_WORKSPACE_NAME = "三号工位"
+
+
+def relay_request(focus_workspace: str) -> str:
+    """The relay utterance, naming one lane's own Focus Session's workspace."""
+    return f"请你给{focus_workspace}那个会话回一句话，内容是收到。"
+
+
+#: What the *fourth* variant asks, and it asks for a verb the Call Agent owns.
+#: `live call` v2 (#196) needs the Focus Session to change **during** a call, and
+#: the one thing that moves it is the user relaying into a Session (#165 Q2) — so
+#: this sentence asks for a relay and the Call Agent runs `bridgectl relay`,
+#: which the wrapper log records.
+#:
+#: **It names the Session**, by the one half of its name the harness picks. Run
+#: `20260903T081717Z` is why: an earlier version named none, and on both lanes
+#: the Call Agent went looking with `brief` and never relayed at all — on the
+#: claude lane it briefed two of the nine Sessions this machine is running,
+#: which is also a relay that must not land. The task half really cannot be
+#: pinned (it is the agent's own thread name), so the project half is.
+#:
+#: **Worded for a recogniser, not for a page.** The same run had the corner
+#: brackets dropped and 吧 come back as 把, so what reached the Call Agent was
+#: not a quotable message: `请你把继续把这句话转达给…`. No brackets here, no
+#: 吧/把, and `回一句话` is the Answer Relay's own shape rather than a synonym
+#: for it. **No hang-up ask** either, for `LONG_REQUEST`'s reason: this call has
+#: to outlive the relay by a whole turn.
+RELAY_REQUEST = relay_request(FOCUS_WORKSPACE_NAME)
+
 #: The voice `say` synthesises with. `Flo` and `Eddy` are premium zh_CN voices
 #: that have never been downloaded on this machine, and `say` does not say so —
 #: it exits 0 and writes 0.41 s of something that is not the sentence, where
@@ -140,18 +195,36 @@ WAV_MINIMUM_SECONDS = 1.0
 PLAIN = "plain"
 LONG = "long"
 NEEDS = "needs"
+RELAY = "relay"
 
-#: Which variant the *next* call plays, as a file in `wav_directory` holding one
-#: variant name. Two things force a per-call channel rather than a settings key:
-#: one engine walks every step of a lane, and both call steps run on it — so a
-#: sentence fixed at engine start would be one step's sentence spoken into the
-#: other step's call. It is derived from `wav_directory` rather than configured
-#: because both sides already agree on that path, and one more key would be one
-#: more thing `derive_config` and `HarnessSettings` had to keep in step.
+#: What the *current or next* call plays, as a file in `wav_directory` holding
+#: one variant name a line. Two things force a per-call channel rather than a
+#: settings key: one engine walks every step of a lane, and every call step runs
+#: on it — so a sentence fixed at engine start would be one step's sentence
+#: spoken into the other step's call. It is derived from `wav_directory` rather
+#: than configured because both sides already agree on that path, and one more
+#: key would be one more thing `derive_config` and `HarnessSettings` had to keep
+#: in step.
+#:
+#: **A list rather than one name** (#196). v1's mechanism played one utterance
+#: per call, which is every call the harness could describe: a call that is
+#: spoken into once. `live call` v2 speaks a relay into a call that is already
+#: up and then drives a second Session's Stop on that same call, so the step has
+#: to be able to put a *second* sentence on a track while the first call is
+#: still holding it. The step appends a line; the transport plays whichever
+#: lines it has not played yet, one at a time and never over itself.
 #:
 #: Absent, empty or unknown reads as `PLAIN`: the step that does not care about
 #: the variant gets the one #183 accepted.
 NEXT_VARIANT_FILE = "next-variant"
+
+#: How often the transport looks at that file while a call is up. Not every
+#: frame: `_next` runs every 20 ms inside the event loop, and a stat plus a read
+#: fifty times a second is disk work in the one place that must never fall
+#: behind the media clock. Half a second is far under any step's own timing —
+#: the sentences either side of it are seconds long — and it is also the floor
+#: on the silence between two queued utterances, which is a floor worth having.
+PLAYLIST_POLL_SECONDS = 0.5
 
 #: How long the call is left alone after the peer connection comes up, before
 #: the utterance goes out. The probe's `--settle` default, and the figure every
@@ -185,6 +258,11 @@ class HarnessSettings:
     request: str = REQUEST
     long_request: str = LONG_REQUEST
     needs_request: str = NEEDS_REQUEST
+    #: This lane's two extra Sessions' workspace names (#196). The relay
+    #: utterance is built from the first rather than configured beside it, so
+    #: the name that is said and the name that is created cannot drift.
+    focus_workspace: str = FOCUS_WORKSPACE_NAME
+    ringing_workspace: str = RINGING_WORKSPACE_NAME
     voice: str = WAV_VOICE
     wav_sample_rate: int = WAV_SAMPLE_RATE
     settle_seconds: float = SETTLE_SECONDS
@@ -192,7 +270,12 @@ class HarnessSettings:
     @property
     def requests(self) -> dict[str, str]:
         """Every utterance this run can put on a track, by its variant name."""
-        return {PLAIN: self.request, LONG: self.long_request, NEEDS: self.needs_request}
+        return {
+            PLAIN: self.request,
+            LONG: self.long_request,
+            NEEDS: self.needs_request,
+            RELAY: relay_request(self.focus_workspace),
+        }
 
     @property
     def next_variant_path(self) -> Path:
@@ -221,22 +304,58 @@ class HarnessSettings:
 def ask_for(wav_directory: Path, variant: str) -> None:
     """Say which variant the next call plays. Written by the step, read at dial.
 
-    Every step that dials states its variant, including the one that wants the
-    default: a file left behind by the call before it is otherwise the thing
-    that decides, and "whatever the last step wanted" is not a request anybody
-    made.
+    **The list is replaced, not appended to.** Every step that dials states its
+    variant, including the one that wants the default: a file left behind by the
+    call before it is otherwise the thing that decides, and "whatever the last
+    step wanted" is not a request anybody made — nor is "and then whatever the
+    step before that had left queued".
     """
     wav_directory.mkdir(parents=True, exist_ok=True)
     (wav_directory / NEXT_VARIANT_FILE).write_text(variant + "\n", encoding="utf-8")
 
 
-def variant_asked_for(wav_directory: Path, known: tuple[str, ...]) -> str:
-    """Which variant to play now. Anything the harness cannot play reads as `PLAIN`."""
+def ask_for_nothing(wav_directory: Path) -> None:
+    """Say that this call opens in silence, and waits to be told what to say (#196).
+
+    An **empty** list, which is a different answer from no list at all: a step
+    that has written nothing has not asked for silence, and gets #183's
+    utterance. `live call` v2 needs a call that comes up and says nothing until
+    the step has watched something else happen on it, so it says so.
+    """
+    wav_directory.mkdir(parents=True, exist_ok=True)
+    (wav_directory / NEXT_VARIANT_FILE).write_text("", encoding="utf-8")
+
+
+def ask_next(wav_directory: Path, variant: str) -> None:
+    """Queue one more utterance for the call that is up (#196).
+
+    Appended rather than written, because the transport reads the whole list and
+    plays what it has not played yet: replacing the file would re-play the
+    sentence this call opened with. The step that appends is saying "and then
+    say this", and it says it while the call it is talking about is running.
+    """
+    wav_directory.mkdir(parents=True, exist_ok=True)
+    with (wav_directory / NEXT_VARIANT_FILE).open("a", encoding="utf-8") as playlist:
+        playlist.write(variant + "\n")
+
+
+def variants_asked_for(wav_directory: Path, known: tuple[str, ...]) -> tuple[str, ...]:
+    """Every variant queued so far, in order. What cannot be played reads as `PLAIN`.
+
+    A **missing** file is one `PLAIN`: the step that did not say anything about
+    the variant gets the one #183 accepted, and a call nobody wrote a line for
+    is not a call that was asked to stay quiet. A file that exists and holds no
+    name is `()` — a step that asked for silence and will say when to break it
+    (`ask_for_nothing`).
+    """
     path = wav_directory / NEXT_VARIANT_FILE
     if not path.exists():
-        return PLAIN
-    asked = path.read_text(encoding="utf-8").strip()
-    return asked if asked in known else PLAIN
+        return (PLAIN,)
+    return tuple(
+        line.strip() if line.strip() in known else PLAIN
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
 
 
 # --- what crosses the process boundary --------------------------------------
@@ -433,6 +552,16 @@ class WavTrackSource:
             )
         return seconds
 
+    @property
+    def idle(self) -> bool:
+        """Whether the track is carrying silence — nothing queued and nothing mid-word.
+
+        The one question a second utterance has to ask before it goes out: the
+        wire truncates an utterance a second one is appended to (#175), and the
+        harness must not be the thing that proves it.
+        """
+        return not self._pending
+
     async def next(self, track: Any) -> bytes:
         """One 20 ms payload: the next WAV frame, or silence, paced in real time."""
         if track._started is None:
@@ -476,38 +605,59 @@ class HarnessCallTransport:
         *,
         settings: HarnessSettings,
         observations: Observations,
-        utterance: list[bytes],
-        variant: str = PLAIN,
+        utterances: dict[str, list[bytes]],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._settings = settings
         self._observations = observations
-        #: Which of the run's utterances this call plays. Chosen per call, by
-        #: the step that dialled, because one engine holds every call a lane's
-        #: walk makes and two of those steps want different sentences.
-        self._variant = variant
-        #: Already synthesised, resampled and framed — by `harness_call`, while
-        #: the engine was being assembled. Not here, and that is the point: this
-        #: runs inside the event loop, one step before the handshake, and `say`
-        #: is a subprocess and the resampler is CPU. A second of blocking there
-        #: is a second the peer connection is not being set up in.
-        self._utterance = utterance
+        #: Every utterance this run can put on a track, already synthesised,
+        #: resampled and framed — by `harness_call`, while the engine was being
+        #: assembled. Not here, and that is the point: this runs inside the event
+        #: loop, one step before the handshake, and `say` is a subprocess and the
+        #: resampler is CPU. A second of blocking there is a second the peer
+        #: connection is not being set up in.
+        #:
+        #: All of them rather than the one this call opens with, because since
+        #: #196 the step may queue another *while the call is up* and the answer
+        #: to "which sentence is that" has to already be in memory.
+        self._utterances = utterances
+        self._clock = clock
         self._real = webrtc_transport(silent=True)
         self._source = WavTrackSource(observations=observations)
-        self._spoke = False
+        #: How many of the playlist's lines have been **queued** — the cursor
+        #: into it, not a count of finished utterances: it is incremented when a
+        #: line is handed to the frame source, which is a moment before the
+        #: first frame of it leaves. `WavTrackSource.idle` is what says whether
+        #: the last one has actually gone out.
+        self._enqueued = 0
         self._connected_at: float | None = None
+        self._looked_at: float | None = None
         self._ended: str | None = None
         # Reaching past the transport's own surface, deliberately and only here.
         self._real._microphone._next = self._next  # type: ignore[attr-defined]
+        queued = self._playlist()
         observations.note(
             "wav source installed",
             transport_factory=REFERENCE,
-            variant=variant,
+            # `None` where the step asked for silence, so the observation says
+            # what this call opened as rather than naming a sentence nobody
+            # queued. The reader takes the newest non-null (`_last`), which is
+            # the variant that actually went out once one does.
+            variant=queued[0] if queued else None,
+            queued=list(queued),
             voice=settings.voice,
-            request=settings.requests[variant],
-            frames=len(self._utterance),
+            request=settings.requests[queued[0]] if queued else None,
             rate=settings.wav_sample_rate,
             settle_seconds=settings.settle_seconds,
         )
+
+    @property
+    def _spoke(self) -> bool:
+        """Whether this call was ever talked into at all."""
+        return self._enqueued > 0
+
+    def _playlist(self) -> tuple[str, ...]:
+        return variants_asked_for(self._settings.wav_directory, tuple(self._utterances))
 
     async def _next(self, track: Any) -> bytes:
         """Every 20 ms, and the only clock this side has once the call is up.
@@ -519,17 +669,33 @@ class HarnessCallTransport:
         `settle_seconds` — the probe's own dial-time silence window, which every
         run that was heard used (`--settle`, default 10 s).
         """
-        if not self._spoke and self._real.is_connected:
-            now = time.monotonic()
+        if self._real.is_connected:
+            now = self._clock()
             if self._connected_at is None:
                 self._connected_at = now
                 self._observations.note(
                     "peer connection up", settle_seconds=self._settings.settle_seconds
                 )
-            elif now - self._connected_at >= self._settings.settle_seconds:
-                self._spoke = True
-                self._source.enqueue(self._utterance, variant=self._variant)
+            elif now - self._connected_at >= self._settings.settle_seconds and self._source.idle:
+                if self._looked_at is None or now - self._looked_at >= PLAYLIST_POLL_SECONDS:
+                    self._looked_at = now
+                    self._speak_the_next_line()
         return await self._source.next(track)
+
+    def _speak_the_next_line(self) -> None:
+        """Put the next queued utterance on the track, if the step has queued one.
+
+        Read off disk each time rather than captured at dial, because the step
+        that queues the second one is in pytest and this is the engine: the file
+        is the whole of what crosses between them, in the same direction
+        `observations` crosses back.
+        """
+        queued = self._playlist()
+        if self._enqueued >= len(queued):
+            return
+        variant = queued[self._enqueued]
+        self._enqueued += 1
+        self._source.enqueue(self._utterances[variant], variant=variant)
 
     # -- the `CallTransport` protocol, delegated ----------------------------
 
@@ -595,8 +761,9 @@ def harness_call(*, sink: Any = None, settings: dict[str, Any] | None = None) ->
     **All of them, not the one this run will use**, for the first reason above:
     one engine holds every call a lane's walk makes, and a variant first
     synthesised at dial time would move a broken voice from "the run never
-    started" to "the last step failed for a reason nothing names". Which one
-    goes on the track is decided per call, by the step that dialled.
+    started" to "the last step failed for a reason nothing names". Which ones go
+    on the track, and in what order, is decided per call by the step that
+    dialled — and since #196 a step may add one while its call is still up.
     """
     mine, theirs = HarnessSettings.split(settings)
     observations = Observations(mine.observations)
@@ -624,12 +791,6 @@ def harness_call(*, sink: Any = None, settings: dict[str, Any] | None = None) ->
         )
 
     def build() -> CallTransport:
-        variant = variant_asked_for(mine.wav_directory, tuple(utterances))
-        return HarnessCallTransport(
-            settings=mine,
-            observations=observations,
-            utterance=utterances[variant],
-            variant=variant,
-        )
+        return HarnessCallTransport(settings=mine, observations=observations, utterances=utterances)
 
     return realtime_call(sink=sink, settings=theirs, transport_factory=build)

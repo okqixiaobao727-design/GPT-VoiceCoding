@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import Outlet, SwitchAdjudicator
-from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
+from gpt_voicecoding.core.briefing import BriefState, RosterBrief, SessionBrief
 from gpt_voicecoding.core.call_keeper import CallKeeper
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
@@ -313,15 +313,47 @@ class RosterBriefer:
             self._sessions.focus,
             reason=SYSTEM_DIALLED,
             answerable=tuple(
-                session.target
-                for session in sessions
-                if session.waiting_for.kind is WaitingKind.QUESTION
-                and self._answerable(session.target)
+                session.target for session in sessions if self._answerable_for(session)
             ),
         )
         if not any(isinstance(item, SpokenBrief) for item in items):
             return None
         return items
+
+    def focus_brief(self) -> SpokenBrief | None:
+        """The Focus Session as it stands now, or None if it is past needing the user.
+
+        The mid-call half of the same seam (#196), read on the same terms as
+        `handover` and by the same rule: **a Session earns a brief when its
+        roster row is not `RUNNING`**, and that rule lives in one place. So the
+        row is taken from `briefing.roster` — which is also what settles the two
+        edges a target lookup would have to answer for itself, an exited Session
+        and a Child Process appearing nowhere (#165 Q7).
+
+        `None` where there is no Focus Session, where its row has gone, and
+        where the row says it is running again: the wait that armed the word may
+        have been answered at the terminal while the Voice was mid-sentence, and
+        all three of those are the same silence.
+        """
+        focus = self._sessions.focus
+        if focus is None:
+            return None
+        sessions = self._sessions.live()
+        row = next(
+            (row for row in briefing.roster(sessions, focus).rows if row.target == focus), None
+        )
+        if row is None or row.state is BriefState.RUNNING:
+            return None
+        session = next((live for live in sessions if live.target == focus), None)
+        if session is None:  # pragma: no cover - the roster read it out of this list
+            return None
+        return briefing.spoken(
+            briefing.session(session, question_answerable=self._answerable_for(session))
+        )
+
+    def _answerable_for(self, session: Session) -> bool:
+        """The one fact a row cannot carry, for one Session (`handover`'s own test)."""
+        return session.waiting_for.kind is WaitingKind.QUESTION and self._answerable(session.target)
 
 
 class BridgeCore:

@@ -96,8 +96,17 @@ from support import LaneBlocked, StepFailed
 from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
-from gpt_voicecoding.core.call_keeper import COOL_DOWN_OWED_LINE, COOL_DOWN_PAID_LINE
-from gpt_voicecoding.core.policy import DEFAULT_COOL_DOWN_SECONDS, DEFAULT_SILENCE_END_SECONDS
+from gpt_voicecoding.core.call_keeper import (
+    COOL_DOWN_OWED_LINE,
+    COOL_DOWN_PAID_LINE,
+    MID_CALL_NOTHING_LINE,
+    MID_CALL_SPOKEN_LINE,
+)
+from gpt_voicecoding.core.policy import (
+    DEFAULT_COOL_DOWN_SECONDS,
+    DEFAULT_SILENCE_END_SECONDS,
+    DEFAULT_SPEECH_SETTLE_SECONDS,
+)
 from gpt_voicecoding.seams.call import Cue
 from gpt_voicecoding.seams.control_plane import Action
 
@@ -340,6 +349,21 @@ HAND_OVER_LINE = r"dialling a call holding \d+ hand-over item"
 COOL_DOWN_OWED_PATTERN = re.escape(COOL_DOWN_OWED_LINE.split("%g")[0])
 COOL_DOWN_PAID_PATTERN = re.escape(COOL_DOWN_PAID_LINE)
 
+#: The two lines the Call Keeper writes about mid-call news (#196), as patterns.
+#: The gap and the interval have no surface of their own either — an
+#: announcement that *waits* leaves no cue, no snapshot and no wrapper run — so
+#: these are the run's only witness, and they are built from the format strings
+#: for `COOL_DOWN_OWED_PATTERN`'s reason.
+MID_CALL_SPOKEN_PATTERN = re.escape(MID_CALL_SPOKEN_LINE.split("%s")[0])
+MID_CALL_NOTHING_PATTERN = re.escape(MID_CALL_NOTHING_LINE)
+
+#: The fragment of `live_call.relay_request` the engine's user-speech line has to
+#: carry, chosen the way the other three were: the middle of the sentence, and
+#: spaceless, so a recogniser that inserts a boundary is not what the step grades.
+#: Neither the target nor the payload — both of those are what the *Call Agent*
+#: has to get right, and this line is only asking whether the words arrived.
+LIVE_CALL_RELAY_HEARD_SUBSTRING = "回一句话"
+
 #: The engine's own two lines for the call's *other* speaker, imported rather
 #: than retyped: the long step's whole reading of "the Voice held the call open"
 #: is these strings, and a copy here would be a copy that can drift silently
@@ -351,6 +375,37 @@ VOICE_SPEECH_LINES = (VOICE_SPEAKING_LINE, VOICE_QUIET_LINE)
 #: (`core/bridge.py`, `_log.info("ended the Live Call after %g seconds …")`), and
 #: what is being recognised is the sentence around it.
 CEILING_END_LINE = r"ended the Live Call after .* without call activity"
+
+
+def _announced_after_the_voice_fell_silent(lines: list[str]) -> bool:
+    """Whether the first mid-call announcement came after the Voice's own last edge closed.
+
+    The gap rule, read off the engine's own log: what may be spoken into is a
+    call on which nobody is speaking, and the Voice's two edges
+    (`core/bridge.py`) are the half of that the log carries. So of the edges
+    written **before** the announcement, the last one must be the *stopped* one —
+    or there must be none at all, which is a call whose Voice had not spoken
+    since the dial and is a legitimate gap of its own.
+
+    A module-level rule with no walk behind it, for `_cue_complaint`'s reason: an
+    acceptance run is an expensive place to discover an ordering written the
+    wrong way round (#109), and CI grades this one for free.
+
+    `True` when there is no announcement: this answers "was it spoken into a
+    gap", and the step asks separately whether it was spoken at all.
+    """
+    announced = next(
+        (at for at, line in enumerate(lines) if re.search(MID_CALL_SPOKEN_PATTERN, line)), None
+    )
+    if announced is None:
+        return True
+    speaking = None
+    for line in lines[:announced]:
+        if VOICE_SPEAKING_LINE in line:
+            speaking = True
+        elif VOICE_QUIET_LINE in line:
+            speaking = False
+    return speaking is not True
 
 
 def _hand_over_of_more_than_one(line: str) -> bool:
@@ -851,6 +906,19 @@ class Lane:
     name: str
     agent: str
     binary: str
+    #: What `live call` v2's two extra Sessions' workspaces are called on this
+    #: lane, and so what the Voice knows those Sessions by: the project half of a
+    #: Session Name is the workspace directory's basename
+    #: (`adapters/agent/_project.py`), and the relay utterance says the first of
+    #: them out loud to pin the Session it must land in (#196).
+    #:
+    #: **Per lane, and that is the whole point.** The Codex daemon is
+    #: machine-wide, so the Claude lane's engine holds the Codex lane's Sessions
+    #: as well as its own; two lanes sharing a name is two rows the sentence
+    #: cannot tell apart, and run `20260903T093813Z` is the Claude lane's Call
+    #: Agent looking at two `二号工位 · Reply READY` and answering with `brief`.
+    #: Said out loud by a recogniser, so both are ordinary spoken Chinese.
+    call_workspaces: tuple[str, str]
     #: What this lane adds to the **configured** token variable name to reach its
     #: own bot. One bot, one engine (`docs/app-bundle.md` § Cutover) is what
     #: makes two lanes at once possible at all, and it is kept by giving each
@@ -943,6 +1011,7 @@ class Lane:
 CLAUDE = Lane(
     name="claude",
     agent="claude",
+    call_workspaces=(live_call.FOCUS_WORKSPACE_NAME, live_call.RINGING_WORKSPACE_NAME),
     binary="claude",
     # The first lane keeps the engine's own configured variable, untouched.
     token_env_suffix="",
@@ -1017,6 +1086,7 @@ CLAUDE = Lane(
 CODEX = Lane(
     name="codex",
     agent="codex",
+    call_workspaces=("五号工位", "六号工位"),
     binary="codex",
     # The second bot, which already exists and messages the same user chat.
     token_env_suffix="_2",
@@ -2697,12 +2767,13 @@ class Walk:
                 f"observe. What it does hold: {seen.entries[-3:] or 'nothing at all'}"
             )
         dialled = self._the_keeper_dials_and_paces_itself()
+        news = self._mid_call_the_focus_session_speaks_and_the_rest_rings()
         return (
             f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; "
             f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; cues {cues_played}; "
             f"call down ({self._call_line()!r}), ended by the {ended_by}; transport "
             f"{seen.transport_factory}, wav variant {seen.variant!r}, ended "
-            f"{seen.end_reason!r}. Then {dialled}"
+            f"{seen.end_reason!r}. Then {dialled}. Then {news}"
         )
 
     def _the_keeper_dials_and_paces_itself(self) -> str:
@@ -2945,6 +3016,402 @@ class Walk:
         document = tomllib.loads(self.config.path.read_text())
         given = document.get("policy", {}).get("cool_down_seconds")
         return DEFAULT_COOL_DOWN_SECONDS if given is None else float(given)
+
+    def _speech_settle_seconds(self) -> float:
+        """The settle window this lane's engine is actually running.
+
+        The third of the three policy durations a call step waits on, read the
+        same way for the same reason: a step that waits out a *gap* is waiting
+        out this number, and a literal here would be the harness's own copy of a
+        dial the engine owns.
+        """
+        document = tomllib.loads(self.config.path.read_text())
+        given = document.get("policy", {}).get("speech_settle_seconds")
+        return DEFAULT_SPEECH_SETTLE_SECONDS if given is None else float(given)
+
+    @contextmanager
+    def _an_extra_session(
+        self, workspace_name: str
+    ) -> Iterator[tuple[hand_started.HandStartedSession, Path]]:
+        """One more Session of this lane's kind, in its own trusted workspace (#196).
+
+        Started **exactly the way the lane's own is** — the `TAKE_THE_TERMINAL`
+        shim on a pty that is the child's controlling terminal — because a Codex
+        Session is a daemon-held root that a live terminal in its workspace
+        vouches for (ADR 0020, #208), and one started any other way never enters
+        the roster at all. That is what failed four times in wave 1.
+
+        **The basename is the caller's**, and it is what the Voice knows this
+        Session by: the project half of a Session Name is the workspace
+        directory's name (`adapters/agent/_project.py`), so
+        `live_call.relay_request` can say one of these out loud and the run can
+        grade that nothing ever says the other. The per-lane directory above it
+        is what keeps two lanes' extra Sessions apart while they share a run.
+
+        Its own workspace, and its own trust grant: two Sessions in one directory
+        would make "which rollout is this Session's" unanswerable for the steps
+        after this one, and a workspace neither agent has seen stops at a
+        full-screen trust dialog before it registers anything (`TrustGate`).
+        """
+        run_directory = self.config.workspace.parent
+        lane_label = f"{self.lane.name}-{workspace_name}"
+        workspace = support.workspace_at(
+            run_directory / lane_label / workspace_name,
+            self.session.environment.get("PATH", ""),
+        )
+        session = hand_started.HandStartedSession(
+            lane=lane_label,
+            binary=self.session.binary,
+            arguments=self.session.arguments,
+            workspace=workspace,
+            environment=self.session.environment,
+            journal=self.journal,
+            transcript=run_directory / f"pty-{lane_label}.log",
+        )
+        with support.TrustGate(
+            workspace,
+            run_directory=run_directory,
+            journal=self.journal,
+            label=lane_label,
+            environment=self.session.environment,
+        ):
+            session.start()
+            self.journal("extra.session.started", lane=self.lane.name, workspace=str(workspace))
+            try:
+                yield session, workspace
+            finally:
+                session.stop()
+
+    def _row_in(self, workspace: Path) -> dict | None:
+        """The roster row for a Session working in that directory, if the engine has one.
+
+        The join this phase can make and `_row_for` cannot: the extra Sessions
+        have no ground truth taken for them — nothing here reads their records —
+        and the workspace is the one fact the harness chose and the roster
+        carries.
+        """
+        wanted = {str(workspace), os.path.realpath(workspace)}
+        for row in self._roster_rows():
+            listed = row.get("workspace")
+            if isinstance(listed, str) and listed in wanted:
+                return row
+        return None
+
+    def _mid_call_the_focus_session_speaks_and_the_rest_rings(self) -> str:
+        """v2's phase: mid-call news reaches the user two different ways (#196).
+
+        The rule under test is `CONTEXT.md`'s and #196's: while a call is up, a
+        wake-worthy event about the **Focus Session** is spoken in the first gap
+        on both sides, from a reading taken at that instant; an event about any
+        other Session is the EVENT cue and nothing more. Neither has a surface a
+        run can see — a cue is a sound and an announcement is one utterance among
+        others — so both are read off the engine's own lines.
+
+        **Four phases, and the order is the whole design.**
+
+        1. **`二号工位` stops** with Voice still off, and Voice then comes on: the
+           engine dials on a fresh reading of the roster. A system dial moves
+           nothing, so the Session this call is *about* is not the Focus one —
+           which is the state the ticket's sentence starts from, and it is that
+           Session and not the lane's own so that one chain runs through the
+           whole phase: dialled about it, relayed into it, announced about it.
+        2. The user relays into the Focus workspace's Session **by voice**, which
+           is the only thing that moves the Focus Session mid-call (#165 Q2).
+           Which Session the Call Agent chose is read off the wrapper log's argv
+           and recorded — including whether it is the one the call was dialled
+           about — and it is not graded, because grading it would grade the Voice.
+        3. That Session stops, driven by the relayed words themselves, and is
+           announced after the Voice falls silent. One announcement, not two.
+        4. **One interval later**, the ringing workspace's Session stops. This is
+           the case the ticket exists for: an event about **another** Session
+           *while a Focus Session exists*. It must ring and say nothing.
+
+        **Phase 4 comes last, and waits.** The ring and the announcement share
+        one "last sounded at" (#196), so a Stop inside the interval is folded
+        and plays no cue at all — the rule working, which run `20260903T093813Z`
+        graded as a failure. The relay is what drives the Focus Session's Stop,
+        so that Stop always arrives within seconds of the relay and cannot be
+        beaten by anything this step types; the interval is therefore waited out
+        rather than raced, and the ceiling is checked up front to make sure the
+        wait is not what ends the call.
+
+        **The ring is graded by name.** Every announcement carries the Session it
+        named (`MID_CALL_SPOKEN_LINE`), so what is asserted is that no
+        announcement on this call ever names the ringing workspace — which says
+        exactly what the rule says rather than sampling an absence.
+        """
+        if self.config.call_observations is None or self.config.call_wav_directory is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        focus_name = self.config.call_focus_workspace
+        ringing_name = self.config.call_ringing_workspace
+        if focus_name is None or ringing_name is None:
+            raise LaneBlocked(
+                "this run's config names no workspaces for the two extra Sessions, so the "
+                "utterance and the step cannot agree on which Session is which (#196)"
+            )
+        started = time.monotonic()
+        cool_down = self._cool_down_seconds()
+        settle = self._speech_settle_seconds()
+        ceiling = self._silence_ceiling_seconds()
+        turn = self.far_side.agent_turn_seconds
+        # **The interval has to fit inside the ceiling**, because the phase waits
+        # one out on a call it must still be holding afterwards. The announcement
+        # makes the Voice speak, which restarts the ceiling, so what has to fit
+        # is the interval plus the ringing Session's own Stop reaching the engine.
+        if cool_down + settle + LIVE_CALL_CUE_SECONDS >= ceiling:
+            raise LaneBlocked(
+                f"this lane's Silence Ceiling is {ceiling:.0f}s and one mid-call interval is "
+                f"{cool_down:.0f}s: the wait this phase makes between the announcement and "
+                f"the ring would be what ends the call, and the ring would be graded against "
+                f"a call that had already gone"
+            )
+        with (
+            self._an_extra_session(focus_name) as (focus, focus_at),
+            self._an_extra_session(ringing_name) as (third, third_at),
+        ):
+            # Both are waited for before anything else happens, so that the
+            # roster the call is dialled on already holds them and the boot turn
+            # each launch starts (#110) is over before this phase types anything.
+            focus_address = self._await_extra_session(focus_at, turn)
+            third_address = self._await_extra_session(third_at, turn)
+            # --- 1. a Stop with Voice off, and then Voice on ------------------
+            # In this order, so the dial cannot land *before* the Stop: turning
+            # Voice on is itself a `wake` (#195), and a Stop that arrived on a
+            # call already up would be mid-call news about the lane's own
+            # Session — which in a whole run is the Focus Session, and so the one
+            # thing this phase must not begin with.
+            # Nothing this phase does means anything on a call it did not open,
+            # and the phase before it can leave one behind without knowing:
+            # `_leave_no_call_up` is what makes that impossible rather than
+            # unlikely. Voice is still off here, which is what bounds the watch.
+            if not self._leave_no_call_up(LIVE_CALL_CUE_SECONDS):
+                raise LaneBlocked(
+                    f"a Live Call was still up after this phase asked for it to end, so there "
+                    f"is no call of its own to grade: {self._call_line()!r}"
+                )
+            # **`二号工位`'s Stop is what dials**, not the lane's own: the ticket's
+            # sentence is one chain through one Session — dialled about it, then
+            # relayed into it, then announced about it — and a dial about some
+            # other Session would leave the middle of that chain unwalked.
+            self._drive_extra_session(focus, focus_at, turn)
+            live_call.ask_for_nothing(self.config.call_wav_directory)
+            mark = len(self.engine.log_lines())
+            with self._voice_route_only():
+                opened = support.wait_for(
+                    lambda: bool(support.matching_lines(self._log_since(mark), HAND_OVER_LINE)),
+                    deadline_seconds=LIVE_CALL_OPEN_SECONDS + cool_down,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                up = support.wait_for(
+                    lambda: not self._call_is_down(),
+                    deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                if not (opened and up):
+                    raise StepFailed(
+                        f"a Session stopped and Voice came on with Message off, and no call "
+                        f"was up within {LIVE_CALL_OPEN_SECONDS + cool_down:.0f}s — dialled: "
+                        f"{opened}, up: {self._call_line()!r}. Engine log tail: "
+                        f"{self._log_since(mark)[-8:]}"
+                    )
+                # --- 2. the user relays into 二号工位, by voice ----------------
+                runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
+                relaying = len(self.engine.log_lines())
+                live_call.ask_next(self.config.call_wav_directory, live_call.RELAY)
+                heard = support.wait_for(
+                    lambda: bool(
+                        self._user_speech_lines(LIVE_CALL_RELAY_HEARD_SUBSTRING, since=relaying)
+                    ),
+                    deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                relayed = support.wait_for(
+                    lambda: bool(self._verbs_since(runs_before, Action.RELAY)),
+                    deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                relays = self._verbs_since(runs_before, Action.RELAY)
+                # --- 3. and the Focus Session is spoken about -----------------
+                # The relayed words are what drives its turn, so nothing is typed
+                # here. The budget is that turn, plus the gap, plus the slack the
+                # line itself is written with.
+                announced = support.wait_for(
+                    lambda: bool(
+                        support.matching_lines(self._log_since(relaying), MID_CALL_SPOKEN_PATTERN)
+                    ),
+                    deadline_seconds=turn + settle + LIVE_CALL_CUE_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                since_relay = self._log_since(relaying)
+                announcements = support.matching_lines(since_relay, MID_CALL_SPOKEN_PATTERN)
+                after_silence = _announced_after_the_voice_fell_silent(since_relay)
+                # --- 4. a Session that is not the Focus one stops -------------
+                # **After one interval, measured from that announcement.** The
+                # ring and the announcement share one "last sounded at" (#196),
+                # so a Stop inside the interval is folded and no cue is played —
+                # which is the rule working, and run `20260903T093813Z` is the
+                # step grading it as a failure: the relayed Session's own Stop
+                # was announced two milliseconds after it landed, and the ringing
+                # Session's Stop two seconds after that. The interval cannot be
+                # raced, so it is waited out.
+                if announced:
+                    time.sleep(cool_down + LIVE_CALL_POLL_SECONDS)
+                ringing = len(self.engine.log_lines())
+                if relayed and announced:
+                    self._drive_extra_session(third, third_at, turn)
+                rang = support.wait_for(
+                    lambda: bool(self._cue_lines(Cue.EVENT, since=ringing)),
+                    deadline_seconds=turn,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                after_the_ring = support.matching_lines(
+                    self._log_since(ringing), MID_CALL_SPOKEN_PATTERN
+                )
+                rings = len(self._cue_lines(Cue.EVENT, since=mark))
+                self._end_any_live_call()
+        self._measured("live call v2", started, self._call_is_down())
+        named_the_ringer = [
+            line for line in [*announcements, *after_the_ring] if ringing_name in line
+        ]
+        self.journey.observe(
+            "live call v2 mid-call news",
+            f"the Focus Session is {focus_address} in {focus_at} and the ringing one "
+            f"{third_address} in {third_at}; EVENT cues on this call: {rings}; the Voice "
+            f"relayed with {relays or 'nothing'} — which Session it picked is recorded and "
+            f"not graded, and it is the Session the call was dialled about: "
+            f"{any(focus_address in verb for verb in relays)}; announcements after the relay: "
+            f"{[line.strip() for line in announcements] or 'none'}; the last edge of the "
+            f"Voice before the first of them: {after_silence}",
+        )
+        if not heard:
+            raise StepFailed(
+                f"the relay utterance went on the track and the engine never logged the "
+                f"user's speech within {LIVE_CALL_HEARD_SECONDS:.0f}s. It carries "
+                f"{live_call.relay_request(focus_name)!r} and the line looked for carries "
+                f"{LIVE_CALL_RELAY_HEARD_SUBSTRING!r}. Engine log tail: "
+                f"{self._log_since(relaying)[-8:]}"
+            )
+        if not relayed:
+            raise StepFailed(
+                f"the engine heard the relay asked for and the Call Agent never ran "
+                f"`{Action.RELAY}` within {LIVE_CALL_HANDOFF_SECONDS:.0f}s. What it ran "
+                f"instead: {self._verbs_run(since=runs_before) or 'nothing at all'}"
+            )
+        if not announced:
+            silent = support.matching_lines(self._log_since(relaying), MID_CALL_NOTHING_PATTERN)
+            raise StepFailed(
+                f"the user relayed into a Session by voice — {relays} — and the engine never "
+                f"spoke its brief into the call within "
+                f"{turn + settle + LIVE_CALL_CUE_SECONDS:.0f}s. A relay makes that "
+                f"Session the Focus Session (#165 Q2), and its next Stop is spoken in the "
+                f"first gap (#196). Whether it decided there was nothing to say instead: "
+                f"{[line.strip() for line in silent] or 'no such line'}. Engine log tail: "
+                f"{self._log_since(relaying)[-10:]}"
+            )
+        if not rang:
+            raise StepFailed(
+                f"{third_address} stopped while {focus_address} was the Focus Session, one "
+                f"whole {cool_down:.0f}s interval after the announcement, and no EVENT cue was "
+                f"played within {turn:.0f}s. The cues this call played: "
+                f"{self._cue_order(since=mark)}; the call now: {self._call_line()!r}. Engine "
+                f"log tail: {self._log_since(ringing)[-8:]}"
+            )
+        if named_the_ringer:
+            raise StepFailed(
+                f"a Session that is not the Focus one stopped and the engine spoke its brief "
+                f"into the call. The rest of the roster is the EVENT cue and nothing more, and "
+                f"the user asks with `{Action.BRIEF}` (#196). The lines naming "
+                f"{ringing_name}: {[line.strip() for line in named_the_ringer]}"
+            )
+        if len(announcements) != 1:
+            raise StepFailed(
+                f"one Stop about the Focus Session earned {len(announcements)} announcements "
+                f"on one call. A word owed is one flag and not a queue (#196): "
+                f"{[line.strip() for line in announcements]}"
+            )
+        if not after_silence:
+            raise StepFailed(
+                f"the brief was spoken while the Voice's own last edge was still `speaking` — "
+                f"there was no gap to speak into, and the wire has no silent mid-call path "
+                f"(#175, #196). The announcement: {announcements[0].strip()!r}"
+            )
+        return (
+            f"Focus {focus_address}, ringing {third_address}; the Voice relayed with {relays}; "
+            f"{rings} EVENT cue(s), none of them announced; then one announcement after the "
+            f"Voice fell silent, {announcements[0].strip()!r}"
+        )
+
+    def _await_extra_session(self, workspace: Path, turn_seconds: float) -> str:
+        """Wait for an extra Session to reach the roster, and answer with its address.
+
+        The budget is the roster's own discovery allowance plus one agent turn:
+        a launch runs a boot turn from its first moment (#110) and a Codex
+        Session is listed only once its daemon holds it (ADR 0020), so what is
+        being waited out is a turn and a discovery pass, both of which this
+        module already has a number for.
+        """
+        deadline = DISCOVERY_SECONDS + turn_seconds
+        listed = support.wait_for(
+            lambda: self._row_in(workspace) is not None,
+            deadline_seconds=deadline,
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        if not listed:
+            raise StepFailed(
+                f"an extra Session was started in {workspace} the way the lane's own is and "
+                f"never reached the roster within {deadline:.0f}s. What the engine holds: "
+                f"{[row.get('workspace') for row in self._roster_rows()]}"
+            )
+        return _address_of(self._row_in(workspace) or {})
+
+    def _drive_extra_session(
+        self,
+        extra: hand_started.HandStartedSession,
+        workspace: Path,
+        turn_seconds: float,
+    ) -> None:
+        """Type one instruction at an extra Session's keyboard, once it can take one.
+
+        **Idle first.** A lane with a `boot` prompt is running a turn from the
+        moment it starts (#110), and nothing may be typed into a Session that is
+        mid-turn — the rule `settle_boot_turn` exists for, applied to a Session
+        this phase started rather than to the lane's own.
+
+        Nothing is waited for afterwards. What follows the Stop is a cue, and the
+        caller waits on that; a wait on the roster in between would be a second,
+        weaker reading of the same turn. No ground truth is taken for these
+        Sessions either, because nothing grades what they said — only that they
+        stopped.
+        """
+        idle = support.wait_for(
+            lambda: str((self._row_in(workspace) or {}).get("state")) != "running",
+            deadline_seconds=turn_seconds,
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        extra.submit(ACKNOWLEDGE.words)
+        self.journal(
+            "extra.session.driven",
+            lane=self.lane.name,
+            workspace=str(workspace),
+            was_idle=idle,
+            state=(self._row_in(workspace) or {}).get("state"),
+        )
+
+    def _verbs_since(self, runs_before: int, action: Action) -> list[str]:
+        """Every run of one verb the Call Agent made after a mark, whole argv tail.
+
+        The mark is a count of wrapper lines rather than a time, for
+        `_log_since`'s reason: the Call Agent may run a verb more than once per
+        request (#181 finding 1), and what a phase asks about is the runs *it*
+        provoked. The whole tail and not the verb, because the argv is where the
+        Session it chose is written down.
+        """
+        return [
+            verb for verb in self._verbs_run(since=runs_before) if verb.split()[:1] == [str(action)]
+        ]
 
     def live_call_long(self) -> str:
         """A Live Call the system's own Voice keeps alive (#184).
@@ -3335,8 +3802,13 @@ class Walk:
             down_at=time.monotonic(),
         )
 
-    def _verbs_run(self) -> list[str]:
+    def _verbs_run(self, *, since: int = 0) -> list[str]:
         """Every verb the Call Agent put to the control plane, in order.
+
+        `since` is a count of *wrapper lines* and not of verbs, because it is a
+        mark a phase took before provoking anything and the wrapper log is what
+        it counted: a line carrying nothing but options contributes no verb, and
+        slicing the verbs by a line count would drift by one from that line on.
 
         Recorded rather than graded (see `live_call`). The wrapper logs the whole
         argv, and what identifies the verb is the first word that is not the
@@ -3345,7 +3817,7 @@ class Walk:
         than being silently dropped for not matching anything known.
         """
         spoken: list[str] = []
-        for line in support.cli_wrapper_runs(self.config.cli_wrapper_log):
+        for line in support.cli_wrapper_runs(self.config.cli_wrapper_log)[since:]:
             words = line.split()[1:]  # the UTC stamp is the harness's, not the agent's
             while words and words[0].startswith("--"):
                 # `--socket <path>`, and any other option the instructions carry.
@@ -3499,6 +3971,35 @@ class Walk:
             return
         answer = self.bridgectl("live", timeout=LIVE_CALL_OPEN_SECONDS)
         self.journal("live.call.cleanup", lane=self.lane.name, answer=answer.text)
+
+    def _leave_no_call_up(self, quiet_seconds: float) -> bool:
+        """End whatever call is up, and watch long enough to see none come back.
+
+        **One reading of "down" is not a call that is not about to be up.** A
+        dial decided is a call that arrives seconds later — run
+        `20260903T063156Z` measured 5.1s between the Keeper saying it would dial
+        and the adapter saying it had — so a phase that reads the call down and
+        starts work can be holding a call it never asked for by its second
+        action. Run `20260903T090555Z` is that, exactly: the Cool-down of the
+        phase before elapsed, its owed dial was paid, and the call came up
+        1.5 seconds after that phase had cleaned up and gone.
+
+        Called with **Voice off**, which is what makes the watch finite: nothing
+        the system does unbidden can dial while it is off (`wake`'s first
+        refusal), so what is being waited out is only a dial already in flight.
+        """
+        quiet_since: float | None = None
+        deadline = time.monotonic() + quiet_seconds + LIVE_CALL_END_SECONDS
+        while time.monotonic() < deadline:
+            if not self._call_is_down():
+                self._end_any_live_call()
+                quiet_since = None
+            elif quiet_since is None:
+                quiet_since = time.monotonic()
+            elif time.monotonic() - quiet_since >= quiet_seconds:
+                return True
+            time.sleep(LIVE_CALL_POLL_SECONDS)
+        return self._call_is_down()
 
     # --- plumbing ---------------------------------------------------------
 

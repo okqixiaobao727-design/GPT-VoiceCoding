@@ -45,6 +45,19 @@ round (`legacy@1d32845:bridge/coordinator.py:1014-1019`) — **adapted** to the
 owed dial, which is re-armed by an event and paid from a fresh reading rather
 than replayed. Cool-down itself is **new**: legacy had none, and
 `legacy@1d32845:bridge/livecall.py:561-581` is the incident that says why.
+
+Mid-call news (#196) has the same accounting. Legacy paced what it said into a
+live call with a one-at-a-time FIFO and supersession — a queued notice replaced
+by a newer one about the same Session
+(`legacy@1d32845:bridge/coordinator.py:1306-1337`,
+`legacy@1d32845:bridge/store.py:2768-2814`). The supersession is **adapted**
+into the fresh reading: this module keeps one flag and no queue, and what is
+said is `focus_brief()`'s answer at the moment of speaking, which supersedes
+every event since the flag was armed without holding any of them. Pacing by an
+interval is **new** — legacy paced by the queue draining, which is not a pace at
+all on a wire with no silent mid-call path (#175). The EVENT cue and the Focus
+Session itself: **legacy has no such behaviour**, so there is nothing to port —
+it had one call, one queue and no notion of which Session the user was on.
 """
 
 from __future__ import annotations
@@ -70,10 +83,13 @@ from gpt_voicecoding.seams.call import (
     Dial,
     DialReason,
     HandoverItem,
+    SpokenBrief,
     UserSpeaking,
     UserSpeech,
     VoiceSpeech,
 )
+from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.identity import new_request_id
 
 _log = logging.getLogger(__name__)
 
@@ -92,6 +108,16 @@ CEILING_END_LINE = "ended the Live Call after %g seconds without call activity"
 #: has for it, and `tests/acceptance/journey.py` greps them.
 COOL_DOWN_OWED_LINE = "a Cool-down is running for another %g seconds; one dial is owed"
 COOL_DOWN_PAID_LINE = "the Cool-down elapsed; dialling on a fresh reading"
+
+#: What the run is told about mid-call news. The gap and the interval have no
+#: surface of their own either — an announcement that *waits* leaves no cue and
+#: no snapshot — so these three lines are what a whole-lane run reads the rule
+#: off, and `tests/acceptance/journey.py` greps them.
+MID_CALL_SPOKEN_LINE = "spoke the Focus Session's brief into the gap in the Live Call: %s"
+MID_CALL_NOTHING_LINE = (
+    "the gap came and the Focus Session no longer needs the user; nothing is spoken"
+)
+MID_CALL_UNDELIVERED_LINE = "the Live Call would not carry the Focus Session's brief: %s"
 
 #: Why a call the user opened exists, and the *whole* hand-over it gets (#167
 #: Q6). A user who pressed the toggle is about to say what they want; briefing
@@ -128,6 +154,24 @@ class Briefer(Protocol):
         `SpokenBrief` and friends `Briefing` builds. There is no type between
         the two, because a second one would be a second place that decides what
         a hand-over is made of.
+        """
+        ...
+
+    def focus_brief(self) -> SpokenBrief | None:
+        """The Focus Session as it stands **now**, or None if it is past needing the user.
+
+        The mid-call counterpart of `handover`, and read on the same terms: at
+        the moment of sounding, never at the moment of the event (ADR 0017). A
+        word owed to the Focus Session cannot go stale, because it is composed
+        when it is spoken — so the answer to "the Session was answered at the
+        terminal while the Voice was mid-sentence" is `None` here, and the
+        Keeper says nothing at all.
+
+        A `SpokenBrief` and not Briefing's own `SessionBrief`: the Keeper knows
+        nothing of what is said (`CONTEXT.md`, *Call Keeper*), so what crosses
+        this Protocol is the thing the Call seam already carries (#194,
+        `seams/call.py::speak`) and the mapping is the production adapter's, as
+        it already is for `handover`'s items.
         """
         ...
 
@@ -181,11 +225,23 @@ class Sounding:
     cue: Cue
 
 
+@dataclass(frozen=True, slots=True)
+class Speaking:
+    """Say a word to the Focus Session, from a reading taken now.
+
+    Carries nothing, and that is the whole point: the machine decides *that* the
+    gap is open and the interval has run, and what is actually said is the
+    Briefer's answer at the instant the shell asks. An act that carried a brief
+    would be a brief the machine had been holding since the event, which is the
+    replay ADR 0017 forbids.
+    """
+
+
 #: The closed set of things the state machine asks the shell to do. An empty
-#: tuple is the fourth answer the ticket names — *nothing* — and it is spelled
-#: as an absence rather than as a member, because a `Nothing()` act would be a
-#: thing the shell has to look at and then not do.
-Act = Dialling | Ending | Sounding
+#: tuple is the answer beside them — *nothing* — and it is spelled as an absence
+#: rather than as a member, because a `Nothing()` act would be a thing the shell
+#: has to look at and then not do.
+Act = Dialling | Ending | Sounding | Speaking
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +293,25 @@ class CallTime:
         self._ceiling_attempted_for: str | None = None
         self._cool_down_until: float | None = None
         self._dial_owed = False
+        #: **One "last sounded at" for rings and Focus announcements alike**
+        #: (#196), and it is paced by `cool_down_seconds` rather than by a dial
+        #: of its own: mid-call news and a fresh call are the same interruption
+        #: at two volumes, and Simon settled it with the ticket's own words —
+        #: 还是沿用那个间隔的配置. None until this call has sounded once.
+        self._last_sounded_at: float | None = None
+        #: Whether a word is owed to the Focus Session. One flag, not a queue:
+        #: three events during one utterance buy one brief, because what is
+        #: spoken is a reading taken at the gap and not the events themselves.
+        self._focus_owed = False
+        #: When this call last had nobody speaking on it — the dial, or the
+        #: moment the later of the two speakers stopped — and None while either
+        #: is speaking. The gap is measured from here and from **nothing else**:
+        #: the run's landed-facts note on #196 is explicit that the gap is not
+        #: built on `UserSpeech(text)`, which is the finished transcript and
+        #: often lands only at hand-off or teardown (#194). `_last_activity_at`
+        #: is fed by that transcript, so a gap measured from it would be pushed
+        #: out by a late transcript of an utterance that had already ended.
+        self._gap_since: float | None = None
 
     @property
     def silence_end_seconds(self) -> float:
@@ -248,21 +323,24 @@ class CallTime:
     def wake(self, now: float, permits: Permits, *, focus: bool) -> tuple[Act, ...]:
         """Something happened that could be worth a call.
 
-        `focus` says only whether the event concerns the Focus Session, and
-        **this ticket reads nothing off it**: who needs the user is the
-        Briefer's answer at the moment of acting, never the flag's. It is on the
-        interface from the start because `wake` is the Keeper's surface and its
-        test surface, and #196 — which speaks in the gap for the Focus Session
-        and rings for the rest — is what gives it a reader.
+        `focus` says only whether the event concerns the Focus Session — never
+        what it was about, and never a brief. Who needs the user is read off the
+        Briefer at the moment of acting, in both directions: a call is dialled
+        on a fresh hand-over, and a word is spoken from a fresh `focus_brief`.
 
         Four answers, in the order they are decided:
 
         - Duty or Voice off: **nothing, and nothing recorded.** Legacy suppressed
           the event rather than queueing it (`legacy@1d32845:bridge/host.py:2100-2101`),
-          and a later flip is a fresh `wake` on its own — so an owed dial written
-          here would be the queue that rule exists to refuse.
-        - A call is already up: nothing. Mid-call news is #196's, and the one
-          thing that must not happen meanwhile is a second call.
+          and a later flip is a fresh `wake` on its own — so an owed dial or an
+          owed word written here would be the queue that rule exists to refuse.
+          Mid-call this is the whole of "Duty or Voice off mid-call": no ring, no
+          announcement, and the call stays up with the ceiling still running.
+        - A call is already up: **mid-call news** (#196). The Focus Session earns
+          a word owed, spoken in the first gap an interval after the last mid-call
+          sound; every other Session earns the EVENT cue and nothing more, folded
+          to one ring per interval, and the user asks with `brief`. The one thing
+          that must not happen meanwhile is a second call.
         - Inside a Cool-down: one dial becomes **owed**, and only one. Three
           events buy one call, because what is paid out at expiry is a fresh
           reading of the whole roster and not the events themselves.
@@ -271,7 +349,7 @@ class CallTime:
         if not permits.dial:
             return ()
         if self._call_id is not None:
-            return ()
+            return self._mid_call(now, permits, focus=focus)
         if self._cooling_down(now):
             self._dial_owed = True
             _log.info(COOL_DOWN_OWED_LINE, self._cool_down_until - now)  # type: ignore[operator]
@@ -292,18 +370,33 @@ class CallTime:
         return (Dialling(user_opened=True),)
 
     def tick(self, now: float, permits: Permits) -> tuple[Act, ...]:
-        """The one-second clock: Cool-down expiry, then the Silence Ceiling.
+        """The one-second clock: Cool-down expiry, the owed word, then the Ceiling.
 
-        The two cannot both fire — an owed dial is only paid with no call up,
-        and the ceiling only measures one that is — so the order between them is
-        documentation rather than precedence.
+        The first and the last cannot both fire — an owed dial is only paid with
+        no call up, and the ceiling only measures one that is — so the order
+        between them is documentation rather than precedence.
+
+        **This is where a gap is noticed.** The falling edge of an utterance is
+        never itself a gap: the settle window has to run out first, and nothing
+        else happens on a call where both sides have stopped talking. So the
+        word owed to the Focus Session is paid on the clock, and the edges only
+        re-ask in case the window had already passed.
+
+        **The ceiling wins a tick they would share.** A call about to be ended
+        for silence is not a call to start an utterance in, and the ceiling's
+        sixty seconds are twelve settle windows: they can only coincide when
+        the word was owed and the gap opened in the same second the call ran
+        out, and then the ending is what the user is owed.
         """
         acts: list[Act] = []
         acts.extend(self._cool_down_elapsed(now, permits))
-        acts.extend(self._ceiling(now, permits))
+        ceiling = self._ceiling(now, permits)
+        if not ceiling:
+            acts.extend(self._owed_word(now, permits))
+        acts.extend(ceiling)
         return tuple(acts)
 
-    def heard(self, event: CallEvent, now: float) -> tuple[Act, ...]:
+    def heard(self, event: CallEvent, now: float, permits: Permits) -> tuple[Act, ...]:
         """One event from the Call seam. Cues live here; nothing else does.
 
         **CONNECTED when the dial comes up, ENDED on any end** — and the cue is
@@ -311,6 +404,12 @@ class CallTime:
         the user is owed is the sound of the call *they* were on ending, and
         whether the system was still the one holding it is a bookkeeping
         question they cannot hear (#186).
+
+        The speaking edges take `permits` because a word owed to the Focus
+        Session is re-asked on each of them (#196). It is almost always the
+        clock that pays it — the settle window has not run out at the instant an
+        utterance ends — but an edge that arrives after the window has already
+        passed is a gap opening, and the tick would only be the second to see it.
         """
         match event:
             case CallEnded() | CallDropped():
@@ -322,10 +421,10 @@ class CallTime:
                 return ()
             case UserSpeaking():
                 self._note_speech(now, user=event.speaking)
-                return ()
+                return self._owed_word(now, permits)
             case VoiceSpeech():
                 self._note_speech(now, voice=event.speaking)
-                return ()
+                return self._owed_word(now, permits)
             case CallStarted():
                 # Adopted whoever opened it: one voice surface, one holder.
                 self.dialled(now, call_id=event.call_id)
@@ -363,6 +462,11 @@ class CallTime:
         self._user_speaking = False
         self._quiet_at = None
         self._ceiling_attempted_for = None
+        # The gap is open from the dial: nobody is speaking on a call that has
+        # just come up, and the settle window is what keeps the Voice's reading
+        # of the hand-over from being cut into.
+        self._gap_since = now
+        self._forget_mid_call()
 
     def ended(self, now: float) -> None:
         """The call is over, however it ended. Cool-down starts here and only here."""
@@ -372,6 +476,8 @@ class CallTime:
         self._user_speaking = False
         self._quiet_at = None
         self._ceiling_attempted_for = None
+        self._gap_since = None
+        self._forget_mid_call()
         self._start_cool_down(now)
 
     def nothing_to_say(self, now: float) -> None:
@@ -384,7 +490,112 @@ class CallTime:
         del now
         self._dial_owed = False
 
+    def spoke(self, now: float) -> None:
+        """A brief was handed to the call — delivered, refused, or raised on.
+
+        All three stamp the interval and clear the flag, by #195's rule that one
+        event buys one attempt. A flag re-armed by its own failure would wait for
+        the next gap holding a reading it had already taken, which is the replay
+        ADR 0017 forbids in another shape; the next wake-worthy event arms it
+        again, and that one is news.
+        """
+        self._focus_owed = False
+        self._last_sounded_at = now
+
+    def nothing_to_speak(self, now: float) -> None:
+        """The Briefer answered `None` at the gap: the word is cancelled, silently.
+
+        Nothing sounded, so the interval is **not** stamped: a ring the user
+        never heard may not pace the next one. The flag goes because the reading
+        answered it — the Session was seen to no longer need the user, which is
+        also how a Focus Session that has ended clears what was owed to it.
+        """
+        del now
+        self._focus_owed = False
+
     # -- the rules --------------------------------------------------------
+
+    def _mid_call(self, now: float, permits: Permits, *, focus: bool) -> tuple[Act, ...]:
+        """News while a call is up: a word for the Focus Session, a ring for the rest.
+
+        The two are not alternatives to each other in the same instant. A Focus
+        event arms the flag and then asks whether it can be paid *now*; anything
+        else is the EVENT cue, and it is the whole of what the system says about
+        another Session mid-call — the user asks with `brief` when they want to
+        know which (#167 Q7-Q9).
+        """
+        if focus:
+            self._focus_owed = True
+            return self._owed_word(now, permits)
+        if not self._interval_elapsed(now):
+            return ()
+        self._sounded(now)
+        return (Sounding(Cue.EVENT),)
+
+    def _owed_word(self, now: float, permits: Permits) -> tuple[Act, ...]:
+        """Pay the word owed to the Focus Session, when the call will take one.
+
+        Three conditions, and all three are about the call rather than about the
+        Session: the switches still allow the system to touch it, both sides have
+        fallen silent for the settle window, and one interval has passed since
+        the last mid-call sound of either kind. What is *said* is decided
+        afterwards, by the Briefer, which is why nothing here looks at a brief.
+
+        The interval is not stamped here. The act may find that the Session no
+        longer needs the user, and a word nobody heard may not pace the next one.
+        """
+        if not permits.dial or not self._focus_owed or self._call_id is None:
+            return ()
+        if not self._in_gap(now) or not self._interval_elapsed(now):
+            return ()
+        return (Speaking(),)
+
+    def _in_gap(self, now: float) -> bool:
+        """Whether both sides have been silent long enough to speak into.
+
+        **The two speaking states and the settle window, and nothing else.** The
+        window covers the human pause — a breath between two sentences is not a
+        turn ending — and since #195 it covers only that, the transport's playout
+        lag having been absorbed before `VoiceSpeech(speaking=False)` is raised.
+
+        `_last_activity_at` is deliberately not consulted, though the Silence
+        Ceiling measures from it: it is fed by `UserSpeech(text)`, the finished
+        transcript, which since #194 often lands at hand-off or at teardown —
+        long after the utterance it describes ended. A gap measured from it would
+        be pushed out by news of a pause that was already over, and the run's
+        landed-facts note on #196 says in as many words not to build the gap on
+        that event.
+
+        `_gap_since` starts at the dial, so a call is not spoken into the instant
+        it connects: the Voice is about to read the hand-over it was dialled on,
+        and the wire has no silent mid-call path to insert a second utterance
+        through (#175).
+        """
+        if self._call_id is None or self._gap_since is None:
+            return False
+        if self._voice_speaking or self._user_speaking:
+            return False
+        return now >= self._gap_since + self._speech_settle_seconds
+
+    def _interval_elapsed(self, now: float) -> bool:
+        """Whether this call has been quiet of *system* sound for one interval."""
+        return (
+            self._last_sounded_at is None or now - self._last_sounded_at >= self._cool_down_seconds
+        )
+
+    def _sounded(self, now: float) -> None:
+        self._last_sounded_at = now
+
+    def _forget_mid_call(self) -> None:
+        """Both mid-call facts belong to the call they were raised on.
+
+        A word owed on a call that has ended is owed to nobody: the gap it was
+        waiting for was that call's, and the next wake-worthy event dials a call
+        of its own on a fresh reading. Carrying the interval across would pace
+        the new call's first ring by a sound heard on the old one.
+        """
+        self._last_sounded_at = None
+        self._focus_owed = False
 
     def _cooling_down(self, now: float) -> bool:
         return self._cool_down_until is not None and now < self._cool_down_until
@@ -479,16 +690,19 @@ class CallTime:
         if voice is not None:
             self._voice_speaking = voice
         self._note_activity(now)
-        self._quiet_at = None if (self._user_speaking or self._voice_speaking) else now
+        speaking = self._user_speaking or self._voice_speaking
+        self._quiet_at = None if speaking else now
+        self._gap_since = None if speaking else now
 
 
 class CallKeeper:
     """The async shell: the Call adapter, one lock, the Briefer, and the clock.
 
     Five entries, and no content passes through any of them. `live_toggle`,
-    `wake`, `tick`, `heard` and `status` are the whole surface — there is no
-    `speak`, because handing words to a live call is mid-call behaviour and that
-    is #196's.
+    `wake`, `tick`, `heard` and `status` are the whole surface. Mid-call news
+    (#196) added no sixth: what is spoken into a gap is the Briefer's answer at
+    the moment of speaking, so it arrives through the same one seam the dial's
+    hand-over does and never through a caller's argument.
     """
 
     def __init__(
@@ -561,7 +775,7 @@ class CallKeeper:
         """One event the Call seam raised. Recorded, and cued."""
         async with self._operation_lock:
             now = self._clock()
-            await self._unattended(self._time.heard(event, now), now)
+            await self._unattended(self._time.heard(event, now, self._permits()), now)
 
     def status(self) -> KeeperStatus:
         """The call id, the Cool-down remaining, and whether a dial is owed.
@@ -602,6 +816,8 @@ class CallKeeper:
             match act:
                 case Sounding():
                     await self._play(act.cue)
+                case Speaking():
+                    await self._say_what_stands_now(now)
                 case Ending():
                     if act.ceiling:
                         _log.info(CEILING_END_LINE, self._time.silence_end_seconds)
@@ -645,6 +861,39 @@ class CallKeeper:
         # call that never arrived would bar the dial that fixes it.
         self._time.dialled(now, call_id=snapshot.call_id if snapshot.is_up else None)
         return snapshot
+
+    async def _say_what_stands_now(self, now: float) -> None:
+        """Speak the Focus Session's brief into the gap, read at this instant.
+
+        The reading is taken here and nowhere earlier (ADR 0017): the wait that
+        armed the word may have been answered at the terminal while the Voice was
+        mid-sentence, and the answer to that is silence rather than an
+        announcement about a Session that is past needing anyone.
+
+        `Briefing.text` is never on this path. What crosses is the seam's own
+        `SpokenBrief` (#194) and the Voice words it (`CONTEXT.md`, *Session
+        Brief*), so nothing here phrases anything.
+
+        **The attempt is stamped whether or not it lands.** The interval is
+        recorded before the refusal travels on, so an adapter that raises cannot
+        be asked again in the same gap; `_unattended` writes down what happened.
+        """
+        brief = self._briefer.focus_brief()
+        if brief is None:
+            _log.info(MID_CALL_NOTHING_LINE)
+            self._time.nothing_to_speak(now)
+            return
+        try:
+            receipt = await self._call.speak(brief, request_id=new_request_id())
+        finally:
+            self._time.spoke(now)
+        if receipt.outcome is Delivery.DELIVERED:
+            # The Session's name, and nothing else off the brief: a whole-lane
+            # run has no other way to tell *which* Session was announced, and
+            # the name is what the user would have heard first.
+            _log.info(MID_CALL_SPOKEN_LINE, brief.name)
+        else:
+            _log.info(MID_CALL_UNDELIVERED_LINE, receipt.reason)
 
     async def _end(self, now: float) -> CallSnapshot | None:
         """End the call, and let go of it here rather than on the event that follows.
