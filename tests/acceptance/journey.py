@@ -364,6 +364,35 @@ def _hand_over_of_more_than_one(line: str) -> bool:
     return found is not None and int(found.group(1)) > 1
 
 
+#: What `bridgectl status` calls a call that is not up. Everything the Call
+#: Keeper is *waiting out* is rendered after it, in brackets, on the same line
+#: (`control_plane/commands.py`, `_cool_down`).
+CALL_DOWN_LINE = "call: none"
+
+
+def _no_call_is_up(call_line: str) -> bool:
+    """Whether that `call:` line says no call is up — whatever else it also says.
+
+    **The Cool-down rides this line, and it is not a call.** #195 gave the one
+    rule with no surface of its own a place to be read, and put it beside
+    `call: none` because that is the line an operator looks at when they are
+    asking why nothing rang. A step that compared the whole line for equality
+    therefore read every second of a running Cool-down as a call still up — and
+    run `20260903T060110Z` is what that cost: the ceiling released the call at
+    18:06:31.382 and the step that waits for it returned at 18:07:02, when the
+    window it was about to test had already elapsed. The failure looked like
+    subprocess cost and was a string comparison (#218).
+
+    So the note is severed and the head is judged. A call id is never the word
+    `none` and carries no bracket, so nothing else can read as down; a surface
+    that answered something else entirely — `_call_line` falls back to the head
+    of whatever `status` printed — reads as *not* down, which is the safe way
+    round for a step whose next move is to act on a call being over.
+    """
+    head, _, _note = call_line.partition(" (")
+    return head == CALL_DOWN_LINE
+
+
 @dataclass(frozen=True)
 class _VoiceWatch:
     """What one call's Voice did, watched on the watching step's own clock.
@@ -2744,10 +2773,16 @@ class Walk:
             by_ceiling = self._ceiling_ended_the_call(since=mark)
             # **The wake goes in first, and only while the window is observed
             # open.** The Cool-down starts when the call is released and runs
-            # thirty seconds; this harness walks two lanes in two threads, each
-            # spending `bridgectl` subprocesses, and run `20260903T050619Z`
-            # reached this point thirty-six seconds after the release — so the
-            # engine dialled, correctly, and the step graded a race it had lost.
+            # thirty seconds. Runs `20260903T050619Z` and `20260903T060110Z`
+            # both reached this point thirty-six seconds after the release, on
+            # both lanes — so the engine dialled, correctly, and the step graded
+            # a race it had lost. That was not the price of getting here: the
+            # wait above answered `_call_is_down`, which read a rendered
+            # Cool-down as a call still up and so returned when the *window*
+            # expired rather than when the ceiling released the call (#218,
+            # `_no_call_is_up`). The path from here to the flip is three
+            # `bridgectl` runs and about a second — `20260903T060110Z`'s
+            # journal has them at 06:07:02.342, .402 and .461.
             # `bridgectl status` reports the remaining Cool-down (#195), so the
             # window is *read* rather than assumed, and the cue check that used
             # to sit here waits until after the flip.
@@ -2778,6 +2813,20 @@ class Walk:
                     support.matching_lines(self._log_since(inside), COOL_DOWN_PAID_PATTERN)
                 ),
                 deadline_seconds=cool_down + LIVE_CALL_OPEN_SECONDS,
+                poll_seconds=LIVE_CALL_POLL_SECONDS,
+            )
+            # **The decision and the dial are two lines, and the second one is
+            # waited for.** `paid` is the Keeper saying it will dial; the
+            # hand-over line is the adapter saying it did, written when the
+            # realtime session is up. Run `20260903T063156Z` measured the gap
+            # twice, on the two lanes' own earlier dials — 5.08s on claude
+            # (`the Cool-down elapsed` 18:35:45.170, the hand-over 18:35:50.251)
+            # and 5.10s on codex (18:37:02.326, 18:37:07.429) — and a count
+            # taken at the decision counted nothing on both. The budget is the
+            # one the phase's first dial gets, because it is the same dial.
+            support.wait_for(
+                lambda: bool(support.matching_lines(self._log_since(inside), HAND_OVER_LINE)),
+                deadline_seconds=LIVE_CALL_OPEN_SECONDS,
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
             paid_dials = support.matching_lines(self._log_since(inside), HAND_OVER_LINE)
@@ -3437,8 +3486,12 @@ class Walk:
         return answer.text[:200]
 
     def _call_is_down(self) -> bool:
-        """No call is up **right now**, in the engine's own words."""
-        return self._call_line() == "call: none"
+        """No call is up **right now**, in the engine's own words.
+
+        The reading needs a subprocess and a whole harness; the judgement is a
+        string rule, and `_no_call_is_up` holds it where CI can grade it.
+        """
+        return _no_call_is_up(self._call_line())
 
     def _end_any_live_call(self) -> None:
         """Leave no call behind, and never open one doing it."""
