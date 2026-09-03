@@ -1167,12 +1167,6 @@ class BridgeCore:
             receipt.reason,
         )
 
-    def _known(self, target: SessionTarget) -> Session | None:
-        try:
-            return self._state.sessions.resolve(target)
-        except BridgeCoreError:
-            return None
-
     def _spawned(self, target: SessionTarget) -> bool:
         """Whether the roster **positively says** this is a Child Process (#79).
 
