@@ -394,6 +394,17 @@ HARNESS_CALL_REFERENCE = live_call.REFERENCE
 #: complete table. A lane says its own (`journey.Lane`).
 DEFAULT_CALL_WORKSPACES = (live_call.FOCUS_WORKSPACE_NAME, live_call.RINGING_WORKSPACE_NAME)
 
+#: The Relay ceiling every run is given, in seconds, in place of the one the user
+#: configured. The shipped default is ten minutes (`core/policy.py`), and #197
+#: asks a step to observe what happens *past* the ceiling — so a run on the real
+#: number would spend ten minutes per lane waiting for a clock rather than
+#: proving a path. The value is short enough to sit inside one step and longer
+#: than the round trip a `bridgectl relay` takes, so a Relay that is held is held
+#: because the Session's window is shut and not because the harness was slow.
+#: The steps read it back out of the run's config (`journey.Walk`), so this
+#: number appears nowhere else.
+ACCEPTANCE_RELAY_CEILING_SECONDS = 20
+
 
 @dataclass(frozen=True)
 class DerivedConfig:
@@ -452,6 +463,17 @@ def derive_config(
     point an agent at one. `[adapters] session_launcher` goes with them because
     it names a module the parked tree no longer has. What is left is a config the
     engine under test could have been given.
+
+    **A fourth value is replaced, and it is a policy dial rather than a path:**
+    `[policy] relay_ceiling_seconds` becomes `ACCEPTANCE_RELAY_CEILING_SECONDS`.
+    #197 asks a step to observe what a Relay does *past* its ceiling, and the
+    shipped ceiling is ten minutes — so a run on the user's own number would
+    spend ten minutes per lane waiting for a clock. What acceptance proves here
+    is the path a relay that finally failed takes to the user, not the number it
+    waits out; the number is policy, and the fast suite holds the shipped
+    default. Said out loud because it is a deviation of a different kind from
+    the three above: those keep two engines out of each other's way, and this
+    one changes what the engine under test does.
 
     One value is **rewritten** rather than copied, and only when the caller asks:
     `[adapters.settings.companion_channel] token_env`. Two lanes run at once
@@ -515,6 +537,10 @@ def derive_config(
     log = dict(document["log"])
     log["path"] = str(run_directory / "engine.log")
     document["log"] = log
+
+    policy = dict(document.get("policy", {}))
+    policy["relay_ceiling_seconds"] = ACCEPTANCE_RELAY_CEILING_SECONDS
+    document["policy"] = policy
 
     dropped = [name for name in ("launch",) if document.pop(name, None) is not None]
     adapters = dict(document["adapters"])

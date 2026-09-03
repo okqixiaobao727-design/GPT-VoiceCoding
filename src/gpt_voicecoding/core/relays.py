@@ -68,10 +68,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 
 from gpt_voicecoding.core.clock import Clock, default_clock
-from gpt_voicecoding.core.lifecycle import Lifecycle
+from gpt_voicecoding.core.lifecycle import Lifecycle, RelayReason
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay, RelayKind, RelayQueue
 from gpt_voicecoding.core.sessions import SessionRegistry
@@ -87,46 +86,6 @@ from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import AgentKind, RequestId, SessionTarget, new_request_id
 
 _log = logging.getLogger(__name__)
-
-
-class RelayReason(StrEnum):
-    """Why a Relay stands where it does. Closed, and the only thing said about it.
-
-    This replaces seven English sentences and one inline apology. They were
-    written here because a surface rendered them verbatim, which made Bridge
-    Core the author of words the user hears — a second renderer beside the
-    Voice, which re-renders whatever it is handed anyway (#175). A code says the
-    fact; composing the sentence is the Voice's rule, in the instructions.
-
-    **The proven/unproven pairs collapsed.** Two of these used to be four,
-    because a sentence about a ceiling may not claim non-delivery of an
-    `UNKNOWN` — the grade that means the far side may well have the words.
-    A code claims nothing about arrival: `ceiling_passed` is a fact about this
-    system's own limit, and the attempt's grade travels beside it.
-    """
-
-    #: The attempt proved the words reached the model. Nothing else does.
-    DELIVERED = "delivered"
-    #: The words wait, and may go again when the Session next takes a turn.
-    #: Both grades that earn another attempt live here: nothing was sent, or an
-    #: attempt **proved** nothing arrived.
-    AWAITING_REPLY_WINDOW = "awaiting_reply_window"
-    #: An attempt proved nothing either way, so the words are kept and never
-    #: sent again on this system's own authority (P9). Saying them again is the
-    #: user's to authorise.
-    DUPLICATE_RISK = "duplicate_risk"
-    #: The far side parked the words in front of a person. It settles on its
-    #: own; a second copy is a second decision for the same human.
-    HELD_FAR_SIDE = "held_far_side"
-    #: Terminal: the words waited past `relay_ceiling_seconds` and left the
-    #: ledger, so nothing retries them.
-    CEILING_PASSED = "ceiling_passed"
-    #: Terminal: the Session those words were for ended while they waited.
-    SESSION_ENDED = "session_ended"
-    #: Terminal, and refused before the wire: the question is no longer
-    #: answerable from here, so the words were never queued for an inbox that
-    #: cannot take them (#68).
-    QUESTION_UNANSWERABLE = "question_unanswerable"
 
 
 #: Which code each grade earns while a Relay is still in play. Total over the
@@ -217,27 +176,6 @@ class RelayOutcome:
     def line(self) -> str:
         """This receipt in the one format every surface prints."""
         return receipt_line(state=str(self.state), grade=self.grade, reason=str(self.reason))
-
-
-def terminal_line(outcome: RelayOutcome) -> str:
-    """A relay that finally failed, as a bare code line pushed at the user.
-
-    **The grade travels with it**, so an expired `UNKNOWN` and an expired
-    `FAILED` do not read alike. That distinction is the entire reason the
-    deleted reports came in proven and unproven pairs: "it never reached the
-    session" is true of one and a guess about the other. The code says what
-    happened here, the grade says what was proved, and neither has to hedge on
-    the other's behalf — which is why one line of codes can replace four
-    sentences without claiming more than the receipt does.
-
-    **Temporary, and deliberately the narrowest thing that keeps the news
-    flowing.** A terminal failure has to reach the user, and until #197 lands the
-    only route it has is the Companion Channel push, which carries text. So it
-    carries codes, and no sentence. #197 folds the reason onto the Session's row
-    and wakes the Keeper instead, and deletes this function whole with the three
-    calls that use it.
-    """
-    return outcome.line
 
 
 class RelayPipeline:
@@ -494,5 +432,4 @@ __all__ = [
     "may_be_retried",
     "reason_for",
     "receipt_line",
-    "terminal_line",
 ]

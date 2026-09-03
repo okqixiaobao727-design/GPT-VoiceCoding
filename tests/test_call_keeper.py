@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import replace
 
 import pytest
 
 from fakes import FakeCall
 from gpt_voicecoding.core.adjudication import SwitchAdjudicator
 from gpt_voicecoding.core.call_keeper import (
+    CARRIED_UNDELIVERED,
+    NOTHING_UNDELIVERED,
     USER_OPENED,
     CallKeeper,
     Dialling,
@@ -635,6 +638,36 @@ class TestMidCallNewsSpeaksInTheGapAndRingsForTheRest:
         assert keeper.call.spoken == [], "the settle window had not run out"
         keeper.wait(1.0)
         assert keeper.call.spoken == [FOCUS]
+
+    def test_the_line_it_writes_says_whether_the_brief_carried_an_undelivered_relay(
+        self, caplog
+    ) -> None:
+        """#197: the run that cannot listen reads the fact off this one line.
+
+        A code-shaped token and not the sentence: the sentence is Briefing's and
+        is *spoken*, and a log line that reprinted it would be a second renderer
+        of words the Voice rewrites anyway (#175).
+        """
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.call_keeper")
+        keeper = self.in_a_call(
+            briefer=FakeBriefer(
+                focus=replace(FOCUS, undelivered="your last reply did not arrive, because x")
+            )
+        )
+        keeper.wake(focus=True)
+        keeper.wait(SETTLE)
+
+        assert keeper.call.spoken != []
+        assert f"undelivered={CARRIED_UNDELIVERED}" in caplog.text
+
+    def test_a_brief_with_nothing_undelivered_says_so_on_the_same_line(self, caplog) -> None:
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.call_keeper")
+        keeper = self.in_a_call()
+        keeper.wake(focus=True)
+        keeper.wait(SETTLE)
+
+        assert keeper.call.spoken == [FOCUS]
+        assert f"undelivered={NOTHING_UNDELIVERED}" in caplog.text
 
     def test_the_brief_is_read_at_the_moment_of_sounding_and_not_at_the_event(self) -> None:
         """ADR 0017's rule, mid-call: what is spoken is what stands *now*."""

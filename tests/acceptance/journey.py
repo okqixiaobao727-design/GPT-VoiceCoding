@@ -94,19 +94,24 @@ import support
 from support import LaneBlocked, StepFailed
 
 from gpt_voicecoding.adapters.call.realtime import cues
+from gpt_voicecoding.adapters.call.realtime.adapter import VOICE_SAID_LINE
 from gpt_voicecoding.core.bridge import VOICE_QUIET_LINE, VOICE_SPEAKING_LINE
 from gpt_voicecoding.core.briefing import STATE_WORDING, BriefState
 from gpt_voicecoding.core.call_keeper import (
+    CARRIED_UNDELIVERED,
     COOL_DOWN_OWED_LINE,
     COOL_DOWN_PAID_LINE,
     MID_CALL_NOTHING_LINE,
     MID_CALL_SPOKEN_LINE,
 )
+from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import (
     DEFAULT_COOL_DOWN_SECONDS,
+    DEFAULT_RELAY_CEILING_SECONDS,
     DEFAULT_SILENCE_END_SECONDS,
     DEFAULT_SPEECH_SETTLE_SECONDS,
 )
+from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.seams.call import Cue
 from gpt_voicecoding.seams.control_plane import Action
 
@@ -356,6 +361,32 @@ COOL_DOWN_PAID_PATTERN = re.escape(COOL_DOWN_PAID_LINE)
 #: for `COOL_DOWN_OWED_PATTERN`'s reason.
 MID_CALL_SPOKEN_PATTERN = re.escape(MID_CALL_SPOKEN_LINE.split("%s")[0])
 MID_CALL_NOTHING_PATTERN = re.escape(MID_CALL_NOTHING_LINE)
+
+#: A mid-call announcement whose brief said the user's last reply never arrived
+#: (#197). The Keeper writes one code-shaped token at the end of the line it
+#: already writes, so this is that line with the token pinned; the *sentence* is
+#: Briefing's and is spoken, never logged.
+MID_CALL_UNDELIVERED_PATTERN = (
+    rf"{re.escape(MID_CALL_SPOKEN_LINE.split('%s')[0])}.*undelivered={CARRIED_UNDELIVERED}"
+)
+
+#: What the Voice actually said, as the realtime adapter writes it down (#197).
+VOICE_SAID_PATTERN = re.escape(VOICE_SAID_LINE.split("%s")[0])
+
+#: What #173 §6 pins in the sentence the user hears when their last reply never
+#: arrived — "你上次的回复没送到，因为…". Matched as a **substring per #181**,
+#: and the substring is the negated verb rather than the whole phrase, because
+#: the Voice composes the sentence and this run does not get to predict it.
+#:
+#: Three spellings measured on three real calls, all of the same fact:
+#: `冇送到` (`20260903T112830Z` — the Voice answers this user in Cantonese,
+#: where 没 is 冇), `没送达` (`20260903T121349Z`) and #173 §6's own `没送到`.
+#: Pinning any one of them would have graded the product's own rule — a Session
+#: Brief is spoken "in the language the user is speaking"
+#: (`instructions/catalogue.py`, `voice.notice.*`) — as a failure. What cannot
+#: vary is that the user is told the words did **not** go: the negation and the
+#: verb. That is what is pinned, and nothing around it.
+UNDELIVERED_SPOKEN_PATTERN = r"[没冇未]送"
 
 #: The fragment of `live_call.relay_request` the engine's user-speech line has to
 #: carry, chosen the way the other three were: the middle of the sentence, and
@@ -809,6 +840,51 @@ RELAY_WORD = "BRAVO"
 #: written by the agents — and kept out of the workspace because being outside is
 #: the entire reason Codex has to ask before writing there.
 OUTSIDE_THE_SANDBOX = "outside-the-sandbox"
+
+#: The words #197 sends after the relayed instruction and never expects to
+#: arrive. **No effect and no target**: they are relayed into a Session that is
+#: mid-turn on a permission nobody has answered yet, so the Reply Window is shut
+#: for as long as the step keeps it shut — and if the product were broken and
+#: they did land, an instruction that asked for nothing changes nothing the rest
+#: of the walk reads. Deliberately not a second copy of `RELAY_WORD`'s file.
+UNDELIVERED = Instruction(words="Ignore this line entirely. Do nothing about it.")
+
+#: What a brief carries once a Relay to that Session has passed its ceiling: the
+#: label Briefing prints and the receipt's own reason code, matched as two facts
+#: rather than as one sentence — the sentence is Briefing's to reword, the code
+#: is the contract (`core/briefing.py::_undelivered_wording`).
+UNDELIVERED_PATTERN = rf"undelivered:.*\b{RelayReason.CEILING_PASSED}\b"
+
+#: The line the deleted escalation path used to push at the user for a Relay that
+#: finally failed (`core/relays.py::terminal_line`, removed by #197). Asserted
+#: **absent**: the news travels as a brief field now, and a run that found this
+#: again would have found the notice path back.
+TERMINAL_REPORT_PATTERN = r"state=reported_failed"
+
+
+def _receipt_fields(answer: str) -> dict[str, str]:
+    """One `bridgectl` receipt, as the fields it is made of.
+
+    `state`, `grade` and `reason` in the one format every surface prints
+    (`core/relays.py::receipt_line`). Read as fields rather than searched as a
+    sentence, because a substring match on `delivered` passes on a *retained*
+    relay whose `state` happens to spell it — and in one place, because two
+    steps read the same receipt and two parsers are two things to keep in step.
+    """
+    return dict(field.split("=", 1) for field in answer.split() if "=" in field)
+
+
+@dataclass(frozen=True)
+class _UndeliveredObservation:
+    """What #197's half of the `relay` step saw, carried to the step's own line.
+
+    `mark` is where the engine log stood when the held Relay went in, so the
+    Stop Notice read afterwards is read from the same place.
+    """
+
+    mark: int
+    evidence: str
+
 
 #: Turn 3 — arrives from Telegram.
 INBOUND = writing("inbound.txt", "CHARLIE")
@@ -1973,6 +2049,13 @@ class Walk:
         if not answer.ok:
             raise StepFailed(f"relay refused: {answer.text}")
 
+        # #197's half of this turn, and it goes **before** the approval is
+        # answered: the Session is mid-turn on a permission nobody has resolved
+        # yet, so its Reply Window is shut and stays shut for as long as this
+        # step leaves it shut. That is what makes the hold a fact rather than a
+        # race against how long an agent takes.
+        undelivered = self._a_relay_that_outlives_its_ceiling()
+
         self.approval_resolution = self._resolve_approval_effect(
             scenario="relay",
             requirement=approval_effect.ApprovalRequirement.REQUIRED,
@@ -1986,7 +2069,7 @@ class Walk:
         # fields rather than looking for a word anywhere in a sentence: `state`
         # and `grade` both spell `delivered`, so a substring match passed on a
         # retained relay whose *state* happened to say so.
-        receipt = dict(field.split("=", 1) for field in answer.text.split() if "=" in field)
+        receipt = _receipt_fields(answer.text)
         if receipt.get("grade") != "delivered":
             # #68's rule, and the one place it is observable: a route that cannot
             # be taken surfaces **as a graded delivery failure carrying a reason
@@ -2010,7 +2093,131 @@ class Walk:
                 f"{self.approval_resolution.effect_observed}; {target} contains "
                 f"{relayed.effect_in(self.config.workspace)!r}"
             )
-        return f"{answer.text}; {target} contains {relayed.content}"
+        stop_notice = self._stop_notice_carrying_the_undelivered_relay(since=undelivered.mark)
+        if not stop_notice:
+            raise StepFailed(
+                "the Relay that passed its ceiling reached `brief`, and the Stop Notice this "
+                "turn published afterwards did not carry it — the two readings of one row "
+                f"disagree (#197). Engine log tail: {self._log_since(undelivered.mark)[-8:]}"
+            )
+        return (
+            f"{answer.text}; {target} contains {relayed.content}; "
+            f"{undelivered.evidence}; the Stop Notice carried it too"
+        )
+
+    # --- a relay that finally failed (#197) --------------------------------
+
+    def _a_relay_that_outlives_its_ceiling(self) -> _UndeliveredObservation:
+        """Hold one Relay past the ceiling, and read the reason off the Session.
+
+        #197's rule from the user's side: a Relay that finally fails reaches
+        them **through Briefing**, as a field on that Session's brief, and not as
+        a line pushed beside it. Three things are graded here and each is a fact
+        a broken product would get wrong differently:
+
+        * the words were **held** — the receipt says `retained`, so what is
+          measured afterwards is a ceiling and not a delivery that failed;
+        * one ceiling later `brief <address>` carries `undelivered` with the
+          receipt's own reason code, on a Session that is still alive;
+        * **no free-text report went out.** The three announce sites #197
+          deleted pushed `terminal_line` at the Companion Channel, so a run that
+          found that line again would have found the notice path back.
+
+        The wait is the engine's own dial, read out of this run's config the way
+        every other duration here is (`_relay_ceiling_seconds`); one poll of
+        margin is added because the sweep runs on the engine's one-second tick.
+        """
+        if self.address is None:  # pragma: no cover - the caller checked
+            raise LaneBlocked("no Session to hold a relay for")
+        ceiling = self._relay_ceiling_seconds()
+        mark = len(self.engine.log_lines())
+        # The same deadline the turn-driving relay gets, and for the same
+        # reason: `bridgectl` hands every action ten seconds and the engine's
+        # own proof of delivery on the Claude lane waits forty-five, so the
+        # surface cannot reach the reply on the shipped budget
+        # (`support.RELAY_DEADLINE_SECONDS`). Measured again on run
+        # `20260903T105429Z`, where this exact call timed out at 10s.
+        held = self.bridgectl(
+            "relay", self.address, UNDELIVERED.words, timeout=support.RELAY_DEADLINE_SECONDS
+        )
+        if not held.ok:
+            raise StepFailed(f"the relay that should have been held was refused: {held.text}")
+        receipt = _receipt_fields(held.text)
+        if receipt.get("state") != str(Lifecycle.RETAINED):
+            raise StepFailed(
+                f"the words meant to wait out the ceiling were answered {held.text!r}: their "
+                f"state is {receipt.get('state', '<no state field>')!r} and not "
+                f"`{Lifecycle.RETAINED}`, so this turn's Reply Window was open and there is "
+                "no held Relay to grade"
+            )
+        time.sleep(ceiling + TURN_POLL_SECONDS)
+        briefed = support.wait_for(
+            lambda: bool(re.search(UNDELIVERED_PATTERN, self._brief_text())),
+            deadline_seconds=TURN_SETTLE_SECONDS,
+            poll_seconds=TURN_POLL_SECONDS,
+        )
+        text = self._brief_text()
+        if not briefed:
+            raise StepFailed(
+                f"a Relay to {self.address} passed its {ceiling:.0f}s ceiling and "
+                f"`bridgectl brief` says nothing about it: {text!r}"
+            )
+        pushed = support.matching_lines(self._log_since(mark), TERMINAL_REPORT_PATTERN)
+        if pushed:
+            raise StepFailed(
+                "a Relay that finally failed was reported as free text as well as on the "
+                f"row — the notice path #197 deleted is back: {[line.strip() for line in pushed]}"
+            )
+        line = next(
+            (one.strip() for one in text.splitlines() if re.search(UNDELIVERED_PATTERN, one)),
+            "",
+        )
+        return _UndeliveredObservation(
+            mark=mark, evidence=f"a Relay held past {ceiling:.0f}s reads back as {line!r}"
+        )
+
+    def _brief_text(self) -> str:
+        """What `bridgectl brief <address>` says about this walk's Session, whole."""
+        if self.address is None:  # pragma: no cover - the caller checked
+            return ""
+        answer = self.bridgectl("brief", self.address)
+        return answer.text if answer.ok else ""
+
+    def _stop_notice_carrying_the_undelivered_relay(self, *, since: int) -> bool:
+        """Whether a Stop published since `since` carried the undelivered field.
+
+        The second half of #197's `relay` observation: the field is on the row,
+        so **every** reading of that row carries it — the one `brief` takes and
+        the one the Stop Notice is rendered from, which is the same `briefing`
+        call and must not be able to disagree with it.
+        """
+
+        def carried() -> bool:
+            lines = self._log_since(since)
+            if not support.matching_lines(lines, ENGINE_STOP_LINE):
+                return False
+            return bool(support.matching_lines(lines, UNDELIVERED_PATTERN))
+
+        return bool(
+            support.wait_for(
+                carried,
+                deadline_seconds=TURN_SETTLE_SECONDS + TURN_POLL_SECONDS,
+                poll_seconds=TURN_POLL_SECONDS,
+            )
+        )
+
+    def _relay_ceiling_seconds(self) -> float:
+        """The Relay ceiling this lane's engine is actually running.
+
+        Read out of the lane's own config and only then off the shipped default,
+        exactly as the Cool-down and the Silence Ceiling are. The run's config
+        carries the harness's own number (`support.derive_config`), and reading
+        it back rather than importing it is what keeps the step honest if that
+        deviation is ever withdrawn.
+        """
+        document = tomllib.loads(self.config.path.read_text())
+        given = document.get("policy", {}).get("relay_ceiling_seconds")
+        return DEFAULT_RELAY_CEILING_SECONDS if given is None else float(given)
 
     # --- approval ---------------------------------------------------------
 
@@ -2768,12 +2975,13 @@ class Walk:
             )
         dialled = self._the_keeper_dials_and_paces_itself()
         news = self._mid_call_the_focus_session_speaks_and_the_rest_rings()
+        failed = self._mid_call_a_relay_that_finally_failed()
         return (
             f"call up on `bridgectl live` ({call.answer!r}); engine heard {spoken[-1]!r}; "
             f"{len(runs)} `bridgectl` run(s) logged, verbs {verbs}; cues {cues_played}; "
             f"call down ({self._call_line()!r}), ended by the {ended_by}; transport "
             f"{seen.transport_factory}, wav variant {seen.variant!r}, ended "
-            f"{seen.end_reason!r}. Then {dialled}. Then {news}"
+            f"{seen.end_reason!r}. Then {dialled}. Then {news}. Then {failed}"
         )
 
     def _the_keeper_dials_and_paces_itself(self) -> str:
@@ -3041,6 +3249,181 @@ class Walk:
         document = tomllib.loads(self.config.path.read_text())
         given = document.get("policy", {}).get("speech_settle_seconds")
         return DEFAULT_SPEECH_SETTLE_SECONDS if given is None else float(given)
+
+    def _mid_call_a_relay_that_finally_failed(self) -> str:
+        """#197's phase of `live call`: the user hears why their words never landed.
+
+        The ticket's own Red-first, on a real call. A Relay is held past its
+        ceiling into the **Focus Session** while a call is up, and the two
+        things that follow are the user's side of it:
+
+        * **one `speak` whose brief carried `undelivered`** — the Keeper's
+          mid-call line ends on a code-shaped token saying so
+          (`core/call_keeper.py::MID_CALL_SPOKEN_LINE`), because the brief
+          itself crosses the Call seam and is never written down;
+        * **the Voice said it** — the assistant transcript the realtime adapter
+          writes down carries #173 §6's "没送到". A substring per #181: the Voice
+          composes the sentence from what Briefing handed it, and this run does
+          not get to predict the rest of it.
+
+        **The hold is arranged, never raced.** The Relay is queued only after the
+        Session is *already* waiting on a permission nobody will answer, which is
+        a shut Reply Window that stays shut for as long as this phase leaves it
+        shut (`seams/agent.py::derive_reply_window`). Precedent is #105 and #79:
+        the situation the step judges is arranged, and nothing that is judged is.
+
+        The permission is raised by the lane's own actionable instruction, so
+        neither lane is handed the other's idea of what needs asking about.
+        """
+        if self.config.call_observations is None or self.config.call_wav_directory is None:
+            raise LaneBlocked(
+                "this run's engine was not given the harness Call adapter, so there is no "
+                "call to hold without a microphone (`support.derive_config(spoken_call=True)`)"
+            )
+        focus_name = self.config.call_focus_workspace
+        if focus_name is None:
+            raise LaneBlocked("this run's config names no workspace for the extra Session (#196)")
+        ceiling = self._relay_ceiling_seconds()
+        settle = self._speech_settle_seconds()
+        silence = self._silence_ceiling_seconds()
+        cool_down = self._cool_down_seconds()
+        turn = self.far_side.agent_turn_seconds
+        # **The ceiling has to fit inside the Silence Ceiling.** This phase waits
+        # a Relay ceiling out on a call it must still be holding afterwards, and
+        # the Voice says nothing while it waits — so a Relay ceiling longer than
+        # the silence one would end the call before the news it is waiting for.
+        if ceiling + settle + LIVE_CALL_CUE_SECONDS >= silence:
+            raise LaneBlocked(
+                f"this lane's Silence Ceiling is {silence:.0f}s and its Relay ceiling "
+                f"{ceiling:.0f}s: the wait this phase makes would be what ends the call, and "
+                "the announcement would be graded against a call that had already gone"
+            )
+        started = time.monotonic()
+        with self._an_extra_session(focus_name) as (extra, workspace):
+            address = self._await_extra_session(workspace, turn)
+            if not self._leave_no_call_up(LIVE_CALL_CUE_SECONDS):
+                raise LaneBlocked(
+                    f"a Live Call was still up after this phase asked for it to end, so there "
+                    f"is no call of its own to grade: {self._call_line()!r}"
+                )
+            # Its Stop is what dials, so the call is up and about this Session.
+            self._drive_extra_session(extra, workspace, turn)
+            live_call.ask_for_nothing(self.config.call_wav_directory)
+            mark = len(self.engine.log_lines())
+            with self._voice_route_only():
+                opened = support.wait_for(
+                    lambda: bool(support.matching_lines(self._log_since(mark), HAND_OVER_LINE)),
+                    deadline_seconds=LIVE_CALL_OPEN_SECONDS + cool_down,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                up = support.wait_for(
+                    lambda: not self._call_is_down(),
+                    deadline_seconds=LIVE_CALL_CUE_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                if not (opened and up):
+                    raise StepFailed(
+                        f"a Session stopped and Voice came on with Message off, and no call "
+                        f"was up within {LIVE_CALL_OPEN_SECONDS + cool_down:.0f}s — dialled: "
+                        f"{opened}, up: {self._call_line()!r}"
+                    )
+                # **The address is read again here, never carried.** A row is
+                # re-keyed as the lane learns more about it — a Claude row is
+                # matched on its session id and its pid may be read differently
+                # between passes (`sessions.py::_better_known`) — so the address
+                # taken when the Session first reached the roster can name a row
+                # the registry no longer holds. Run `20260903T111253Z` is that:
+                # `relay` refused with `unknown Session`.
+                address = self._extra_address(workspace, address)
+                # **The Relay is what makes it the Focus Session** (#165 Q2), and
+                # the instruction it carries is what shuts its Reply Window.
+                shutting = self.lane.actionable(workspace)
+                shut_at = shutting.path_in(workspace)
+                if shut_at is not None:
+                    shut_at.parent.mkdir(parents=True, exist_ok=True)
+                asked = self.bridgectl(
+                    "relay", address, shutting.words, timeout=support.RELAY_DEADLINE_SECONDS
+                )
+                if not asked.ok:
+                    raise StepFailed(f"the relay that arms this phase was refused: {asked.text}")
+                waiting = support.wait_for(
+                    lambda: str((self._row_in(workspace) or {}).get("state")) == "waiting",
+                    deadline_seconds=turn,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                if not waiting:
+                    raise LaneBlocked(
+                        f"{address} never reached `waiting` on {self.lane.asks_about}, so its "
+                        "Reply Window was never shut and there is no Relay to hold"
+                    )
+                holding = len(self.engine.log_lines())
+                address = self._extra_address(workspace, address)
+                held = self.bridgectl(
+                    "relay", address, UNDELIVERED.words, timeout=support.RELAY_DEADLINE_SECONDS
+                )
+                receipt = _receipt_fields(held.text)
+                if not held.ok or receipt.get("state") != str(Lifecycle.RETAINED):
+                    raise StepFailed(
+                        f"the words meant to wait out the ceiling were answered "
+                        f"{held.text!r}, and not as `{Lifecycle.RETAINED}` — the Session's "
+                        "Reply Window was open after all"
+                    )
+                announced = support.wait_for(
+                    lambda: bool(
+                        support.matching_lines(
+                            self._log_since(holding), MID_CALL_UNDELIVERED_PATTERN
+                        )
+                    ),
+                    # **The ceiling, and then a whole gap.** The word waits for
+                    # one judged on both sides, and the Voice's own answer is
+                    # what it usually waits behind: run `20260903T112830Z`
+                    # passed the ceiling at 23:41:16 and was spoken at 23:44:12,
+                    # because that call's playout took the full 180s drain
+                    # (`realtime/webrtc.py`) to report its stop edge. The budget
+                    # is therefore a whole answer, as every other wait on a
+                    # speaking call here is.
+                    deadline_seconds=(
+                        ceiling + LIVE_CALL_ANSWER_SECONDS + settle + LIVE_CALL_CUE_SECONDS
+                    ),
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                spoken = support.wait_for(
+                    lambda: bool(
+                        support.matching_lines(
+                            support.matching_lines(self._log_since(holding), VOICE_SAID_PATTERN),
+                            UNDELIVERED_SPOKEN_PATTERN,
+                        )
+                    ),
+                    deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
+                    poll_seconds=LIVE_CALL_POLL_SECONDS,
+                )
+                said = [
+                    line.strip()
+                    for line in support.matching_lines(self._log_since(holding), VOICE_SAID_PATTERN)
+                ]
+                self._end_any_live_call()
+        self._measured("live call undelivered", started, self._call_is_down())
+        self.journey.observe(
+            "live call a relay that finally failed",
+            f"a Relay to {address} was held while it waited on a permission and passed its "
+            f"{ceiling:.0f}s ceiling; the Voice said: {said or 'nothing recorded'}",
+        )
+        if not announced:
+            raise StepFailed(
+                f"a Relay to the Focus Session passed its {ceiling:.0f}s ceiling on a call "
+                f"that was up, and no announcement carried it. Engine log tail: "
+                f"{self._log_since(holding)[-10:]}"
+            )
+        if not spoken:
+            raise StepFailed(
+                f"the brief carried the undelivered Relay and the Voice never said "
+                f"anything matching {UNDELIVERED_SPOKEN_PATTERN!r} (#173 §6). What it said: "
+                f"{said or 'nothing this call recorded'}"
+            )
+        return (
+            f"a Relay held past {ceiling:.0f}s reached {address} as a spoken brief, and the "
+            f"Voice said so in its own words"
+        )
 
     @contextmanager
     def _an_extra_session(
@@ -3356,6 +3739,19 @@ class Walk:
             f"{rings} EVENT cue(s), none of them announced; then one announcement after the "
             f"Voice fell silent, {announcements[0].strip()!r}"
         )
+
+    def _extra_address(self, workspace: Path, fallback: str) -> str:
+        """That extra Session's address **as the roster spells it right now**.
+
+        A row is re-keyed as the lane learns more about it, and an address held
+        across a turn can name a row the registry no longer holds — which the
+        control plane answers, correctly, with `unknown Session`. Reading it
+        again costs one `status` and is the only way to address a Session the
+        harness did not create the identity of. The last known address is
+        returned when the row has gone, so the caller's own refusal says what
+        it was trying to reach.
+        """
+        return _address_of(self._row_in(workspace) or {}) or fallback
 
     def _await_extra_session(self, workspace: Path, turn_seconds: float) -> str:
         """Wait for an extra Session to reach the roster, and answer with its address.

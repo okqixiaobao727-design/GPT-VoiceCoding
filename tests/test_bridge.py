@@ -38,7 +38,7 @@ from gpt_voicecoding.core.errors import CallInstructionsMissing, ChildSessionErr
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
 from gpt_voicecoding.core.router import Classification
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, UndeliveredRelay
 from gpt_voicecoding.core.switches import SwitchName
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -51,6 +51,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressObservation,
     ProgressOmission,
     ProgressRole,
+    RelayReceipt,
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
@@ -74,7 +75,7 @@ from gpt_voicecoding.seams.call import (
     VoiceSpeech,
 )
 from gpt_voicecoding.seams.companion_channel import InboundText
-from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
 
@@ -1191,25 +1192,31 @@ class TestTheRelayPipelineEndToEnd:
         assert [call.text for call in hub.agent.calls] == ["ship it"]
         assert len(hub.channel.sent) == receipts
 
-    def test_ten_minutes_of_waiting_becomes_one_reported_failure(self) -> None:
+    def test_ten_minutes_of_waiting_lands_on_the_row_and_not_in_the_channel(self) -> None:
+        """#197: the news travels as a brief field, never as a line pushed beside it."""
         hub = Hub()
         hub.emit(InboundText(text="ship it"))
+        pushed = list(hub.channel.sent)
 
         hub.now += TEN_MINUTES
         hub.tick()
 
         assert hub.state.relays.pending() == ()
-        assert hub.channel.sent[-1] == "state=reported_failed grade=none reason=ceiling_passed"
+        assert hub.state.sessions.resolve(CODEX).undelivered == UndeliveredRelay(
+            reason=str(RelayReason.CEILING_PASSED)
+        )
+        assert hub.channel.sent == pushed, "no terminal line is pushed at the user any more"
 
     def test_an_expired_relay_that_was_attempted_does_not_read_like_one_that_was_not(
         self,
     ) -> None:
-        """The grade travels with the terminal news, so `UNKNOWN` is not read as `FAILED`.
+        """The grade travels onto the row, so `UNKNOWN` is not read as `FAILED`.
 
         This is what the four deleted ceiling reports came in proven/unproven
         pairs for: "it never reached the session" is true of words that never
         went and a guess about an attempt that proved nothing. The code says
-        what happened here; the grade says what was proved.
+        what happened here; the grade says what was proved, and Briefing's verb
+        is chosen from the pair.
         """
         hub = Hub()
         hub.agent.outcome = Delivery.UNKNOWN
@@ -1220,16 +1227,131 @@ class TestTheRelayPipelineEndToEnd:
         hub.now += TEN_MINUTES
         hub.tick()
 
-        assert hub.channel.sent[-1] == ("state=reported_failed grade=unknown reason=ceiling_passed")
+        undelivered = hub.state.sessions.resolve(CODEX).undelivered
+        assert undelivered == UndeliveredRelay(
+            reason=str(RelayReason.CEILING_PASSED), grade=Delivery.UNKNOWN
+        )
+        assert (
+            "may not have arrived"
+            in briefing.spoken(briefing.session(hub.state.sessions.resolve(CODEX))).undelivered
+        )
+
+    def test_a_second_failure_replaces_the_reason_the_first_one_left(self) -> None:
+        hub = Hub()
+        hub.emit(InboundText(text="ship it"))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        hub.agent.outcome = Delivery.UNKNOWN
+        hub.agent.reason = "no readback"
+        hub.emit(InboundText(text="and this"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+
+        assert hub.state.sessions.resolve(CODEX).undelivered == UndeliveredRelay(
+            reason=str(RelayReason.CEILING_PASSED), grade=Delivery.UNKNOWN
+        )
+
+    def test_a_relay_that_reaches_the_session_afterwards_clears_it(self) -> None:
+        hub = Hub()
+        hub.emit(InboundText(text="ship it"))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        assert hub.state.sessions.resolve(CODEX).undelivered is not None
+
+        hub.emit(InboundText(text="and this"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        assert hub.state.sessions.resolve(CODEX).undelivered is None
+
+    def test_a_verdict_that_lands_clears_it_too(self) -> None:
+        """An Approval Relay is the user's own words arriving (#165 Q2, #197)."""
+        hub = Hub(voice=False)
+        hub.emit(InboundText(text="ship it"))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.WAITING,
+                    waiting_for=WaitingFor(
+                        kind=WaitingKind.PERMISSION,
+                        tool_name="Bash",
+                        detail="push the branch",
+                        approval_id="a1",
+                    ),
+                ),
+            )
+        )
+        asyncio.run(hub.core.discover())
+        assert hub.state.sessions.resolve(CODEX).undelivered is not None
+
+        asyncio.run(hub.core.answer_approval("a1", ApprovalVerdict.ALLOW))
+
+        assert hub.state.sessions.resolve(CODEX).undelivered is None
+
+    def test_a_receipt_that_arrives_late_and_proves_delivery_clears_it(self) -> None:
+        """The proof came back minutes later on the inbox's own route (ADR 0013)."""
+        hub = Hub(voice=False)
+        hub.agent.outcome = Delivery.UNKNOWN
+        hub.agent.reason = "no readback"
+        hub.emit(InboundText(text="ship it"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        assert hub.state.sessions.resolve(CODEX).undelivered is not None
+        # A second Relay is queued and still waiting; its proof arrives late.
+        hub.emit(InboundText(text="and this"))
+        pending = hub.state.relays.pending()
+
+        hub.emit(
+            RelayReceipt(
+                target=CODEX,
+                receipt=DeliveryReceipt(
+                    request_id=pending[0].request_id,
+                    outcome=Delivery.DELIVERED,
+                    reason="the Session acknowledged it",
+                ),
+            )
+        )
+
+        assert hub.state.sessions.resolve(CODEX).undelivered is None
+
+    def test_a_relay_still_queued_leaves_the_field_exactly_as_it_stands(self) -> None:
+        hub = Hub()
+        hub.emit(InboundText(text="ship it"))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        stood = hub.state.sessions.resolve(CODEX).undelivered
+
+        hub.emit(InboundText(text="and this"))
+
+        assert hub.state.sessions.resolve(CODEX).undelivered == stood
+
+    def test_a_relay_held_in_front_of_a_person_leaves_it_alone_too(self) -> None:
+        hub = Hub()
+        hub.agent.outcome = Delivery.HELD
+        hub.agent.reason = "parked for a human"
+        hub.emit(InboundText(text="ship it"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+
+        assert hub.state.sessions.resolve(CODEX).undelivered is None
 
     def test_a_session_that_ends_reports_the_words_still_waiting_for_it(self) -> None:
+        """No wake and no field: an exited Session appears nowhere, so the log has it."""
         hub = Hub()
         hub.emit(InboundText(text="ship it"))
 
         hub.emit(SessionEnded(target=CODEX))
 
         assert hub.state.relays.pending() == ()
-        assert hub.state.sessions.all()[0].lifecycle is SessionLifecycle.ENDED
+        ended = hub.state.sessions.all()[0]
+        assert ended.lifecycle is SessionLifecycle.ENDED
+        assert ended.undelivered is None
+        assert hub.call.calls_started == 0
 
 
 class TestTheInboundRouterEndToEnd:
@@ -2675,3 +2797,103 @@ class TestMidCallNewsThroughTheWholeHub:
 
         assert hub.call.spoken == []
         assert hub.call.calls_started == 1
+
+
+class TestARelayThatFinallyFailedReachesTheUser:
+    """#197, end to end: the reason travels as a brief field, through the Keeper.
+
+    Bridge Core folds one field onto the Session's row and wakes the Keeper with
+    the Focus judged *now* — a relay can pass its ceiling minutes after it was
+    queued, and the user may have answered another Session since (ADR 0017).
+    """
+
+    OTHER = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
+
+    def waiting(self, hub: Hub, target: SessionTarget) -> None:
+        """Put a stopped, question-shaped reading on that row, as a Stop would."""
+        hub.state.sessions.set_stop_reading(
+            target,
+            waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            progress=ProgressObservation.readable(
+                has_history=True,
+                read_at=datetime(2026, 9, 3, 1, 2, 3, tzinfo=UTC),
+                recent=(ProgressEntry(ordinal=0, role=ProgressRole.ASSISTANT, text="I got here"),),
+            ),
+            now=hub.now,
+        )
+
+    def failed_relay(self, hub: Hub, target: SessionTarget) -> None:
+        """The user's words, attempted and proven not to have arrived."""
+        hub.agent.answerable_questions.add(target)
+        hub.agent.outcome = Delivery.FAILED
+        hub.agent.reason = "the far side refused"
+        asyncio.run(hub.core.relay(target, "main"))
+
+    def test_a_failure_with_no_call_up_dials_and_hands_the_reason_over(self) -> None:
+        hub = Hub()
+        self.waiting(hub, CODEX)
+        self.failed_relay(hub, CODEX)
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+
+        assert hub.call.calls_started == 1
+        briefs = [item for item in hub.call.opened_on[0].hand_over if isinstance(item, SpokenBrief)]
+        assert [brief.undelivered for brief in briefs] == [
+            "your last reply did not arrive, because ceiling_passed"
+        ]
+
+    def test_a_failure_under_cool_down_owes_a_dial_rather_than_dialling_now(self) -> None:
+        hub = Hub(cool_down_seconds=3_600.0)
+        hub.toggle()
+        hub.toggle()  # the call the user opened ends, and a Cool-down begins
+        self.waiting(hub, CODEX)
+        self.failed_relay(hub, CODEX)
+        dialled = hub.call.calls_started
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+
+        assert hub.call.calls_started == dialled, "the Cool-down had not elapsed"
+        assert hub.core.status().dial_owed
+
+    def hub_on_a_call(self) -> Hub:
+        hub = Hub(
+            sessions=((CODEX, "port the log"), (self.OTHER, "the other one")),
+            silence_end_seconds=3_600.0,
+        )
+        hub.toggle()
+        return hub
+
+    def gap(self, hub: Hub) -> None:
+        hub.now += 5.0
+        hub.tick()
+
+    def test_a_failure_mid_call_is_spoken_at_the_gap_as_the_focus_brief(self) -> None:
+        hub = self.hub_on_a_call()
+        self.waiting(hub, CODEX)
+        self.failed_relay(hub, CODEX)
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+        self.gap(hub)
+
+        (spoken,) = hub.call.spoken
+        assert "port the log" in spoken.name
+        assert spoken.undelivered == "your last reply did not arrive, because ceiling_passed"
+
+    def test_a_session_the_user_has_since_left_only_rings(self) -> None:
+        """`focus` is judged at the wake, not when the words were queued."""
+        hub = self.hub_on_a_call()
+        self.waiting(hub, self.OTHER)
+        self.failed_relay(hub, self.OTHER)
+        self.waiting(hub, CODEX)
+        hub.state.sessions.set_focus(CODEX)
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+        self.gap(hub)
+
+        assert hub.call.spoken == []
+        assert hub.call.cues.count(Cue.EVENT) == 1
+        assert hub.state.sessions.resolve(self.OTHER).undelivered is not None

@@ -113,7 +113,16 @@ COOL_DOWN_PAID_LINE = "the Cool-down elapsed; dialling on a fresh reading"
 #: surface of their own either — an announcement that *waits* leaves no cue and
 #: no snapshot — so these three lines are what a whole-lane run reads the rule
 #: off, and `tests/acceptance/journey.py` greps them.
-MID_CALL_SPOKEN_LINE = "spoke the Focus Session's brief into the gap in the Live Call: %s"
+MID_CALL_SPOKEN_LINE = (
+    "spoke the Focus Session's brief into the gap in the Live Call: %s undelivered=%s"
+)
+
+#: The token `MID_CALL_SPOKEN_LINE` ends on when the brief it spoke said nothing
+#: about an undelivered Relay, and the one it ends on when it did. Two facts and
+#: no words: the sentence itself is Briefing's and is spoken, not logged, and a
+#: line that reprinted it would be a second renderer of it (#175).
+NOTHING_UNDELIVERED = "none"
+CARRIED_UNDELIVERED = "carried"
 MID_CALL_NOTHING_LINE = (
     "the gap came and the Focus Session no longer needs the user; nothing is spoken"
 )
@@ -891,7 +900,11 @@ class CallKeeper:
             # The Session's name, and nothing else off the brief: a whole-lane
             # run has no other way to tell *which* Session was announced, and
             # the name is what the user would have heard first.
-            _log.info(MID_CALL_SPOKEN_LINE, brief.name)
+            _log.info(
+                MID_CALL_SPOKEN_LINE,
+                brief.name,
+                CARRIED_UNDELIVERED if brief.undelivered else NOTHING_UNDELIVERED,
+            )
         else:
             _log.info(MID_CALL_UNDELIVERED_LINE, receipt.reason)
 

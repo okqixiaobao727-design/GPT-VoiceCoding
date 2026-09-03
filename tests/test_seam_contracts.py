@@ -486,6 +486,7 @@ class TestTheDial:
             "decision",
             "answerable_here",
             "last_activity_at",
+            "undelivered",
         }
 
     def test_a_hand_over_over_the_item_cap_is_refused_here(self) -> None:

@@ -55,7 +55,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Final
 
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.sessions import Session, UndeliveredRelay
 from gpt_voicecoding.seams.agent import (
     ProgressAvailability,
     ProgressObservation,
@@ -193,6 +193,9 @@ class SessionBrief:
     #: Whether the user can answer this from here, rather than at the terminal.
     answerable_here: bool
     last_activity_at: datetime | None
+    #: The last Relay to this Session that finally failed, or `None` when the
+    #: user's words have all landed (`CONTEXT.md`, *Session Brief*).
+    undelivered: UndeliveredRelay | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,7 +280,26 @@ def session(session: Session, *, question_answerable: bool = False) -> SessionBr
         decision=_decision(session),
         answerable_here=_answerable_here(session, question_answerable=question_answerable),
         last_activity_at=session.last_activity,
+        undelivered=session.undelivered,
     )
+
+
+def earns_a_brief(session: Session) -> bool:
+    """Whether this Session has anything the user is owed a whole brief about.
+
+    **One rule, in one place**, because a hand-over and the mid-call word have
+    to agree about it: a call that briefed one set of Sessions and spoke about
+    another would be two answers to one question (#209, #213).
+
+    Two ways to earn one. A row that has **stopped** is asking something of the
+    user — a running Session is in the roster and asking nobody anything, so it
+    gets its header row and nothing more. And a row carrying an **undelivered
+    Relay** earns one whatever it is doing (#197): the user's own words did not
+    reach it, and that is news about the Session rather than a state of it, so
+    a Session that went straight back to work is a Session the user still has
+    to be told about — `CONTEXT.md`'s *Session Brief* promises exactly that.
+    """
+    return _state(session) is not BriefState.RUNNING or session.undelivered is not None
 
 
 def omitting_newest(brief: SessionBrief) -> SessionBrief:
@@ -317,6 +339,7 @@ def spoken(brief: SessionBrief) -> SpokenBrief:
         decision=tuple(line.strip() for line in _decision_lines(brief)),
         answerable_here=_answer_wording(brief.answerable_here),
         last_activity_at=_when(brief.last_activity_at),
+        undelivered=_undelivered_wording(brief.undelivered),
     )
 
 
@@ -333,7 +356,9 @@ def handover(
     dialled, then the Roster Brief, then the full brief of every Session that
     needs the user — Focus first, because the roster it is taken from is ordered
     Focus first (#165 Q6). **A running Session gets its header row and nothing
-    more:** it is in the roster, and there is nothing it is asking of anybody.
+    more:** it is in the roster, and there is nothing it is asking of anybody —
+    unless the user's last reply to it never arrived, which is news about it
+    whatever it is doing (`earns_a_brief`, #197).
 
     **Over budget, bodies go and words stay.** The newest message is dropped
     from the *back* — the Sessions the roster ordered last — and each one that
@@ -381,7 +406,7 @@ def handover(
     briefs = [
         session(by_target[row.target], question_answerable=row.target in answerable)
         for row in summary.rows
-        if row.state is not BriefState.RUNNING and row.target in by_target
+        if row.target in by_target and earns_a_brief(by_target[row.target])
     ]
     return _fitted(DialReason(text=reason), summary, briefs)
 
@@ -756,12 +781,39 @@ def _session_lines(brief: SessionBrief) -> list[str]:
     lines.extend(_decision_lines(brief))
     lines.append(f"  answer: {_answer_wording(brief.answerable_here)}")
     lines.append(f"  last activity: {_when(brief.last_activity_at)}")
+    if brief.undelivered is not None:
+        lines.append(f"  undelivered: {_undelivered_wording(brief.undelivered)}")
     return lines
 
 
 def _answer_wording(answerable_here: bool) -> str:
     """Where the user answers this, in the two phrases both carriers use."""
     return "from here" if answerable_here else "at the terminal"
+
+
+def _undelivered_wording(undelivered: UndeliveredRelay | None) -> str:
+    """The user's last reply to this Session, and why it never arrived.
+
+    `CONTEXT.md`'s *Session Brief* promise, worded here because this module is
+    the one place the user's vocabulary lives (#175). Empty when nothing is
+    undelivered — the ordinary case, and one an adapter writes no line for.
+
+    **The verb is the grade's.** An attempt that proved nothing arrived may be
+    reported as not having arrived; one that proved nothing either way — an
+    `UNKNOWN` on a route where an accepted write is not a receipt (ADR 0013), or
+    words parked in front of a person on the far side — may only be reported as
+    *may not have*. That is the same rule the four deleted ceiling reports came
+    in proven and unproven pairs for, kept in one sentence instead of four
+    (`core/relays.py::RelayReason`).
+
+    The reason travels as its code rather than as a phrase per code: it is the
+    receipt's own word, the same one `status` and the CLI print, and the Voice
+    composes the sentence the user hears from it (#173 §6).
+    """
+    if undelivered is None:
+        return ""
+    arrival = "did not arrive" if undelivered.proven_not_to_have_arrived else "may not have arrived"
+    return f"your last reply {arrival}, because {undelivered.reason}"
 
 
 def _when(last_activity_at: datetime | None) -> str:

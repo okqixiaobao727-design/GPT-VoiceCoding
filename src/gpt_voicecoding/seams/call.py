@@ -192,14 +192,13 @@ class SpokenBrief:
     to the Voice by `name`. Every field is a string Briefing has already worded,
     so the adapter assembles and never phrases (see the module docstring).
 
-    **There is no `undelivered` field.** #194's body listed one, and `CONTEXT.md`'s
-    *Session Brief* promises it — "when the user's last reply to it never
-    arrived, that it did not and why". Nothing in Core carries that fact onto a
-    brief today: `core/briefing.py::SessionBrief` has no such field and the
-    undelivered Relay queue is never read into one (the run's landed-facts note
-    on #194). A field fed by nothing would read as an answered question, so it is
-    absent here rather than blank. Reconciled and not forgotten: the ticket that
-    gives the glossary's sentence a source adds it in both places at once.
+    **`undelivered` is `CONTEXT.md`'s *Session Brief* promise, sourced** — "when
+    the user's last reply to it never arrived, that it did not and why". It is
+    the empty string when nothing is undelivered, which is the ordinary case and
+    reads as one: an adapter writes no line for it. Its verb is Briefing's, not
+    this seam's, because an attempt that proved nothing either way may not be
+    said to have failed (`core/relays.py::RelayReason`); the whole sentence
+    arrives here already worded, like every other field.
     """
 
     name: str
@@ -209,6 +208,9 @@ class SpokenBrief:
     decision: tuple[str, ...]
     answerable_here: str
     last_activity_at: str
+    #: Why the user's last reply to this Session never arrived, in Briefing's
+    #: words — empty when nothing is undelivered.
+    undelivered: str = ""
 
     def __post_init__(self) -> None:
         if not self.state.strip():
@@ -223,6 +225,7 @@ class SpokenBrief:
             self.newest,
             self.answerable_here,
             self.last_activity_at,
+            self.undelivered,
             *self.decision,
         )
 

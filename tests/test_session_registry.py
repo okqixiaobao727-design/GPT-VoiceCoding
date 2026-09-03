@@ -20,7 +20,8 @@ from gpt_voicecoding.core.errors import (
     StaleSessionError,
     UnknownSessionError,
 )
-from gpt_voicecoding.core.sessions import Session, SessionRegistry
+from gpt_voicecoding.core.lifecycle import RelayReason
+from gpt_voicecoding.core.sessions import Session, SessionRegistry, UndeliveredRelay
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
@@ -456,6 +457,38 @@ class TestTheFocusSession:
         )
 
         assert registry.focus is None
+
+    def test_an_undelivered_relay_does_not_follow_a_new_thread_either(self) -> None:
+        """#197, on #77's edge: the words that never landed were for the thread that has gone."""
+        registry = SessionRegistry()
+        held = SessionTarget(agent=AgentKind.CODEX, session_id="abc", pid=6548)
+        registry.register(Session(target=held, workspace=WORKSPACE, first_seen=1_000.0))
+        registry.set_undelivered(held, UndeliveredRelay(reason=RelayReason.CEILING_PASSED))
+
+        fresh = registry.observed_one(
+            SessionInspection(
+                target=SessionTarget(agent=AgentKind.CODEX, session_id="def", pid=6548),
+                workspace=WORKSPACE,
+            ),
+            now=2_000.0,
+        )
+
+        assert fresh.undelivered is None
+
+    def test_it_does_follow_a_row_that_merely_gained_its_thread_id(self) -> None:
+        """The same Session gaining the id it had none of (#73) keeps its own news."""
+        registry = SessionRegistry()
+        anonymous = SessionTarget(agent=AgentKind.CODEX, pid=6548)
+        registry.register(Session(target=anonymous, workspace=WORKSPACE, first_seen=1_000.0))
+        undelivered = UndeliveredRelay(reason=RelayReason.CEILING_PASSED)
+        registry.set_undelivered(anonymous, undelivered)
+
+        named = SessionTarget(agent=AgentKind.CODEX, session_id="abc", pid=6548)
+        fresh = registry.observed_one(
+            SessionInspection(target=named, workspace=WORKSPACE), now=2_000.0
+        )
+
+        assert fresh.undelivered == undelivered
 
     def test_the_focus_follows_a_codex_row_that_gains_its_thread_id(self) -> None:
         """A better-known identity is the same Session, and nothing ended (#73)."""
