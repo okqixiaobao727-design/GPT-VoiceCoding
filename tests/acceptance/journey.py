@@ -2692,12 +2692,18 @@ class Walk:
           engine's own `CEILING_END_LINE`, on this lane's own configured ceiling;
         * **a wake inside the Cool-down does not dial again, and is paid when it
           elapses.** Voice off and straight back on is one more `wake` (#195) and
-          the only one this harness can place inside a thirty-second window with
-          certainty: an agent turn takes an unpredictable share of it, so a
-          second Stop would grade a race rather than the rule. What the engine
-          writes down is the rule itself — one dial owed, then one dial paid from
-          a fresh reading — and the absence graded beside it is that no call came
-          up in between.
+          the only one this harness can place inside a thirty-second window: an
+          agent turn takes an unpredictable share of it, so a second Stop would
+          grade a race rather than the rule. What the engine writes down is the
+          rule itself — one dial owed, then one dial paid from a fresh reading —
+          and the absence graded beside it is that no call came up in between.
+
+          **The window is read, never assumed.** `bridgectl status` reports the
+          Cool-down still to run, so the step flips against a number the engine
+          published and says so when it arrived too late to prove anything — run
+          `20260903T050619Z` reached the wake thirty-six seconds after the
+          release, and a step that assumed the window was open graded a correct
+          dial as a violation.
 
         The two phases share the step because they share the sentence the ticket
         wrote: this is `live call` v1, one call's worth longer.
@@ -2734,18 +2740,26 @@ class Walk:
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
             by_ceiling = self._ceiling_ended_the_call(since=mark)
+            # **The wake goes in first, and only while the window is observed
+            # open.** The Cool-down starts when the call is released and runs
+            # thirty seconds; this harness walks two lanes in two threads, each
+            # spending `bridgectl` subprocesses, and run `20260903T050619Z`
+            # reached this point thirty-six seconds after the release — so the
+            # engine dialled, correctly, and the step graded a race it had lost.
+            # `bridgectl status` reports the remaining Cool-down (#195), so the
+            # window is *read* rather than assumed, and the cue check that used
+            # to sit here waits until after the flip.
+            inside = len(self.engine.log_lines())
+            remaining = self._cool_down_remaining()
+            for position in ("off", "on"):
+                answer = self.bridgectl("switch", "voice", position)
+                if not answer.ok:
+                    raise LaneBlocked(f"`switch voice {position}` refused: {answer.text}")
             ended_cue = support.wait_for(
                 lambda: bool(self._cue_lines(Cue.ENDED, since=mark)),
                 deadline_seconds=LIVE_CALL_CUE_SECONDS,
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
-            # The Cool-down is running from the moment above. This is the wake
-            # inside it, and it is instant by construction.
-            inside = len(self.engine.log_lines())
-            for position in ("off", "on"):
-                answer = self.bridgectl("switch", "voice", position)
-                if not answer.ok:
-                    raise LaneBlocked(f"`switch voice {position}` refused: {answer.text}")
             owed = support.wait_for(
                 lambda: bool(
                     support.matching_lines(self._log_since(inside), COOL_DOWN_OWED_PATTERN)
@@ -2753,6 +2767,9 @@ class Walk:
                 deadline_seconds=LIVE_CALL_CUE_SECONDS,
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
+            # Read the moment the engine has answered, and before the window can
+            # close: a hand-over line found after the Cool-down elapsed is the
+            # owed dial being *paid*, which is the next thing this step grades.
             dialled_inside = bool(support.matching_lines(self._log_since(inside), HAND_OVER_LINE))
             paid = support.wait_for(
                 lambda: bool(
@@ -2767,10 +2784,11 @@ class Walk:
         hand_over = support.matching_lines(self._log_since(mark), HAND_OVER_LINE)
         self.journey.observe(
             "live call v1 keeper",
-            f"ceiling {ceiling:.0f}s, cool-down {cool_down:.0f}s; {len(hand_over)} dial(s) in "
-            f"the whole phase, the first {hand_over[0].strip() if hand_over else 'never made'}; "
-            f"cues {self._cue_order(since=mark)}; ended by the ceiling: {by_ceiling}; a wake "
-            f"inside the Cool-down was owed: {owed}, paid: {paid}",
+            f"ceiling {ceiling:.0f}s, cool-down {cool_down:.0f}s with {remaining:.0f}s still to "
+            f"run when the wake went in; {len(hand_over)} dial(s) in the whole phase, the first "
+            f"{hand_over[0].strip() if hand_over else 'never made'}; cues "
+            f"{self._cue_order(since=mark)}; ended by the ceiling: {by_ceiling}; the wake was "
+            f"owed: {owed}, paid: {paid}",
         )
         if not opened:
             raise StepFailed(
@@ -2810,18 +2828,29 @@ class Walk:
                 f"{LIVE_CALL_CUE_SECONDS:.0f}s. The user hears a call end however it ended "
                 f"(#186), and the Keeper is what rings it now (#195)"
             )
+        if remaining <= 0:
+            raise StepFailed(
+                f"the call ended and this step did not reach the wake before the "
+                f"{cool_down:.0f}s Cool-down had elapsed — `bridgectl status` already read "
+                f"`call: none` with no Cool-down on it. Nothing is proven either way: a wake "
+                f"outside the window is one the engine is free to dial on, which is what the "
+                f"window is for. This is the harness losing a race, not the Keeper breaking a "
+                f"rule"
+            )
         if dialled_inside:
             raise StepFailed(
-                f"a wake arrived inside the {cool_down:.0f}s Cool-down and the engine dialled "
-                f"anyway: {support.matching_lines(self._log_since(inside), HAND_OVER_LINE)!r}. "
-                f"After any end of a call the system does not dial again until the Cool-down "
-                f"has elapsed (`CONTEXT.md`, *Cool-down*)"
+                f"a wake arrived with {remaining:.0f}s of the {cool_down:.0f}s Cool-down still "
+                f"to run and the engine dialled anyway: "
+                f"{support.matching_lines(self._log_since(inside), HAND_OVER_LINE)!r}. After "
+                f"any end of a call the system does not dial again until the Cool-down has "
+                f"elapsed (`CONTEXT.md`, *Cool-down*)"
             )
         if not owed:
             raise StepFailed(
-                f"Voice came back on inside the Cool-down and the engine neither dialled nor "
-                f"said it owed a dial. One event buys one attempt, and an event inside a "
-                f"Cool-down marks it owed. Engine log tail: {self._log_since(inside)[-8:]}"
+                f"Voice came back on with {remaining:.0f}s of Cool-down still to run and the "
+                f"engine neither dialled nor said it owed a dial. One event buys one attempt, "
+                f"and an event inside a Cool-down marks it owed. Engine log tail: "
+                f"{self._log_since(inside)[-8:]}"
             )
         if not paid:
             raise StepFailed(
@@ -2842,6 +2871,18 @@ class Walk:
             f"played; a wake inside the {cool_down:.0f}s Cool-down dialled nothing and was paid "
             f"exactly once when it elapsed"
         )
+
+    def _cool_down_remaining(self) -> float:
+        """How much Cool-down the engine says is still to run, in its own words.
+
+        Read off `bridgectl status`, which reports it beside `call: none` (#195),
+        rather than timed on this side: the release and this harness's next poll
+        are separated by two lanes' worth of subprocesses, and a window measured
+        here would be measuring the harness. Zero when nothing is pending, which
+        is also what a surface with no such line answers.
+        """
+        found = re.search(r"cool-down (\d+(?:\.\d+)?)s", self._call_line())
+        return float(found.group(1)) if found else 0.0
 
     def _cool_down_seconds(self) -> float:
         """The Cool-down this lane's engine is actually running.
