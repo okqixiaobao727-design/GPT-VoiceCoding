@@ -3069,10 +3069,22 @@ class Walk:
             # a later phase grades.
             filled = self._fill_a_history_worth_paging(focus, focus_at, focus_address, turn)
             # **The Stop goes in with Voice still off, and Voice comes on after
-            # it.** Turning Voice on is itself a `wake` (#195), so in this order
-            # the dial cannot land before the Session it is supposed to be about
-            # has stopped. #196's ordering, and its reason.
+            # it has landed.** Turning Voice on is itself a `wake` (#195), so
+            # this order is what keeps the dial from happening before the Session
+            # it is supposed to be about has stopped — #196's ordering, and its
+            # reason.
+            #
+            # **And the landing is waited for, which #196 did not have to do.**
+            # `_drive_extra_session` types and returns; the turn runs on. #196
+            # only asked whether a dial happened, so a wake that beat the Stop
+            # still passed it. This walk grades what the dial *carried*, and runs
+            # `20260903T230…` on both lanes are the difference: the hand-over was
+            # taken mid-turn, so the Voice was handed `READY` from the fill loop's
+            # last turn and codex's own row still said `还在运行中`. What the walk
+            # needs is the roster as it stands *after* the question, so it waits
+            # for the question to be the Session's newest message.
             self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
+            self._await_the_question(focus_at, focus_address, turn)
             live_call.ask_for_nothing(self.config.call_wav_directory)
             mark = len(self.engine.log_lines())
             with self._voice_route_only():
@@ -3193,6 +3205,45 @@ class Walk:
                 f"nothing for `再往前` to page back to"
             ),
         )
+
+    def _await_the_question(self, workspace: Path, address: str, turn_seconds: float) -> str:
+        """Wait until the engine reads that Session as having stopped on the question.
+
+        The precondition every later phase rests on, made true rather than
+        assumed: the dial has to be about a Session that has *finished* asking,
+        because phase 2 grades what the Voice was handed about it and phase 3
+        relays an answer to it.
+
+        **Read as the Session's newest message, not as its roster state.** A row
+        leaves `running` the moment the turn ends, but what the hand-over carries
+        is `newest` (`seams/call.py`), and those are two readings of one turn that
+        land at different times. What this waits for is the one the walk grades.
+        """
+        wanted = _spoken_fragment(ASK_A_QUESTION.words.split(":")[-1].strip())
+        landed = support.wait_for(
+            lambda: (
+                _unspaced(wanted)
+                in _unspaced(
+                    _newest_message(self._brief_of(self._extra_address(workspace, address)))
+                )
+            ),
+            deadline_seconds=turn_seconds,
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        newest = _newest_message(self._brief_of(self._extra_address(workspace, address)))
+        if not landed:
+            raise LaneBlocked(
+                f"{address} was asked to stop on a question and {turn_seconds:.0f}s later the "
+                f"engine still reads its newest message as {newest[:120]!r}, not "
+                f"{wanted!r}. Nothing this walk dials about would be the Session it grades"
+            )
+        self.journal(
+            "extra.session.stopped.on.a.question",
+            lane=self.lane.name,
+            workspace=str(workspace),
+            newest=newest[:200],
+        )
+        return newest
 
     def _the_engine_dials_about_a_session_that_stopped(self, mark: int, cool_down: float) -> str:
         """Phase 1: nobody presses anything, and a call comes up holding a briefing.
@@ -4292,18 +4343,12 @@ class Walk:
         # silently and correctly (`call_keeper.py::nothing_to_speak`).
         owing = len(self.engine.log_lines())
         self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
-        # **What the brief will be about**, read after the Stop lands and before
-        # the word is paid: the announcement is spoken from a reading taken at
-        # the gap (ADR 0017), so what the user hears has to be *this* Stop's
-        # newest message and not the one the call was dialled on.
-        stopped_on = support.wait_for(
-            lambda: bool(
-                _newest_message(self._brief_of(self._extra_address(focus_at, focus_address)))
-            ),
-            deadline_seconds=turn,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
-        )
-        fresh = _newest_message(self._brief_of(self._extra_address(focus_at, focus_address)))
+        # **What the brief will be about**, waited for rather than read once: the
+        # announcement is spoken from a reading taken at the gap (ADR 0017), so
+        # what the user hears has to be *this* Stop's newest message. A read
+        # taken before the turn ended would be the answer the relay drove, and
+        # the comparison would pass on a stale announcement.
+        fresh = self._await_the_question(focus_at, focus_address, turn)
         announced = support.wait_for(
             lambda: bool(support.matching_lines(self._log_since(owing), MID_CALL_SPOKEN_PATTERN)),
             deadline_seconds=turn + cool_down + settle + LIVE_CALL_CUE_SECONDS,
@@ -4367,12 +4412,6 @@ class Walk:
         # Session; what the Voice made of it is the transcript. A run where the
         # word was paid and the Voice said something stale or about something
         # else would pass every line above.
-        if not stopped_on:
-            raise LaneBlocked(
-                f"{focus_address} stopped again and `bridgectl brief` carried no `newest` "
-                f"line within {turn:.0f}s, so there is nothing for the announcement to be "
-                f"compared against"
-            )
         if not self._voice_said_something_carrying(_spoken_fragment(fresh), since=owing):
             raise StepFailed(
                 f"the engine spoke the Focus Session's brief into the call "
