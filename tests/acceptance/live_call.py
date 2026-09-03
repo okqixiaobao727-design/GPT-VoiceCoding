@@ -13,8 +13,8 @@ this fills, and `realtime_call`'s `transport_factory` parameter
 
 ## Ported, not invented (ADR 0010, #183)
 
-Every audio decision here is **ported** from the local probe
-`scripts/realtime_text_entry_probe.py` (untracked, main checkout), which is the
+Every audio decision here is **ported** from the probe
+`scripts/realtime_text_entry_probe.py`, which is the
 reference implementation: #181 ran it and found synthesised speech on the media
 track reaching the Call Agent 3/3 with no device opened.
 
