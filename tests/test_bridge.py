@@ -2576,3 +2576,102 @@ class TestEveryNoticeNamesTheSessionItIsAbout:
 
         (announcement,) = hub.channel.sent
         assert "  permission: Bash — push the branch" in announcement
+
+
+class TestMidCallNewsThroughTheWholeHub:
+    """#196, end to end: the Focus Session is spoken to, the rest rings.
+
+    The Keeper's own tests prove the timing on a fake Briefer. What is proved
+    here is the half only a hub has: that the Focus Session's brief the Keeper
+    speaks is the one `RosterBriefer` reads off the roster at that instant, and
+    that a Session which is not the Focus one earns the EVENT cue and no words.
+    """
+
+    OTHER = SessionTarget(agent=AgentKind.CLAUDE, session_id="def", pid=100)
+
+    def hub_on_a_call(self, **kwargs: object) -> Hub:
+        hub = Hub(  # type: ignore[arg-type]
+            sessions=((CODEX, "port the log"), (self.OTHER, "the other one")),
+            **kwargs,
+        )
+        hub.toggle()
+        hub.state.sessions.set_focus(CODEX)
+        return hub
+
+    def gap(self, hub: Hub) -> None:
+        hub.now += 5.0
+        hub.tick()
+
+    def test_the_focus_session_is_spoken_about_in_the_first_gap(self) -> None:
+        hub = self.hub_on_a_call()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+        assert hub.call.spoken == [], "the settle window had not run out"
+
+        self.gap(hub)
+
+        (spoken,) = hub.call.spoken
+        assert "port the log" in spoken.name
+        assert "Which base?" in " ".join(spoken.decision)
+        assert hub.call.calls_started == 1, "mid-call news never dials a second call"
+
+    def test_the_brief_spoken_is_the_reading_taken_at_the_gap(self) -> None:
+        """ADR 0017 mid-call: the Session answered in between is not announced."""
+        hub = self.hub_on_a_call()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+        hub.agent.discovery = LaneDiscovery(
+            rows=(
+                SessionInspection(
+                    target=CODEX,
+                    workspace=Path("/tmp/workspace"),
+                    state=SessionState.RUNNING,
+                ),
+            )
+        )
+        asyncio.run(hub.core.discover())
+        self.gap(hub)
+
+        assert hub.call.spoken == []
+
+    def test_another_session_rings_and_is_not_spoken_about(self) -> None:
+        hub = self.hub_on_a_call()
+
+        hub.emit(SessionStopped(target=self.OTHER))
+        self.gap(hub)
+
+        assert hub.call.spoken == []
+        assert hub.call.cues.count(Cue.EVENT) == 1
+
+    def test_the_focus_session_ending_clears_what_was_owed_to_it(self) -> None:
+        """#196's last test: a word owed to a Session that has gone is owed to nobody.
+
+        Cleared by the *reading* and not by a second entry on the Keeper: the
+        row is gone, so `focus_brief` answers `None` at the gap and the flag goes
+        with the answer. ADR 0017 all the way down — the Keeper holds no target,
+        it asks who the Focus Session is at the moment of sounding.
+        """
+        hub = self.hub_on_a_call()
+
+        hub.emit(
+            SessionStopped(
+                target=CODEX,
+                waiting_for=WaitingFor(kind=WaitingKind.QUESTION, prompt="Which base?"),
+            )
+        )
+        hub.agent.discovery = LaneDiscovery(rows=())
+        asyncio.run(hub.core.discover())
+        self.gap(hub)
+
+        assert hub.call.spoken == []
+        assert hub.call.calls_started == 1

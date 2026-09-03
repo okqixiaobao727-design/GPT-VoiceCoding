@@ -806,6 +806,10 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
         harness_live_call=any(
             step in arrangement.selection.steps for step in journey_module.LIVE_CALL_STEPS
         ),
+        # #196: what this lane's two extra Sessions' workspaces are called. The
+        # harness's Call adapter says the first out loud and the step creates
+        # both directories, so the name travels as one value from here.
+        call_workspaces=lane.call_workspaces,
     )
     engine = support.Engine(
         config=config,

@@ -73,6 +73,25 @@ def source(clock: Clock) -> live_call.WavTrackSource:
     return live_call.WavTrackSource(clock=clock.monotonic, sleep=clock.sleep)
 
 
+class FakeRealTransport:
+    """The half of the production transport `HarnessCallTransport` delegates to.
+
+    Only `is_connected` matters to the playlist: everything the frame source does
+    is decided by whether the peer connection is up and how long it has been.
+    """
+
+    def __init__(self) -> None:
+        self.is_connected = True
+        self._microphone = FakeMicrophone()
+
+
+class FakeMicrophone:
+    """The one method the harness reaches past the transport's surface to shadow."""
+
+    async def _next(self, track: object) -> bytes:  # pragma: no cover - replaced at once
+        return live_call.SILENT_FRAME
+
+
 # --- framing ----------------------------------------------------------------
 
 
@@ -442,3 +461,192 @@ def test_a_surface_that_answered_something_else_entirely_is_not_read_as_down() -
     """`_call_line` falls back to the head of whatever `status` printed when no
     `call:` line is in it — a refusal must not read as a quiet keeper."""
     assert journey._no_call_is_up("engine unreachable") is False
+
+
+# --- the playlist, and the second utterance on a call that is up (#196) -------
+
+
+def playlist_settings(tmp_path: Path) -> live_call.HarnessSettings:
+    return live_call.HarnessSettings(
+        observations=tmp_path / "observations.jsonl", wav_directory=tmp_path
+    )
+
+
+def test_a_source_is_idle_only_while_it_has_nothing_left_to_say() -> None:
+    clock = Clock()
+    queued = source(clock)
+    assert queued.idle
+
+    queued.enqueue(live_call.framed(b"\x01\x02" * live_call.FRAME_SAMPLES))
+    assert not queued.idle
+
+    asyncio.run(queued.next(FakeTrack()))
+    assert queued.idle
+
+
+class TransportUnderTest:
+    """One `HarnessCallTransport` with the real WebRTC half stubbed out."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.clock = Clock()
+        monkeypatch.setattr(live_call, "webrtc_transport", lambda **_: FakeRealTransport())
+        self.settings = playlist_settings(tmp_path)
+        # Three frames, so an utterance is still going out on the turn after the
+        # one that queued it — which is the state `idle` exists to describe.
+        sentence = live_call.framed(b"\x01\x02" * live_call.FRAME_SAMPLES * 3)
+        self.transport = live_call.HarnessCallTransport(
+            settings=self.settings,
+            observations=live_call.Observations(self.settings.observations),
+            utterances={
+                live_call.PLAIN: list(sentence),
+                live_call.NEEDS: list(sentence),
+                live_call.LONG: list(sentence),
+                live_call.RELAY: list(sentence),
+            },
+            clock=self.clock.monotonic,
+        )
+        self.track = FakeTrack()
+
+    def frame(self, *, after: float = 0.0) -> None:
+        """One 20 ms turn of the audio loop, `after` seconds later."""
+        self.clock.now += after
+        asyncio.run(self.transport._next(self.track))
+
+    def drain(self) -> None:
+        """Turn the loop until the track is carrying silence again."""
+        for _ in range(16):
+            if self.transport._source.idle:
+                return
+            self.frame()
+        raise AssertionError("the utterance never finished going out")
+
+    @property
+    def played(self) -> list[str]:
+        seen = live_call.observed(self.settings.observations)
+        return [
+            str(entry["variant"])
+            for entry in seen.entries
+            if entry["what"] == "wav utterance on the track"
+        ]
+
+
+def test_nothing_goes_out_before_the_settle_window_has_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_call.ask_for(tmp_path, live_call.NEEDS)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS - 1.0)
+
+    assert under.played == []
+
+
+def test_the_first_queued_utterance_goes_out_once_the_call_has_settled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_call.ask_for(tmp_path, live_call.NEEDS)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS)
+
+    assert under.played == [live_call.NEEDS]
+
+
+def test_a_line_appended_while_the_call_is_up_is_spoken_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v2's whole mechanism: the step says "and then say this", mid-call (#196)."""
+    live_call.ask_for(tmp_path, live_call.NEEDS)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS)
+    under.drain()
+
+    live_call.ask_next(tmp_path, live_call.PLAIN)
+    under.frame(after=live_call.PLAYLIST_POLL_SECONDS)
+
+    assert under.played == [live_call.NEEDS, live_call.PLAIN]
+
+
+def test_a_queued_utterance_never_goes_out_over_the_one_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wire truncates an utterance a second one is appended to (#175)."""
+    live_call.ask_for(tmp_path, live_call.NEEDS)
+    live_call.ask_next(tmp_path, live_call.PLAIN)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS)
+    under.frame(after=live_call.PLAYLIST_POLL_SECONDS)
+
+    assert under.played == [live_call.NEEDS], "the first utterance was still going out"
+
+
+def test_the_playlist_is_not_read_on_every_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fifty stats a second is disk work in the one loop that may not fall behind."""
+    live_call.ask_for(tmp_path, live_call.NEEDS)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS)
+    under.drain()
+
+    live_call.ask_next(tmp_path, live_call.PLAIN)
+    under.frame(after=0.02)
+
+    assert under.played == [live_call.NEEDS]
+
+
+def test_a_call_asked_for_nothing_puts_nothing_on_the_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_call.ask_for_nothing(tmp_path)
+    under = TransportUnderTest(tmp_path, monkeypatch)
+
+    under.frame()
+    under.frame(after=live_call.SETTLE_SECONDS)
+    under.frame(after=live_call.PLAYLIST_POLL_SECONDS)
+
+    assert under.played == []
+
+    live_call.ask_next(tmp_path, live_call.RELAY)
+    under.frame(after=live_call.PLAYLIST_POLL_SECONDS)
+
+    assert under.played == [live_call.RELAY]
+
+
+# --- was the brief spoken into a gap? (#196) ---------------------------------
+
+
+SPOKEN = (
+    "2026-09-03 20:45:13,115 INFO gpt_voicecoding.core.call_keeper: spoke the Focus "
+    "Session's brief into the gap in the Live Call: 二号工位 · Reply READY"
+)
+STARTED = f"2026-09-03 20:45:00,000 INFO gpt_voicecoding.core.bridge: {journey.VOICE_SPEAKING_LINE}"
+STOPPED = f"2026-09-03 20:45:10,000 INFO gpt_voicecoding.core.bridge: {journey.VOICE_QUIET_LINE}"
+
+
+def test_an_announcement_after_the_voice_closed_its_span_was_spoken_into_a_gap() -> None:
+    assert journey._announced_after_the_voice_fell_silent([STARTED, STOPPED, SPOKEN])
+
+
+def test_an_announcement_over_an_open_span_was_not() -> None:
+    """The wire truncates an utterance a second one is appended to (#175)."""
+    assert not journey._announced_after_the_voice_fell_silent([STARTED, STOPPED, STARTED, SPOKEN])
+
+
+def test_a_voice_that_never_spoke_on_this_call_is_a_gap_of_its_own() -> None:
+    assert journey._announced_after_the_voice_fell_silent([SPOKEN])
+
+
+def test_an_edge_after_the_announcement_is_not_read_back_onto_it() -> None:
+    """The announcement makes the Voice speak; that span is its own consequence."""
+    assert journey._announced_after_the_voice_fell_silent([STOPPED, SPOKEN, STARTED])
+
+
+def test_no_announcement_at_all_is_not_this_rules_complaint() -> None:
+    assert journey._announced_after_the_voice_fell_silent([STARTED])

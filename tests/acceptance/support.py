@@ -389,6 +389,11 @@ CALL_SETTINGS_KEY = "call"
 #: `PYTHONPATH`.
 HARNESS_CALL_REFERENCE = live_call.REFERENCE
 
+#: The workspace names a run that names none gets — the harness's own defaults,
+#: so a caller that does not care about `live call` v2's pinning still writes a
+#: complete table. A lane says its own (`journey.Lane`).
+DEFAULT_CALL_WORKSPACES = (live_call.FOCUS_WORKSPACE_NAME, live_call.RINGING_WORKSPACE_NAME)
+
 
 @dataclass(frozen=True)
 class DerivedConfig:
@@ -409,6 +414,11 @@ class DerivedConfig:
     cli_wrapper: Path | None = None
     #: Where that wrapper logs the runs the Call Agent made.
     cli_wrapper_log: Path | None = None
+    #: What this lane's two extra Sessions' workspaces are called (#196). The
+    #: step creates the directories and the harness's Call adapter says the
+    #: first of them out loud, so both halves read this one value.
+    call_focus_workspace: str | None = None
+    call_ringing_workspace: str | None = None
 
 
 def derive_config(
@@ -422,6 +432,7 @@ def derive_config(
     codex_socket_directory: Path | None = None,
     dropped_agents: tuple[AgentKind, ...] = (),
     harness_live_call: bool = False,
+    call_workspaces: tuple[str, str] | None = None,
     control_plane_cli: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
@@ -549,14 +560,26 @@ def derive_config(
         settings[CODEX_SETTINGS_KEY] = codex
 
     observations = wav_directory = wrapper = wrapper_log = None
+    focus_workspace = ringing_workspace = None
     if harness_live_call:
         observations = run_directory / "live-call.jsonl"
         wav_directory = run_directory / "live-call-wav"
+        # **The two extra Sessions' workspace names are per lane, and they come
+        # from here** (#196). The project half of a Session Name is the workspace
+        # directory's basename, and `live call` v2 says one of those names out
+        # loud to pin the Session a relay must land in — so a name shared by two
+        # lanes stops pinning anything. It has to: the Codex daemon is
+        # machine-wide, so the Claude lane's engine holds the Codex lane's
+        # Sessions too, and run `20260903T093813Z` had it looking at two rows
+        # called `二号工位 · Reply READY` and answering with `brief`.
+        focus_workspace, ringing_workspace = call_workspaces or DEFAULT_CALL_WORKSPACES
         adapters["call"] = HARNESS_CALL_REFERENCE
         settings[CALL_SETTINGS_KEY] = {
             **settings.get(CALL_SETTINGS_KEY, {}),
             "observations": str(observations),
             "wav_directory": str(wav_directory),
+            "focus_workspace": focus_workspace,
+            "ringing_workspace": ringing_workspace,
         }
         wrapper_log = run_directory / "bridgectl-runs.log"
         wrapper = write_cli_wrapper(
@@ -584,6 +607,8 @@ def derive_config(
         call_wav_directory=wav_directory,
         cli_wrapper=wrapper,
         cli_wrapper_log=wrapper_log,
+        call_focus_workspace=focus_workspace,
+        call_ringing_workspace=ringing_workspace,
     )
 
 
@@ -1296,7 +1321,17 @@ def workspace_path(run_directory: Path, lane: str) -> Path:
 
 def fresh_workspace(run_directory: Path, lane: str, path_value: str) -> Path:
     """A disposable `git init` directory, one per lane, kept with the run."""
-    workspace = workspace_path(run_directory, lane)
+    return workspace_at(workspace_path(run_directory, lane), path_value)
+
+
+def workspace_at(workspace: Path, path_value: str) -> Path:
+    """One disposable `git init` directory, at a path the caller chose.
+
+    Split out of `fresh_workspace` because one caller needs to choose the
+    *basename*: the project half of a Session Name is the workspace directory's
+    name (`adapters/agent/_project.py`), so a step that has to say a Session's
+    name out loud has to pick the directory it is named for (#196).
+    """
     workspace.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "init", "--quiet", str(workspace)],

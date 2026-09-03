@@ -33,6 +33,7 @@ from gpt_voicecoding.core.call_keeper import (
     Ending,
     Permits,
     Sounding,
+    Speaking,
 )
 from gpt_voicecoding.core.errors import CallInstructionsMissing
 from gpt_voicecoding.core.policy import CorePolicy
@@ -66,6 +67,19 @@ WAITING = SpokenBrief(
     last_activity_at="a moment ago",
 )
 
+#: What the Focus Session's own brief reads as, mid-call. A different Session
+#: from `WAITING`, so a test can tell the brief a call was *dialled* on from the
+#: one spoken into a call that was already up.
+FOCUS = SpokenBrief(
+    name="repo · the focus session",
+    agent="codex",
+    state="waiting for a decision",
+    newest="which branch?",
+    decision=("this one",),
+    answerable_here="from here",
+    last_activity_at="a moment ago",
+)
+
 #: What a system-dialled call's hand-over looks like in these tests: the reason
 #: the Briefer's production adapter puts first, and one Session Brief behind it.
 NEEDS_THE_USER: tuple[HandoverItem, ...] = (DialReason(text="Sessions need the user."), WAITING)
@@ -74,15 +88,31 @@ NEEDS_THE_USER: tuple[HandoverItem, ...] = (DialReason(text="Sessions need the u
 class FakeBriefer:
     """Who needs the user, as one answer a test sets and counts the readings of."""
 
-    def __init__(self, answer: tuple[HandoverItem, ...] | None = NEEDS_THE_USER) -> None:
+    def __init__(
+        self,
+        answer: tuple[HandoverItem, ...] | None = NEEDS_THE_USER,
+        *,
+        focus: SpokenBrief | None = FOCUS,
+    ) -> None:
         self.answer = answer
+        #: What the Focus Session's own brief reads as *right now*. A test that
+        #: proves the fresh reading (#196) changes this between the event and
+        #: the gap, exactly as a Session answered at the terminal would.
+        self.focus = focus
         #: How many times the Keeper actually asked. ADR 0017 is a claim about
         #: *when* this is read, so a test that proves freshness counts it.
         self.readings = 0
+        #: The same count for the mid-call verb, which is read at the moment of
+        #: sounding and never at the moment of the event.
+        self.focus_readings = 0
 
     def handover(self) -> tuple[HandoverItem, ...] | None:
         self.readings += 1
         return self.answer
+
+    def focus_brief(self) -> SpokenBrief | None:
+        self.focus_readings += 1
+        return self.focus
 
 
 class Keeper:
@@ -543,11 +573,10 @@ class TestWhatTheUserHearsAtEachEndOfACall:
         keeper.hear(CallEnded(call_id="a-call-nobody-here-held"))
         assert keeper.call.cues == [Cue.ENDED]
 
-    def test_the_mid_call_cue_has_no_caller_yet(self) -> None:
-        """`Cue.EVENT` ships for #196 and is rung by nothing in this ticket."""
+    def test_speech_on_a_quiet_call_rings_nothing_by_itself(self) -> None:
+        """The cue marks news, not talking: #196 rings it from `wake` and nowhere else."""
         keeper = Keeper()
         keeper.up()
-        keeper.wake()
         keeper.hear(UserSpeech(text="hello"), VoiceSpeech(speaking=True))
         assert Cue.EVENT not in keeper.call.cues
 
@@ -560,6 +589,213 @@ class TestWhatTheUserHearsAtEachEndOfACall:
         keeper.up()
         keeper.hear(CallEnded(call_id="call-1"))
         assert keeper.status.cool_down_remaining == COOL_DOWN  # type: ignore[attr-defined]
+
+
+class TestMidCallNewsSpeaksInTheGapAndRingsForTheRest:
+    """#196: while a call is up, the Focus Session is spoken and the rest rings.
+
+    The wire has no silent mid-call path (#175) — a second append truncates the
+    utterance in flight — so every announcement waits for a gap on both sides
+    and for one interval since the last mid-call sound. Both facts are timing,
+    and both are proved here on the fake clock rather than against a call.
+    """
+
+    def in_a_call(self, **kwargs: object) -> Keeper:
+        """A Keeper holding a call the events below arrive during.
+
+        Opened through the Live Toggle rather than by handing the machine a
+        `CallStarted`, because the adapter has to be holding a call too: a
+        `speak` into an adapter whose own call is down is refused there, which is
+        exactly the fake being honest (`tests/fakes.py::FakeCall.speak`).
+        """
+        keeper = Keeper(**kwargs)  # type: ignore[arg-type]
+        keeper.toggle()
+        return keeper
+
+    def gap(self, keeper: Keeper) -> None:
+        """Let the settle window run out on a call where nobody is speaking."""
+        keeper.wait(SETTLE)
+
+    # -- the Focus Session, in the gap -------------------------------------
+
+    def test_a_focus_event_says_nothing_while_the_voice_is_still_speaking(self) -> None:
+        keeper = self.in_a_call()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wake(focus=True)
+        keeper.wait(SETTLE * 2)
+        assert keeper.call.spoken == []
+
+    def test_it_speaks_the_fresh_brief_once_the_voice_has_settled(self) -> None:
+        keeper = self.in_a_call()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wake(focus=True)
+        keeper.wait(1.0)
+        keeper.hear(VoiceSpeech(speaking=False))
+        keeper.wait(SETTLE - 1.0)
+        assert keeper.call.spoken == [], "the settle window had not run out"
+        keeper.wait(1.0)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_the_brief_is_read_at_the_moment_of_sounding_and_not_at_the_event(self) -> None:
+        """ADR 0017's rule, mid-call: what is spoken is what stands *now*."""
+        keeper = self.in_a_call()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wake(focus=True)
+        assert keeper.briefer.focus_readings == 0
+        keeper.hear(VoiceSpeech(speaking=False))
+        self.gap(keeper)
+        assert keeper.briefer.focus_readings == 1
+
+    def test_three_focus_events_in_one_utterance_are_one_brief(self) -> None:
+        keeper = self.in_a_call()
+        keeper.hear(VoiceSpeech(speaking=True))
+        for _ in range(3):
+            keeper.wake(focus=True)
+        keeper.hear(VoiceSpeech(speaking=False))
+        self.gap(keeper)
+        keeper.wait(COOL_DOWN)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_a_session_that_no_longer_needs_the_user_is_not_spoken_about(self) -> None:
+        """The flag is cleared by the reading, so nothing is owed afterwards."""
+        keeper = self.in_a_call()
+        keeper.wake(focus=True)
+        keeper.briefer.focus = None
+        self.gap(keeper)
+        assert keeper.call.spoken == []
+        keeper.briefer.focus = FOCUS
+        keeper.wait(COOL_DOWN)
+        assert keeper.call.spoken == [], "the word was owed to a Session that answered itself"
+
+    def test_the_user_speaking_holds_the_word_back_as_the_voice_does(self) -> None:
+        keeper = self.in_a_call()
+        keeper.hear(UserSpeaking(speaking=True))
+        keeper.wake(focus=True)
+        keeper.wait(SETTLE * 2)
+        assert keeper.call.spoken == []
+        keeper.hear(UserSpeaking(speaking=False))
+        self.gap(keeper)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_a_word_owed_waits_indefinitely_rather_than_going_stale(self) -> None:
+        """It cannot go stale: it is composed when it is spoken, not when armed."""
+        keeper = self.in_a_call(auto_hangup=False)
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wake(focus=True)
+        keeper.wait(CEILING * 3)
+        assert keeper.call.spoken == []
+        keeper.hear(VoiceSpeech(speaking=False))
+        self.gap(keeper)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_a_late_transcript_does_not_push_the_gap_out(self) -> None:
+        """The gap is the two speaking states, never `UserSpeech(text)` (#196, #194).
+
+        The finished transcript often lands at hand-off or at teardown, long
+        after the utterance it describes ended. A gap measured from it would be
+        pushed out by news of a pause that was already over.
+        """
+        keeper = self.in_a_call()
+        keeper.hear(UserSpeaking(speaking=True))
+        keeper.wake(focus=True)
+        keeper.now += 1.0
+        keeper.hear(UserSpeaking(speaking=False))
+        keeper.wait(SETTLE - 1.0)
+        keeper.hear(UserSpeech(text="what the user had said a while ago"))
+        keeper.wait(1.0)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_no_word_is_carried_into_the_next_call(self) -> None:
+        """The gap it was waiting for was that call's, and that call is over."""
+        keeper = self.in_a_call()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wake(focus=True)
+        keeper.toggle()
+        keeper.now += COOL_DOWN
+        keeper.toggle()
+        self.gap(keeper)
+        assert keeper.call.spoken == []
+
+    # -- everything else, as one ring --------------------------------------
+
+    def test_an_event_about_another_session_rings_and_says_nothing(self) -> None:
+        keeper = self.in_a_call()
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 1
+        assert keeper.call.spoken == []
+
+    def test_a_second_ring_inside_the_interval_is_folded_into_the_first(self) -> None:
+        keeper = self.in_a_call(auto_hangup=False)
+        keeper.wake(focus=False)
+        keeper.wait(COOL_DOWN - 1.0)
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 1
+        keeper.wait(1.0)
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 2
+
+    def test_the_ring_and_the_spoken_word_share_the_one_interval(self) -> None:
+        """One "last sounded at" for both, so news of any kind is paced together."""
+        keeper = self.in_a_call(auto_hangup=False)
+        keeper.wake(focus=False)
+        keeper.wake(focus=True)
+        keeper.wait(COOL_DOWN - 1.0)
+        assert keeper.call.spoken == [], "the ring had not been an interval ago"
+        keeper.wait(1.0)
+        assert keeper.call.spoken == [FOCUS]
+
+    def test_a_ring_after_a_spoken_word_waits_out_the_same_interval(self) -> None:
+        keeper = self.in_a_call(auto_hangup=False)
+        keeper.wake(focus=True)
+        self.gap(keeper)
+        assert keeper.call.spoken == [FOCUS]
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 0
+        keeper.wait(COOL_DOWN)
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 1
+
+    # -- the switches ------------------------------------------------------
+
+    def test_duty_off_mid_call_neither_rings_nor_announces(self) -> None:
+        """The call stays up and the ceiling still runs; the system is just quiet."""
+        keeper = self.in_a_call(duty=False)
+        keeper.wake(focus=True)
+        keeper.wake(focus=False)
+        self.gap(keeper)
+        assert keeper.call.spoken == []
+        assert keeper.call.cues.count(Cue.EVENT) == 0
+        assert keeper.call.calls_ended == 0
+
+    def test_duty_coming_back_on_is_one_wake_and_one_ring(self) -> None:
+        keeper = self.in_a_call(duty=False)
+        keeper.wake(focus=True)
+        keeper.flip(SwitchName.DUTY, True)
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 1
+        self.gap(keeper)
+        assert keeper.call.spoken == [], "the event that arrived with Duty off was not queued"
+
+    def test_voice_off_mid_call_is_the_same_silence(self) -> None:
+        keeper = self.in_a_call(voice=False)
+        keeper.wake(focus=True)
+        self.gap(keeper)
+        assert keeper.call.spoken == []
+
+    # -- a speak that does not land ----------------------------------------
+
+    def test_a_speak_the_adapter_refuses_is_not_tried_again(self) -> None:
+        """One event buys one attempt (#195), on the voice path as on the dial."""
+
+        class MuteCall(FakeCall):
+            async def speak(self, brief: SpokenBrief, *, request_id: object) -> object:  # type: ignore[override]
+                raise RuntimeError("the wire would not take it")
+
+        keeper = self.in_a_call(call=MuteCall(), auto_hangup=False)
+        keeper.wake(focus=True)
+        self.gap(keeper)
+        keeper.wait(COOL_DOWN * 2)
+        assert keeper.briefer.focus_readings == 1
 
 
 class TestTheStateMachineOnItsOwn:
@@ -590,13 +826,24 @@ class TestTheStateMachineOnItsOwn:
 
     def test_the_ceiling_and_the_cue_are_the_machines_own_answers(self) -> None:
         time = self.machine()
-        assert time.heard(CallStarted(call_id="call-1"), 0.0) == (  # type: ignore[attr-defined]
+        assert time.heard(CallStarted(call_id="call-1"), 0.0, permits()) == (  # type: ignore[attr-defined]
             Sounding(Cue.CONNECTED),
         )
         assert time.tick(CEILING + 1, permits()) == (Ending(ceiling=True),)  # type: ignore[attr-defined]
 
-    def test_the_focus_flag_changes_nothing_in_this_ticket(self) -> None:
-        """It is on the interface from the start because #196 rewrites nothing."""
+    def test_the_focus_flag_decides_nothing_when_no_call_is_up(self) -> None:
+        """With no call, both kinds of event buy the same thing: one dial."""
         for focus in (True, False):
             time = self.machine()
             assert time.wake(0.0, permits(), focus=focus) == (Dialling(),)  # type: ignore[attr-defined]
+
+    def test_a_focus_event_mid_call_becomes_a_word_owed_and_then_a_speaking(self) -> None:
+        time = self.machine()
+        time.heard(CallStarted(call_id="call-1"), 0.0, permits())  # type: ignore[attr-defined]
+        assert time.wake(0.0, permits(), focus=True) == ()  # type: ignore[attr-defined]
+        assert time.tick(SETTLE, permits()) == (Speaking(),)  # type: ignore[attr-defined]
+
+    def test_a_non_focus_event_mid_call_is_the_cue_and_nothing_else(self) -> None:
+        time = self.machine()
+        time.heard(CallStarted(call_id="call-1"), 0.0, permits())  # type: ignore[attr-defined]
+        assert time.wake(0.0, permits(), focus=False) == (Sounding(Cue.EVENT),)  # type: ignore[attr-defined]

@@ -685,8 +685,8 @@ def test_a_wav_directory_nobody_wrote_in_plays_the_request_v0_accepted(
     tmp_path: Path,
 ) -> None:
     """The default is #183's sentence: a step that does not care gets that one."""
-    assert live_call.variant_asked_for(tmp_path, (live_call.PLAIN, live_call.LONG)) == (
-        live_call.PLAIN
+    assert live_call.variants_asked_for(tmp_path, (live_call.PLAIN, live_call.LONG)) == (
+        live_call.PLAIN,
     )
 
 
@@ -694,10 +694,39 @@ def test_the_step_names_the_variant_and_the_harness_reads_it_back(tmp_path: Path
     """The per-call channel, both halves. One engine holds both steps' calls."""
     live_call.ask_for(tmp_path / "wav", live_call.LONG)
     known = (live_call.PLAIN, live_call.LONG)
-    assert live_call.variant_asked_for(tmp_path / "wav", known) == live_call.LONG
+    assert live_call.variants_asked_for(tmp_path / "wav", known) == (live_call.LONG,)
 
     live_call.ask_for(tmp_path / "wav", live_call.PLAIN)
-    assert live_call.variant_asked_for(tmp_path / "wav", known) == live_call.PLAIN
+    assert live_call.variants_asked_for(tmp_path / "wav", known) == (live_call.PLAIN,)
+
+
+def test_a_step_can_queue_a_second_utterance_behind_the_first(tmp_path: Path) -> None:
+    """v2 speaks a relay into a call that is already up, and then waits on it (#196)."""
+    live_call.ask_for(tmp_path / "wav", live_call.NEEDS)
+    live_call.ask_next(tmp_path / "wav", live_call.RELAY)
+
+    known = (live_call.NEEDS, live_call.RELAY)
+    assert live_call.variants_asked_for(tmp_path / "wav", known) == (
+        live_call.NEEDS,
+        live_call.RELAY,
+    )
+
+
+def test_a_call_can_be_asked_to_open_in_silence(tmp_path: Path) -> None:
+    """An empty list is a different answer from no list at all (#196)."""
+    live_call.ask_for_nothing(tmp_path / "wav")
+
+    assert live_call.variants_asked_for(tmp_path / "wav", (live_call.PLAIN,)) == ()
+
+
+def test_the_step_that_dials_replaces_whatever_the_last_call_left(tmp_path: Path) -> None:
+    """ "Whatever the step before had queued" is not a request anybody made."""
+    live_call.ask_for(tmp_path / "wav", live_call.NEEDS)
+    live_call.ask_next(tmp_path / "wav", live_call.RELAY)
+    live_call.ask_for(tmp_path / "wav", live_call.PLAIN)
+
+    known = (live_call.PLAIN, live_call.NEEDS, live_call.RELAY)
+    assert live_call.variants_asked_for(tmp_path / "wav", known) == (live_call.PLAIN,)
 
 
 def test_a_variant_the_harness_cannot_play_is_the_default_rather_than_a_crash(
@@ -706,7 +735,7 @@ def test_a_variant_the_harness_cannot_play_is_the_default_rather_than_a_crash(
     """A call that comes up mute proves nothing; one that speaks #183's words says so."""
     (tmp_path / "wav").mkdir()
     (tmp_path / "wav" / live_call.NEXT_VARIANT_FILE).write_text("whistling\n")
-    assert live_call.variant_asked_for(tmp_path / "wav", (live_call.PLAIN,)) == live_call.PLAIN
+    assert live_call.variants_asked_for(tmp_path / "wav", (live_call.PLAIN,)) == (live_call.PLAIN,)
 
 
 def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
@@ -714,6 +743,54 @@ def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
     settings = live_call.HarnessSettings(
         observations=Path("/tmp/o.jsonl"), wav_directory=Path("/tmp/wav")
     )
-    assert set(settings.requests) == {live_call.PLAIN, live_call.LONG, live_call.NEEDS}
+    assert set(settings.requests) == {
+        live_call.PLAIN,
+        live_call.LONG,
+        live_call.NEEDS,
+        live_call.RELAY,
+    }
     assert settings.requests[live_call.PLAIN] == live_call.REQUEST
     assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST
+
+
+def test_the_relay_utterance_names_the_workspace_the_step_creates() -> None:
+    """One value, said out loud and made on disk — or the Voice names nothing (#196).
+
+    The project half of a Session Name is the workspace directory's basename
+    (`adapters/agent/_project.py`), which is the only half the harness picks. So
+    the sentence and the directory are built from the same string, and this is
+    what stops one of them being renamed alone.
+    """
+    for lane in journey.LANES:
+        focus, _ = lane.call_workspaces
+        assert focus in live_call.relay_request(focus)
+        assert journey.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
+
+
+def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
+    """The Claude lane's engine holds the Codex lane's Sessions (`20260903T093813Z`).
+
+    The Codex daemon is machine-wide, so one engine's roster carries the other
+    lane's rows. A name shared between lanes is two rows the relay utterance
+    cannot tell apart, which is a Call Agent that goes looking and never relays.
+    """
+    spoken = [name for lane in journey.LANES for name in lane.call_workspaces]
+
+    assert len(set(spoken)) == len(spoken), spoken
+
+
+def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> None:
+    """Configured once, per lane, and the sentence follows it (#196)."""
+    settings = live_call.HarnessSettings(
+        observations=Path("/tmp/o.jsonl"),
+        wav_directory=Path("/tmp/wav"),
+        focus_workspace="五号工位",
+        ringing_workspace="六号工位",
+    )
+
+    assert settings.requests[live_call.RELAY] == live_call.relay_request("五号工位")
+
+
+def test_the_relay_utterance_asks_for_no_hang_up() -> None:
+    """This call has to outlive the relay by a whole turn (`LONG_REQUEST`'s reason)."""
+    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
