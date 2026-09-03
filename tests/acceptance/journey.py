@@ -3286,6 +3286,10 @@ class Walk:
             request=live_call.NEEDS_REQUEST,
         )
         narrowing = len(self.engine.log_lines())
+        # **The absence is the narrowing question's**, and the mark is taken
+        # here. See the complaint below for why the general question's runs are
+        # recorded rather than graded.
+        runs_before_narrowing = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         named = self._one_question_the_hand_over_answers(
             variant=live_call.NARROWING,
             heard=LIVE_CALL_NARROWING_HEARD_SUBSTRING,
@@ -3296,11 +3300,15 @@ class Walk:
         # sometimes after the Voice has begun answering — so the answer starting
         # is not the end of the chance for one.
         support.wait_for(
-            lambda: len(support.cli_wrapper_runs(self.config.cli_wrapper_log)) > runs_before,
+            lambda: (
+                len(support.cli_wrapper_runs(self.config.cli_wrapper_log)) > runs_before_narrowing
+            ),
             deadline_seconds=LIVE_CALL_NO_VERB_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
-        runs = support.cli_wrapper_runs(self.config.cli_wrapper_log)[runs_before:]
+        every_run = support.cli_wrapper_runs(self.config.cli_wrapper_log)
+        runs = every_run[runs_before_narrowing:]
+        asked_generally = every_run[runs_before:runs_before_narrowing]
         # **The general answer is the lines between the two marks**, so the
         # narrowed one — which is supposed to carry the name — cannot be read as
         # the general one having carried it.
@@ -3312,12 +3320,20 @@ class Walk:
         ]
         answered_narrowly = self._voice_said_lines(since=narrowing)
         stopped_on = _spoken_fragment(ASK_A_QUESTION.words.split(":")[-1].strip())
+        # What this call came up holding, so the recorded runs can be read
+        # against it: a Call Agent re-reading a roster it was handed ten items of
+        # is the thing #194's instruction rewording was for.
+        opening = support.matching_lines(self._log_since(0), HAND_OVER_LINE)
+        dialled_with = _hand_over_kinds(opening[0]) if opening else []
         self.journey.observe(
             "live call the hand-over answered",
             f"asked generally, the Voice said {answered_generally or 'nothing recorded'}; "
             f"asked to narrow to {focus_name!r} it said "
             f"{answered_narrowly or 'nothing recorded'}; `bridgectl` runs across both: "
-            f"{runs or 'none'}; whether the narrowed answer carried a fragment of what that "
+            f"{runs or 'none'} after the narrowing, {asked_generally or 'none'} for the "
+            f"general question — the second is recorded and not graded, beside the dial's own "
+            f"{len(dialled_with)} hand-over item(s) ({dialled_with}); whether the "
+            f"narrowed answer carried a fragment of what that "
             f"Session stopped on ({stopped_on!r}) — recorded, not graded: "
             f"{self._voice_said_something_carrying(stopped_on, since=narrowing)}",
         )
@@ -3364,13 +3380,21 @@ class Walk:
                 f"`initialItems`. What it said: "
                 f"{answered_narrowly or 'nothing this call recorded'}"
             )
+        # **The narrowing question's absence is graded; the general one's is
+        # recorded.** The narrowed answer is one Session's *whole brief*, which
+        # is unambiguously in `initialItems`, and both lanes answered it with no
+        # verb. The general question's answer is a roster, and on run
+        # `20260903T223601Z` the claude lane re-read it with a bare `brief` five
+        # seconds before answering while the codex lane ran nothing — one
+        # behaviour on two lanes in one run is the realtime model's discretion,
+        # and #181 says a step may not be a coin toss about one.
         if runs:
             raise StepFailed(
-                f"the Voice answered both questions, and the Call Agent ran {len(runs)} "
-                f"`bridgectl` command(s) for two questions with no verb in either: {runs!r}. "
-                f"The whole point of the hand-over is that the answers were already in the "
-                f"call — a hand-off here says the Voice went looking for what it was holding "
-                f"(#194)"
+                f"the user narrowed to one Session and the Call Agent ran {len(runs)} "
+                f"`bridgectl` command(s) for a question with no verb in it: {runs!r}. That "
+                f"Session's whole brief rode `initialItems` — a hand-off here says the Voice "
+                f"went looking for what it was holding (#194), which its own instructions "
+                f"tell it never to do (`core/instructions/voice.py`)"
             )
         return (
             f"asked what needed them the Voice answered with counts and no names; asked to "
