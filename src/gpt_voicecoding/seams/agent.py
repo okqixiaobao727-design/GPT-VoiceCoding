@@ -230,9 +230,9 @@ class WaitingFor:
         still a stop, and reading it as `WAITING` is what makes Briefing say
         *unreadable* rather than a false *running* (#166 B7).
 
-        Read by `SessionRegistry.set_stop_reading` for a registered row and by
-        `bridge.stop_brief` for a Stop whose Session no discovery pass has landed
-        yet (#213). Deliberately not a field on `SessionStopped`: the lanes
+        Read by `SessionRegistry.set_stop_reading` (#213), for the row it holds
+        and for the one it stands in for when no discovery pass has landed yet
+        (#216). Deliberately not a field on `SessionStopped`: the lanes
         observe the wait, and what it implies is this side's rule.
         """
         return SessionState.IDLE if self.kind is WaitingKind.NONE else SessionState.WAITING

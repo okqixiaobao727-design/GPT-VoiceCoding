@@ -84,7 +84,7 @@ def notice_for(one: Session) -> str:
     this module: the harness's mirror has to break when the product's own words
     move, and since #189 those words are `Briefing`'s.
     """
-    return briefing.text(stop_brief(one, one.target, WaitingFor()))
+    return briefing.text(stop_brief(one, WaitingFor()))
 
 
 def row(one: Session) -> dict:
@@ -476,7 +476,6 @@ class TestTheProductsOwnNoticesAreAttributable:
         notice = briefing.text(
             stop_brief(
                 mine,
-                mine.target,
                 WaitingFor(
                     kind=WaitingKind.PERMISSION,
                     tool_name="Write",
