@@ -392,7 +392,7 @@ class SessionRegistry:
         attempt is said out loud rather than swallowed.
         """
         try:
-            self._focus = self._live_row(target).target
+            self._focus = self._held_row(target).target
         except (UnknownSessionError, StaleSessionError):
             _log.info("the user replied to a Session this roster does not hold: %s", target)
 
@@ -675,7 +675,7 @@ class SessionRegistry:
         The Reply Window follows from it and is never set directly — there is
         one field, so there is nothing for a second writer to disagree with.
         """
-        held = self._live_row(target)
+        held = self._held_row(target)
         updated = replace(held, state=state)
         self._sessions[held.target] = updated
         return updated
@@ -756,7 +756,7 @@ class SessionRegistry:
     def _held_or_stood_in_for(self, target: SessionTarget, *, now: float) -> Session:
         """The live row for that identity, or a new one standing in for it (#216).
 
-        Both refusals `_live_row` raises mean the same thing to a Stop — the
+        Both refusals `_held_row` raises mean the same thing to a Stop — the
         roster holds no row for *this* identity — and a Stop is evidence the
         identity is real: unknown is a Session the cadence has not reached yet,
         and stale is a second process under a session id the roster knows (a
@@ -764,7 +764,7 @@ class SessionRegistry:
         created, and the next whole-lane pass reconciles it like any other.
 
         **An ended Session keeps its ended row, and a Stop does not resurrect
-        it.** `_live_row` answers with the row held for that identity whatever
+        it.** `_held_row` answers with the row held for that identity whatever
         its lifecycle, which is what this wants: `mark_ended` recorded that the
         Session is gone, and that is the later fact. The Stop's reading still
         lands on the row — the roster does not lose a reading — but the row
@@ -773,7 +773,7 @@ class SessionRegistry:
         registry inventing a Session out of two events about one.
         """
         try:
-            return self._live_row(target)
+            return self._held_row(target)
         except (UnknownSessionError, StaleSessionError):
             return self.register(stand_in(target, first_seen=now))
 
@@ -785,14 +785,23 @@ class SessionRegistry:
         Relayed into would leave the roster claiming a dead process is running.
         `resolve` guards *addressing*; this records *what happened*.
         """
-        held = self._live_row(target)
+        held = self._held_row(target)
         ended = replace(held, lifecycle=SessionLifecycle.ENDED)
         self._sessions[held.target] = ended
         self._focus_ended(held.target)
         return ended
 
-    def _live_row(self, target: SessionTarget) -> Session:
-        """The held row for that identity, whatever it is — or why there is none."""
+    def _held_row(self, target: SessionTarget) -> Session:
+        """The row held for that identity, whatever it is — or why there is none.
+
+        **Whatever it is includes its lifecycle**: an ended row is still that
+        Session's row and comes back from here, which is what all four callers
+        want — `mark_ended` is idempotent, `set_focus` and `set_stop_reading`
+        write onto the row the roster holds, and `_held_or_stood_in_for` stands
+        a row in only where there is none to hold. It was called `_live_row`
+        until #216, and the name read as a guarantee it never made: `live()` is
+        what filters by lifecycle, and it is the only thing that does.
+        """
         candidates = self._by_session_id(target)
         if not candidates:
             raise UnknownSessionError(target)
