@@ -871,20 +871,27 @@ def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
     assert journey.RELAY_RECEIPT_QUEUED not in said
 
 
-def test_the_relayed_answer_dictates_the_reply_detail_is_graded_on() -> None:
+def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
     """#198 §3a grades the Voice's Detail answer against the Session's `newest`.
 
     The Voice speaks Chinese and `newest` is whatever language that agent chose,
     so a free-form reply makes the criterion a test of which lane answered in
     which language: run `20260903T231626Z` passed on Codex and failed the Claude
-    lane for translating its English `newest` faithfully. The relayed answer
-    therefore dictates the reply, and these are the exclusions that keep the
-    dictated one gradeable.
+    lane for translating its English `newest` faithfully. So the reply is
+    dictated — through the Session's own driving instruction, because run
+    `20260903T233723Z` put it in the spoken payload and both lanes' Call Agents
+    relayed `可以继续` alone. These are the exclusions that keep it gradeable.
     """
-    said = live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
     reply = live_call.DICTATED_REPLY
 
-    assert reply in said
+    assert reply in journey.ASK_A_QUESTION_THEN_SAY.words
+    assert journey.THE_QUESTION_ASKED in journey.ASK_A_QUESTION_THEN_SAY.words
+    # Not the plain turn: phases 4 and 5 re-drive with it and their turn has to
+    # end on the question, not on an answer to the drive itself.
+    assert reply not in journey.ASK_A_QUESTION.words
+    # And not in the payload, which stays the one clause the step follows through
+    # the air, the Call Agent's argv and the Session's next turn.
+    assert reply not in live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
     assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING in reply
     # Neither receipt wording: an echo of the receipt would otherwise pass.
     assert journey.RELAY_RECEIPT_QUEUED not in reply

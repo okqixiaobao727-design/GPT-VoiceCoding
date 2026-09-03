@@ -194,8 +194,10 @@ class CallWorkspaces:
         return iter((self.focus, self.ringing, self.waiting))
 
 
-#: The sentence the relayed answer tells the Session to reply with, and so what
-#: that Session's `newest` is by the time Detail asks about it (#198 §3a).
+#: The sentence the Focus Session is told to answer a relay with, and so what
+#: that Session's `newest` is by the time Detail asks about it (#198 §3a). It
+#: reaches the Session through its own driving instruction
+#: (`journey.ASK_A_QUESTION_THEN_SAY`), not through the relayed payload.
 #:
 #: **Dictated, because a free-form reply is not gradeable.** §3a asks that the
 #: Voice's Detail answer carry a substring of the Session's `newest`. The Voice
@@ -207,6 +209,10 @@ class CallWorkspaces:
 #: correct behaviour on the other. Dictating the reply restores the harness's
 #: own premise, that graded fragments come from lines the walk put there
 #: (`journey._spoken_fragment`).
+#:
+#: Lives here rather than in `journey` because it is spoken Chinese of the same
+#: kind as the utterances around it, and `journey` imports it for the one
+#: instruction that dictates it.
 #:
 #: Chinese, so the Voice reads it out rather than translating it. It spells
 #: neither `收到` nor `已转达` — both are receipt wordings
@@ -225,15 +231,15 @@ def relay_request(focus_workspace: str) -> str:
     receipt (`instructions/voice.py`), and a payload spelling it would make the
     receipt and its echo one string the step could not tell apart.
 
-    `可以继续` stays its first clause: that fragment is the one the step follows
-    through the air, the Call Agent's argv and the Session's own next turn
-    (`journey.LIVE_CALL_ANSWER_SUBSTRING`). What follows it dictates the reply,
-    for `DICTATED_REPLY`'s reasons.
+    **The payload stays one clause**, and `DICTATED_REPLY` is not in it. Run
+    `20260903T233723Z` said the dictation out loud here — `内容是可以继续，并且请
+    它只回复这一句：…` — and both lanes' Call Agents relayed `可以继续` alone,
+    reading the rest as an instruction to themselves. What the walk needs
+    dictated is the *Session's* reply, and the Session is driven by the walk
+    already: `journey.ASK_A_QUESTION_THEN_SAY` carries it, so it does not have to
+    survive the air, the Call Agent's reading and the argv to get there.
     """
-    return (
-        f"请你给{focus_workspace}那个会话回一句话，内容是可以继续，"
-        f"并且请它只回复这一句：{DICTATED_REPLY}"
-    )
+    return f"请你给{focus_workspace}那个会话回一句话，内容是可以继续。"
 
 
 def narrowing_request(focus_workspace: str) -> str:

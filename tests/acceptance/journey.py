@@ -993,10 +993,38 @@ ACKNOWLEDGE = Instruction(
 #: described, because what this turn has to produce is a *final answer* the
 #: promotion gate can read (#188): one interrogative, and no menu or code around
 #: it that would make the reading rest on something other than the question.
+#: The line `ASK_A_QUESTION` dictates, named rather than cut back out of the
+#: sentence that carries it. It is what the walk waits on (`_await_the_question`)
+#: and what phase 2 grades the narrowed answer against, and reading it back out
+#: with a `split(":")` was a parse that held only while the sentence carried one
+#: colon — `ASK_A_QUESTION_THEN_SAY` carries two.
+THE_QUESTION_ASKED = "Should I continue?"
+
 ASK_A_QUESTION = Instruction(
     words=(
-        "Reply with exactly this one line and nothing else: Should I continue? "
-        "Do not use any tools."
+        f"Reply with exactly this one line and nothing else: {THE_QUESTION_ASKED} "
+        f"Do not use any tools."
+    )
+)
+
+#: The same turn, for the one Session phase 3 relays an answer to, plus what to
+#: say when that answer arrives (#198 §3a).
+#:
+#: **The dictation reaches the Session here, not through the relay.** Run
+#: `20260903T233723Z` put it in the spoken payload instead, and both lanes' Call
+#: Agents relayed `可以继续` alone and read the rest as an instruction to
+#: themselves. This way it crosses nothing: the walk drives this Session
+#: directly, and the reply Detail is graded on is a line the walk wrote.
+#:
+#: Only this Session and only this drive. Phases 4 and 5 re-drive with
+#: `ASK_A_QUESTION`, whose turn has to end on the question itself — a standing
+#: "answer the next message with …" would make the *drive* the message it
+#: answered.
+ASK_A_QUESTION_THEN_SAY = Instruction(
+    words=(
+        f"{ASK_A_QUESTION.words} After you have sent that line, if a further message "
+        f"arrives, reply to it with exactly this one line and nothing else: "
+        f"{live_call.DICTATED_REPLY}"
     )
 )
 
@@ -3093,7 +3121,7 @@ class Walk:
             # last turn and codex's own row still said `还在运行中`. What the walk
             # needs is the roster as it stands *after* the question, so it waits
             # for the question to be the Session's newest message.
-            self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
+            self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION_THEN_SAY)
             self._await_the_question(focus_at, focus_address, turn)
             live_call.ask_for_nothing(self.config.call_wav_directory)
             mark = len(self.engine.log_lines())
@@ -3229,7 +3257,7 @@ class Walk:
         is `newest` (`seams/call.py`), and those are two readings of one turn that
         land at different times. What this waits for is the one the walk grades.
         """
-        wanted = _spoken_fragment(ASK_A_QUESTION.words.split(":")[-1].strip())
+        wanted = _spoken_fragment(THE_QUESTION_ASKED)
         landed = support.wait_for(
             lambda: (
                 _unspaced(wanted)
@@ -3436,7 +3464,7 @@ class Walk:
             )
         ]
         answered_narrowly = self._voice_said_lines(since=narrowing)
-        stopped_on = _spoken_fragment(ASK_A_QUESTION.words.split(":")[-1].strip())
+        stopped_on = _spoken_fragment(THE_QUESTION_ASKED)
         # What this call came up holding, so the recorded runs can be read
         # against it: a Call Agent re-reading a roster it was handed ten items of
         # is the thing #194's instruction rewording was for.
