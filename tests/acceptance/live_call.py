@@ -542,6 +542,11 @@ class HarnessCallTransport:
     async def wait_connected(self, timeout_seconds: float) -> None:
         await self._real.wait_connected(timeout_seconds)
 
+    async def playback_drained(self, timeout_seconds: float) -> None:
+        # Delegated whole. The harness replaces the microphone and nothing about
+        # the speaker, so the playout fact is the real transport's own (#195).
+        await self._real.playback_drained(timeout_seconds)
+
     @property
     def is_connected(self) -> bool:
         return self._real.is_connected

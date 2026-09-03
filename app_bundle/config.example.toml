@@ -54,6 +54,13 @@ chat_id   = "000000000"
 # Where the bridge's own threads run. A location, so it defaults to ~.
 # workspace = "~/code"
 
+# How the two speaking spans are derived. Neither is a measurement: the first is
+# how long the user's transcript may go quiet before the utterance is called
+# over, and the second bounds how long the Voice's stop edge waits for your
+# audio path to finish playing.
+# user_quiet_seconds         = 1.5
+# voice_playout_wait_seconds = 180
+
 # --- The external binaries, stated because this is a bundle ------------------
 #
 # The menu-bar shell reads your login shell's PATH and hands it to the engine,
@@ -74,6 +81,8 @@ executable = "/opt/homebrew/bin/codex"
 # Optional; these are the locked defaults.
 # relay_ceiling_seconds   = 600
 # silence_end_seconds     = 60
+# cool_down_seconds       = 30
+# speech_settle_seconds   = 5
 # history_page_entries    = 5
 
 [log]

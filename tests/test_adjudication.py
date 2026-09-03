@@ -35,7 +35,7 @@ class TestTheTwoOutwardQuestions:
 
         assert adjudicator.may_touch_call() is False
         assert adjudicator.may_push() is False
-        assert adjudicator.outlets() == ()
+        assert adjudicator.outlets() == frozenset()
 
     def test_duty_alone_allows_nothing(self) -> None:
         """Duty is permission for the switches beneath it, not an action of its own."""
@@ -49,7 +49,7 @@ class TestTheTwoOutwardQuestions:
 
         assert adjudicator.may_touch_call() is True
         assert adjudicator.may_push() is False
-        assert adjudicator.outlets() == (Outlet.VOICE,)
+        assert adjudicator.outlets() == frozenset({Outlet.VOICE})
 
     def test_message_under_duty_allows_text_and_nothing_else(self) -> None:
         """Messages-only is a supported state, not a degraded one."""
@@ -57,13 +57,13 @@ class TestTheTwoOutwardQuestions:
 
         assert adjudicator.may_push() is True
         assert adjudicator.may_touch_call() is False
-        assert adjudicator.outlets() == (Outlet.MESSAGE,)
+        assert adjudicator.outlets() == frozenset({Outlet.MESSAGE})
 
-    def test_both_under_duty_allow_both_outlets_voice_first(self) -> None:
-        """Order is the escalation preference: speak into the call before pushing."""
+    def test_both_under_duty_allow_both_outlets(self) -> None:
+        """A set and not a sequence: nothing walks the outlets in turn (#195)."""
         adjudicator = SwitchAdjudicator(board(duty=True, voice=True, message=True))
 
-        assert adjudicator.outlets() == (Outlet.VOICE, Outlet.MESSAGE)
+        assert adjudicator.outlets() == frozenset({Outlet.VOICE, Outlet.MESSAGE})
 
     def test_duty_off_silences_both_without_rewriting_either(self) -> None:
         """Flipping Duty back on restores what the user chose, not a default."""
@@ -71,11 +71,11 @@ class TestTheTwoOutwardQuestions:
         adjudicator = SwitchAdjudicator(switches)
         switches.flip(SwitchName.DUTY, False)
 
-        assert adjudicator.outlets() == ()
+        assert adjudicator.outlets() == frozenset()
         assert switches.is_set(SwitchName.VOICE) is True
 
         switches.flip(SwitchName.DUTY, True)
-        assert adjudicator.outlets() == (Outlet.VOICE, Outlet.MESSAGE)
+        assert adjudicator.outlets() == frozenset({Outlet.VOICE, Outlet.MESSAGE})
 
     def test_the_adjudicator_reads_live_state_rather_than_a_copy(self) -> None:
         """Bridge Core's truth is one object; nothing here may snapshot it."""
@@ -109,7 +109,7 @@ class TestTheAutoHangupQuestion:
         """Ending a silent call reaches nobody, so it never joins the outlets."""
         adjudicator = SwitchAdjudicator(board())
 
-        assert adjudicator.outlets() == ()
+        assert adjudicator.outlets() == frozenset()
 
 
 class TestFeatureSwitches:

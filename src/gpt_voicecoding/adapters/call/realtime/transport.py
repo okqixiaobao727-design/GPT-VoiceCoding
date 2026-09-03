@@ -10,8 +10,17 @@ interface that a test can stand in for, and everything else stays testable.
 
 The interface is the minimum the signalling conversation actually needs, in the
 order it needs it: an offer to send, an answer to apply, a connection to wait
-for, a state to grade a `speak` against, and a way to be told the far side went
-away. Anything larger would be inventing a lifecycle framework for one caller.
+for, a state to grade a `speak` against, one fact about playout, and a way to be
+told the far side went away. Anything larger would be inventing a lifecycle
+framework for one caller.
+
+**Why playout is here and not above the Call seam.** `VoiceSpeech(speaking=False)`
+means the Voice's audio has *finished playing* (#195). Only this side knows when
+that is: the jitter prefetch, this transport's own playback buffer and the
+device all sit between the last inbound frame and the last audible sample, and
+none of them is visible above the seam. Publishing the *generating* edge instead
+made every caller that waits for a gap add a settle window of its own, computed
+from numbers it could not see — the shallow shape #184 shipped and #195 closed.
 """
 
 from __future__ import annotations
@@ -53,6 +62,23 @@ class CallTransport(Protocol):
     @property
     def is_connected(self) -> bool:
         """Whether the audio path is up *right now*. What a `speak` is graded on."""
+        ...
+
+    async def playback_drained(self, timeout_seconds: float) -> None:
+        """Return when the last inbound audio frame has finished playing.
+
+        **Returns rather than raises when the time runs out.** The caller is
+        about to publish "the Voice stopped", and a bounded wait that expired is
+        still the best answer anybody has: an edge that never arrives is worse
+        than one that arrives a little early, because the whole point of the
+        edge is that something downstream is waiting for the gap.
+
+        "Drained" is two facts and both are this side's: nothing more has come
+        in for the transport's own quiet bound, and nothing it did come in with
+        is still queued for the device. A silent run has no device and no queue,
+        so the first fact is the whole answer there — which is correct, not a
+        stand-in: there is no speaker to trail.
+        """
         ...
 
     def on_lost(self, handler: LostHandler) -> None:

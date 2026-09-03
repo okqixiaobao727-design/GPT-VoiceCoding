@@ -232,7 +232,7 @@ def terminal_line(outcome: RelayOutcome) -> str:
 
     **Temporary, and deliberately the narrowest thing that keeps the news
     flowing.** A terminal failure has to reach the user, and until #197 lands the
-    only route it has is the escalation pipeline, which carries text. So it
+    only route it has is the Companion Channel push, which carries text. So it
     carries codes, and no sentence. #197 folds the reason onto the Session's row
     and wakes the Keeper instead, and deletes this function whole with the three
     calls that use it.

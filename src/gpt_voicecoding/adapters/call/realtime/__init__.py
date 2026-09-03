@@ -21,6 +21,7 @@ from gpt_voicecoding.adapters.call.realtime.adapter import (
     DELEGATION_ACK_FILLER,
     INCLUDE_STARTUP_CONTEXT,
     SANDBOX,
+    USER_QUIET_POLL_FRACTION,
     DelegatedTurnError,
     RealtimeCallAdapter,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "DELEGATION_ACK_FILLER",
     "INCLUDE_STARTUP_CONTEXT",
     "SANDBOX",
+    "USER_QUIET_POLL_FRACTION",
     "CallTransport",
     "DelegatedTurnError",
     "RealtimeCallAdapter",

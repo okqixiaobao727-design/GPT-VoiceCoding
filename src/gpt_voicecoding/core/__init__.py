@@ -1,8 +1,8 @@
 """Bridge Core — the hub. Owns every policy and the system's single source of truth.
 
 Bridge Core decides; the modules around it do. Policy that lives here and nowhere
-else: the Stop Notice escalation pipeline, Relay queueing against the Reply
-Window, the one-call-at-a-time invariant, and switch adjudication. **The Approval
+else: the Live Call's time — one call, Cool-down, the Silence Ceiling — Relay
+queueing against the Reply Window, and switch adjudication. **The Approval
 Relay is not on that list** (#191): it carries a verdict to the dialog the roster
 says is open and decides nothing about how long that dialog lives, because the
 wire that holds the hook is what bounds it (ADR 0015, amended).
@@ -12,7 +12,7 @@ undelivered Relay queue. Modules keep no copies; every surface queries the hub.
 The durable subset is persisted by an internal storage component only Bridge Core
 touches — nothing else may read those files, or the disk becomes a second truth.
 
-Bridge Core may grow internal components (escalation pipeline, relay queue,
+Bridge Core may grow internal components (the Call Keeper, the relay queue,
 persistence), separately testable but *not* new external seams: outsiders see one
 Bridge Core.
 
@@ -31,9 +31,11 @@ The ones that decide — the policy, all of it:
 
 - ``adjudication`` — what the switches permit the *system* to do. Never consulted
   by the control plane (ADR 0002).
-- ``interlock`` — one call at a time, above the Call seam. The only door to
-  opening one.
-- ``escalation`` — the Stop Notice route matrix for one delivery attempt.
+- ``call_keeper`` — the Call Keeper: one call at a time, Cool-down after any end
+  of one, and the Silence Ceiling. The only door to opening a call, and the one
+  truth about whether one is up. It absorbed the interlock and the escalation
+  route matrix (#195): dialling is paced here and briefed from a fresh reading,
+  and what was left of escalation is one Companion Channel push in ``bridge``.
 - ``relays`` — queueing the user's own words against the Reply Window, and the
   ceiling on how long they may wait.
 - ``router`` — what inbound text means. Unknown or ambiguous fails closed.

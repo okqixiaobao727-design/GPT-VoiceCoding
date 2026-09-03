@@ -244,7 +244,7 @@ def _rules() -> tuple[Rule, ...]:
                 "The current detail of a stop is Bridge Core's to supply, read at the "
                 "moment it is announced, and reading it reaches no Session."
             ),
-            enforced_by="the escalation pipeline's Notice and its state — core/escalation.py",
+            enforced_by="the Session Brief a Stop is announced from — core/bridge.py::stop_brief",
         ),
         Rule(
             id="delegated.notice.reads-before-it-reports",
@@ -264,7 +264,7 @@ def _rules() -> tuple[Rule, ...]:
                 "permission and its tool, or nothing yet readable — is structured state "
                 "Bridge Core holds, including that a fact is missing."
             ),
-            enforced_by="the roster row's WaitingFor and the escalation Notice",
+            enforced_by="the roster row's WaitingFor and the brief built from it",
         ),
         Rule(
             id="voice.notice.invents-no-detail",
@@ -418,10 +418,10 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.CORE,
             source="skill/retrying.md:1-10",
             gist=(
-                "Bridge Core escalates a Stop Notice and decides whether one may be retried; "
-                "a failed delivery never becomes an automatic retry on its own."
+                "Bridge Core announces a Stop Notice and decides whether anything follows a "
+                "failed delivery; a failed delivery never becomes an automatic retry."
             ),
-            enforced_by="the escalation pipeline's notice states — core/escalation.py",
+            enforced_by="one push, graded and never replayed — core/bridge.py::_push",
         ),
         Rule(
             id="delegated.retry.only-a-retryable-notice",
@@ -437,17 +437,20 @@ def _rules() -> tuple[Rule, ...]:
             audience=Audience.CORE,
             source="skill/retrying.md:11-33",
             gist=(
-                "One canonical stop and notice state, in one place — no second ledger for "
-                "the same fact and no field that only an old table had."
+                "One canonical reading of what each Session is waiting on, in one place — no "
+                "second ledger for the same fact and no field that only an old table had."
             ),
-            enforced_by="the escalation pipeline over one BridgeState — core/state.py",
+            enforced_by="one current-state reading over one BridgeState — core/state.py",
         ),
         Rule(
             id="core.retry.requeues-exactly-one",
             audience=Audience.CORE,
             source="skill/retrying.md:34-45",
-            gist="A retry puts exactly the named notice back, and grades its own delivery.",
-            enforced_by="the escalation pipeline's requeue path — core/escalation.py",
+            gist=(
+                "An outlet becoming available announces what a fresh reading says still waits, "
+                "once each, and grades its own delivery. No historical notice is replayed."
+            ),
+            enforced_by="the reading an opened outlet takes — core/bridge.py::_an_outlet_opened",
         ),
         Rule(
             id="core.retry.refusals-name-their-reason",
@@ -488,7 +491,7 @@ def _rules() -> tuple[Rule, ...]:
                 "starts nothing in its place. Retrying inside a pipeline, before any "
                 "terminal outcome is reported, is a different thing."
             ),
-            enforced_by="the escalation and Relay pipelines' terminal outcomes — issue #2",
+            enforced_by="the notice push and the Relay pipeline's terminal outcomes — issue #2",
         ),
         # --- the Call Agent's own rules (#173 §4) ---------------------------
         Rule(

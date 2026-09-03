@@ -87,6 +87,7 @@ from gpt_voicecoding.seams.call import (
     HandoverItem,
     SpokenBrief,
     SpokenRosterBrief,
+    UserSpeaking,
     UserSpeech,
     VoiceSpeech,
 )
@@ -156,6 +157,14 @@ INCLUDE_STARTUP_CONTEXT = False
 #: a request this engine can see (ADR 0018, "No `HandoffRequested` event").
 HANDOFF_REQUEST = "handoff_request"
 
+#: How often the user's quiet bound is checked, as a fraction of the bound
+#: itself. Derived rather than stated, so a run that dials `user_quiet_seconds`
+#: gets a poll in proportion to it: a fixed interval beside a settable bound is
+#: the same number written twice, and drifts the first time one of them moves.
+#: A quarter recognises the ending well inside the bound and costs four
+#: wake-ups a pause rather than forty.
+USER_QUIET_POLL_FRACTION = 0.25
+
 
 class _Abandoned(Exception):
     """This call attempt was hung up or dropped while the handshake was running."""
@@ -189,6 +198,22 @@ class _LiveCall:
     #: delta and the `done` that would have cleared it cannot leave the latch
     #: set over the call that follows.
     speaking: bool = False
+    #: Whether the Voice's stop edge is already being waited out. One waiter per
+    #: call: codex emits `transcript/done` once per *turn* and an answer it
+    #: splits in two produces two of them, so without this a second `done` would
+    #: start a second wait and the edge would be published twice.
+    draining: bool = False
+    #: Which of the Voice's spans is the current one. A `done` starts a wait for
+    #: the playout to finish, and a delta can arrive before that wait ends — the
+    #: Voice speaking again. The waiter carries the number it was started for
+    #: and publishes nothing when it no longer matches, so the edge it was
+    #: waiting to raise cannot land on the span that replaced it.
+    speaking_span: int = 0
+    #: Whether the *user* is in the middle of an utterance on this call, and
+    #: when their last delta arrived. Per attempt for `speaking`'s reason: half
+    #: a sentence heard on a call that dropped is not the next call's.
+    user_speaking: bool = False
+    last_user_delta_at: float = 0.0
     #: The user's current utterance, as the deltas have spelled it so far, and
     #: what was last raised upward from it. Per attempt for `speaking`'s reason:
     #: half a sentence heard on a call that dropped is not the next call's.
@@ -657,6 +682,7 @@ class RealtimeCallAdapter:
         # Before the drop, because a caller reconciling on `CallDropped` should
         # already have heard whatever the user managed to say on the way out.
         self._user_finished(live)
+        self._user_stopped(live)
         live.fail(reason)
         if was_up:
             self._emit(CallDropped(call_id=live.thread_id, detail=reason))
@@ -829,6 +855,43 @@ class RealtimeCallAdapter:
         delta = params.get("delta")
         if isinstance(delta, str) and delta:
             live.heard.append(delta)
+            self._user_started(live)
+
+    def _user_started(self, live: _LiveCall) -> None:
+        """The user began an utterance. Only the first delta of one is news (#195).
+
+        The span the Silence Ceiling holds on. Every delta restamps the quiet
+        bound; the first one also starts the watcher that closes the span when
+        nothing else does.
+        """
+        live.last_user_delta_at = time.monotonic()
+        if live.user_speaking:
+            return
+        live.user_speaking = True
+        self._emit(UserSpeaking(speaking=True))
+        self._spawn(self._user_quiet_watch(live))
+
+    async def _user_quiet_watch(self, live: _LiveCall) -> None:
+        """Close the user's span when the deltas simply stop.
+
+        The fallback end, and the one this adapter owns. The other three are the
+        wire's — a user `done`, the hand-off carrying the sentence, the Voice's
+        first reply delta — and each of them presupposes a turn that took; the
+        measured exchange in `_user_said_more` had none of them.
+        """
+        while live.user_speaking and self._call is live:
+            quiet = self._settings.user_quiet_seconds
+            if time.monotonic() - live.last_user_delta_at >= quiet:
+                self._user_stopped(live)
+                return
+            await asyncio.sleep(quiet * USER_QUIET_POLL_FRACTION)
+
+    def _user_stopped(self, live: _LiveCall) -> None:
+        """Close the user's speaking span, once, whichever of the four got here first."""
+        if not live.user_speaking:
+            return
+        live.user_speaking = False
+        self._emit(UserSpeaking(speaking=False))
 
     def _user_spoke(self, live: _LiveCall, text: str) -> None:
         """Raise one whole utterance upward, once.
@@ -847,8 +910,12 @@ class RealtimeCallAdapter:
         speaker's.
         """
         said = text.strip()
+        # Whatever carried the whole utterance is also proof it is over — a
+        # `done`, or the hand-off that routed it. An empty one carries neither
+        # words nor an ending, so it closes nothing.
         if not said:
             return
+        self._user_stopped(live)
         if not live.heard and live.said is not None and _unspaced(said) == _unspaced(live.said):
             return
         live.heard.clear()
@@ -872,9 +939,25 @@ class RealtimeCallAdapter:
         seam publishes a *span*, so every delta after the first says nothing the
         span does not already say.
         """
-        if params.get("role") != ASSISTANT_ROLE or live.speaking:
+        if params.get("role") != ASSISTANT_ROLE:
+            return
+        # The Voice answering is the user having finished: they are not talked
+        # over. One of the four ends of the user's span (#195).
+        self._user_stopped(live)
+        if live.draining:
+            # The Voice started generating again while the previous turn's audio
+            # was still playing. That is **one continuous stretch of speech**, so
+            # the span stays open: publishing a stop and a start here would
+            # invent a gap the user never heard, and a gap is exactly what the
+            # Silence Ceiling and #196's gap-waiter read this event for. The
+            # waiter is left stale by the new number and publishes nothing.
+            live.draining = False
+            live.speaking_span += 1
+            return
+        if live.speaking:
             return
         live.speaking = True
+        live.speaking_span += 1
         self._emit(VoiceSpeech(speaking=True))
 
     def _transcribed(self, live: _LiveCall, params: Message) -> None:
@@ -888,14 +971,52 @@ class RealtimeCallAdapter:
         """
         role = params.get("role")
         if role == ASSISTANT_ROLE:
-            live.speaking = False
-            self._emit(VoiceSpeech(speaking=False))
+            self._voice_finishing(live)
             return
         if role != USER_ROLE:
             return
         text = params.get("text")
         if isinstance(text, str):
             self._user_spoke(live, text)
+
+    def _voice_finishing(self, live: _LiveCall) -> None:
+        """The Voice stopped *generating*. The edge waits for it to stop *playing* (#195).
+
+        `VoiceSpeech(speaking=False)` means the audio has finished playing, and
+        only this side of the Call seam can know when that is: the jitter
+        prefetch, the playback buffer and the device all sit between the last
+        inbound frame and the last audible sample. Publishing the generating
+        edge instead made every caller that waits for a gap add a settle window
+        computed from numbers it could not see (#184's shape, closed here).
+
+        Nothing is awaited on the reader task: the notification loop must keep
+        draining while the audio finishes, so the wait runs beside it.
+        """
+        if live.draining or not live.speaking:
+            return
+        live.draining = True
+        self._spawn(self._voice_finished(live, live.speaking_span))
+
+    async def _voice_finished(self, live: _LiveCall, span: int) -> None:
+        """Wait out the playout, then publish the stop edge — once, for that span."""
+        try:
+            await live.transport.playback_drained(self._settings.voice_playout_wait_seconds)
+        except Exception:  # noqa: BLE001 - a transport that cannot answer is not a lost edge
+            _log.exception("the transport raised while draining; the stop edge is published now")
+        if not live.draining or live.speaking_span != span:
+            return
+        live.draining = False
+        self._voice_stopped(live)
+
+    def _voice_stopped(self, live: _LiveCall) -> None:
+        """Close the Voice's span, once, and only while this call is still the one."""
+        if not live.speaking:
+            return
+        live.speaking = False
+        # A call that went away while the audio drained has already been
+        # reported as ended, and an edge about a call that is over is noise.
+        if self._call is live:
+            self._emit(VoiceSpeech(speaking=False))
 
     def _turn_heard(self, turn: _DelegatedTurn, method: str, params: Message) -> None:
         if method == "item/completed":

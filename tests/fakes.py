@@ -47,6 +47,7 @@ from gpt_voicecoding.seams.call import (
     HandoverItem,
     SpokenBrief,
     SpokenRosterBrief,
+    UserSpeaking,
     VoiceSpeech,
 )
 from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
@@ -335,6 +336,17 @@ class FakeCall:
         """
         if self.sink is not None:
             self.sink.emit(VoiceSpeech(speaking=speaking))
+
+    def user_speaking(self, *, speaking: bool) -> None:
+        """Raise one edge of the *user's* speech, with no audio anywhere (#195).
+
+        The counterpart of `voice_speech`, and the reason the Silence Ceiling
+        can be proved on both sides without a microphone: how a real adapter
+        derives these edges from a transcript stream is behind the seam, and
+        nothing above it may depend on that derivation.
+        """
+        if self.sink is not None:
+            self.sink.emit(UserSpeaking(speaking=speaking))
 
 
 def handed_over(call: FakeCall) -> str:

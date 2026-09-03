@@ -60,6 +60,26 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 #: slow" into "the user is never answered".
 DEFAULT_DELEGATED_TURN_TIMEOUT_SECONDS = 300.0
 
+#: How long the user's transcript may go without a delta before this adapter
+#: calls the utterance over — the fourth end of `UserSpeaking`'s span, and the
+#: only one this side invents (`seams/call.py`). Dialled rather than fixed
+#: because the number is **unmeasured**: whether user deltas arrive during or
+#: after the speech is what #212's timestamped record settles, and a value
+#: nobody can change without a release is a value that measurement cannot
+#: correct. A second and a half is longer than the gap between two deltas of one
+#: sentence and shorter than a pause a listener hears as the end of one.
+DEFAULT_USER_QUIET_SECONDS = 1.5
+
+#: How long the Voice's stop edge waits for the audio to finish playing before it
+#: is published anyway (#195). A safety net rather than a schedule: an answer
+#: generated in ten seconds and spoken over seventy-five trails its own
+#: generation by more than a minute, and the ceiling is *held* while it does,
+#: which is correct — a call somebody is still hearing is not idle. What this
+#: bounds is a wait that would otherwise outlive its call if the transport
+#: stopped answering, so it is dialled for the machine whose audio path is
+#: slower than this one's.
+DEFAULT_VOICE_PLAYOUT_WAIT_SECONDS = 180.0
+
 
 #: The realtime model the backend still accepts. codex populates `session.model`
 #: on this path no matter how it is configured, and its own default
@@ -101,12 +121,17 @@ class RealtimeCallSettings:
     #: `None` means the machine's own default, which is what a laptop wants.
     input_device: int | None = None
     output_device: int | None = None
+    #: The two timings the speaking spans are derived with. See their defaults.
+    user_quiet_seconds: float = DEFAULT_USER_QUIET_SECONDS
+    voice_playout_wait_seconds: float = DEFAULT_VOICE_PLAYOUT_WAIT_SECONDS
 
     def __post_init__(self) -> None:
         for name in (
             "connect_timeout_seconds",
             "request_timeout_seconds",
             "delegated_turn_timeout_seconds",
+            "user_quiet_seconds",
+            "voice_playout_wait_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise SettingsError(f"{name} must be a positive number of seconds")

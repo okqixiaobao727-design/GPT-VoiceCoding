@@ -50,6 +50,8 @@ class Hub:
         channel_outcome: Delivery = Delivery.DELIVERED,
         channel_reason: str = "fake channel",
         silence_end_seconds: float = 60.0,
+        cool_down_seconds: float = 30.0,
+        speech_settle_seconds: float = 5.0,
     ) -> None:
         self.now = 1_000.0
         switches = Switchboard()
@@ -82,7 +84,11 @@ class Hub:
             call=self.call,
             channel=self.channel,
             agents={AgentKind.CODEX: self.agent, AgentKind.CLAUDE: self.agent},
-            policy=CorePolicy(silence_end_seconds=silence_end_seconds),
+            policy=CorePolicy(
+                silence_end_seconds=silence_end_seconds,
+                cool_down_seconds=cool_down_seconds,
+                speech_settle_seconds=speech_settle_seconds,
+            ),
             grammar=TextGrammar(control_commands=COMMANDS),
             clock=lambda: self.now,
             control=control,  # type: ignore[arg-type]

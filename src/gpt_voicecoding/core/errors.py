@@ -173,21 +173,6 @@ class StateFormatError(BridgeCoreError):
         self.reason = reason
 
 
-class SecondCallRefused(BridgeCoreError):
-    """Something asked to open a voice surface while the system already owns one.
-
-    The one-call-at-a-time invariant, raised rather than silently absorbed: a
-    caller that meant to *open* a call has a different plan to make when one is
-    already up, and hiding that is how the reference implementation's escalation
-    path pressed the toggle on top of a system-owned call and left two
-    assistants talking to each other.
-    """
-
-    def __init__(self, call_id: str) -> None:
-        super().__init__(f"the system already owns call {call_id!r}; nothing may open a second")
-        self.call_id = call_id
-
-
 class CallInstructionsMissing(BridgeCoreError):
     """A call was asked for on an engine that generated no rules for it to run on.
 
@@ -199,7 +184,7 @@ class CallInstructionsMissing(BridgeCoreError):
     not say which one was absent would send a reader to the wrong generator.
 
     Raised where Bridge Core builds the `Dial`, which is the one place that knows
-    what it generated. The blank check that used to live in the interlock is gone
+    what it generated. The blank check that used to live above the seam is gone
     with it: a `Dial` refuses its own empty halves at construction, so by the time
     one exists there is nothing left to check.
     """

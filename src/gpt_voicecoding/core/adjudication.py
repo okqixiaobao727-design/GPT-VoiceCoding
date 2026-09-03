@@ -42,8 +42,12 @@ from gpt_voicecoding.core.switches import Switchboard, SwitchName
 class Outlet(StrEnum):
     """A way the system can reach the user right now.
 
-    Ordered as the escalation pipeline prefers them: a Live Call the user is
-    already in beats a push they have to go and look at.
+    A **set** and not a sequence. It was ordered while one pipeline walked the
+    outlets in turn and stopped at the first that proved delivery; since #195
+    there is no such walk — the Call Keeper dials and the Companion Channel is
+    pushed, each under its own switch and neither before the other — so what a
+    caller asks is *which outlets just became available*, and an order beside
+    that answer would be a preference nothing acts on.
     """
 
     #: The Live Call — the system's one voice surface.
@@ -88,11 +92,11 @@ class SwitchAdjudicator:
         """
         return self._switches.is_effective(feature)
 
-    def outlets(self) -> tuple[Outlet, ...]:
-        """Every outlet open right now, in escalation preference order."""
-        open_now = []
+    def outlets(self) -> frozenset[Outlet]:
+        """Every outlet open right now. A set: see `Outlet`."""
+        open_now = set()
         if self.may_touch_call():
-            open_now.append(Outlet.VOICE)
+            open_now.add(Outlet.VOICE)
         if self.may_push():
-            open_now.append(Outlet.MESSAGE)
-        return tuple(open_now)
+            open_now.add(Outlet.MESSAGE)
+        return frozenset(open_now)

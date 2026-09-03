@@ -85,7 +85,6 @@ the user is told.
 | `unknown_session` | No Session by that identity was ever registered here. |
 | `stale_session` | Known session id, unreachable under that identity — a fork, or an end. |
 | `unknown_pending` | Nothing is waiting under that id; it was answered, or its hook ended. |
-| `second_call_refused` | Something asked to open a call while the system owns one. |
 | `refused` | Any other Bridge Core refusal. Still carries its own words. |
 | `engine_unreachable` | Raised by a **surface**, never sent by the engine: nothing answered. |
 
@@ -366,17 +365,24 @@ where the other three start off, and it hangs from nothing. The Silence Ceiling
 is the call's own limit rather than an act toward the user, so it ends a silent
 call with Duty off and on calls the user opened; only this switch stops it. How
 long that silence runs is configuration, not a switch — `[policy]
-silence_end_seconds`. Bridge Core asks `SwitchAdjudicator.may_auto_hangup()`,
-the same way it asks `may_touch_call()` before it speaks.
+silence_end_seconds`, and `speech_settle_seconds` for how long a pause stays a
+pause before it counts. The Call Keeper asks `SwitchAdjudicator.may_auto_hangup()`,
+the same way it asks `may_touch_call()` before it dials.
 
 Growing the set is additive on the wire and not a protocol change: the grammar
 above is unchanged, and a surface renders `status`'s switches over its own known
 order, so a key it has no row for is ignored rather than guessed at.
 
-Turning an outlet on marks current-state reconciliation as owed. The next
-ordinary discovery pass uses its fresh lane rows and announces each live main
-Session still waiting on a question or permission. It never replays a historical
-Stop Notice.
+Turning an outlet on is read **at the flip**, on the roster as it stands: each
+live main Session still waiting on a question or permission is pushed to the
+Companion Channel, and the Call Keeper is woken once. It never replays a
+historical Stop Notice.
+
+A wake reaches the call only through the Keeper, which paces it: after any end of
+a call — hung up, dropped, or a dial that failed — `[policy] cool_down_seconds`
+passes before it dials again, and a wake inside that window marks one dial owed
+and pays it from a fresh reading when the window closes. The user's own
+`bridgectl live` is not subject to it.
 
 ### `live` — the Live Toggle
 
@@ -552,6 +558,8 @@ workspace = "~/code"                # where the bridge's own threads run; defaul
 [policy]                            # optional; these are the locked defaults
 relay_ceiling_seconds   = 600
 silence_end_seconds     = 60
+cool_down_seconds       = 30
+speech_settle_seconds   = 5
 
 [log]                               # required: three numbers with no default
 max_bytes                     = 8388608

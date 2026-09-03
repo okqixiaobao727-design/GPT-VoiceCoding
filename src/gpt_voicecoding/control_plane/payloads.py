@@ -269,6 +269,11 @@ def status_document(
         "lanes": {str(agent): reason for agent, reason in status.lanes.items()},
         "degraded_lanes": {str(agent): reason for agent, reason in status.degraded_lanes.items()},
         "call_id": status.call_id,
+        # The other two facts the Call Keeper holds. Additive on the wire, which
+        # is what growing this set has always been (`docs/control-plane.md`): a
+        # surface with no row for them ignores them.
+        "cool_down_remaining": status.cool_down_remaining,
+        "dial_owed": status.dial_owed,
         "pending_relays": [pending_relay_document(item) for item in status.pending_relays],
     }
 

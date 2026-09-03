@@ -245,6 +245,30 @@ def render(reply: Reply) -> str:
     return ""
 
 
+def _cool_down(data: dict[str, object]) -> str:
+    """What the Call Keeper is waiting out, said whenever there is anything to say.
+
+    Read beside `call: none`, because that is the line an operator looks at when
+    they are asking why nothing rang, and this is the answer they cannot get
+    anywhere else — a call that does not happen leaves no other trace (#195).
+
+    **The two facts are read independently.** A Cool-down that has run out but
+    has not yet been paid — the window between its expiry and the next tick —
+    reports `0.0` remaining and a dial still owed, and gating the owed flag on
+    the remaining seconds hid exactly that state behind a bare `call: none`.
+    Silent only when both are empty, so the ordinary line is unchanged.
+    """
+    remaining = data.get("cool_down_remaining") or 0.0
+    assert isinstance(remaining, int | float)
+    owed = bool(data.get("dial_owed"))
+    if remaining <= 0 and not owed:
+        return ""
+    said = [f"cool-down {remaining:.0f}s"] if remaining > 0 else []
+    if owed:
+        said.append("one dial owed")
+    return f" ({', '.join(said)})"
+
+
 def _status_lines(data: dict[str, object]) -> list[str]:
     switches = data["switches"]
     assert isinstance(switches, dict)
@@ -252,7 +276,7 @@ def _status_lines(data: dict[str, object]) -> list[str]:
         "switches: " + ", ".join(f"{name} {'on' if on else 'off'}" for name, on in switches.items())
     ]
     call_id = data["call_id"]
-    lines.append(f"call: {call_id}" if call_id else "call: none")
+    lines.append(f"call: {call_id}" if call_id else f"call: none{_cool_down(data)}")
     lines.extend(_status_roster_lines(data["sessions"]))
     lines.extend(_lane_lines(data.get("lanes")))
     lines.extend(_degraded_lane_lines(data.get("degraded_lanes")))

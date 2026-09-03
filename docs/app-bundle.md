@@ -220,13 +220,11 @@ its own carrier reached that Session — the hook installed in its config direct
 there is a blocked step rather than a failed one, and the receipt says which.
 
 **8. The Companion Channel.** A notice must reach Telegram, and a reply typed
-there must come back as inbound text. **Run this with Voice off**, together with
-step 9's text-only leg — with Voice on it cannot pass, and that is correct
-behaviour rather than a fault. The escalation matrix sends a notice to the
-Companion Channel only when the call route is shut: with Voice on and no call
-up, escalation *opens a call and speaks* instead of pushing. Ending a call with
-Voice on therefore produces no push, and must not be recorded as a failure of
-this step.
+there must come back as inbound text. The two surfaces are independent since
+#195: a Stop Notice is pushed under the Message Switch whatever the call is
+doing, and the Call Keeper decides separately whether to dial. So this step
+passes with Voice on or off, and a call coming up beside the push is the product
+working rather than a failure of this step.
 
 **9. The switches.** Duty off: nothing is spoken and nothing is pushed, but
 events are still recorded and the control plane still answers. Voice off,
