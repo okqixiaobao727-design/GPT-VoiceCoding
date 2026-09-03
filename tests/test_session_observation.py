@@ -16,7 +16,11 @@ from pathlib import Path
 import pytest
 
 from gpt_voicecoding.core import sessions as sessions_module
-from gpt_voicecoding.core.sessions import NoNameMatchError, SessionRegistry
+from gpt_voicecoding.core.sessions import (
+    UNOBSERVED_WORKSPACE,
+    NoNameMatchError,
+    SessionRegistry,
+)
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
@@ -750,6 +754,7 @@ class TestWhatAStopWritesIntoTheRow:
             SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
             waiting_for=WaitingFor(),
             progress=ProgressObservation(),
+            now=NOW,
         )
 
         assert held.state is SessionState.IDLE
@@ -762,6 +767,7 @@ class TestWhatAStopWritesIntoTheRow:
             SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
             waiting_for=A_QUESTION,
             progress=ProgressObservation(),
+            now=NOW,
         )
 
         assert held.state is SessionState.WAITING
@@ -780,6 +786,7 @@ class TestWhatAStopWritesIntoTheRow:
             SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
             waiting_for=NOT_CAUGHT_UP,
             progress=ProgressObservation(),
+            now=NOW,
         )
 
         assert held.state is SessionState.WAITING
@@ -791,11 +798,90 @@ class TestWhatAStopWritesIntoTheRow:
         target = SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045)
 
         held = registry.set_stop_reading(
-            target, waiting_for=NOT_CAUGHT_UP, progress=ProgressObservation()
+            target, waiting_for=NOT_CAUGHT_UP, progress=ProgressObservation(), now=NOW
         )
 
         assert held.waiting_for == A_QUESTION
         assert held.state is SessionState.WAITING
+
+    def test_a_stop_for_a_session_no_pass_has_landed_puts_it_on_the_roster(self) -> None:
+        """The row a Stop stands in for is the roster's, not one reader's (#216).
+
+        Discovery runs on a cadence, so a Session can stop before any pass has
+        landed a row for it. The Stop is a reading of a Session that exists, so
+        it is recorded here — which is what lets the fresh reading a dial is
+        briefed from cover it (ADR 0017); before #216 the stand-in was built
+        inside the announcement and thrown away, and the call had nothing to be
+        about.
+        """
+        registry = SessionRegistry()
+        target = SessionTarget(agent=AgentKind.CODEX, session_id="a891a18f")
+
+        held = registry.set_stop_reading(
+            target, waiting_for=A_QUESTION, progress=ProgressObservation(), now=NOW
+        )
+
+        assert registry.live() == (held,)
+        assert held.target == target
+        assert held.state is SessionState.WAITING
+        assert held.waiting_for == A_QUESTION
+
+    def test_the_row_a_stop_stands_in_for_invents_nothing_it_did_not_read(self) -> None:
+        """Only the address, the wait and *when we first saw it* are facts here."""
+        registry = SessionRegistry()
+
+        held = registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CODEX, session_id="a891a18f"),
+            waiting_for=WaitingFor(),
+            progress=ProgressObservation(),
+            now=NOW,
+        )
+
+        assert held.first_seen == NOW
+        assert held.workspace == UNOBSERVED_WORKSPACE
+        assert held.name is None
+        assert held.progress.availability is ProgressAvailability.NOT_READ
+        assert held.last_activity is None
+
+    def test_a_stop_after_the_session_ended_does_not_stand_a_live_row_in_for_it(self) -> None:
+        """The End is the later fact; a Stop lands on the row and leaves it ended.
+
+        The stand-in exists for a Session nobody has read yet, not for one the
+        roster watched end — reopening that row would be the registry inventing
+        a Session out of two events about one, and the roster would brief and
+        dial about a Session that is gone.
+        """
+        registry = self.observed()
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045)
+        registry.mark_ended(target)
+
+        held = registry.set_stop_reading(
+            target, waiting_for=A_QUESTION, progress=ProgressObservation(), now=NOW + 5
+        )
+
+        assert held.lifecycle is SessionLifecycle.ENDED
+        assert registry.live() == ()
+        assert len(registry.all()) == 1
+
+    def test_a_discovery_pass_reconciles_the_row_a_stop_stood_in_for(self) -> None:
+        """The stand-in is a row like any other, so the next whole-lane read owns it."""
+        registry = SessionRegistry()
+        registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
+            waiting_for=A_QUESTION,
+            progress=ProgressObservation(),
+            now=NOW,
+        )
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(claude_row(session_id="e34368aa", pid=10045, state=SessionState.RUNNING)),
+            now=NOW + 5,
+        )
+
+        assert len(registry.live()) == 1
+        assert registry.live()[0].state is SessionState.RUNNING
+        assert registry.live()[0].workspace == WORKSPACE
 
     def test_the_next_discovery_reading_overwrites_what_the_stop_wrote(self) -> None:
         """The Stop shrinks the stale window; it is not a second source of truth."""
@@ -804,6 +890,7 @@ class TestWhatAStopWritesIntoTheRow:
             SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
             waiting_for=WaitingFor(),
             progress=ProgressObservation(),
+            now=NOW,
         )
 
         registry.observe(

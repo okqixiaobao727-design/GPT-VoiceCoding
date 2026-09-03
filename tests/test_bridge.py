@@ -1016,26 +1016,67 @@ class TestAChildProcessIsNeverAnnounced:
 
         assert "port the log" in handed_over(hub.call)
 
-    def test_a_stop_on_a_session_the_roster_has_not_seen_is_still_announced(self) -> None:
+    def test_a_stop_on_a_session_the_roster_has_not_seen_reaches_both_outlets(self) -> None:
         """Unknown is not child, and the asymmetry is the point.
 
         Discovery runs on a cadence, so a Session can stop before the roster has
         a row for it. Refusing to announce that would lose the notice entirely,
         while announcing a child costs one message about something that is about
-        to be refused anyway.
+        to be refused anyway — and since #216 it costs a call too, which is the
+        price of never losing the notice a real Session's Stop is.
+
+        **One Stop, both outlets, in one test**, because the defect #216 names is
+        exactly that the two disagreed: the text named the Session and the call
+        never came. What a call comes up holding is the *roster*'s reading at the
+        moment of dialling (ADR 0017), so the fix is not to hand the dial this
+        notice's own brief — the second source of truth #213 deleted — but to
+        put the row the Stop stands in for on the roster, where the fresh reading
+        finds it.
         """
         hub = Hub()
 
         hub.emit(SessionStopped(target=SessionTarget(agent=AgentKind.CODEX, session_id="new")))
 
-        # Announced as text, from the stand-in row the Stop itself carries. Not
-        # dialled: what a call comes up holding is the *roster*'s reading at the
-        # moment of dialling (ADR 0017), and no discovery pass has put this
-        # Session on it — so there is no brief for a call to be about, and the
-        # Keeper stays quiet rather than ringing about nothing.
         assert hub.channel.sent
         assert "codex:new" in hub.channel.sent[0]
-        assert hub.call.calls_started == 0
+        assert hub.call.calls_started == 1
+        assert "codex:new" in handed_over(hub.call)
+
+    def test_the_question_an_unseen_session_stopped_on_is_what_the_call_carries(self) -> None:
+        """The stand-in row carries the Stop's own reading, so the dial says it.
+
+        The wait is the whole point of the notice: a call that rang about a
+        Session and could not say what it was waiting on would be #209's defect
+        under a different cause.
+        """
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=SessionTarget(agent=AgentKind.CODEX, session_id="new"),
+                waiting_for=WaitingFor(
+                    kind=WaitingKind.QUESTION, prompt="Which base?", approval_id="q-1"
+                ),
+            )
+        )
+
+        assert hub.call.calls_started == 1
+        assert "Which base?" in handed_over(hub.call)
+
+    def test_the_session_a_stop_stood_in_for_is_on_the_roster_afterwards(self) -> None:
+        """One roster, so `status` answers about it like every other reader."""
+        hub = Hub()
+
+        hub.emit(
+            SessionStopped(
+                target=SessionTarget(agent=AgentKind.CODEX, session_id="new"),
+                waiting_for=self.permission(),
+            )
+        )
+
+        listed = [row for row in hub.core.status().sessions if row.target.session_id == "new"]
+        assert len(listed) == 1
+        assert listed[0].state is SessionState.WAITING
 
     def test_a_permission_a_child_raises_is_not_announced(self) -> None:
         """A Codex subagent thread can raise a real `requestApproval`.

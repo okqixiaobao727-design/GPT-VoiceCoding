@@ -503,6 +503,7 @@ class TestRelayingAndApproving:
             child,
             waiting_for=WaitingFor(kind=WaitingKind.PERMISSION, tool_name="Bash", approval_id="c1"),
             progress=ProgressObservation(),
+            now=0.0,
         )
 
         reply = surface.ask(Action.APPROVE, approval_id="c1", verdict="allow")

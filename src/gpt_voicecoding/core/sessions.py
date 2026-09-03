@@ -45,6 +45,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Final
 
 from gpt_voicecoding.core.errors import (
     AmbiguousNameError,
@@ -391,7 +392,7 @@ class SessionRegistry:
         attempt is said out loud rather than swallowed.
         """
         try:
-            self._focus = self._live_row(target).target
+            self._focus = self._held_row(target).target
         except (UnknownSessionError, StaleSessionError):
             _log.info("the user replied to a Session this roster does not hold: %s", target)
 
@@ -674,13 +675,18 @@ class SessionRegistry:
         The Reply Window follows from it and is never set directly — there is
         one field, so there is nothing for a second writer to disagree with.
         """
-        held = self._live_row(target)
+        held = self._held_row(target)
         updated = replace(held, state=state)
         self._sessions[held.target] = updated
         return updated
 
     def set_stop_reading(
-        self, target: SessionTarget, *, waiting_for: WaitingFor, progress: ProgressObservation
+        self,
+        target: SessionTarget,
+        *,
+        waiting_for: WaitingFor,
+        progress: ProgressObservation,
+        now: float,
     ) -> Session:
         """Fold the whole reading a Stop carried into that Session's roster row.
 
@@ -721,12 +727,55 @@ class SessionRegistry:
         **Discovery still wins afterwards.** The next caught-up reading overwrites
         this state as it overwrites any other; the Stop's write shrinks the stale
         window to zero rather than becoming a second source of truth.
+
+        **A Stop for a Session no pass has landed lands a row here too** (#216).
+        Discovery runs on a cadence, so a Session can stop before any reading of
+        its lane has covered it — and a Stop *is* a reading, taken of a Session
+        that demonstrably exists. Recording it is what lets every reader answer
+        alike: the notice's text and the fresh roster reading a system-dialled
+        call is briefed from (ADR 0017) had disagreed about whether the Session
+        existed at all, so the user was told in words and never rung. `now` is
+        that row's `first_seen` — when *we* first saw it, which is exactly what
+        this Stop was.
+
+        Legacy (ADR 0010) — **adapted.** The reference implementation put a
+        Session on its roster from the event itself: every hook message, a Stop
+        included, upserted the row (`legacy@1d32845:bridge/store.py:1644-1712`,
+        called from `bridge/daemon.py:1192-1248`), so a Stop was never about a
+        Session the store had no record of. What is adapted is that principle
+        and not its shape — rows here still arrive by observation (this module's
+        own rule), and the row a Stop lands is a stand-in carrying only what the
+        Stop read, which the next discovery pass reconciles.
         """
-        held = self._live_row(target)
+        held = self._held_or_stood_in_for(target, now=now)
         updated = held.with_waiting_for(waiting_for, waiting=True).with_progress(progress)
         updated = replace(updated, state=updated.waiting_for.stopped_state)
         self._sessions[held.target] = updated
         return updated
+
+    def _held_or_stood_in_for(self, target: SessionTarget, *, now: float) -> Session:
+        """The live row for that identity, or a new one standing in for it (#216).
+
+        Both refusals `_held_row` raises mean the same thing to a Stop — the
+        roster holds no row for *this* identity — and a Stop is evidence the
+        identity is real: unknown is a Session the cadence has not reached yet,
+        and stale is a second process under a session id the roster knows (a
+        `--resume` fork). Either way the row the Stop is about is the one being
+        created, and the next whole-lane pass reconciles it like any other.
+
+        **An ended Session keeps its ended row, and a Stop does not resurrect
+        it.** `_held_row` answers with the row held for that identity whatever
+        its lifecycle, which is what this wants: `mark_ended` recorded that the
+        Session is gone, and that is the later fact. The Stop's reading still
+        lands on the row — the roster does not lose a reading — but the row
+        stays out of `live()`, so nothing is briefed or dialled about a Session
+        that has ended. Standing a *second*, live row in for it would be this
+        registry inventing a Session out of two events about one.
+        """
+        try:
+            return self._held_row(target)
+        except (UnknownSessionError, StaleSessionError):
+            return self.register(stand_in(target, first_seen=now))
 
     def mark_ended(self, target: SessionTarget) -> Session:
         """A Session is gone. Its Reply Window closes with it, by derivation.
@@ -736,14 +785,23 @@ class SessionRegistry:
         Relayed into would leave the roster claiming a dead process is running.
         `resolve` guards *addressing*; this records *what happened*.
         """
-        held = self._live_row(target)
+        held = self._held_row(target)
         ended = replace(held, lifecycle=SessionLifecycle.ENDED)
         self._sessions[held.target] = ended
         self._focus_ended(held.target)
         return ended
 
-    def _live_row(self, target: SessionTarget) -> Session:
-        """The held row for that identity, whatever it is — or why there is none."""
+    def _held_row(self, target: SessionTarget) -> Session:
+        """The row held for that identity, whatever it is — or why there is none.
+
+        **Whatever it is includes its lifecycle**: an ended row is still that
+        Session's row and comes back from here, which is what all four callers
+        want — `mark_ended` is idempotent, `set_focus` and `set_stop_reading`
+        write onto the row the roster holds, and `_held_or_stood_in_for` stands
+        a row in only where there is none to hold. It was called `_live_row`
+        until #216, and the name read as a guarantee it never made: `live()` is
+        what filters by lifecycle, and it is the only thing that does.
+        """
         candidates = self._by_session_id(target)
         if not candidates:
             raise UnknownSessionError(target)
@@ -780,6 +838,29 @@ class SessionRegistry:
             for held in self._sessions.values()
             if held.target.agent is target.agent and held.target.session_id == target.session_id
         ]
+
+
+#: The one `Session` field nobody observed, for the row a Stop stands in for.
+#: `Session` is the roster's record and requires a workspace; a Stop carries
+#: none. Named here, once, and named as unobserved rather than spelled at the
+#: call site as a plausible-looking `Path("/")` — a stand-in that reads like a
+#: fact is the thing to avoid. No brief reads it, and `Briefing` prints the
+#: address for a row with no name (`spoken_name`'s own floor).
+UNOBSERVED_WORKSPACE: Final = Path()
+
+
+def stand_in(target: SessionTarget, *, first_seen: float) -> Session:
+    """A row for a Stop the roster holds no Session for, carrying only its address.
+
+    A Stop can arrive for a Session no discovery pass has landed yet, and a
+    notice nobody receives is worse than one naming the Session by the address
+    the user can still answer it by. **Nothing here is invented**: there is no
+    name, the progress stays the default `NOT_READ` — Briefing's word for
+    "nobody looked" — the workspace is unobserved, and the wait and the state
+    are written by `set_stop_reading` from the reading the Stop itself carried.
+    `first_seen` is the one fact the registry owns and this moment supplies.
+    """
+    return Session(target=target, workspace=UNOBSERVED_WORKSPACE, first_seen=first_seen)
 
 
 def spoken_name(session: Session) -> str:

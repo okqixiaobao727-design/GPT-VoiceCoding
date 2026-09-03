@@ -45,8 +45,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
-from pathlib import Path
-from typing import Final
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import Outlet, SwitchAdjudicator
@@ -149,8 +147,7 @@ SYSTEM_DIALLED = (
 
 
 def stop_brief(
-    session: Session | None,
-    target: SessionTarget,
+    session: Session,
     waiting_for: WaitingFor,
     *,
     progress: ProgressObservation | None = None,
@@ -177,62 +174,27 @@ def stop_brief(
     at the moment the Session stopped, and the sweep and reconcile paths each
     carry the wait they are about; the roster row supplies everything else — the
     Session Name, the workspace, the last activity — that the reading itself does
-    not know.
+    not know. The row is also what the brief is *addressed* as: it carries the
+    better-known target where the roster holds one, so no separate address is
+    passed in beside it.
 
-    **The state is the row's, and only a row nobody holds derives it here.** A
-    Stop is not a Session running, and this path used to be the one place that
-    said so: it derived the state from the wait because
-    `SessionRegistry.set_stop_reading` left a row that merely ended a turn in
-    whatever state the last discovery pass found (#209). Since #213 the registry
-    derives it, by the same rule in the one place it now lives
-    (`WaitingFor.stopped_state`), so a registered row is briefed as the registry
-    holds it and nothing here overrides it. The derivation is still read for the
-    stand-in below — a Stop for a Session no discovery pass has landed yet has no
-    row to have been folded into.
+    **The state is the row's, and this path never derives one.** A Stop is not a
+    Session running, and this used to be the one place that said so: it derived
+    the state from the wait because `SessionRegistry.set_stop_reading` left a row
+    that merely ended a turn in whatever state the last discovery pass found
+    (#209). Since #213 the registry derives it, by the same rule in the one place
+    it now lives (`WaitingFor.stopped_state`), so a row is briefed as the
+    registry holds it and nothing here overrides it. **There is always a row**:
+    since #216 a Stop for a Session no discovery pass has landed registers one
+    standing in for it (`core/sessions.py::stand_in`), so the second, private
+    derivation this function used to keep for that case is gone with the case.
     """
-    row = (
-        session
-        if session is not None
-        else replace(_stand_in(target), state=waiting_for.stopped_state)
-    )
     row = replace(
-        row,
+        session,
         waiting_for=waiting_for,
-        progress=progress if progress is not None else row.progress,
+        progress=progress if progress is not None else session.progress,
     )
     return briefing.session(row, question_answerable=question_answerable)
-
-
-#: The two `Session` fields a brief never reads, for the one row nobody observed.
-#: `Session` is the roster's record and requires both; `briefing.session` reads
-#: neither (`core/briefing.py::session` takes `target`, `name`, `state`,
-#: `waiting_for`, `progress`, `last_activity`, `child`). Named here, once, and
-#: named as unobserved rather than spelled at the call site as a plausible-looking
-#: `Path("/")` and `0.0` — a stand-in that reads like a fact is the thing to
-#: avoid. Nothing consumes either: this row is never registered, never persisted
-#: and never answered from.
-UNOBSERVED_WORKSPACE: Final = Path()
-UNOBSERVED_FIRST_SEEN: Final = 0.0
-
-
-def _stand_in(target: SessionTarget) -> Session:
-    """A row for a Stop the roster holds no Session for, carrying only its address.
-
-    A Stop can arrive for a Session no discovery pass has landed yet, and a
-    notice nobody receives is worse than one naming the Session by the address
-    the user can still answer it by — which is `spoken_name`'s own floor
-    (`core/sessions.py:773-785`) and the shape `Briefing` prints for a row with
-    no name. **Nothing a brief reads is invented**: there is no name, the
-    progress stays the default `NOT_READ` — Briefing's word for "nobody looked" —
-    and the wait is the one the Stop itself carried. The two fields `Session`
-    requires and no brief reads are the constants above, and they are unobserved
-    rather than assumed.
-    """
-    return Session(
-        target=target,
-        workspace=UNOBSERVED_WORKSPACE,
-        first_seen=UNOBSERVED_FIRST_SEEN,
-    )
 
 
 def _as_read_now(read: Session, fresh: ProgressObservation) -> Session:
@@ -964,11 +926,18 @@ class BridgeCore:
         """
         if self._spawned(event.target):
             return
-        session = self._known(event.target)
-        if session is not None:
-            session = self._state.sessions.set_stop_reading(
-                event.target, waiting_for=event.waiting_for, progress=event.progress
-            )
+        # **Every Stop writes its reading to the roster, including the first one
+        # about a Session no discovery pass has covered** (#216): the registry
+        # stands a row in for it, so the text this path pushes and the fresh
+        # roster reading a dial is briefed from (ADR 0017) say the same thing
+        # about the same Session. There is no `known` branch left here — which
+        # Session exists is the registry's question, and it has one answer.
+        session = self._state.sessions.set_stop_reading(
+            event.target,
+            waiting_for=event.waiting_for,
+            progress=event.progress,
+            now=self._stamp(),
+        )
         await self._announce_waiting(
             session,
             event.target,
@@ -983,7 +952,7 @@ class BridgeCore:
 
     async def _announce_waiting(
         self,
-        session: Session | None,
+        session: Session,
         target: SessionTarget,
         waiting_for: WaitingFor,
         *,
@@ -1016,7 +985,6 @@ class BridgeCore:
         """
         brief = stop_brief(
             session,
-            target,
             waiting_for,
             progress=progress,
             question_answerable=(
@@ -1198,12 +1166,6 @@ class BridgeCore:
             receipt.outcome,
             receipt.reason,
         )
-
-    def _known(self, target: SessionTarget) -> Session | None:
-        try:
-            return self._state.sessions.resolve(target)
-        except BridgeCoreError:
-            return None
 
     def _spawned(self, target: SessionTarget) -> bool:
         """Whether the roster **positively says** this is a Child Process (#79).
