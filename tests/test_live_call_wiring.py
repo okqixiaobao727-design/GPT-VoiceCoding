@@ -871,6 +871,34 @@ def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
     assert journey.RELAY_RECEIPT_QUEUED not in said
 
 
+def test_the_relayed_answer_dictates_the_reply_detail_is_graded_on() -> None:
+    """#198 §3a grades the Voice's Detail answer against the Session's `newest`.
+
+    The Voice speaks Chinese and `newest` is whatever language that agent chose,
+    so a free-form reply makes the criterion a test of which lane answered in
+    which language: run `20260903T231626Z` passed on Codex and failed the Claude
+    lane for translating its English `newest` faithfully. The relayed answer
+    therefore dictates the reply, and these are the exclusions that keep the
+    dictated one gradeable.
+    """
+    said = live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
+    reply = live_call.DICTATED_REPLY
+
+    assert reply in said
+    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING in reply
+    # Neither receipt wording: an echo of the receipt would otherwise pass.
+    assert journey.RELAY_RECEIPT_QUEUED not in reply
+    assert journey.RELAY_RECEIPT_DELIVERED not in reply
+    # Nor any lane's workspace name, which the answer is graded on elsewhere.
+    for lane in journey.LANES:
+        for workspace in lane.call_workspaces:
+            assert workspace not in reply
+    # And no run shared with the relayed payload, so an answer that read the
+    # words back rather than the Session's reply does not pass.
+    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in journey.LIVE_CALL_ANSWER_SUBSTRING
+    assert " " not in journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING
+
+
 def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
     """The Claude lane's engine holds the Codex lane's Sessions (`20260903T093813Z`).
 

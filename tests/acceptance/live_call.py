@@ -194,6 +194,27 @@ class CallWorkspaces:
         return iter((self.focus, self.ringing, self.waiting))
 
 
+#: The sentence the relayed answer tells the Session to reply with, and so what
+#: that Session's `newest` is by the time Detail asks about it (#198 §3a).
+#:
+#: **Dictated, because a free-form reply is not gradeable.** §3a asks that the
+#: Voice's Detail answer carry a substring of the Session's `newest`. The Voice
+#: speaks Chinese; `newest` is whatever language that agent chose. Run
+#: `20260903T231626Z` had the Codex lane answer in Chinese (substring held) and
+#: the Claude lane in English — `A teammate session replied "可以继续" …` — which
+#: the Voice **translated** faithfully into Chinese, sharing no character with
+#: it. The criterion passed on one lane by accident of language and failed
+#: correct behaviour on the other. Dictating the reply restores the harness's
+#: own premise, that graded fragments come from lines the walk put there
+#: (`journey._spoken_fragment`).
+#:
+#: Chinese, so the Voice reads it out rather than translating it. It spells
+#: neither `收到` nor `已转达` — both are receipt wordings
+#: (`instructions/voice.py`) an echo of which would pass this grade — and not
+#: the workspace name, which the answer is already graded on elsewhere.
+DICTATED_REPLY = "那我就接着往下做。"
+
+
 def relay_request(focus_workspace: str) -> str:
     """The answer utterance, naming one lane's own Focus Session's workspace.
 
@@ -203,8 +224,16 @@ def relay_request(focus_workspace: str) -> str:
     deliberately not `收到` — that is the wording the Voice says for a *queued*
     receipt (`instructions/voice.py`), and a payload spelling it would make the
     receipt and its echo one string the step could not tell apart.
+
+    `可以继续` stays its first clause: that fragment is the one the step follows
+    through the air, the Call Agent's argv and the Session's own next turn
+    (`journey.LIVE_CALL_ANSWER_SUBSTRING`). What follows it dictates the reply,
+    for `DICTATED_REPLY`'s reasons.
     """
-    return f"请你给{focus_workspace}那个会话回一句话，内容是可以继续。"
+    return (
+        f"请你给{focus_workspace}那个会话回一句话，内容是可以继续，"
+        f"并且请它只回复这一句：{DICTATED_REPLY}"
+    )
 
 
 def narrowing_request(focus_workspace: str) -> str:

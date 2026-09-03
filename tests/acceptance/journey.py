@@ -424,6 +424,16 @@ LIVE_CALL_RELAY_HEARD_SUBSTRING = "回一句话"
 #: air, the Call Agent's argv, and the Session's own record.
 LIVE_CALL_ANSWER_SUBSTRING = "可以继续"
 
+#: The fragment of `live_call.DICTATED_REPLY` the Voice's **Detail** answer has
+#: to carry (#198 §3a). The relayed answer dictates that reply, so by the time
+#: Detail asks, this is a mid-sentence run of the Session's own `newest` — and
+#: one both lanes reproduce, which a free-form reply was not (`DICTATED_REPLY`).
+#:
+#: Mid-sentence and spaceless for `LIVE_CALL_HEARD_SUBSTRING`'s reasons, and it
+#: shares no run with `LIVE_CALL_ANSWER_SUBSTRING`, so an answer that read the
+#: *relayed* words back rather than the Session's reply does not pass it.
+LIVE_CALL_DICTATED_REPLY_SUBSTRING = "接着往下做"
+
 #: The three fragments #198's Detail and History utterances are recognised by,
 #: chosen for `LIVE_CALL_HEARD_SUBSTRING`'s reasons: the middle of each sentence,
 #: spaceless, and none of them the Session's name — which is the Call Agent's
@@ -3708,9 +3718,13 @@ class Walk:
 
         **Read first, and by substring.** The reading has to be taken before the
         question is asked, or the thing compared against is a page the answer
-        itself could have changed; and what is looked for is a short opening
-        fragment of it (`_spoken_fragment`), because the Voice paraphrases a
-        record into a sentence and #181 grades every read by substring.
+        itself could have changed; and what is looked for is a fragment of it,
+        because the Voice paraphrases a record into a sentence and #181 grades
+        every read by substring. The two History questions take that fragment
+        off the page (`_spoken_fragment`, whose opening-of-the-line rule holds
+        because those entries are lines the walk dictated); Detail takes it from
+        `LIVE_CALL_DICTATED_REPLY_SUBSTRING`, since the relayed answer dictated
+        the reply that `newest` now is.
 
         **`--before` is graded on the argv and not on the answer.** Which entry
         the Call Agent's own older page held is its cursor's business; that it
@@ -3727,6 +3741,19 @@ class Walk:
                 f"`bridgectl brief {address}` carries no `newest` line mid-call, so there is "
                 f"nothing for the Voice's Detail answer to be compared against: "
                 f"{brief.text[:300]!r}"
+            )
+        # **A `newest` that is not the dictated reply is the relay not having
+        # taken, and blaming the Voice for it would read as a Detail failure.**
+        # The relayed answer tells the Session what to say back
+        # (`live_call.DICTATED_REPLY`), so this is the setup's fact, not the
+        # call's — a Session that answered in its own words is a run to send
+        # back rather than a grade to loosen.
+        if LIVE_CALL_DICTATED_REPLY_SUBSTRING not in _unspaced(newest):
+            raise LaneBlocked(
+                f"{address}'s newest message is {newest[:200]!r}, which does not carry "
+                f"{LIVE_CALL_DICTATED_REPLY_SUBSTRING!r} — the relayed answer dictated "
+                f"{live_call.DICTATED_REPLY!r} and this Session replied in its own words, so "
+                f"the Detail question has nothing stable to be graded against"
             )
         newest_page = self._history_page(address=address)
         if not newest_page.entries:
@@ -3749,7 +3776,7 @@ class Walk:
             heard=LIVE_CALL_DETAIL_HEARD_SUBSTRING,
             action=Action.BRIEF,
             address=address,
-            wanted=(_spoken_fragment(newest),),
+            wanted=(LIVE_CALL_DICTATED_REPLY_SUBSTRING,),
             about=f"the Session Brief's newest message {newest[:120]!r}",
             verb_is_graded=False,
         )
