@@ -392,10 +392,10 @@ HARNESS_CALL_REFERENCE = live_call.REFERENCE
 #: The workspace names a run that names none gets — the harness's own defaults,
 #: so a caller that does not care about the folded `live call`'s pinning still writes a
 #: complete table. A lane says its own (`journey.Lane`).
-DEFAULT_CALL_WORKSPACES = (
-    live_call.FOCUS_WORKSPACE_NAME,
-    live_call.RINGING_WORKSPACE_NAME,
-    live_call.WAITING_WORKSPACE_NAME,
+DEFAULT_CALL_WORKSPACES = live_call.CallWorkspaces(
+    focus=live_call.FOCUS_WORKSPACE_NAME,
+    ringing=live_call.RINGING_WORKSPACE_NAME,
+    waiting=live_call.WAITING_WORKSPACE_NAME,
 )
 
 #: The Relay ceiling every run is given, in seconds, in place of the one the user
@@ -450,7 +450,7 @@ def derive_config(
     codex_socket_directory: Path | None = None,
     dropped_agents: tuple[AgentKind, ...] = (),
     harness_live_call: bool = False,
-    call_workspaces: tuple[str, str, str] | None = None,
+    call_workspaces: live_call.CallWorkspaces | None = None,
     control_plane_cli: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
@@ -606,8 +606,11 @@ def derive_config(
         # machine-wide, so the Claude lane's engine holds the Codex lane's
         # Sessions too, and run `20260903T093813Z` had it looking at two rows
         # called `二号工位 · Reply READY` and answering with `brief`.
+        named = call_workspaces or DEFAULT_CALL_WORKSPACES
         focus_workspace, ringing_workspace, waiting_workspace = (
-            call_workspaces or DEFAULT_CALL_WORKSPACES
+            named.focus,
+            named.ringing,
+            named.waiting,
         )
         adapters["call"] = HARNESS_CALL_REFERENCE
         settings[CALL_SETTINGS_KEY] = {

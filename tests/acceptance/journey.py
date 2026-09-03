@@ -1159,7 +1159,7 @@ class Lane:
     #: cannot tell apart, and run `20260903T093813Z` is the Claude lane's Call
     #: Agent looking at two `二号工位 · Reply READY` and answering with `brief`.
     #: Said out loud by a recogniser, so both are ordinary spoken Chinese.
-    call_workspaces: tuple[str, str, str]
+    call_workspaces: live_call.CallWorkspaces
     #: What this lane adds to the **configured** token variable name to reach its
     #: own bot. One bot, one engine (`docs/app-bundle.md` § Cutover) is what
     #: makes two lanes at once possible at all, and it is kept by giving each
@@ -1252,10 +1252,10 @@ class Lane:
 CLAUDE = Lane(
     name="claude",
     agent="claude",
-    call_workspaces=(
-        live_call.FOCUS_WORKSPACE_NAME,
-        live_call.RINGING_WORKSPACE_NAME,
-        live_call.WAITING_WORKSPACE_NAME,
+    call_workspaces=live_call.CallWorkspaces(
+        focus=live_call.FOCUS_WORKSPACE_NAME,
+        ringing=live_call.RINGING_WORKSPACE_NAME,
+        waiting=live_call.WAITING_WORKSPACE_NAME,
     ),
     binary="claude",
     # The first lane keeps the engine's own configured variable, untouched.
@@ -1331,7 +1331,9 @@ CLAUDE = Lane(
 CODEX = Lane(
     name="codex",
     agent="codex",
-    call_workspaces=("五号工位", "六号工位", "七号工位"),
+    call_workspaces=live_call.CallWorkspaces(
+        focus="五号工位", ringing="六号工位", waiting="七号工位"
+    ),
     binary="codex",
     # The second bot, which already exists and messages the same user chat.
     token_env_suffix="_2",
@@ -2007,29 +2009,59 @@ class Walk:
         )
 
     def _drive_until_history_pages(self) -> int:
-        """Drive turns until the history is longer than one page can hold.
+        """Drive turns at the walk's own Session until its history outgrows one page.
 
         **A floor and a ceiling, and the floor is the ticket's.** #171's red line
         asks for more than `history_page_entries` entries driven *first*, at
-        least six turns of them — so six are driven whatever the Session already
-        said, and a lane that arrived with a long history is not allowed to skip
-        the walk the step is supposed to make. Past the floor the engine's own
+        least six of them — so six are driven whatever the Session already said,
+        and a lane that arrived with a long history is not allowed to skip the
+        walk the step is supposed to make. Past the floor the engine's own
         `older` is what says the page has somewhere to go, because the page size
         is the engine's dial and this harness deliberately does not read it.
+        """
+        return self._fill_until_a_page_is_full(
+            page=lambda: self._history_page(),
+            drive=lambda: self._drive_turn("fill the history", ACKNOWLEDGE),
+            floor=HISTORY_TURNS_FLOOR,
+            complaint=(
+                "turns did not produce more than one History page: either nothing is being "
+                "recorded or the page is unbounded"
+            ),
+        )
 
-        Turns are words-only for `ACKNOWLEDGE`'s reason — one that raised a
-        permission would sit in `waiting` until `approval` answered it.
+    def _fill_until_a_page_is_full(
+        self,
+        *,
+        page: Callable[[], HistoryReading | None],
+        drive: Callable[[], object],
+        floor: int = 0,
+        complaint: str,
+    ) -> int:
+        """Drive turns until `history` says something older than this page exists.
+
+        Both callers want the same bounded loop and differ in three ways, which
+        are the three parameters: whose page to read, how to make that Session
+        take a turn, and whether a minimum number of turns is owed whatever the
+        history already holds. `page` may answer `None` — a Session whose record
+        the engine has not read yet has no page, and that is "not yet" rather
+        than a failure (`_history_read_yet`).
+
+        `HISTORY_TURNS_CEILING` bounds it either way: a page that never fills is
+        a page that is unbounded, and this loop is the only thing that would
+        otherwise say so by running forever.
         """
         driven = 0
-        while driven < HISTORY_TURNS_FLOOR or not self._history_page().older:
+        while True:
+            read = page()
+            if driven >= floor and read is not None and read.older:
+                return driven
             if driven >= HISTORY_TURNS_CEILING:
                 raise StepFailed(
-                    f"{driven} turns did not produce more than one History page: either "
-                    f"nothing is being recorded or the page is unbounded"
+                    f"{driven} {complaint}. What one page holds: "
+                    f"{read if read is not None else 'no record the engine has read'}"
                 )
-            self._drive_turn("fill the history", ACKNOWLEDGE)
+            drive()
             driven += 1
-        return driven
 
     def _history_page(
         self, *, before: int | None = None, address: str | None = None
@@ -2059,6 +2091,18 @@ class Walk:
                 f"`bridgectl history {wanted}` carried no observation time: {answer.text[:200]!r}"
             )
         return _history_reading(answer.text)
+
+    def _brief_of(self, address: str) -> str:
+        """What `bridgectl brief <address>` says about one Session, whole.
+
+        `_brief_text`'s reading, for an address rather than for the walk's own
+        Session: the folded `live call` grades the Voice against Sessions the
+        harness started and holds no ground truth for. Empty on a refusal, which
+        the caller complains about in its own words — what a missing brief means
+        differs between a Session the engine has read and one it has not.
+        """
+        answer = self.bridgectl("brief", address)
+        return answer.text if answer.ok else ""
 
     def _history_read_yet(self, address: str) -> HistoryReading | None:
         """That Session's newest History page, or `None` if there is not one yet (#198).
@@ -3033,7 +3077,7 @@ class Walk:
             mark = len(self.engine.log_lines())
             with self._voice_route_only():
                 dialled = self._the_engine_dials_about_a_session_that_stopped(mark, cool_down)
-                answered = self._the_voice_answers_out_of_the_hand_over(focus_name)
+                answered = self._the_voice_answers_out_of_the_hand_over(focus_name, focus_address)
                 relayed = self._the_answer_is_relayed_and_receipted(
                     focus_name, focus_at, focus_address, turn
                 )
@@ -3122,36 +3166,33 @@ class Walk:
     ) -> int:
         """Drive turns at an extra Session until its History has a page behind it.
 
-        `_drive_until_history_pages`' rule, for a Session the harness started
-        rather than for the walk's own, and without #171's floor: what phase 3a
-        needs is not "more than the page size, driven by this step" — that is
-        #171's own red line and `brief` still walks it — but simply an older page
-        for `再往前` to have been answered out of. The engine's own `older` is
-        what says the page has somewhere to go, because the page size is the
-        engine's dial and this harness deliberately does not read it.
+        `_drive_until_history_pages`' loop, for a Session the harness started
+        rather than for the walk's own, and **without #171's floor**: what phase
+        3a needs is not "more than the page size, driven by this step" — that is
+        #171's red line and `brief` still walks it — but simply an older page for
+        `再往前` to have been answered out of.
 
         Turns are words-only for `ACKNOWLEDGE`'s reason, and they run with Voice
         off: every one of them ends in a Stop, and a Stop on a call that was up
         would be mid-call news a later phase is graded on.
         """
-        driven = 0
-        while True:
-            page = self._history_read_yet(self._extra_address(workspace, address))
-            if page is not None and page.older:
-                return driven
-            if driven >= HISTORY_TURNS_CEILING:
-                raise LaneBlocked(
-                    f"{driven} turns at {address} did not produce a second History page, so "
-                    f"there is nothing for `再往前` to page back to. What one page holds: "
-                    f"{page if page is not None else 'no record the engine has read'}"
-                )
+
+        def take_a_turn() -> None:
             self._drive_extra_session(extra, workspace, turn)
             support.wait_for(
                 lambda: str((self._row_in(workspace) or {}).get("state")) != "running",
                 deadline_seconds=turn,
                 poll_seconds=LIVE_CALL_POLL_SECONDS,
             )
-            driven += 1
+
+        return self._fill_until_a_page_is_full(
+            page=lambda: self._history_read_yet(self._extra_address(workspace, address)),
+            drive=take_a_turn,
+            complaint=(
+                f"turns at {address} did not produce a second History page, so there is "
+                f"nothing for `再往前` to page back to"
+            ),
+        )
 
     def _the_engine_dials_about_a_session_that_stopped(self, mark: int, cool_down: float) -> str:
         """Phase 1: nobody presses anything, and a call comes up holding a briefing.
@@ -3232,7 +3273,7 @@ class Walk:
             f"CONNECTED played"
         )
 
-    def _the_voice_answers_out_of_the_hand_over(self, focus_name: str) -> str:
+    def _the_voice_answers_out_of_the_hand_over(self, focus_name: str, focus_address: str) -> str:
         """Phase 2: two questions only the dial can answer, and no verb behind either (#194).
 
         `initialItems` is retained and never repeated (#175 Q5), so a Voice that
@@ -3258,18 +3299,24 @@ class Walk:
           which is the smallest thing that separates a counted roster from a
           list. Nothing about *which* counts, because the states in a roster are
           the roster's business and vary with what else this machine is running;
-        * the second answer **names the Session** the call was dialled about. The
-          name is the workspace's basename, which is the project half of a
-          Session Name (`adapters/agent/_project.py`) and which this harness
-          chose;
-        * **and the Call Agent ran nothing across either of them.** The wrapper
-          log gains no run from the first question to the end of the second.
-          That is the sharp one and the reason the phase exists: the counted
-          roster *and* one Session's whole brief both came out of the dial, and
-          the Voice went looking for neither. An absence, so it is scoped to this
-          phase's own window (#181) — the Voice's spans are waited out and then
-          watched a while longer, because a hand-off can arrive after an answer
-          has begun.
+        * the second answer **names the Session** the call was dialled about and
+          says **what it last said**. The name is the workspace's basename, which
+          is the project half of a Session Name (`adapters/agent/_project.py`)
+          and which this harness chose; the newest message is the field a
+          `SpokenBrief` carries (`seams/call.py`), so an answer holding both is
+          one taken from a Session Brief — whichever half fetched it;
+        **What is recorded and not graded: which half answered.** The wrapper
+        log's runs for both questions go into the verdict beside the dial's own
+        item count and kinds — but no absence is asserted over them. Run
+        `20260903T223601Z` had the claude lane re-read the roster with a bare
+        `brief` before answering generally and the codex lane run nothing; run
+        `20260903T224718Z` had it the other way round on the narrowing. One
+        behaviour, four lane-runs, three shapes: the product has no rule today
+        about which half answers a read question, and #181 says a step may not be
+        a coin toss about one. **#220 is where that split's rule is open** — the
+        Voice's own instructions do tell it to answer from what it holds
+        (`core/instructions/voice.py`), and a diagnosis may change what the rule
+        should be, which is not this step's to pre-empt.
 
         **Recorded and not graded:** whether the narrowed answer carries a
         fragment of what that Session actually stopped on. The name alone is weak
@@ -3278,6 +3325,15 @@ class Walk:
         Voice paraphrases and two lanes of transcripts should be read before a
         fragment is chosen.
         """
+        # Read before either question, so what the Voice is compared against is
+        # what the engine was holding when the call came up rather than anything
+        # the answers themselves moved.
+        newest = _newest_message(self._brief_of(focus_address))
+        if not newest:
+            raise LaneBlocked(
+                f"`bridgectl brief {focus_address}` carries no `newest` line, so there is "
+                f"nothing for the narrowed answer to be compared against"
+            )
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
         counted = self._one_question_the_hand_over_answers(
@@ -3380,21 +3436,19 @@ class Walk:
                 f"`initialItems`. What it said: "
                 f"{answered_narrowly or 'nothing this call recorded'}"
             )
-        # **The narrowing question's absence is graded; the general one's is
-        # recorded.** The narrowed answer is one Session's *whole brief*, which
-        # is unambiguously in `initialItems`, and both lanes answered it with no
-        # verb. The general question's answer is a roster, and on run
-        # `20260903T223601Z` the claude lane re-read it with a bare `brief` five
-        # seconds before answering while the codex lane ran nothing — one
-        # behaviour on two lanes in one run is the realtime model's discretion,
-        # and #181 says a step may not be a coin toss about one.
-        if runs:
+        # **Which half answers a read question is recorded, never graded** —
+        # see the docstring, and #220. What is graded is the answer's shape: a
+        # `SpokenBrief` carries the newest message (`seams/call.py`), so an
+        # answer naming the Session and quoting what it last said is one taken
+        # from a Session Brief, whichever half fetched it.
+        if not self._voice_said_something_carrying(_spoken_fragment(newest), since=narrowing):
             raise StepFailed(
-                f"the user narrowed to one Session and the Call Agent ran {len(runs)} "
-                f"`bridgectl` command(s) for a question with no verb in it: {runs!r}. That "
-                f"Session's whole brief rode `initialItems` — a hand-off here says the Voice "
-                f"went looking for what it was holding (#194), which its own instructions "
-                f"tell it never to do (`core/instructions/voice.py`)"
+                f"the user narrowed to {focus_name!r} and the Voice named it without saying "
+                f"what it last said. A Session Brief is its project and task, its agent, where "
+                f"it stands, and one sentence of its newest message "
+                f"(`core/instructions/voice.py`); the engine holds "
+                f"{newest[:120]!r} for it. What the Voice said: "
+                f"{answered_narrowly or 'nothing this call recorded'}"
             )
         return (
             f"asked what needed them the Voice answered with counts and no names; asked to "
@@ -3463,7 +3517,7 @@ class Walk:
         #196's own rule as a failure: the answer this phase relays is what drives
         the Focus Session's next Stop, and a Focus Stop mid-call is a `speak` the
         engine hands to the call in the first gap (`call_keeper.py::_owed_word`).
-        So what is graded is that every assistant turn after the receipt is
+        So what is graded is that every Voice turn after the receipt is
         **accounted for by an engine payment in the same window** — the Voice
         going on by itself is what is forbidden, and the engine handing it a
         brief is not that. The count is recorded either way, which is what makes
@@ -3522,7 +3576,7 @@ class Walk:
             f"{any(focus_address in verb for verb in relays)}; the Voice said "
             f"{self._voice_said_lines(since=relaying) or 'nothing recorded'}; "
             f"{len(payments)} engine payment(s) in the window, "
-            f"{'no' if not unaccounted else unaccounted} assistant turn(s) unaccounted for; "
+            f"{'no' if not unaccounted else unaccounted} Voice turn(s) unaccounted for; "
             f"what the Call Agent ran before the relay: "
             f"{self._verbs_run(since=runs_before)[:-1] or 'nothing'}",
         )
@@ -3567,7 +3621,7 @@ class Walk:
             raise StepFailed(
                 f"the Voice said its receipt and then said {unaccounted} more thing(s) nobody "
                 f"asked it for: the window holds {len(payments)} engine payment(s) "
-                f"({[line.strip() for line in payments]}) and more assistant turns than that. "
+                f"({[line.strip() for line in payments]}) and more Voice turns than that. "
                 f"What it said: {self._voice_said_lines(since=relaying)}"
             )
         return (
@@ -3632,12 +3686,21 @@ class Walk:
         cursor = min(ordinal for ordinal, _ in newest_page.entries)
         latest = max(ordinal for ordinal, _ in newest_page.entries)
         older_page = self._history_page(before=cursor, address=address)
+        # **Detail's verb is recorded, not graded** (#220, and `seams/call.py`):
+        # a `SpokenBrief` already carries `name`, `state` and `newest`, so
+        # `bridgectl brief` on a Session the call was dialled about adds nothing
+        # the Voice does not hold — run `20260903T224718Z`'s claude lane answered
+        # this question correctly with no verb at all, and the answer was
+        # word-for-word what it had said from the hand-over a minute earlier.
+        # What is graded is the answer.
         detail = self._one_read_asked_for_by_voice(
             variant=live_call.DETAIL,
             heard=LIVE_CALL_DETAIL_HEARD_SUBSTRING,
             action=Action.BRIEF,
+            address=address,
             wanted=(_spoken_fragment(newest),),
             about=f"the Session Brief's newest message {newest[:120]!r}",
+            verb_is_graded=False,
         )
         # **Older than `newest`, which is what the question asks for.** The newest
         # page *includes* the newest entry (#171 amends ADR 0016), so the entry
@@ -3652,12 +3715,19 @@ class Walk:
                 f"there is nothing older than `newest` on it for `它之前说了什么` to have been "
                 f"answered out of"
             )
+        # **History's verb *is* graded, and this is the line the whole phase
+        # turns on.** A `SpokenBrief` carries `newest` and no history at all
+        # (`seams/call.py`), so no hand-over can answer "what did it say before"
+        # — the Voice has to hand this one off, and a run where `history` never
+        # ran is a defect rather than the model's discretion.
         history = self._one_read_asked_for_by_voice(
             variant=live_call.HISTORY,
             heard=LIVE_CALL_HISTORY_HEARD_SUBSTRING,
             action=Action.HISTORY,
+            address=address,
             wanted=tuple(_spoken_fragment(text) for text in earlier_entries),
             about=f"an entry on {address}'s newest History page ({newest_page.entries!r})",
+            without=HISTORY_CURSOR_OPTION,
         )
         if not older_page.entries:
             raise LaneBlocked(
@@ -3670,6 +3740,7 @@ class Walk:
             variant=live_call.EARLIER,
             heard=LIVE_CALL_EARLIER_HEARD_SUBSTRING,
             action=Action.HISTORY,
+            address=address,
             wanted=tuple(_spoken_fragment(text) for _, text in older_page.entries),
             about=f"an entry on the page before ordinal {cursor} ({older_page.entries!r})",
             argv=HISTORY_CURSOR_OPTION,
@@ -3682,22 +3753,42 @@ class Walk:
         variant: str,
         heard: str,
         action: Action,
+        address: str,
         wanted: tuple[str, ...],
         about: str,
+        verb_is_graded: bool = True,
         argv: str | None = None,
+        without: str | None = None,
     ) -> str:
-        """One spoken question that the Call Agent has to answer with a read verb.
+        """One spoken question that the user gets an answer to, and how it was answered.
 
         Three of these make phase 3a, and they differ only in the sentence, the
-        verb, and what the engine was holding when it was asked — so they are one
-        method rather than three that would drift apart. Every wait is
-        lower-bounded and every read is a substring (#181).
+        verb, what the engine was holding when it was asked, and **whether the
+        verb is graded**. One method rather than three that would drift apart.
+        Every wait is lower-bounded and every read is a substring (#181).
 
-        `wanted` is a *set* of acceptable fragments and any one of them passes: a
+        **`verb_is_graded` is the whole design of this phase.** A hand-over
+        carries `SpokenBrief`s, and a `SpokenBrief` is `name`, `agent`, `state`,
+        `newest`, the decision and where it can be answered (`seams/call.py`).
+        So:
+
+        * *Detail* asks for what a `SpokenBrief` already holds. Whether the Voice
+          answers from `initialItems` or hands off to the Call Agent for a
+          `brief` it does not need is a split the product has no rule for today
+          (#220) — and run `20260903T224718Z` saw both, one lane each. The verb
+          is **recorded**; the answer is graded.
+        * *History* and its older page ask for what **no** hand-over carries: a
+          `SpokenBrief` holds `newest` and nothing before it. The Voice cannot
+          answer without handing off, so the verb is **graded**, and with it the
+          `--before` cursor that makes the second one paging (#171).
+
+        `wanted` is a set of acceptable fragments and any one of them passes: a
         History page holds several entries and the Voice picks which to read out,
-        and pinning one would grade the Voice's choice rather than whether it was
-        answering out of the record. `argv` is an option that has to appear in
-        the wrapper log, which is how paging is observed.
+        so pinning one would grade the choice rather than whether it answered out
+        of the record. `argv` is an option that must appear in the verb's own
+        argv; `without` is one that must not — the first History read is not a
+        paged one, and a cursor on it would answer the *older-page* question
+        before it was asked.
         """
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
@@ -3706,11 +3797,11 @@ class Walk:
             lambda: bool(self._user_speech_lines(heard, since=asking)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
         )
-        ran = support.wait_for(
-            lambda: bool(self._verbs_since(runs_before, action)),
-            deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
-            poll_seconds=LIVE_CALL_POLL_SECONDS,
-        )
+        if verb_is_graded:
+            self._while_the_call_is_up(
+                lambda: bool(self._verbs_since(runs_before, action)),
+                deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
+            )
         answered = self._while_the_call_is_up(
             lambda: any(
                 self._voice_said_something_carrying(fragment, since=asking)
@@ -3720,37 +3811,53 @@ class Walk:
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
         )
         verbs = self._verbs_since(runs_before, action)
+        # **The verb has to be about the Session the question named.** The Call
+        # Agent picks the target off what it heard, and this machine runs nine
+        # Sessions during a walk — a `history` of somebody else's record read
+        # back convincingly would otherwise pass.
+        about_it = [verb for verb in verbs if address in verb]
         said = self._voice_said_lines(since=asking)
         self.journey.observe(
             f"live call {variant} by voice",
-            f"the Call Agent ran {verbs or 'nothing'}; the Voice said "
-            f"{said or 'nothing recorded'}; what the engine was holding: {about}",
+            f"the Call Agent ran {verbs or 'nothing'}, {len(about_it)} of them naming "
+            f"{address} — {'graded' if verb_is_graded else 'recorded, not graded (#220)'}; "
+            f"the Voice said {said or 'nothing recorded'}; what the engine was holding: {about}",
         )
         if not arrived:
             raise StepFailed(
                 f"the {variant} utterance went on the track and the engine never logged the "
                 f"user's speech within {LIVE_CALL_HEARD_SECONDS:.0f}s. The line looked for "
-                f"carries {heard!r}. Engine log tail: {self._log_since(asking)[-8:]}"
+                f"carries {heard!r}. The call now: {self._call_line()!r}. Engine log tail: "
+                f"{self._log_since(asking)[-8:]}"
             )
-        if not ran:
+        if verb_is_graded and not about_it:
             raise StepFailed(
-                f"the engine heard the {variant} question and the Call Agent never ran "
-                f"`{action}` within {LIVE_CALL_HANDOFF_SECONDS:.0f}s. What it ran instead: "
+                f"the engine heard the {variant} question about {address} and the Call Agent "
+                f"never ran `{action}` for it within {LIVE_CALL_HANDOFF_SECONDS:.0f}s. No "
+                f"hand-over carries a Session's history — a `{SESSION_BRIEF_KIND}` holds its "
+                f"newest message and nothing before it (`seams/call.py`) — so this one cannot "
+                f"be answered without the verb. What it ran: "
                 f"{self._verbs_run(since=runs_before) or 'nothing at all'}"
             )
-        if argv is not None and not any(argv in verb for verb in verbs):
+        if argv is not None and not any(argv in verb for verb in about_it):
             raise StepFailed(
                 f"the user asked for the older page and the Call Agent ran `{action}` without "
-                f"`{argv}`: {verbs}. Paging is the cursor, and a read that did not carry one "
+                f"`{argv}`: {about_it}. Paging is the cursor, and a read that did not carry one "
                 f"answered out of the newest page (#171)"
+            )
+        if without is not None and any(without in verb for verb in about_it):
+            raise StepFailed(
+                f"the user asked what that Session said before, and the Call Agent paged "
+                f"straight past it with `{without}`: {about_it}. The newest page is what this "
+                f"question is answered out of; the cursor belongs to the one after it (#171)"
             )
         if not answered:
             raise StepFailed(
-                f"the Call Agent ran {verbs} and the Voice never said anything carrying "
-                f"{[fragment for fragment in wanted if fragment]!r} — {about}. What it said: "
-                f"{said or 'nothing this call recorded'}"
+                f"the Call Agent ran {verbs or 'nothing'} and the Voice never said anything "
+                f"carrying {[fragment for fragment in wanted if fragment]!r} — {about}. What "
+                f"it said: {said or 'nothing this call recorded'}"
             )
-        return f"{variant} answered with {verbs} and read back to the user"
+        return f"{variant} answered out of {about_it or 'the hand-over'} and read back to the user"
 
     def _the_voice_holds_the_call_open(self, ceiling: float) -> str:
         """Phase 3b: the Voice's own answer outlasts the Silence Ceiling (#184).
@@ -3897,7 +4004,7 @@ class Walk:
           mid-call line ends on a code-shaped token saying so
           (`core/call_keeper.py::MID_CALL_SPOKEN_LINE`), because the brief
           itself crosses the Call seam and is never written down;
-        * **the Voice said it** — the assistant transcript the realtime adapter
+        * **the Voice said it** — the Voice transcript the realtime adapter
           writes down carries #173 §6's "没送到". A substring per #181: the Voice
           composes the sentence from what Briefing handed it, and this run does
           not get to predict the rest of it.
@@ -4185,6 +4292,18 @@ class Walk:
         # silently and correctly (`call_keeper.py::nothing_to_speak`).
         owing = len(self.engine.log_lines())
         self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
+        # **What the brief will be about**, read after the Stop lands and before
+        # the word is paid: the announcement is spoken from a reading taken at
+        # the gap (ADR 0017), so what the user hears has to be *this* Stop's
+        # newest message and not the one the call was dialled on.
+        stopped_on = support.wait_for(
+            lambda: bool(
+                _newest_message(self._brief_of(self._extra_address(focus_at, focus_address)))
+            ),
+            deadline_seconds=turn,
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        fresh = _newest_message(self._brief_of(self._extra_address(focus_at, focus_address)))
         announced = support.wait_for(
             lambda: bool(support.matching_lines(self._log_since(owing), MID_CALL_SPOKEN_PATTERN)),
             deadline_seconds=turn + cool_down + settle + LIVE_CALL_CUE_SECONDS,
@@ -4242,6 +4361,25 @@ class Walk:
                 f"the brief was spoken while the Voice's own last edge was still `speaking` — "
                 f"there was no gap to speak into, and the wire has no silent mid-call path "
                 f"(#175, #196). The announcement: {announcements[0].strip()!r}"
+            )
+        # **And the user heard the brief, not just that there was one.** The
+        # engine's `speak` line says a brief was handed to the call and names the
+        # Session; what the Voice made of it is the transcript. A run where the
+        # word was paid and the Voice said something stale or about something
+        # else would pass every line above.
+        if not stopped_on:
+            raise LaneBlocked(
+                f"{focus_address} stopped again and `bridgectl brief` carried no `newest` "
+                f"line within {turn:.0f}s, so there is nothing for the announcement to be "
+                f"compared against"
+            )
+        if not self._voice_said_something_carrying(_spoken_fragment(fresh), since=owing):
+            raise StepFailed(
+                f"the engine spoke the Focus Session's brief into the call "
+                f"({announcements[0].strip()!r}) and the Voice never said what that Session "
+                f"had just said. The reading is taken at the gap (ADR 0017), and the engine "
+                f"holds {fresh[:120]!r} for it. What the Voice said: "
+                f"{self._voice_said_lines(since=owing) or 'nothing this call recorded'}"
             )
         return (
             f"{ringing_address} stopped and rang without a word said about it ({rings} EVENT "
@@ -4787,7 +4925,7 @@ class Walk:
     def _voice_said_lines(self, *, since: int = 0) -> list[str]:
         """Every line the realtime adapter wrote down of what the Voice said (#197).
 
-        The assistant transcript, which is the only witness this side has of the
+        The Voice transcript, which is the only witness this side has of the
         Voice's own words: the Call seam raises the Voice's half as a *span* and
         never as text (`seams/call.py`), so a step that wants to know what was
         said reads the adapter's log line and nothing else. Stripped, because
@@ -4802,7 +4940,7 @@ class Walk:
         """Whether the Voice's transcript since a mark carries a fragment (#181, #198).
 
         Spaceless on both sides for `_user_speech_lines`' reason, and for one
-        more of its own: the assistant transcript comes back from the same
+        more of its own: the Voice transcript comes back from the same
         recogniser-adjacent path and has been seen to put a boundary inside a
         word. What is asked is only whether the words are in there.
         """

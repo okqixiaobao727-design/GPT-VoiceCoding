@@ -63,7 +63,7 @@ import subprocess
 import time
 import wave
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -153,6 +153,45 @@ RINGING_WORKSPACE_NAME = "三号工位"
 #: Never named in any utterance: nobody speaks on the call it earns. Per lane for
 #: `FOCUS_WORKSPACE_NAME`'s reason.
 WAITING_WORKSPACE_NAME = "四号工位"
+
+
+@dataclass(frozen=True, slots=True)
+class CallWorkspaces:
+    """The three roles one lane's extra Sessions play, named rather than ordered.
+
+    They were a `tuple[str, str, str]` until the third arrived and every reader
+    of it — the lane, `derive_config`'s unpacking, the settings table it writes
+    and the `DerivedConfig` it returns — had to be changed in step. The roles are
+    what those readers actually mean, so they are what is carried: `workspaces
+    .focus` cannot be read as `workspaces.ringing` the way `[0]` can be read as
+    `[1]`, and a fourth role would be a field rather than a fourth position
+    threaded through four files.
+
+    Kept out of `HarnessSettings`, which stays flat: its fields are
+    `[adapters.settings.call]` keys, and that table crosses a process boundary
+    as TOML.
+    """
+
+    #: The one every call is dialled about, relayed into, briefed, paged and
+    #: announced. Said out loud by the utterances, which is why it is per lane.
+    focus: str
+    #: The one that only ever rings. The run's proof about it is that nothing
+    #: spoken ever names it.
+    ringing: str
+    #: The one that stops inside the Cool-down after the hang-up. Nothing says it
+    #: out loud either.
+    waiting: str
+
+    def __post_init__(self) -> None:
+        named = (self.focus, self.ringing, self.waiting)
+        if len(set(named)) != len(named):
+            raise ValueError(
+                f"a lane's three extra Sessions need three names it can tell apart: {named}"
+            )
+
+    def __iter__(self) -> Iterator[str]:
+        """The three names, for a caller that wants to check them as a set."""
+        return iter((self.focus, self.ringing, self.waiting))
 
 
 def relay_request(focus_workspace: str) -> str:

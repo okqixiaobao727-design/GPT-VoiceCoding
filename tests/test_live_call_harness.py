@@ -745,7 +745,7 @@ def test_a_queued_receipt_is_a_receipt_too() -> None:
 
 
 def test_a_receipt_the_recogniser_put_a_space_inside_is_still_a_receipt() -> None:
-    """Run `20260902T093755Z`'s inserted space, on the assistant side (#181)."""
+    """Run `20260902T093755Z`'s inserted space, on the Voice's side (#181)."""
     assert journey._unaccounted_voice_turns([_said("已转 达了")], RECEIPTS) == 0
 
 

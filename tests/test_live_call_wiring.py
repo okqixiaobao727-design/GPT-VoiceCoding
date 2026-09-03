@@ -27,6 +27,7 @@ from pathlib import Path
 
 import journey
 import live_call
+import pytest
 import support
 
 from gpt_voicecoding.core.instructions import (
@@ -831,7 +832,7 @@ def test_the_relay_utterance_names_the_workspace_the_step_creates() -> None:
     what stops one of them being renamed alone.
     """
     for lane in journey.LANES:
-        focus = lane.call_workspaces[0]
+        focus = lane.call_workspaces.focus
         assert focus in live_call.relay_request(focus)
         assert journey.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
 
@@ -845,7 +846,7 @@ def test_every_utterance_that_asks_about_a_session_names_it(tmp_path: Path) -> N
     History and its older page ask about the same Session, so each says which.
     """
     for lane in journey.LANES:
-        focus = lane.call_workspaces[0]
+        focus = lane.call_workspaces.focus
         for utterance in (
             live_call.detail_request(focus),
             live_call.history_request(focus),
@@ -891,8 +892,9 @@ def test_every_lane_names_three_extra_sessions(tmp_path: Path) -> None:  # noqa:
     against a Session another phase already moved.
     """
     for lane in journey.LANES:
-        assert len(lane.call_workspaces) == 3
-        assert len(set(lane.call_workspaces)) == 3
+        named = tuple(lane.call_workspaces)
+        assert len(named) == 3
+        assert len(set(named)) == 3
 
 
 def test_the_grade_wording_the_voice_is_told_to_say_is_what_the_step_looks_for() -> None:
@@ -1042,3 +1044,22 @@ def test_the_paging_option_the_step_greps_for_is_the_one_the_surface_takes() -> 
     )
     if rendered.returncode == 0:
         assert journey.HISTORY_CURSOR_OPTION in rendered.stdout
+
+
+def test_the_three_workspace_roles_are_named_rather_than_ordered() -> None:
+    """A third role arrived and four readers of a 3-tuple had to change in step (#198).
+
+    The roles are what those readers mean, so they are what is carried:
+    `workspaces.focus` cannot be misread as `workspaces.ringing` the way `[0]`
+    can be misread as `[1]`.
+    """
+    named = live_call.CallWorkspaces(focus="a", ringing="b", waiting="c")
+
+    assert (named.focus, named.ringing, named.waiting) == ("a", "b", "c")
+    assert tuple(named) == ("a", "b", "c")
+
+
+def test_a_lane_cannot_name_two_of_its_sessions_the_same() -> None:
+    """Two roles sharing a name is a phase graded against a Session another moved."""
+    with pytest.raises(ValueError, match="three names"):
+        live_call.CallWorkspaces(focus="二号工位", ringing="二号工位", waiting="四号工位")
