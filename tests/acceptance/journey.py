@@ -3837,9 +3837,15 @@ class Walk:
         History page holds several entries and the Voice picks which to read out,
         so pinning one would grade the choice rather than whether it answered out
         of the record. `argv` is an option that must appear in the verb's own
-        argv; `without` is one that must not — the first History read is not a
-        paged one, and a cursor on it would answer the *older-page* question
-        before it was asked.
+        argv; `without` is one the **first** read must not carry — the read that
+        opens this question is not a paged one, and a cursor on it would answer
+        the *older-page* question before it was asked.
+
+        Only the first, because paging on is the Call Agent's to do: run
+        `20260903T231626Z`'s codex lane opened with `history <address>` and then
+        walked back two pages inside the same turn to gather enough to say. That
+        is the newest page answering the question and the Call Agent reading
+        around it, not the skip #171 forbids.
         """
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
@@ -3896,11 +3902,11 @@ class Walk:
                 f"`{argv}`: {about_it}. Paging is the cursor, and a read that did not carry one "
                 f"answered out of the newest page (#171)"
             )
-        if without is not None and any(without in verb for verb in about_it):
+        if without is not None and about_it and without in about_it[0]:
             raise StepFailed(
-                f"the user asked what that Session said before, and the Call Agent paged "
-                f"straight past it with `{without}`: {about_it}. The newest page is what this "
-                f"question is answered out of; the cursor belongs to the one after it (#171)"
+                f"the user asked what that Session said before, and the Call Agent opened with "
+                f"`{without}`: {about_it}. The newest page is what this question is answered "
+                f"out of; the cursor belongs to the one after it (#171)"
             )
         if not answered:
             raise StepFailed(
