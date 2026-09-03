@@ -157,6 +157,16 @@ INCLUDE_STARTUP_CONTEXT = False
 #: a request this engine can see (ADR 0018, "No `HandoffRequested` event").
 HANDOFF_REQUEST = "handoff_request"
 
+#: What the Voice said, as codex transcribed it — one line per
+#: `thread/realtime/transcript/done` on the assistant side. Written down and
+#: raised to nobody, for the same reason the hand-off above is: the seam's event
+#: set is closed, and nothing in this system acts on its own speech. What it is
+#: *for* is the run that cannot listen — the Voice's own words are otherwise
+#: unobservable anywhere, so a step that has to know the user was told something
+#: has only the audio, which #181 grades nothing on. The user's half of the
+#: transcript is untouched; it is an event, and it always was.
+VOICE_SAID_LINE = "the Voice said: %s"
+
 #: How often the user's quiet bound is checked, as a fraction of the bound
 #: itself. Derived rather than stated, so a run that dials `user_quiet_seconds`
 #: gets a poll in proportion to it: a fixed interval beside a settable bound is
@@ -971,6 +981,17 @@ class RealtimeCallAdapter:
         """
         role = params.get("role")
         if role == ASSISTANT_ROLE:
+            said = params.get("text")
+            if isinstance(said, str) and said:
+                # **Written down, never raised.** The seam's event set is closed
+                # and this system does not read its own speech back to itself —
+                # the *event* stays the span edge below. What the line is for is
+                # the one question no other surface can answer: what the Voice
+                # actually said, in its own words, for a run that cannot listen
+                # (#181 grades no audio; this is the transcript codex already
+                # sends). One line per `transcript/done`, which codex emits once
+                # per turn.
+                _log.info(VOICE_SAID_LINE, said)
             self._voice_finishing(live)
             return
         if role != USER_ROLE:
@@ -1133,6 +1154,8 @@ def _brief_text(brief: SpokenBrief) -> str:
     lines.extend(f"  {line}" for line in brief.decision)
     lines.append(f"  answer: {brief.answerable_here}")
     lines.append(f"  last activity: {brief.last_activity_at}")
+    if brief.undelivered:
+        lines.append(f"  undelivered: {brief.undelivered}")
     return "\n".join(lines)
 
 

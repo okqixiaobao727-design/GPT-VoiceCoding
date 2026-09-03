@@ -14,7 +14,8 @@ from pathlib import Path
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.briefing import BriefState, Newest, NewestState
-from gpt_voicecoding.core.sessions import Session
+from gpt_voicecoding.core.lifecycle import RelayReason
+from gpt_voicecoding.core.sessions import Session, UndeliveredRelay
 from gpt_voicecoding.seams.agent import (
     SANDBOX_TOOL_NAME,
     ChildClassification,
@@ -38,6 +39,7 @@ from gpt_voicecoding.seams.call import (
     SpokenBrief,
     SpokenRosterBrief,
 )
+from gpt_voicecoding.seams.delivery import Delivery
 from gpt_voicecoding.seams.identity import AgentKind, SessionName, SessionTarget
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -64,6 +66,7 @@ def row(
     name: SessionName | None = None,
     child: ChildClassification | None = None,
     last_activity: datetime | None = READ_AT,
+    undelivered: UndeliveredRelay | None = None,
 ) -> Session:
     return Session(
         target=target,
@@ -75,6 +78,7 @@ def row(
         progress=progress if progress is not None else said("done"),
         last_activity=last_activity,
         child=child or ChildClassification(),
+        undelivered=undelivered,
     )
 
 
@@ -570,6 +574,86 @@ class TestTheSpokenBrief:
 
     def test_a_running_session_carries_no_decision_lines(self) -> None:
         assert briefing.spoken(briefing.session(row(state=SessionState.RUNNING))).decision == ()
+
+
+class TestWhatDidNotArrive:
+    """The one field that says the user's own words never reached a Session.
+
+    The row carries a code and the grade the last attempt earned; this module
+    turns the pair into the sentence, because the verb is the grade's: an
+    attempt that *proved* nothing arrived may say so, and one that proved
+    nothing either way may not (`core/relays.py::RelayReason`, #175).
+    """
+
+    def test_a_brief_with_nothing_undelivered_says_nothing_about_delivery(self) -> None:
+        brief = briefing.session(row())
+
+        assert brief.undelivered is None
+        assert "did not arrive" not in briefing.text(brief)
+        assert briefing.spoken(brief).undelivered == ""
+
+    def test_an_unattempted_relay_that_expired_did_not_arrive(self) -> None:
+        brief = briefing.session(row(undelivered=UndeliveredRelay(reason="ceiling_passed")))
+
+        assert briefing.spoken(brief).undelivered == (
+            "your last reply did not arrive, because ceiling_passed"
+        )
+        assert "your last reply did not arrive, because ceiling_passed" in briefing.text(brief)
+
+    def test_a_proven_failure_that_expired_did_not_arrive_either(self) -> None:
+        brief = briefing.session(
+            row(undelivered=UndeliveredRelay(reason="ceiling_passed", grade=Delivery.FAILED))
+        )
+
+        assert briefing.spoken(brief).undelivered == (
+            "your last reply did not arrive, because ceiling_passed"
+        )
+
+    def test_an_attempt_that_proved_nothing_either_way_only_may_not_have_arrived(self) -> None:
+        """The rule the four deleted ceiling reports came in pairs for."""
+        brief = briefing.session(
+            row(undelivered=UndeliveredRelay(reason="ceiling_passed", grade=Delivery.UNKNOWN))
+        )
+
+        assert briefing.spoken(brief).undelivered == (
+            "your last reply may not have arrived, because ceiling_passed"
+        )
+
+    def test_words_parked_in_front_of_a_person_may_have_arrived_too(self) -> None:
+        brief = briefing.session(
+            row(undelivered=UndeliveredRelay(reason="ceiling_passed", grade=Delivery.HELD))
+        )
+
+        assert briefing.spoken(brief).undelivered.startswith("your last reply may not have arrived")
+
+
+class TestARunningSessionWithWordsThatNeverArrived:
+    """#197: the field is news about a Session, not a state of it.
+
+    A running Session is asking nobody anything and gets a header row alone —
+    but the user's own reply failing to reach it is theirs to hear whatever it
+    went on to do, which is `CONTEXT.md`'s *Session Brief* promise.
+    """
+
+    HELD = UndeliveredRelay(reason=RelayReason.CEILING_PASSED)
+
+    def test_a_running_row_earns_no_brief_on_its_own(self) -> None:
+        assert not briefing.earns_a_brief(row(state=SessionState.RUNNING))
+
+    def test_it_earns_one_the_moment_a_relay_to_it_finally_failed(self) -> None:
+        assert briefing.earns_a_brief(row(state=SessionState.RUNNING, undelivered=self.HELD))
+
+    def test_the_hand_over_carries_that_brief_rather_than_a_header_row_alone(self) -> None:
+        items = briefing.handover(
+            (row(CODEX, state=SessionState.RUNNING, undelivered=self.HELD),),
+            focus=CODEX,
+            reason="Sessions need the user.",
+        )
+
+        briefs = [item for item in items if isinstance(item, SpokenBrief)]
+        assert [brief.undelivered for brief in briefs] == [
+            "your last reply did not arrive, because ceiling_passed"
+        ]
 
 
 class TestTheHandover:

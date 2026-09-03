@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 
 from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.adjudication import Outlet, SwitchAdjudicator
-from gpt_voicecoding.core.briefing import BriefState, RosterBrief, SessionBrief
+from gpt_voicecoding.core.briefing import RosterBrief, SessionBrief
 from gpt_voicecoding.core.call_keeper import CallKeeper
 from gpt_voicecoding.core.clock import Clock, default_clock, wall_clock
 from gpt_voicecoding.core.errors import (
@@ -65,9 +65,14 @@ from gpt_voicecoding.core.instructions import InstructionContext, Instructions, 
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.policy import CorePolicy
 from gpt_voicecoding.core.relay_queue import PendingRelay
-from gpt_voicecoding.core.relays import RelayOutcome, RelayPipeline, reason_for, terminal_line
+from gpt_voicecoding.core.relays import (
+    RelayOutcome,
+    RelayPipeline,
+    RelayReason,
+    reason_for,
+)
 from gpt_voicecoding.core.router import Classification, InboundClass, InboundRouter, TextGrammar
-from gpt_voicecoding.core.sessions import Session, SessionRegistry
+from gpt_voicecoding.core.sessions import Session, SessionRegistry, UndeliveredRelay
 from gpt_voicecoding.core.state import BridgeState
 from gpt_voicecoding.core.switches import SwitchSnapshot
 from gpt_voicecoding.core.verification import (
@@ -342,10 +347,12 @@ class RosterBriefer:
         row = next(
             (row for row in briefing.roster(sessions, focus).rows if row.target == focus), None
         )
-        if row is None or row.state is BriefState.RUNNING:
+        if row is None:
             return None
         session = next((live for live in sessions if live.target == focus), None)
         if session is None:  # pragma: no cover - the roster read it out of this list
+            return None
+        if not briefing.earns_a_brief(session):
             return None
         return briefing.spoken(
             briefing.session(session, question_answerable=self._answerable_for(session))
@@ -714,6 +721,7 @@ class BridgeCore:
         # user's attention, and a Relay that failed to land is precisely the
         # Session they are still waiting on.
         self._state.sessions.set_focus(outcome.target)
+        await self._settle(outcome)
         return outcome
 
     async def answer_approval(
@@ -760,7 +768,7 @@ class BridgeCore:
         request_id = new_request_id()
         receipt = await adapter.approval_relay(request, verdict, request_id=request_id)
         self._state.sessions.set_focus(session.target)
-        return RelayOutcome(
+        outcome = RelayOutcome(
             request_id=request_id,
             target=session.target,
             state=Lifecycle.DELIVERED if receipt.is_delivered else Lifecycle.REPORTED_FAILED,
@@ -768,6 +776,11 @@ class BridgeCore:
             reason=reason_for(receipt),
             receipt=receipt,
         )
+        # An Approval Relay is the user's own words arriving too (#165 Q2 sets
+        # the focus from it for that reason), so a verdict that lands clears
+        # whatever the last Relay that did not land left on the row.
+        await self._settle(outcome)
+        return outcome
 
     def _dialog_on_the_roster(self, approval_id: str) -> tuple[Session, ApprovalRequest] | None:
         """The live row whose current wait carries that handle, and the request for it.
@@ -859,7 +872,7 @@ class BridgeCore:
         """
         expired = self.relays.sweep_expired()
         for outcome in expired:
-            await self._announce(outcome.target, terminal_line(outcome))
+            await self._settle(outcome)
         if not self.events.unread(UserSpeech, UserSpeaking, VoiceSpeech):
             await self.keeper.tick(self._clock())
         return expired
@@ -903,7 +916,7 @@ class BridgeCore:
         for target in gone:
             _log.info("Session %s is no longer running", target)
             for outcome in self.relays.session_ended(target):
-                await self._announce(outcome.target, terminal_line(outcome))
+                await self._settle(outcome)
         return tuple(gone)
 
     async def dispatch(self, event: Event) -> None:
@@ -1043,7 +1056,7 @@ class BridgeCore:
             _log.info("a Session ended that was never registered: %s", event.target)
         self._state.persist()
         for outcome in self.relays.session_ended(event.target):
-            await self._announce(outcome.target, terminal_line(outcome))
+            await self._settle(outcome)
 
     async def _reply_window_changed(self, event: ReplyWindowChanged) -> None:
         """An adapter saw the window move between two discoveries. Land it on the state.
@@ -1071,14 +1084,26 @@ class BridgeCore:
             _log.info("a Reply Window changed on an unknown Session: %s", event.target)
             return
         if event.window is ReplyWindow.OPEN:
-            await self.relays.reply_window_opened(event.target)
+            for outcome in await self.relays.reply_window_opened(event.target):
+                await self._settle(outcome)
 
     def _relay_receipt(self, event: RelayReceipt) -> None:
-        """A receipt that arrived after the call returned. The ledger records it."""
+        """A receipt that arrived after the call returned. The ledger records it.
+
+        **And a late proof of delivery clears the row's `undelivered` too**
+        (#197). The field says what the last Relay that did not arrive was, and
+        a receipt proving one did arrive is exactly the news that ends it — it
+        makes no difference to the user whether the proof came back inside the
+        call or minutes later on the Claude inbox's own acknowledgement route
+        (ADR 0013).
+        """
         try:
-            self._state.relays.classify(event.receipt.request_id, event.receipt)
+            classified = self._state.relays.classify(event.receipt.request_id, event.receipt)
         except UnknownRelayError:
             _log.info("a receipt arrived for a Relay that is no longer pending")
+            return
+        if event.receipt.is_delivered:
+            self._fold_undelivered(classified.target, None)
 
     async def _inbound_text(self, event: InboundText) -> None:
         """Classify one inbound line, act on it, and always answer the user."""
@@ -1121,19 +1146,88 @@ class BridgeCore:
         except BridgeCoreError as refusal:
             await self._reply(str(refusal))
             return
+        await self._settle(outcome)
         await self._reply(outcome.line)
 
-    async def _announce(self, target: SessionTarget, text: str) -> None:
-        """Tell the user something the pipelines decided they need to know.
+    async def _settle(self, outcome: RelayOutcome) -> None:
+        """Land one Relay's standing on the Session's row, and wake if it is news.
 
-        A failed Relay's terminal line, which is text and has no Session Brief
-        behind it (`core/relays.py::terminal_line`, temporary until #197). The
-        Live Call is not a surface that reads sentences out (`CONTEXT.md`, *Stop
-        Notice*), so this has only ever had one route, and since #195 that is
-        the only route there is.
+        **The hub's, because only the hub can judge the Focus Session** (#197). A
+        relay can pass its ceiling minutes after it was queued, and the user may
+        have answered another Session in between (`CONTEXT.md`, *Focus Session*;
+        ADR 0017) — so `focus` is read *here*, at the moment of waking, and the
+        Relay pipeline learns nothing of the Keeper.
+
+        Total over the outcome's reason, and every site that produces one passes
+        through it:
+
+        - `DELIVERED` clears the field. The user's words landed, so there is
+          nothing left undelivered to say — and no wake: an arrival is not news.
+        - `CEILING_PASSED` replaces it and wakes the Keeper once. The reason and
+          the last attempt's grade travel together, because a ceiling may not
+          claim non-delivery of an attempt that proved nothing
+          (`core/relays.py::RelayReason`).
+        - `SESSION_ENDED` and `QUESTION_UNANSWERABLE` are logged and nothing
+          else. An exited Session appears nowhere (`CONTEXT.md`, *Focus
+          Session*), so a field on its row is a field nobody reads; and a
+          question refused before the wire was answered by the receipt the
+          caller is already holding.
+        - Everything still in play — queued, retained, held — leaves the field
+          exactly as it stands. It says what the *last* Relay that did not
+          arrive was, not what the newest one is doing.
+
+        The field is folded onto the row beside the wait, never through it:
+        #209's `with_waiting_for` and #213's `stopped_state` are untouched, and
+        no Reply Window moves.
         """
-        del target  # the line names its own Session; the channel takes it whole
-        await self._push(text)
+        if outcome.reason is RelayReason.DELIVERED:
+            self._fold_undelivered(outcome.target, None)
+            return
+        if outcome.reason is not RelayReason.CEILING_PASSED:
+            if outcome.state is Lifecycle.REPORTED_FAILED:
+                _log.info(
+                    "the user's words for %s will never arrive (reason=%s grade=%s), and "
+                    "nothing is briefed about it",
+                    outcome.target,
+                    outcome.reason,
+                    outcome.grade,
+                )
+            return
+        undelivered = UndeliveredRelay(
+            reason=outcome.reason,
+            grade=None if outcome.receipt is None else outcome.receipt.outcome,
+        )
+        if not self._fold_undelivered(outcome.target, undelivered):
+            return
+        # One wake, carrying no content: whether that Session still needs the
+        # user is read again by the Briefer at the moment the Keeper acts (ADR
+        # 0017). `focus` is judged now, not when the words were queued.
+        await self.keeper.wake(focus=self._state.sessions.focus == outcome.target)
+
+    def _fold_undelivered(
+        self, target: SessionTarget, undelivered: UndeliveredRelay | None
+    ) -> bool:
+        """Write the field, and say whether there was a live row to write it on.
+
+        A Session that ended while the words waited gets nothing: it appears in
+        no brief, so the reason has nowhere to be read from and the log is the
+        record. Same answer for a row the roster never held.
+        """
+        try:
+            session = self._state.sessions.resolve(target)
+        except BridgeCoreError:
+            _log.info("a Relay settled for a Session this roster does not hold: %s", target)
+            return False
+        if not session.is_live:
+            _log.info("a Relay settled for a Session that has ended: %s", target)
+            return False
+        if session.undelivered == undelivered:
+            # Nothing to write. The common case by far — every delivered Relay
+            # to a Session with nothing outstanding lands here — and a write
+            # that changes nothing is a write a reader has to rule out.
+            return True
+        self._state.sessions.set_undelivered(session.target, undelivered)
+        return True
 
     async def _push(self, text: str) -> None:
         """One Companion Channel push, under the Message Switch. The only outlet left.

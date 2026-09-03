@@ -413,6 +413,24 @@ def _rules() -> tuple[Rule, ...]:
         ),
         # --- skill/closing.md ----------------------------------------------
         # --- skill/retrying.md ---------------------------------------------
+        # **The file this group cites described a pipeline that no longer
+        # exists**, and the citations stay anyway. `skill/retrying.md` was
+        # written for a notice that waited in a queue, could be found again and
+        # re-sent; since #195 a Stop reaches the Companion Channel in one push
+        # that is graded and forgotten, and the voice side is the Call Keeper's,
+        # which paces rather than queues (`core/lifecycle.py`, where `PENDING`
+        # and `DROPPED` went). #195 reworded these gists to what the engine
+        # actually does, and #197 deleted the last thing that pushed a Relay's
+        # terminal news as text.
+        #
+        # `source` is **the audit trail back to the migration inventory's row**,
+        # not a description of current behaviour — the module docstring's rule,
+        # "the prose is free; the ids are the contract". Repointing it at a
+        # this-repo decision would lose the one thing it is for: the ability to
+        # ask which inventory row a surviving obligation came from. So the
+        # mismatch is named here rather than papered over, and a rule whose
+        # *meaning* went with that pipeline would be a deleted row rather than a
+        # re-cited one (#195's deferred note, read and answered).
         Rule(
             id="core.retry.owns-escalation-and-eligibility",
             audience=Audience.CORE,

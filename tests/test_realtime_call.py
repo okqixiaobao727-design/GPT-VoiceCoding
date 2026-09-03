@@ -124,6 +124,16 @@ HANDOVER_ITEM_EXAMPLES = (
         answerable_here="at the terminal",
         last_activity_at="not read",
     ),
+    SpokenBrief(
+        name="voicecoding · the dial",
+        agent="codex",
+        state="waiting for your decision",
+        newest="I got this far",
+        decision=("asked: Which base?",),
+        answerable_here="from here",
+        last_activity_at="not read",
+        undelivered="your last reply did not arrive, because ceiling_passed",
+    ),
 )
 
 
@@ -376,6 +386,15 @@ class TestBringingACallUp:
             assert spare >= CODEX_BYTES_PER_TOKEN - 1, (
                 f"{type(item).__name__} has {spare} bytes of slack, too few to round up in"
             )
+
+    def test_a_brief_that_carries_an_undelivered_reply_writes_it_as_its_own_line(self) -> None:
+        """#197: the sentence is Briefing's; this assembles it under a label."""
+        rendered = _item_text(HANDOVER_ITEM_EXAMPLES[-1])
+
+        assert "  undelivered: your last reply did not arrive, because ceiling_passed" in rendered
+
+    def test_a_brief_with_nothing_undelivered_writes_no_such_line(self) -> None:
+        assert "undelivered" not in _item_text(brief("it stopped on a question"))
 
     def test_a_user_opened_dial_carries_exactly_one_item(self, socket_path: Path) -> None:
         """#167 Q6: a call the user opened gets no hand-over, only why it exists."""
@@ -1141,6 +1160,38 @@ class TestWhatTheCallRaisesUpward:
                 await asyncio.sleep(0.05)
 
                 assert [event.speaking for event in sink.of(VoiceSpeech)] == [True, False]
+                await adapter.aclose()
+
+        asyncio.run(scenario())
+
+    def test_what_the_voice_said_is_written_down_and_raised_to_nobody(
+        self, socket_path: Path, caplog
+    ) -> None:
+        """#197: a run that cannot listen reads the Voice's own words off the log.
+
+        The *event* stays the span edge — nothing in this system acts on its own
+        speech, and the seam's event set is closed — so the words go to the log
+        and nowhere else.
+        """
+        caplog.set_level("INFO", logger="gpt_voicecoding.adapters.call.realtime.adapter")
+
+        async def scenario() -> None:
+            async with FakeAppServer(socket_path) as server:
+                realtime_script(server, thread_id=THREAD)
+                sink = Sink()
+                adapter, _ = await riding(server, sink)
+                await adapter.ensure_call(dial())
+
+                await server.notify_all(
+                    "thread/realtime/transcript/done",
+                    {"threadId": THREAD, "role": "assistant", "text": "你上次的回复没送到"},
+                )
+                await asyncio.sleep(0.05)
+
+                assert "没送到" in caplog.text
+                # No span was open, so the `done` closes nothing and raises
+                # nothing: the words went to the log alone.
+                assert sink.of(VoiceSpeech) == []
                 await adapter.aclose()
 
         asyncio.run(scenario())
