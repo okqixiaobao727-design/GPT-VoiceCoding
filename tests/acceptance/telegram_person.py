@@ -294,7 +294,7 @@ class PersonSessionLock:
 
     Two runs share what no `--lane` separates: this session file, which is SQLite
     backing exactly one client, and `support.TrustGate`'s writes to the user's own
-    `~/.claude.json` and `~/.codex/config.toml`, guarded by a *thread* lock that
+    Claude state file and `~/.codex/config.toml`, guarded by a *thread* lock that
     means nothing to a second pytest process. So the run takes this lock before it
     opens the session, and holds it until the session-scoped fixtures tear down.
 

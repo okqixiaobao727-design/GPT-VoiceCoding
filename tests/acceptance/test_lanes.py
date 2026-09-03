@@ -35,7 +35,7 @@ pid and run directory (`telegram_person.PersonSessionLock`).
   connection for exactly this reason; two runs cannot — and the lock is taken
   beside that file, so the refusal arrives before either process opens it.
 * **The trust gate writes the user's own files.** `support.TrustGate`
-  read-modify-writes `~/.claude.json` and `~/.codex/config.toml`, and the lock
+  read-modify-writes the user's Claude state file and `~/.codex/config.toml`, and the lock
   that keeps two lanes off each other there is a **thread** lock — it means
   nothing to a second pytest process, whose revoke can drop the other run's
   entry from a file that is not the harness's to lose.

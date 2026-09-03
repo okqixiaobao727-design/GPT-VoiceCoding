@@ -1232,8 +1232,10 @@ class Walk:
             "workspace trust",
             "arranged by the harness, not observed: both agents stop a run in a directory they "
             "have never seen with a full-screen trust dialog and the Session never registers "
-            "(re-measured on claude 2.1.246, 2026-08-26). `journal.jsonl` carries the grant and "
-            "the revoke. It is not a step: the run cannot both arrange this and judge it.",
+            "(re-measured on claude 2.1.259, 2026-09-03). `journal.jsonl` carries the grant and "
+            "the revoke, and names the state file each landed in — #217 lost a whole lane to a "
+            "grant written where the Session was not reading. It is not a step: the run cannot "
+            "both arrange this and judge it.",
         )
         try:
             boot_mark = self.settle_boot_turn()
