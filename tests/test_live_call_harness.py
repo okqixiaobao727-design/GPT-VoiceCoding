@@ -650,3 +650,141 @@ def test_an_edge_after_the_announcement_is_not_read_back_onto_it() -> None:
 
 def test_no_announcement_at_all_is_not_this_rules_complaint() -> None:
     assert journey._announced_after_the_voice_fell_silent([STARTED])
+
+
+# --- what a dial carried, and what the Voice said after a receipt (#198) ------
+
+
+def _dial(kinds: str) -> str:
+    """One dial line as the realtime adapter writes it (`adapter.py:619`)."""
+    return (
+        "2026-09-04 09:12:00,000 INFO gpt_voicecoding.adapters.call.realtime.adapter: "
+        f"dialling a call holding {len(kinds.split(', ')) if kinds != 'none' else 0} "
+        f"hand-over item(s): {kinds}"
+    )
+
+
+def test_a_system_dial_names_the_kinds_it_carried() -> None:
+    """The kinds are the whole of what a run can read about a hand-over's contents."""
+    assert journey._hand_over_kinds(
+        _dial("DialReason, SpokenRosterBrief, SpokenBrief, SpokenBrief")
+    ) == ["DialReason", "SpokenRosterBrief", "SpokenBrief", "SpokenBrief"]
+
+
+def test_a_dial_that_carried_nothing_names_no_kinds() -> None:
+    """`none` is the adapter's own word for an empty hand-over, not a kind."""
+    assert journey._hand_over_kinds(_dial("none")) == []
+
+
+def test_the_roster_brief_is_not_counted_as_a_session_brief() -> None:
+    """#198 phase 5 subtracts two counts, and one name contains the other's."""
+    kinds = journey._hand_over_kinds(_dial("DialReason, SpokenRosterBrief, SpokenBrief"))
+
+    assert kinds.count(journey.SESSION_BRIEF_KIND) == 1
+    assert kinds.count(journey.ROSTER_BRIEF_KIND) == 1
+
+
+def test_a_line_that_is_not_a_dial_names_no_kinds() -> None:
+    assert journey._hand_over_kinds(STARTED) == []
+
+
+def _said(words: str) -> str:
+    """One `transcript/done` as the realtime adapter writes it down (#197)."""
+    return (
+        "2026-09-04 09:13:00,000 INFO gpt_voicecoding.adapters.call.realtime.adapter: "
+        f"the Voice said: {words}"
+    )
+
+
+RECEIPTS = (journey.RELAY_RECEIPT_DELIVERED, journey.RELAY_RECEIPT_QUEUED)
+RECEIPT = _said("好的，已转达给二号工位。")
+
+
+def test_a_receipt_and_nothing_after_it_leaves_nothing_unaccounted() -> None:
+    assert journey._unaccounted_voice_turns([_said("在的"), RECEIPT], RECEIPTS) == 0
+
+
+def test_the_voice_going_on_by_itself_is_what_the_rule_counts() -> None:
+    """The ticket's own sentence: the receipt, and then the Voice stops (#198)."""
+    lines = [RECEIPT, _said("还有别的事吗"), _said("我再说一遍")]
+
+    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 2
+
+
+def test_an_announcement_the_engine_handed_over_accounts_for_its_own_turn() -> None:
+    """#196's mid-call payment is not the Voice going on by itself (#198)."""
+    lines = [RECEIPT, SPOKEN, _said("二号工位说它可以继续了")]
+
+    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 0
+
+
+def test_a_payment_whose_turn_has_not_landed_yet_is_not_a_violation() -> None:
+    """The `speak` line is written when the brief is handed over, not when it is said."""
+    assert journey._unaccounted_voice_turns([RECEIPT, SPOKEN], RECEIPTS) == -1
+
+
+def test_turns_before_the_receipt_are_not_counted_against_it() -> None:
+    """The window opens at the receipt, so what the Voice said on the way to it is free.
+
+    The **first** line carrying either wording is the receipt, which is why the
+    two lines before it here carry neither: a Voice that says `收到` while
+    acknowledging the user has said a receipt as far as any reader can tell, and
+    the phase's window starts at the relay utterance precisely so that the first
+    one in it is the one the engine's grade produced.
+    """
+    lines = [_said("好的"), _said("我来处理"), RECEIPT]
+
+    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 0
+
+
+def test_a_queued_receipt_is_a_receipt_too() -> None:
+    """A Session that happens to be mid-turn queues the relay, and the run cannot choose."""
+    lines = [_said("收到，等它这一轮结束就转达。"), _said("还有别的事吗")]
+
+    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 1
+
+
+def test_a_receipt_the_recogniser_put_a_space_inside_is_still_a_receipt() -> None:
+    """Run `20260902T093755Z`'s inserted space, on the assistant side (#181)."""
+    assert journey._unaccounted_voice_turns([_said("已转 达了")], RECEIPTS) == 0
+
+
+def test_a_window_with_no_receipt_in_it_is_not_this_rules_complaint() -> None:
+    """A relay nobody was told about fails on the receipt line, before this one reads."""
+    assert journey._unaccounted_voice_turns([_said("在的")], RECEIPTS) is None
+
+
+# --- the two readings phase 3a compares the Voice against (#198) --------------
+
+
+A_BRIEF = "\n".join(
+    (
+        "二号工位 · Reply READY",
+        "  state: waiting for you",
+        "  newest: Should I continue?",
+        "  answer: from here",
+    )
+)
+
+
+def test_the_newest_message_is_read_off_the_line_that_hands_it_over() -> None:
+    assert journey._newest_message(A_BRIEF) == "Should I continue?"
+
+
+def test_a_brief_with_no_newest_line_hands_over_nothing() -> None:
+    """Phase 3a blocks on this rather than comparing the Voice against an empty string."""
+    assert journey._newest_message("二号工位 · Reply READY\n  state: working\n") == ""
+
+
+def test_the_fragment_the_voice_is_asked_for_is_short_and_whitespace_folded() -> None:
+    """The Voice paraphrases a record into a sentence; #181 grades a substring."""
+    assert journey._spoken_fragment("Should   I\ncontinue?") == "Should I con"
+
+
+def test_a_message_shorter_than_the_fragment_is_the_whole_message() -> None:
+    assert journey._spoken_fragment("READY") == "READY"
+
+
+def test_nothing_recorded_asks_the_voice_for_nothing() -> None:
+    """An empty fragment is skipped by the caller rather than matching every line."""
+    assert journey._spoken_fragment("") == ""

@@ -20,12 +20,20 @@ import inspect
 import os
 import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
 import journey
 import live_call
 import support
+
+from gpt_voicecoding.core.instructions import (
+    ControlPlaneCli,
+    InstructionContext,
+    voice_instructions,
+)
+from gpt_voicecoding.seams.call import SpokenBrief, SpokenRosterBrief
 
 A_CONFIG = """
 [engine]
@@ -258,14 +266,20 @@ def test_the_step_is_bound_to_a_method_like_every_other_name(tmp_path: Path) -> 
         assert step in journey.PREREQUISITES
         assert step in journey.STEPS
     assert hasattr(journey.Walk, "live_call")
-    assert hasattr(journey.Walk, "live_call_long")
 
 
-def test_the_long_step_runs_alone_too(tmp_path: Path) -> None:  # noqa: ARG001
-    """#184's Red is one call's own clock; a turn-driving step before it is minutes."""
-    chosen = journey.select(["live call long"])
-    assert chosen.selected == ("live call long",)
-    assert chosen.setup == ()
+def test_the_three_call_steps_are_one_walk(tmp_path: Path) -> None:  # noqa: ARG001
+    """#198 folds v0's route, v1's dial and v2's mid-call news into one step.
+
+    The names went with them: a run asking for `live call long` used to get one
+    call's worth of the flow, and what proves the 0901 flow is the whole walk.
+    Selecting a name nothing answers to is a refusal rather than an empty run.
+    """
+    assert journey.LIVE_CALL_STEPS == ("live call",)
+    assert "live call long" not in journey.STEPS
+    assert "live call briefed" not in journey.STEPS
+    assert not hasattr(journey.Walk, "live_call_long")
+    assert not hasattr(journey.Walk, "live_call_briefed")
 
 
 def test_only_a_run_that_walks_the_step_swaps_the_users_call_adapter(tmp_path: Path) -> None:
@@ -748,6 +762,9 @@ def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
         live_call.LONG,
         live_call.NEEDS,
         live_call.RELAY,
+        live_call.DETAIL,
+        live_call.HISTORY,
+        live_call.EARLIER,
     }
     assert settings.requests[live_call.PLAIN] == live_call.REQUEST
     assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST
@@ -762,9 +779,43 @@ def test_the_relay_utterance_names_the_workspace_the_step_creates() -> None:
     what stops one of them being renamed alone.
     """
     for lane in journey.LANES:
-        focus, _ = lane.call_workspaces
+        focus = lane.call_workspaces[0]
         assert focus in live_call.relay_request(focus)
         assert journey.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
+
+
+def test_every_utterance_that_asks_about_a_session_names_it(tmp_path: Path) -> None:  # noqa: ARG001
+    """Detail and History ask about one Session, and the Call Agent picks the target.
+
+    Run `20260903T081717Z` is the precedent the relay utterance already carries:
+    an utterance that named no Session had the Call Agent go looking, and on one
+    lane it briefed two of the nine Sessions this machine was running. Detail,
+    History and its older page ask about the same Session, so each says which.
+    """
+    for lane in journey.LANES:
+        focus = lane.call_workspaces[0]
+        for utterance in (
+            live_call.detail_request(focus),
+            live_call.history_request(focus),
+            live_call.earlier_request(focus),
+        ):
+            assert focus in utterance
+
+
+def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
+    """Phase 3 is an *answer* to the question the Session stopped on (#198).
+
+    The Session asked `Should I continue?` (`journey.ASK_A_QUESTION`), so the
+    payload is what the user says back — and what the Session's next turn then
+    carries, which is what the step reads. Deliberately not `收到`: that is the
+    wording the Voice says for a **queued** receipt (`instructions/voice.py`),
+    and a payload spelling it would make the receipt and its echo the same
+    string.
+    """
+    said = live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
+
+    assert journey.LIVE_CALL_ANSWER_SUBSTRING in said
+    assert journey.RELAY_RECEIPT_QUEUED not in said
 
 
 def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
@@ -777,6 +828,40 @@ def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
     spoken = [name for lane in journey.LANES for name in lane.call_workspaces]
 
     assert len(set(spoken)) == len(spoken), spoken
+
+
+def test_every_lane_names_three_extra_sessions(tmp_path: Path) -> None:  # noqa: ARG001
+    """#198's walk drives three Sessions besides the lane's own.
+
+    The one the call is dialled about and relayed into, the one that rings while
+    it is up, and the one that stops **inside the Cool-down** after the hang-up —
+    which the paid dial then has to be about. Three names, so no phase is graded
+    against a Session another phase already moved.
+    """
+    for lane in journey.LANES:
+        assert len(lane.call_workspaces) == 3
+        assert len(set(lane.call_workspaces)) == 3
+
+
+def test_the_grade_wording_the_voice_is_told_to_say_is_what_the_step_looks_for() -> None:
+    """The receipt wording is the product's, and the step quotes it (#193 §Voice).
+
+    `已转达` for a delivered relay and `收到` for a queued one are shipped in the
+    Voice's own instructions; a copy in the harness that nothing checks would
+    pass a run where the product had stopped saying either.
+    """
+    spoken = voice_instructions(
+        InstructionContext(
+            cli=ControlPlaneCli(
+                command=Path("/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"),
+                version="1.4.2",
+                socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
+            )
+        )
+    ).text
+
+    assert journey.RELAY_RECEIPT_DELIVERED in spoken
+    assert journey.RELAY_RECEIPT_QUEUED in spoken
 
 
 def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> None:
@@ -794,3 +879,78 @@ def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> Non
 def test_the_relay_utterance_asks_for_no_hang_up() -> None:
     """This call has to outlive the relay by a whole turn (`LONG_REQUEST`'s reason)."""
     assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
+
+
+def test_the_folded_walk_is_the_tenth_step_and_the_only_one_that_dials() -> None:
+    """#198's fold, read off the contract every build ticket's "Red first" line cites.
+
+    Ten names, `live call` last, and it is the whole of `LIVE_CALL_STEPS`: a run
+    that walks it gets the harness's own Call adapter and the `bridgectl`
+    wrapper, and a run that does not keeps the Call adapter the user configured
+    (`conftest.py`, #183).
+    """
+    assert len(journey.STEPS) == 10
+    assert journey.STEPS[-1] == "live call"
+    assert set(journey.LIVE_CALL_STEPS) <= set(journey.STEPS)
+
+
+def test_every_step_the_walk_can_be_asked_for_has_a_prerequisite_row() -> None:
+    """A name with no row is a name `select` cannot close over (#182)."""
+    assert set(journey.PREREQUISITES) == set(journey.STEPS)
+
+
+def test_the_folded_step_still_stands_on_the_roster(tmp_path: Path) -> None:  # noqa: ARG001
+    """Phase 1 grades a dial for carrying the Roster Brief (#198).
+
+    The three Sessions the walk is graded against are its own to start, so no
+    address is owed — but a roster the lane has never proved it can read is not
+    something to grade a hand-over against, and `roster` is one step rather than
+    a walk, so #183's "runnable alone" clause is satisfied by it.
+    """
+    chosen = journey.select(["live call"])
+
+    assert chosen.selected == ("live call",)
+    assert chosen.setup == ("roster",)
+
+
+def test_the_walk_asks_for_every_variant_it_speaks_and_no_others() -> None:
+    """Seven sentences go on one call's track, and each is named once (#198).
+
+    The playlist is a per-call file the transport reads while the call is up
+    (`live_call.NEXT_VARIANT_FILE`, #196), so a variant the step appends and the
+    settings cannot build is a call that falls silent at that phase.
+    """
+    spoken = (
+        live_call.NEEDS,
+        live_call.RELAY,
+        live_call.DETAIL,
+        live_call.HISTORY,
+        live_call.EARLIER,
+        live_call.LONG,
+        live_call.PLAIN,
+    )
+    settings = live_call.HarnessSettings(observations=Path("/o.jsonl"), wav_directory=Path("/w"))
+
+    assert len(set(spoken)) == len(spoken)
+    for variant in spoken:
+        assert settings.requests[variant]
+
+
+def test_the_hand_over_kinds_the_step_grades_are_the_products_own_class_names() -> None:
+    """The adapter writes `type(item).__name__`; a copy here could drift silently."""
+    assert journey.ROSTER_BRIEF_KIND == SpokenRosterBrief.__name__
+    assert journey.SESSION_BRIEF_KIND == SpokenBrief.__name__
+    assert journey.ROSTER_BRIEF_KIND != journey.SESSION_BRIEF_KIND
+
+
+def test_the_paging_option_the_step_greps_for_is_the_one_the_surface_takes() -> None:
+    """`--before` is graded on the Call Agent's argv, so it has to be the real flag (#171)."""
+    assert journey.HISTORY_CURSOR_OPTION == "--before"
+    rendered = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "gpt_voicecoding.control_plane", "history", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rendered.returncode == 0:
+        assert journey.HISTORY_CURSOR_OPTION in rendered.stdout

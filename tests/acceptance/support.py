@@ -390,9 +390,13 @@ CALL_SETTINGS_KEY = "call"
 HARNESS_CALL_REFERENCE = live_call.REFERENCE
 
 #: The workspace names a run that names none gets — the harness's own defaults,
-#: so a caller that does not care about `live call` v2's pinning still writes a
+#: so a caller that does not care about the folded `live call`'s pinning still writes a
 #: complete table. A lane says its own (`journey.Lane`).
-DEFAULT_CALL_WORKSPACES = (live_call.FOCUS_WORKSPACE_NAME, live_call.RINGING_WORKSPACE_NAME)
+DEFAULT_CALL_WORKSPACES = (
+    live_call.FOCUS_WORKSPACE_NAME,
+    live_call.RINGING_WORKSPACE_NAME,
+    live_call.WAITING_WORKSPACE_NAME,
+)
 
 #: The Relay ceiling every run is given, in seconds, in place of the one the user
 #: configured. The shipped default is ten minutes (`core/policy.py`), and #197
@@ -425,11 +429,14 @@ class DerivedConfig:
     cli_wrapper: Path | None = None
     #: Where that wrapper logs the runs the Call Agent made.
     cli_wrapper_log: Path | None = None
-    #: What this lane's two extra Sessions' workspaces are called (#196). The
-    #: step creates the directories and the harness's Call adapter says the
-    #: first of them out loud, so both halves read this one value.
+    #: What this lane's three extra Sessions' workspaces are called (#196,
+    #: #198). The step creates the directories and the harness's Call adapter
+    #: says the first of them out loud, so both halves read this one value.
     call_focus_workspace: str | None = None
     call_ringing_workspace: str | None = None
+    #: The one that stops inside the Cool-down after the hang-up (#198). Nothing
+    #: says it out loud; it is here so one value names it on both sides.
+    call_waiting_workspace: str | None = None
 
 
 def derive_config(
@@ -443,7 +450,7 @@ def derive_config(
     codex_socket_directory: Path | None = None,
     dropped_agents: tuple[AgentKind, ...] = (),
     harness_live_call: bool = False,
-    call_workspaces: tuple[str, str] | None = None,
+    call_workspaces: tuple[str, str, str] | None = None,
     control_plane_cli: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
@@ -586,19 +593,22 @@ def derive_config(
         settings[CODEX_SETTINGS_KEY] = codex
 
     observations = wav_directory = wrapper = wrapper_log = None
-    focus_workspace = ringing_workspace = None
+    focus_workspace = ringing_workspace = waiting_workspace = None
     if harness_live_call:
         observations = run_directory / "live-call.jsonl"
         wav_directory = run_directory / "live-call-wav"
-        # **The two extra Sessions' workspace names are per lane, and they come
-        # from here** (#196). The project half of a Session Name is the workspace
-        # directory's basename, and `live call` v2 says one of those names out
-        # loud to pin the Session a relay must land in — so a name shared by two
+        # **The three extra Sessions' workspace names are per lane, and they
+        # come from here** (#196, #198). The project half of a Session Name is
+        # the workspace directory's basename, and the `live call` walk says the
+        # first of them out loud to pin the Session a relay must land in, and the
+        # second to grade that nothing spoken ever names it — so a name shared by two
         # lanes stops pinning anything. It has to: the Codex daemon is
         # machine-wide, so the Claude lane's engine holds the Codex lane's
         # Sessions too, and run `20260903T093813Z` had it looking at two rows
         # called `二号工位 · Reply READY` and answering with `brief`.
-        focus_workspace, ringing_workspace = call_workspaces or DEFAULT_CALL_WORKSPACES
+        focus_workspace, ringing_workspace, waiting_workspace = (
+            call_workspaces or DEFAULT_CALL_WORKSPACES
+        )
         adapters["call"] = HARNESS_CALL_REFERENCE
         settings[CALL_SETTINGS_KEY] = {
             **settings.get(CALL_SETTINGS_KEY, {}),
@@ -606,6 +616,7 @@ def derive_config(
             "wav_directory": str(wav_directory),
             "focus_workspace": focus_workspace,
             "ringing_workspace": ringing_workspace,
+            "waiting_workspace": waiting_workspace,
         }
         wrapper_log = run_directory / "bridgectl-runs.log"
         wrapper = write_cli_wrapper(
@@ -635,6 +646,7 @@ def derive_config(
         cli_wrapper_log=wrapper_log,
         call_focus_workspace=focus_workspace,
         call_ringing_workspace=ringing_workspace,
+        call_waiting_workspace=waiting_workspace,
     )
 
 

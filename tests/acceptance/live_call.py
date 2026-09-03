@@ -147,9 +147,52 @@ FOCUS_WORKSPACE_NAME = "二号工位"
 RINGING_WORKSPACE_NAME = "三号工位"
 
 
+#: And what the *waiting* Session's workspace is called. #198's walk hangs the
+#: call up and then has a Session stop **inside the Cool-down**, which the paid
+#: dial must be about — so it has to be a Session no earlier phase has moved.
+#: Never named in any utterance: nobody speaks on the call it earns. Per lane for
+#: `FOCUS_WORKSPACE_NAME`'s reason.
+WAITING_WORKSPACE_NAME = "四号工位"
+
+
 def relay_request(focus_workspace: str) -> str:
-    """The relay utterance, naming one lane's own Focus Session's workspace."""
-    return f"请你给{focus_workspace}那个会话回一句话，内容是收到。"
+    """The answer utterance, naming one lane's own Focus Session's workspace.
+
+    **It is an answer**, since #198: the Session stopped on `Should I continue?`
+    (`journey.ASK_A_QUESTION`), and what the user says back is what the Call
+    Agent relays and what that Session's next turn then carries. The payload is
+    deliberately not `收到` — that is the wording the Voice says for a *queued*
+    receipt (`instructions/voice.py`), and a payload spelling it would make the
+    receipt and its echo one string the step could not tell apart.
+    """
+    return f"请你给{focus_workspace}那个会话回一句话，内容是可以继续。"
+
+
+def detail_request(focus_workspace: str) -> str:
+    """ "Tell me more" — the utterance that asks the Call Agent for `brief` (#198).
+
+    It **names the Session** for `relay_request`'s reason: run
+    `20260903T081717Z` had an utterance that named none send the Call Agent
+    looking through nine Sessions this machine was running.
+    """
+    return f"请你详细说说{focus_workspace}那个会话现在是什么情况。"
+
+
+def history_request(focus_workspace: str) -> str:
+    """ "What did it say before" — the utterance that asks for `history` (#198)."""
+    return f"那{focus_workspace}它之前说了什么？请你说说更早的记录。"
+
+
+def earlier_request(focus_workspace: str) -> str:
+    """ "Further back" — the utterance that asks for the older page (#198, #171).
+
+    Paging is on the map's destination, and the page before the newest one is
+    what `bridgectl history <address> --before <ordinal>` answers. The Session is
+    named again rather than left to context: this sentence arrives after two
+    others, and a Call Agent that had lost the thread would page some other
+    Session's record.
+    """
+    return f"再往前，把{focus_workspace}更早的那一页也说一下。"
 
 
 #: What the *fourth* variant asks, and it asks for a verb the Call Agent owns.
@@ -196,6 +239,11 @@ PLAIN = "plain"
 LONG = "long"
 NEEDS = "needs"
 RELAY = "relay"
+#: #198's three: Detail, History and History's older page, each of which the
+#: Call Agent has to answer with a verb of its own.
+DETAIL = "detail"
+HISTORY = "history"
+EARLIER = "earlier"
 
 #: What the *current or next* call plays, as a file in `wav_directory` holding
 #: one variant name a line. Two things force a per-call channel rather than a
@@ -263,6 +311,9 @@ class HarnessSettings:
     #: the name that is said and the name that is created cannot drift.
     focus_workspace: str = FOCUS_WORKSPACE_NAME
     ringing_workspace: str = RINGING_WORKSPACE_NAME
+    #: The third one (#198). Nothing here says it out loud; it is carried so the
+    #: engine-side half and the step agree on every workspace one run creates.
+    waiting_workspace: str = WAITING_WORKSPACE_NAME
     voice: str = WAV_VOICE
     wav_sample_rate: int = WAV_SAMPLE_RATE
     settle_seconds: float = SETTLE_SECONDS
@@ -275,6 +326,9 @@ class HarnessSettings:
             LONG: self.long_request,
             NEEDS: self.needs_request,
             RELAY: relay_request(self.focus_workspace),
+            DETAIL: detail_request(self.focus_workspace),
+            HISTORY: history_request(self.focus_workspace),
+            EARLIER: earlier_request(self.focus_workspace),
         }
 
     @property
