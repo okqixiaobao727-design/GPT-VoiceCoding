@@ -27,6 +27,7 @@ from gpt_voicecoding.seams.agent import (
     ProgressObservation,
     ProgressOmission,
     ProgressRole,
+    ReplyWindow,
     SessionInspection,
     SessionLifecycle,
     SessionState,
@@ -707,6 +708,111 @@ A_QUESTION = WaitingFor(
 #: `WaitingFor.__post_init__` allows the pair only with `UNKNOWN`, which is the
 #: seam saying *ask again, never guess* (#209).
 NOT_CAUGHT_UP = WaitingFor(kind=WaitingKind.UNKNOWN, caught_up=False)
+
+
+class TestWhatAStopWritesIntoTheRow:
+    """A Stop writes the state it implies, so no reader has to compensate (#213).
+
+    Until #213 only a wait that needs the user moved the state, so a Stop that
+    merely ended a turn left the row `RUNNING` for the next discovery pass to
+    correct — one cadence later (≈5.6 s, measured in #209). For that cadence the
+    engine held two answers about one Session: `bridge.stop_brief` derived the
+    state from the wait, so the notice said the turn had finished, while the
+    Roster Brief counted it as running, `brief` read it as running, and a
+    system-dialled call briefed no Session at all unless the caller passed the
+    notice's own reading in beside the roster (#194). The rule those two derived
+    apart now lives once, on `WaitingFor.stopped_state`, and the registry applies
+    it here.
+
+    Legacy (ADR 0010) — **adapted.** `legacy@1d32845:bridge/store.py:2655-2672`
+    (`record_session_stop`) wrote the Stop's consequence into the store the
+    moment the Stop arrived, inserting the row with `ReplyWindow.OPEN` rather
+    than waiting for the next read. Its lifecycle column had no running/finished
+    distinction to carry, so what is adapted is that principle and not the value.
+    """
+
+    def observed(self, **fields: object) -> SessionRegistry:
+        """One Claude Session as the last discovery pass left it — mid-turn by default."""
+        fields.setdefault("state", SessionState.RUNNING)
+        registry = SessionRegistry()
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(claude_row(session_id="e34368aa", pid=10045, **fields)),
+            now=NOW,
+        )
+        return registry
+
+    def test_a_turn_that_ended_asking_nothing_leaves_the_row_idle(self) -> None:
+        """And the Reply Window that follows from it is open, by derivation."""
+        registry = self.observed()
+
+        held = registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
+            waiting_for=WaitingFor(),
+            progress=ProgressObservation(),
+        )
+
+        assert held.state is SessionState.IDLE
+        assert held.reply_window is ReplyWindow.OPEN
+
+    def test_a_stop_on_a_question_leaves_the_row_waiting(self) -> None:
+        registry = self.observed()
+
+        held = registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
+            waiting_for=A_QUESTION,
+            progress=ProgressObservation(),
+        )
+
+        assert held.state is SessionState.WAITING
+        assert held.waiting_for == A_QUESTION
+
+    def test_a_stop_that_could_not_read_the_wait_is_waiting_and_unreadable(self) -> None:
+        """A wait nobody could read is still a stop, and never a Session running.
+
+        `UNKNOWN` in `WAITING` is what makes Briefing read the row as
+        *unreadable* (`core/briefing.py::_state`); `RUNNING` would have made it
+        read as a Session still working.
+        """
+        registry = self.observed()
+
+        held = registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
+            waiting_for=NOT_CAUGHT_UP,
+            progress=ProgressObservation(),
+        )
+
+        assert held.state is SessionState.WAITING
+        assert held.waiting_for == NOT_CAUGHT_UP
+
+    def test_a_stop_that_had_not_caught_up_keeps_the_question_and_stays_waiting(self) -> None:
+        """#209's merge rule is untouched: the state is derived from what is kept."""
+        registry = self.observed(state=SessionState.WAITING, waiting_for=A_QUESTION)
+        target = SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045)
+
+        held = registry.set_stop_reading(
+            target, waiting_for=NOT_CAUGHT_UP, progress=ProgressObservation()
+        )
+
+        assert held.waiting_for == A_QUESTION
+        assert held.state is SessionState.WAITING
+
+    def test_the_next_discovery_reading_overwrites_what_the_stop_wrote(self) -> None:
+        """The Stop shrinks the stale window; it is not a second source of truth."""
+        registry = self.observed()
+        registry.set_stop_reading(
+            SessionTarget(agent=AgentKind.CLAUDE, session_id="e34368aa", pid=10045),
+            waiting_for=WaitingFor(),
+            progress=ProgressObservation(),
+        )
+
+        registry.observe(
+            AgentKind.CLAUDE,
+            seeing(claude_row(session_id="e34368aa", pid=10045, state=SessionState.RUNNING)),
+            now=NOW + 5,
+        )
+
+        assert registry.live()[0].state is SessionState.RUNNING
 
 
 class TestAReadingThatHasNotCaughtUp:

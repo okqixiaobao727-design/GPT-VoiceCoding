@@ -218,6 +218,25 @@ class WaitingFor:
         """Whether this is something only the user can answer."""
         return self.kind in (WaitingKind.QUESTION, WaitingKind.PERMISSION)
 
+    @property
+    def stopped_state(self) -> SessionState:
+        """The state a Session that stopped on this wait is in.
+
+        **One rule, in one place, because two readers used to derive it apart.**
+        A Session that stopped is not a Session running: a turn that ended asking
+        nothing is `IDLE`, which is what `BriefState.FINISHED` means (#165 Q7),
+        and anything else is `WAITING` — a question or a permission because only
+        the user can end it, an `UNKNOWN` because a wait nobody could read is
+        still a stop, and reading it as `WAITING` is what makes Briefing say
+        *unreadable* rather than a false *running* (#166 B7).
+
+        Read by `SessionRegistry.set_stop_reading` for a registered row and by
+        `bridge.stop_brief` for a Stop whose Session no discovery pass has landed
+        yet (#213). Deliberately not a field on `SessionStopped`: the lanes
+        observe the wait, and what it implies is this side's rule.
+        """
+        return SessionState.IDLE if self.kind is WaitingKind.NONE else SessionState.WAITING
+
     def as_approval_request(self, target: SessionTarget) -> ApprovalRequest | None:
         """The pending permission as the Approval Relay addresses it, if it is one.
 

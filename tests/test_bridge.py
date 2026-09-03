@@ -25,6 +25,7 @@ from claude_adapter_fake import ParkedApproval, claude_waiting_roster
 from fakes import PROGRESS_CAPTURE, FakeCall, UnreachableFarSide, handed_over, spoken_words
 from gpt_voicecoding.adapters.agent.claude import adapter as claude_adapter
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter, SessionReport
+from gpt_voicecoding.core import briefing
 from gpt_voicecoding.core.bridge import (
     NO_CONTROL_SURFACE,
     NO_DELEGATE_HANDLER,
@@ -32,6 +33,7 @@ from gpt_voicecoding.core.bridge import (
     VOICE_QUIET_LINE,
     VOICE_SPEAKING_LINE,
 )
+from gpt_voicecoding.core.briefing import BriefState
 from gpt_voicecoding.core.errors import CallInstructionsMissing, ChildSessionError
 from gpt_voicecoding.core.lifecycle import Lifecycle
 from gpt_voicecoding.core.relays import RelayReason
@@ -114,8 +116,8 @@ class TestTheStopNoticePipelineEndToEnd:
 
         # The words go out on the notice's own text — the log line and, where
         # Message is on, the Companion Channel. What the *call* is handed comes
-        # off the roster, which still reads this Session as running, so it is a
-        # header row there (`test_a_session_the_roster_reads_as_running_…`).
+        # off the roster, which the Stop has just moved out of `running`
+        # (`test_the_session_a_stop_dialled_about_is_briefed_from_its_own_row`).
         assert hub.call.calls_started == 1
         assert "port the log" in handed_over(hub.call)
         assert hub.core.status().sessions[0].progress == observed
@@ -156,6 +158,41 @@ class TestTheStopNoticePipelineEndToEnd:
         # The surface's answer, which is the roster payload's own `reply_window`
         # field: derived per read, with the lane's answer folded in.
         assert status.reply_windows[CODEX] is ReplyWindow.OPEN
+
+    def test_a_claude_turn_that_ended_is_counted_as_finished_at_once(self) -> None:
+        """Every reader of the roster, not only the notice (#213).
+
+        The Stop used to leave the row `RUNNING` until the next discovery pass —
+        one cadence in which the notice said the turn had finished and the Roster
+        Brief counted the same Session as running. The row now says what the Stop
+        implies, so the count agrees with the notice from the moment it is read.
+        """
+        hub = Hub(sessions=((CLAUDE, "port the log"),))
+
+        hub.emit(SessionStopped(target=CLAUDE))
+
+        summary = briefing.roster(hub.state.sessions.live(), None)
+        assert summary.counts == {BriefState.FINISHED: 1}
+        assert hub.state.sessions.resolve(CLAUDE).state is SessionState.IDLE
+
+    def test_a_stop_for_a_session_the_roster_never_saw_is_still_briefed_as_stopped(
+        self,
+    ) -> None:
+        """The stand-in row, which no registry fold can have reached (#213).
+
+        A Stop can arrive for a Session no discovery pass has landed yet, and
+        `stop_brief` builds a row for it from the address alone. The state a Stop
+        implies is derived there too — by the same rule the registry now applies
+        to a row it holds — so the notice reads `finished` rather than the
+        `Session` default of `running`.
+        """
+        hub = Hub(voice=False)
+        stranger = SessionTarget(agent=AgentKind.CLAUDE, session_id="stranger", pid=999)
+
+        hub.emit(SessionStopped(target=stranger))
+
+        (notice,) = hub.channel.sent
+        assert notice.startswith("claude:stranger:999 — finished")
 
     def test_a_failed_stop_read_does_not_replace_a_readable_roster_observation(self) -> None:
         hub = Hub()
@@ -1348,18 +1385,18 @@ class TestTheOneCallInvariantEndToEnd:
         assert hub.call.spoken == []
         assert "Which base?" in handed_over(hub.call)
 
-    def test_the_session_a_stop_dialled_about_is_briefed_though_its_row_reads_running(
+    def test_the_session_a_stop_dialled_about_is_briefed_from_its_own_row(
         self,
     ) -> None:
-        """The one row the roster is knowingly stale about is briefed from the Stop.
+        """The row the roster used to be knowingly stale about (#213).
 
-        `sessions.set_stop_reading` leaves a Stop that merely ended a turn in
-        `RUNNING` (#209), and a hand-over briefs no running Session — so without
-        this the call would come up saying a Session needs the user and never say
-        which. What travels is the notice's own brief, whose state `stop_brief`
-        derived from the wait, so it reads `finished` and never `running`: this
-        is not the removed `about` parameter, which briefed whatever the stale
-        row said and put it ahead of the Focus Session.
+        `sessions.set_stop_reading` used to leave a Stop that merely ended a turn
+        in `RUNNING` (#209), and a hand-over briefs no running Session — so the
+        call came up saying a Session needed the user and never said which, until
+        `_system_dial` passed the notice's own brief in beside the roster (#194).
+        The row now carries the state the Stop implies, so the fresh reading ADR
+        0017 asks for covers this Session like any other and nothing is passed
+        alongside.
         """
         hub = Hub()
 
@@ -1372,19 +1409,17 @@ class TestTheOneCallInvariantEndToEnd:
         ]
         briefed = hub.call.opened_on[0].hand_over[-1]
         assert isinstance(briefed, SpokenBrief)
-        # What the row still says, and what the Stop's own reading says instead.
         # The codex lane reads a turn that ended without a final answer as a
         # decision (#166 B2); what matters here is that it is not `running`.
         assert briefed.state == "waiting for your decision"
         assert "port the log" in briefed.name
 
     def test_the_session_a_stop_dialled_about_is_briefed_exactly_once(self) -> None:
-        """Whether or not the roster briefed it itself, it appears once.
+        """One Session, one brief: the roster is the only thing briefed from.
 
-        The roster's reading is the one that travels when there is one — this
-        wait needs the user, so the row moved to `WAITING` and `handover` briefed
-        it from there. The notice's copy is added only in the other case, so a
-        Session is never announced twice on the same call.
+        The Stop moved the row to `WAITING` and `handover` briefed it from there.
+        Nothing is added beside the roster any more, so there is no second copy
+        for a Session to be announced twice by on the same call.
         """
         hub = Hub()
 

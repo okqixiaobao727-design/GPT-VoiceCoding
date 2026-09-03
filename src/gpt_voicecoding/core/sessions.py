@@ -700,19 +700,31 @@ class SessionRegistry:
         (`caught_up=False`, which #150's budget can end on) is not an answer
         either, and it does not erase one.
 
-        **A wait only the user can end also puts the row in `WAITING`**, because
-        the two are one fact and a row that held them apart would answer two
-        ways: `reply_window` is derived from the state *and* the wait
-        (`seams/agent.py::derive_reply_window`), so a row carrying a question
-        beside `RUNNING` would report a parked question and a closed window in
-        the same breath. `needs_the_user` is the seam's own predicate for it, and
-        nothing else here moves the state: a Stop that ended a turn leaves it
-        exactly as the last reading found it, for the discovery pass to say.
+        **The state comes with the reading**, because a row that held them apart
+        would answer two ways: `reply_window` is derived from the state *and* the
+        wait (`seams/agent.py::derive_reply_window`), so a row carrying a
+        question beside `RUNNING` would report a parked question and a closed
+        window in the same breath. Until #213 only a wait that `needs_the_user`
+        moved the state and a Stop that merely ended a turn was left exactly as
+        the last discovery pass found it — normally `RUNNING` — for the next pass
+        to correct one cadence later (≈5.6 s, measured in #209). For that cadence
+        the engine held two answers about one Session: the notice said the turn
+        had finished and every reader of the roster said it was running, and the
+        dial had to be handed the notice's own brief to cover the row.
+
+        So the state is derived from the *merged* wait, by the one rule
+        `WaitingFor.stopped_state` states: `NONE` is `IDLE`, anything else is
+        `WAITING`. Derived from the merged wait and not the reading, so a Stop
+        that could not say what it stopped on still leaves the question this row
+        already knew standing — and standing in `WAITING`, where it was.
+
+        **Discovery still wins afterwards.** The next caught-up reading overwrites
+        this state as it overwrites any other; the Stop's write shrinks the stale
+        window to zero rather than becoming a second source of truth.
         """
         held = self._live_row(target)
         updated = held.with_waiting_for(waiting_for, waiting=True).with_progress(progress)
-        if updated.waiting_for.needs_the_user:
-            updated = replace(updated, state=SessionState.WAITING)
+        updated = replace(updated, state=updated.waiting_for.stopped_state)
         self._sessions[held.target] = updated
         return updated
 

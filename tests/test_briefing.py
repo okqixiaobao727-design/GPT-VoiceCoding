@@ -616,14 +616,14 @@ class TestTheHandover:
         An earlier draft took the Session the call was dialled about and briefed
         it ahead of the Focus Session whatever the row said. That put a `running`
         brief inside the list of Sessions needing the user, because
-        `sessions.set_stop_reading` leaves a row `RUNNING` unless the wait needs
-        the user — a third module's staleness papered over here, at the cost of
-        two of this function's own rules.
+        `sessions.set_stop_reading` then left a row `RUNNING` unless the wait
+        needed the user — a third module's staleness papered over here, at the
+        cost of two of this function's own rules.
 
-        `stopped` is the narrow way back in, and it breaks neither rule: it
-        carries a brief the caller has already read for itself, it goes last, and
-        it goes only where the roster briefed nothing. The tests below it are
-        what say so.
+        There is no way back in. The row a caller used to compensate for — the
+        Session a Stop dialled the call about — now says it stopped
+        (`sessions.set_stop_reading`, #213), so the roster briefs it itself and
+        the tests below are what say so.
         """
         running = row(CODEX, state=SessionState.RUNNING, progress=said("it stopped here"))
 
@@ -753,49 +753,34 @@ class TestTheHandover:
         assert _fits(items)
         Dial(voice="prose", agent="rules", hand_over=items)
 
-    def test_a_stopped_session_the_roster_did_not_brief_is_carried_last(self) -> None:
-        """The one row the roster is knowingly stale about (#209).
+    def test_a_session_whose_row_says_it_stopped_is_briefed_from_the_roster(self) -> None:
+        """The row a caller used to have to compensate for (#213).
 
-        A Stop that merely ended a turn leaves its row `RUNNING`, and a running
-        Session is briefed by nothing here — so the caller passes the reading it
-        took at the Stop, and it goes after every Session the roster did brief.
+        A Stop that merely ended a turn used to leave its row `RUNNING`, and a
+        running Session is briefed by nothing here — so a call dialled by that
+        Stop said a Session needed the user and never said which, until the
+        caller passed the Stop's own brief in beside the roster. The registry now
+        writes the state the Stop implies, so the row arrives here as `IDLE` and
+        is briefed like any other Session that stopped, in its place in the
+        roster's own order.
         """
-        stale = row(CODEX, state=SessionState.RUNNING, progress=said("it stopped here"))
+        stopped = row(CODEX, state=SessionState.IDLE, progress=said("it stopped here"))
         waiting = row(CLAUDE, state=SessionState.WAITING, waiting_for=PERMISSION)
-        stopped = SpokenBrief(
-            name="gpt-voicecoding · a task",
-            agent="codex",
-            state="finished",
-            newest="it stopped here",
-            decision=("nothing is waiting on you",),
-            answerable_here="at the terminal",
-            last_activity_at="not read",
-        )
 
-        items = briefing.handover(
-            (stale, waiting), focus=None, reason="dialled", stopped=(CODEX, stopped)
-        )
+        items = briefing.handover((stopped, waiting), focus=None, reason="dialled")
 
         briefs = [item for item in items if isinstance(item, SpokenBrief)]
-        assert [item.state for item in briefs] == ["requesting permission", "finished"]
-        assert briefs[-1] is stopped
+        assert [item.state for item in briefs] == [
+            "waiting for your decision",
+            "requesting permission",
+        ]
+        assert briefs[0].newest == "it stopped here"
 
-    def test_a_stopped_session_the_roster_did_brief_is_not_carried_twice(self) -> None:
-        """One Session, one brief. The roster's reading is the one that travels."""
-        waiting = row(CODEX, state=SessionState.WAITING, waiting_for=QUESTION)
-        stopped = SpokenBrief(
-            name="gpt-voicecoding · a task",
-            agent="codex",
-            state="finished",
-            newest="it stopped here",
-            decision=("nothing is waiting on you",),
-            answerable_here="at the terminal",
-            last_activity_at="not read",
-        )
+    def test_a_session_that_stopped_is_briefed_exactly_once(self) -> None:
+        """One Session, one brief. The roster's reading is the only one there is."""
+        stopped = row(CODEX, state=SessionState.WAITING, waiting_for=QUESTION)
 
-        items = briefing.handover(
-            (waiting,), focus=None, reason="dialled", stopped=(CODEX, stopped)
-        )
+        items = briefing.handover((stopped,), focus=None, reason="dialled")
 
         briefs = [item for item in items if isinstance(item, SpokenBrief)]
         assert len(briefs) == 1

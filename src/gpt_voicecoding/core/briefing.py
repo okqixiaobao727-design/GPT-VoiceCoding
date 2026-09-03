@@ -326,7 +326,6 @@ def handover(
     *,
     reason: str,
     answerable: Collection[SessionTarget] = (),
-    stopped: tuple[SessionTarget, SpokenBrief] | None = None,
 ) -> tuple[HandoverItem, ...]:
     """Everything a system-dialled call opens holding, inside the wire's ceilings.
 
@@ -349,8 +348,7 @@ def handover(
     first bought header rows with decisions. Measured: two hundred waiting
     Sessions used to come out as one hundred and fifty-four header rows and no
     briefs at all, which is every decision in the roster dropped to keep a list
-    of names. Whole briefs go last, from the back, and `stopped`'s brief after
-    them.
+    of names. Whole briefs go last, from the back.
 
     **The counts never go, at any scale.** They are the summary ADR 0016 asks
     for: with them, a hand-over that could carry thirty-five of two hundred
@@ -363,20 +361,16 @@ def handover(
     truncations (`seams/call.py`), so this returns a hand-over that fits and
     `Dial` asserts that it does.
 
-    **Which Sessions are briefed is the roster's answer, and `stopped` is the
-    one thing the roster cannot answer for.** An earlier draft let the caller
-    name the Session a call was dialled about and briefed it whatever the row
-    said: it put that Session ahead of the Focus Session, and — because
-    `sessions.set_stop_reading` leaves a row `RUNNING` unless the wait needs the
-    user (#209) — it could produce a brief reading "running" among the Sessions
-    that need the user. Both rules hold here. `stopped` is the target a Stop
-    dialled this call about together with the brief that Stop itself read —
-    already worded, and already in the state `bridge.stop_brief` derived from the
-    wait, so it can never read "running" — and it is added **only when the
-    roster's own rows did not brief that target**, and **last**, after every
-    Session the roster did brief. A call whose reason says a Session needs the
-    user and whose hand-over never mentions that Session is what this closes.
-    The stale row is still wrong where it is written, and #209 is where.
+    **Which Sessions are briefed is the roster's answer, and only the
+    roster's.** An earlier draft let the caller name the Session a call was
+    dialled about and briefed it whatever the row said, which put that Session
+    ahead of the Focus Session; a later one took the brief the provoking Stop had
+    read and appended it last, because `sessions.set_stop_reading` used to leave
+    a row that merely ended a turn in `RUNNING` (#209) and a running Session is
+    briefed by nothing here — so a call dialled by that Stop could say a Session
+    needs the user and never mention which. Since #213 the row itself says the
+    Session stopped, so the roster answers for it too and no caller passes a
+    brief in beside it.
 
     `answerable` is the one fact a row cannot carry, as in `session`: the targets
     whose question the lane can still route an Answer Relay into. A live adapter
@@ -389,10 +383,7 @@ def handover(
         for row in summary.rows
         if row.state is not BriefState.RUNNING and row.target in by_target
     ]
-    trailing: tuple[SpokenBrief, ...] = ()
-    if stopped is not None and not any(brief.target == stopped[0] for brief in briefs):
-        trailing = (stopped[1],)
-    return _fitted(DialReason(text=reason), summary, briefs, trailing)
+    return _fitted(DialReason(text=reason), summary, briefs)
 
 
 def text(brief: SessionBrief | RosterBrief) -> str:
@@ -656,20 +647,18 @@ def _fitted(
     reason: DialReason,
     summary: RosterBrief,
     briefs: list[SessionBrief],
-    trailing: tuple[SpokenBrief, ...] = (),
 ) -> tuple[HandoverItem, ...]:
     """Give things back, in the order the docstring of `handover` names, until it fits.
 
-    Four rungs, in the order `handover` states — every newest body from the back,
-    then the roster's header rows from the back, then whole briefs from the back,
-    then the trailing brief the roster could not supply. The loop stops at the
-    first arrangement that fits, so a hand-over that already does is returned
-    untouched: the common case, and the one where every body is carried whole.
+    Three rungs, in the order `handover` states — every newest body from the back,
+    then the roster's header rows from the back, then whole briefs from the back.
+    The loop stops at the first arrangement that fits, so a hand-over that already
+    does is returned untouched: the common case, and the one where every body is
+    carried whole.
 
     A header row is given up before a brief because it is the only thing here
-    that repeats something already said. A brief is given up after it because it
-    is the only thing that carries a decision. The trailing one is given up last
-    of all, because it is the Session this call was dialled about.
+    that repeats something already said. A brief is given up last because it is
+    the only thing that carries a decision.
 
     **The reason and the counts are never given up**, at any scale: they are what
     is left when everything else has gone, and the counts are what still say how
@@ -677,9 +666,8 @@ def _fitted(
     """
     carried = list(briefs)
     rows = list(summary.rows)
-    last = list(trailing)
     while True:
-        items = _handover_items(reason, summary, rows, carried, last)
+        items = _handover_items(reason, summary, rows, carried)
         if _within_ceilings(items):
             return items
         if _one_body_less(carried):
@@ -688,9 +676,6 @@ def _fitted(
             continue
         if carried:
             carried.pop()
-            continue
-        if last:
-            last.pop()
             continue
         # The reason and the counts alone. Nothing here is the caller's to trim,
         # and both are bounded by their own writers.
@@ -720,13 +705,11 @@ def _handover_items(
     summary: RosterBrief,
     rows: list[RosterRow],
     briefs: list[SessionBrief],
-    trailing: list[SpokenBrief],
 ) -> tuple[HandoverItem, ...]:
     return (
         reason,
         _spoken_roster(summary, rows),
         *(spoken(brief) for brief in briefs),
-        *trailing,
     )
 
 

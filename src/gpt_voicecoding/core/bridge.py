@@ -174,19 +174,24 @@ def stop_brief(
     Session Name, the workspace, the last activity — that the reading itself does
     not know.
 
-    **The state is derived from the wait, because a Stop is not a Session
-    running.** `SessionRegistry.set_stop_reading` deliberately leaves a row that
-    merely ended a turn in whatever state the last discovery pass found (#209),
-    which is right for a standing roster and wrong for a notice: it would brief a
-    Session that has just stopped as `running`. So a wait only the user can end —
-    and a wait nobody could read, which is not an answer either — reads as
-    `WAITING`, and a turn that ended asking nothing reads as `IDLE`, which is
-    exactly what `BriefState.FINISHED` means (#165 Q7).
+    **The state is the row's, and only a row nobody holds derives it here.** A
+    Stop is not a Session running, and this path used to be the one place that
+    said so: it derived the state from the wait because
+    `SessionRegistry.set_stop_reading` left a row that merely ended a turn in
+    whatever state the last discovery pass found (#209). Since #213 the registry
+    derives it, by the same rule in the one place it now lives
+    (`WaitingFor.stopped_state`), so a registered row is briefed as the registry
+    holds it and nothing here overrides it. The derivation is still read for the
+    stand-in below — a Stop for a Session no discovery pass has landed yet has no
+    row to have been folded into.
     """
-    row = session if session is not None else _stand_in(target)
+    row = (
+        session
+        if session is not None
+        else replace(_stand_in(target), state=waiting_for.stopped_state)
+    )
     row = replace(
         row,
-        state=(SessionState.IDLE if waiting_for.kind is WaitingKind.NONE else SessionState.WAITING),
         waiting_for=waiting_for,
         progress=progress if progress is not None else row.progress,
     )
@@ -589,16 +594,16 @@ class BridgeCore:
         at the terminal. So the notice names the moment and the roster supplies
         the content.
 
-        **Except for the one row the roster is knowingly stale about.** A Stop
-        that merely ended a turn leaves its row in `RUNNING`
-        (`core/sessions.py::set_stop_reading`, deliberately, #209), and a hand-over
-        briefs no running Session — so a call dialled by that Stop would come up
-        saying a Session needs the user and never mention which. The notice
-        already carries the reading that is *not* stale: `stop_brief` derives the
-        state from the wait for exactly this reason, and `briefing.spoken` worded
-        it. So it is passed alongside, and `handover` places it last and only if
-        the roster did not brief that target itself — never ahead of the Focus
-        Session, and never twice.
+        **Every row, including the one that just stopped.** A Stop used to leave a
+        row that merely ended a turn in `RUNNING` (#209), and a hand-over briefs
+        no running Session — so a call dialled by that Stop came up saying a
+        Session needs the user without mentioning which, and this method passed
+        the notice's own brief alongside for `handover` to place last. Since #213
+        the roster holds a stopped Session as stopped, so the fresh reading
+        covers it like any other and the compensation is gone. Which leaves
+        `notice` naming the moment and nothing else: it stays in the signature
+        because it is the escalation's own callback contract for this route
+        (`core/escalation.py`), and reading nothing off it is exactly ADR 0017.
         """
         sessions = self._state.sessions.live()
         return self._dial(
@@ -612,7 +617,6 @@ class BridgeCore:
                     if session.waiting_for.kind is WaitingKind.QUESTION
                     and self._question_answerable(session.target)
                 ),
-                stopped=((notice.target, notice.spoken) if notice.spoken is not None else None),
             )
         )
 
@@ -1025,7 +1029,8 @@ class BridgeCore:
 
         A held question is the exception to the state shortcut. Its listener can
         open the route before the roster has reported `WAITING`; the event proves
-        the route, not `IDLE`, so only discovery may change the Session state.
+        the route, not `IDLE`, so only a discovery pass or a Stop — the two
+        readings that looked at the Session itself — may change the state there.
         """
         try:
             held = self._state.sessions.resolve(event.target)
