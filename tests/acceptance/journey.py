@@ -2902,6 +2902,14 @@ class Walk:
             )
             paid_dials = support.matching_lines(self._log_since(inside), HAND_OVER_LINE)
             self._end_any_live_call()
+        # **And then again, with Voice off.** This phase ends on a dial it asked
+        # for, and a dial decided is a call that arrives seconds later: on run
+        # `20260903T090555Z` the Cool-down's owed dial landed 1.5 s after the
+        # line above had read the call down and gone, so the phase after this one
+        # began holding a call nobody had opened for it. Here rather than inside
+        # the block above, because `_leave_no_call_up` is only finite once
+        # nothing can dial — which is what leaving `_voice_route_only` settles.
+        left_up = not self._leave_no_call_up(LIVE_CALL_CUE_SECONDS)
         self._measured("live call v1", started, self._call_is_down())
         hand_over = support.matching_lines(self._log_since(mark), HAND_OVER_LINE)
         self.journey.observe(
@@ -2912,6 +2920,11 @@ class Walk:
             f"{self._cue_order(since=mark)}; ended by the ceiling: {by_ceiling}; the wake was "
             f"owed: {owed}, paid: {paid}",
         )
+        if left_up:
+            raise StepFailed(
+                f"this phase dialled and could not put the call back down: {self._call_line()!r}. "
+                f"Every step after this one would be graded against a call it did not open"
+            )
         if not opened:
             raise StepFailed(
                 f"a Session stopped with Voice on and Message off and the engine never dialled "
