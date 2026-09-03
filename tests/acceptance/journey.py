@@ -3458,6 +3458,14 @@ class Walk:
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
         relays = self._verbs_since(runs_before, Action.RELAY)
+        # **The absence starts here, at the relay, and not at the question.**
+        # Finding the Session to relay into is a *read*, and the Call Agent has
+        # to make it: run `20260903T223601Z`'s codex lane ran `brief` at 22:41:57
+        # and `relay … 可以继续` five seconds later, which is the hand-off working.
+        # What the ticket forbids is the Call Agent going on working *after* the
+        # words have gone — "no further `bridgectl` run … until" the next spoken
+        # request — so the mark is taken once the relay is in the log.
+        runs_at_relay = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         receipted = self._while_the_call_is_up(
             lambda: any(
                 self._voice_said_something_carrying(wording, since=relaying)
@@ -3482,12 +3490,7 @@ class Walk:
         unaccounted = _unaccounted_voice_turns(
             since_relay, (RELAY_RECEIPT_DELIVERED, RELAY_RECEIPT_QUEUED)
         )
-        after = self._verbs_since(runs_before, Action.RELAY)
-        further = [
-            verb
-            for verb in self._verbs_run(since=runs_before)
-            if verb.split()[:1] != [str(Action.RELAY)]
-        ]
+        further = self._verbs_run(since=runs_at_relay)
         self.journey.observe(
             "live call the answer relayed",
             f"the Call Agent relayed with {relays or 'nothing'} — which Session it picked is "
@@ -3495,7 +3498,9 @@ class Walk:
             f"{any(focus_address in verb for verb in relays)}; the Voice said "
             f"{self._voice_said_lines(since=relaying) or 'nothing recorded'}; "
             f"{len(payments)} engine payment(s) in the window, "
-            f"{'no' if not unaccounted else unaccounted} assistant turn(s) unaccounted for",
+            f"{'no' if not unaccounted else unaccounted} assistant turn(s) unaccounted for; "
+            f"what the Call Agent ran before the relay: "
+            f"{self._verbs_run(since=runs_before)[:-1] or 'nothing'}",
         )
         if not heard:
             raise StepFailed(
@@ -3512,7 +3517,7 @@ class Walk:
             )
         if not carried:
             raise StepFailed(
-                f"the Call Agent relayed with {after} and {LIVE_CALL_ANSWER_SUBSTRING!r} never "
+                f"the Call Agent relayed with {relays} and {LIVE_CALL_ANSWER_SUBSTRING!r} never "
                 f"reached {focus_address}'s own record within "
                 f"{turn + support.RELAY_DEADLINE_SECONDS:.0f}s. The relay is the user's answer "
                 f"to the question that Session stopped on, so its next turn is where the words "
