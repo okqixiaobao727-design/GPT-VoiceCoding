@@ -4098,8 +4098,13 @@ class Walk:
             lambda: bool(self._user_speech_lines(LIVE_CALL_LONG_HEARD_SUBSTRING, since=asking)),
             deadline_seconds=LIVE_CALL_HEARD_SECONDS + live_call.PLAYLIST_POLL_SECONDS,
         )
+        # **The watch starts where the request landed, not where it was asked
+        # for.** The stretch before it belongs to the previous answer, and a
+        # watch that counted its tail closes on the quiet after it — run
+        # `20260904T000509Z`'s codex lane measured this answer as zero seconds
+        # long off a span opened 0.9s before its request was even heard.
         watch = self._watch_the_voice(
-            asking,
+            self._user_speech_landed_at(LIVE_CALL_LONG_HEARD_SUBSTRING, since=asking),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling,
             quiet_seconds=LIVE_CALL_CUE_SECONDS,
         )
@@ -5072,6 +5077,30 @@ class Walk:
             for line in support.matching_lines(self._log_since(since), USER_SPEECH_LINE)
             if _unspaced(carrying) in _unspaced(line)
         ]
+
+    def _user_speech_landed_at(self, carrying: str, *, since: int) -> int:
+        """Where in the engine log the request this step made was written down.
+
+        A mark for the steps that measure the Voice's *answer*: taken at the
+        line the request landed on rather than at the one the walk asked from,
+        so a span the Voice had already opened is outside the window. Run
+        `20260904T000509Z`'s codex lane is why — it opened a span at 12:17:52.079
+        and the request landed at 12:17:52.974, and a watch that counted the
+        first was one that closed on the previous answer's tail and measured the
+        counting answer as zero seconds long.
+
+        Falls back to `since` when the line is not there: the caller has already
+        waited for it and complains about the absence itself.
+        """
+        window = self._log_since(since)
+        return next(
+            (
+                since + at
+                for at, line in enumerate(window)
+                if re.search(USER_SPEECH_LINE, line) and _unspaced(carrying) in _unspaced(line)
+            ),
+            since,
+        )
 
     def _while_the_call_is_up(
         self, condition: Callable[[], bool], *, deadline_seconds: float
