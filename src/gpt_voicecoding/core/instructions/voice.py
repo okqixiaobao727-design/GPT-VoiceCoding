@@ -144,18 +144,54 @@ def _sections() -> tuple[Section, ...]:
                         "recommendation is that session's opinion, and you say so."
                     ),
                 ),
+                # **The paragraph now starts at the hand-off, because that is
+                # where the receipt was being spoken.** Told only what to say
+                # once the outcome was in, the Voice said the DELIVERED word at
+                # the moment it passed the request on — before the relay verb
+                # ran at all (#221, run `20260904T091550Z`: 已转达 at 21:25:55,
+                # the relay at 21:25:57, and after the words did arrive, no
+                # receipt of any kind). Other runs gave two receipts for one
+                # relay. The hand-off was simply not a moment this text had an
+                # answer for, and the only arrival wording in view was the one
+                # for a delivery that had not happened.
+                #
+                # **Named as what to say there, not as a word not to say.** The
+                # delegation paragraph below records what a prohibition cost
+                # this file once already (#194); and a rule that spelled the
+                # receipt word in order to forbid it would put that word in
+                # front of the Voice at exactly the moment it must not reach
+                # for it. The permission is deliberately conditional — Round 1
+                # Q9 removed the backend's own hand-off filler (ADR 0018), so
+                # the Voice is not being told to fill the gap, only what it may
+                # say if it does.
+                #
+                # **Legacy (ADR 0010): no such behaviour, and its nearest rule
+                # adapted.** Legacy had no realtime Voice and no two-model
+                # split — one skill-driven agent ran the relay itself and
+                # reported the result to the person who had typed the request,
+                # so there was no hand-off moment at which a receipt could be
+                # spoken early. Its nearest rule is
+                # `legacy@1d32845:skill/SKILL.md:63-68`: nothing is real until
+                # the exact command exits successfully, then say plainly what
+                # happened and stop. That is this paragraph's principle one
+                # model behind, adapted here to a split where the half that
+                # speaks never runs the command and has to wait to be told.
                 Block(
                     covers=(
                         "voice.delivery.tells-the-truth-about-arrival",
                         "voice.delivery.a-refusal-is-an-answer",
                     ),
                     text=(
-                        "Once their words have gone back, the engine tells you how it went, "
-                        "and you say one thing. If it arrived, 已转达. If it is waiting for "
-                        "that session to finish this turn, 收到，等它这轮结束送进去. If it was "
-                        "held, or failed, or nobody can tell, one clause of the reason the "
-                        "engine gave. Then stop talking. Do not go back and check on it "
-                        "unless they ask you to."
+                        "Passing their words on is not the same as their arriving, and at "
+                        "the moment you hand them over all you know is that you have handed "
+                        "them over. If you speak at all just then, keep it to a few words "
+                        "that you are on it, and leave arrival out of it. The receipt comes "
+                        "once, and it comes after: the engine tells you how it went, and "
+                        "only then you say one thing. If it arrived, 已转达. If it is "
+                        "waiting for that session to finish this turn, "
+                        "收到，等它这轮结束送进去. If it was held, or failed, or nobody can "
+                        "tell, one clause of the reason the engine gave. Then stop talking. "
+                        "Do not go back and check on it unless they ask you to."
                     ),
                 ),
                 Block(

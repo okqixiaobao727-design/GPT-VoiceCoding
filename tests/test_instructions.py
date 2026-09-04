@@ -516,6 +516,51 @@ class TestTheVoiceHearsProse:
         assert "已转达" in instructions.voice.text
         assert "收到，等它这轮结束送进去" in instructions.voice.text
 
+    @staticmethod
+    def _receipt_paragraph(instructions) -> str:
+        """The one paragraph #173 §3.7 fixes, found by the word it settles on."""
+        paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
+        receipts = [part for part in paragraphs if "已转达" in part]
+        assert len(receipts) == 1, receipts
+        return receipts[0]
+
+    def test_the_hand_off_moment_is_spoken_of_before_the_receipt(self, instructions) -> None:
+        """#221: the Voice said 已转达 at hand-off, seconds before the relay ran.
+
+        The paragraph now reaches the hand-off moment first and tells the Voice
+        what it may say there, so the receipt wording is no longer the only
+        sentence in view when the words go out.
+        """
+        paragraph = self._receipt_paragraph(instructions)
+        marks = (
+            "hand them over",
+            "leave arrival out of it",
+            "已转达",
+        )
+        at = [paragraph.find(mark) for mark in marks]
+        assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
+        assert at == sorted(at), dict(zip(marks, at, strict=True))
+
+    def test_the_receipt_is_named_as_spoken_once_and_only_after_the_outcome(
+        self, instructions
+    ) -> None:
+        """One receipt, from the grade the relay earned — not two, and not none."""
+        paragraph = self._receipt_paragraph(instructions)
+        assert "comes once" in paragraph
+        assert "only then" in paragraph
+
+    def test_the_hand_off_sentence_repeats_no_receipt_wording(self, instructions) -> None:
+        """Naming the word to forbid it is how the Voice comes to say it.
+
+        And a prohibition is what this file's own history warns against (#194):
+        so each settled receipt word appears exactly once, in the sentence that
+        tells the Voice when to say it.
+        """
+        paragraph = self._receipt_paragraph(instructions)
+        assert paragraph.count("已转达") == 1
+        assert paragraph.count("收到，等它这轮结束送进去") == 1
+        assert "已送达" not in instructions.voice.text
+
 
 class TestTheAgentSetIsTheActingHalf:
     """#173 §4: six forms, the CLI that runs them, and nothing it may not run."""
