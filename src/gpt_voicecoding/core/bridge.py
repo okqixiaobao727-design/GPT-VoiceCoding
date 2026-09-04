@@ -122,6 +122,7 @@ from gpt_voicecoding.seams.companion_channel import CompanionChannel, InboundTex
 from gpt_voicecoding.seams.events import Event
 from gpt_voicecoding.seams.identity import (
     AgentKind,
+    RequestId,
     SessionTarget,
     new_request_id,
 )
@@ -1103,7 +1104,7 @@ class BridgeCore:
             _log.info("a receipt arrived for a Relay that is no longer pending")
             return
         if event.receipt.is_delivered:
-            self._fold_undelivered(classified.target, None)
+            self._fold_undelivered(classified.target, None, relay=event.receipt.request_id)
 
     async def _inbound_text(self, event: InboundText) -> None:
         """Classify one inbound line, act on it, and always answer the user."""
@@ -1181,7 +1182,7 @@ class BridgeCore:
         no Reply Window moves.
         """
         if outcome.reason is RelayReason.DELIVERED:
-            self._fold_undelivered(outcome.target, None)
+            self._fold_undelivered(outcome.target, None, relay=outcome.request_id)
             return
         if outcome.reason is not RelayReason.CEILING_PASSED:
             if outcome.state is Lifecycle.REPORTED_FAILED:
@@ -1197,7 +1198,7 @@ class BridgeCore:
             reason=outcome.reason,
             grade=None if outcome.receipt is None else outcome.receipt.outcome,
         )
-        if not self._fold_undelivered(outcome.target, undelivered):
+        if not self._fold_undelivered(outcome.target, undelivered, relay=outcome.request_id):
             return
         # One wake, carrying no content: whether that Session still needs the
         # user is read again by the Briefer at the moment the Keeper acts (ADR
@@ -1205,13 +1206,30 @@ class BridgeCore:
         await self.keeper.wake(focus=self._state.sessions.focus == outcome.target)
 
     def _fold_undelivered(
-        self, target: SessionTarget, undelivered: UndeliveredRelay | None
+        self, target: SessionTarget, undelivered: UndeliveredRelay | None, *, relay: RequestId
     ) -> bool:
         """Write the field, and say whether there was a live row to write it on.
 
         A Session that ended while the words waited gets nothing: it appears in
         no brief, so the reason has nowhere to be read from and the log is the
         record. Same answer for a row the roster never held.
+
+        **Every change to the field is written down, and this is the one place
+        both of them pass through** (#226). The field is read twice — once by
+        `bridgectl brief` and once by the Stop Notice rendered from the same
+        row — and a late proof of delivery legitimately clears it between the
+        two, so the two readings can disagree while both are honest. Nothing
+        distinguished that from the defect until these lines existed: a reader
+        holding two disagreeing readings and no record of the write between them
+        cannot attribute either. It is #75's rule on the announcement side, kept
+        here — an engine silent about the one event that changes a user-visible
+        field leaves the run nothing to attribute.
+
+        Both lines name the Session and the Relay: the Session because the log
+        carries every Session on the machine, and the Relay because "which
+        words" is the whole of what changed. An **unchanged** write says
+        nothing, which is the common case and the reason the silence is worth
+        keeping — a line per delivered Relay would bury the two that matter.
         """
         try:
             session = self._state.sessions.resolve(target)
@@ -1226,6 +1244,21 @@ class BridgeCore:
             # to a Session with nothing outstanding lands here — and a write
             # that changes nothing is a write a reader has to rule out.
             return True
+        if undelivered is None:
+            _log.info(
+                "a Relay to %s arrived after all, and its brief no longer says so: relay=%s",
+                session.target,
+                relay,
+            )
+        else:
+            _log.info(
+                "a Relay to %s did not arrive, and its brief now says so: "
+                "relay=%s reason=%s grade=%s",
+                session.target,
+                relay,
+                undelivered.reason,
+                undelivered.grade,
+            )
         self._state.sessions.set_undelivered(session.target, undelivered)
         return True
 
