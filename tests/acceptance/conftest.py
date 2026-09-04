@@ -86,6 +86,7 @@ pytest.importorskip(
 
 import hand_started  # noqa: E402
 import journey as journey_module  # noqa: E402
+import live_call_step  # noqa: E402
 import support  # noqa: E402 - after the skip, so a venv without the extra collects cleanly
 import telegram_person  # noqa: E402
 
@@ -238,12 +239,37 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Names: " + ", ".join(lane.name for lane in journey_module.LANES)
         ),
     )
+    group.addoption(
+        "--phase",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "grade this Live Call phase and arrange its ground; repeatable. "
+            "Default: every phase. Names: " + ", ".join(live_call_step.PHASES)
+        ),
+    )
 
 
 def _selection(config: pytest.Config) -> journey_module.Selection:
     try:
         return journey_module.select(config.getoption("--step"))
     except journey_module.UnknownStep as unknown:
+        raise pytest.UsageError(str(unknown)) from None
+
+
+def _phase_selection(
+    config: pytest.Config, selection: journey_module.Selection
+) -> live_call_step.PhaseSelection:
+    asked = config.getoption("--phase")
+    if asked and "live call" not in selection.selected:
+        raise pytest.UsageError(
+            "--phase requires --step 'live call'. "
+            f"The phases are: {', '.join(live_call_step.PHASES)}."
+        )
+    try:
+        return live_call_step.select_phases(asked)
+    except live_call_step.UnknownPhase as unknown:
         raise pytest.UsageError(str(unknown)) from None
 
 
@@ -280,13 +306,22 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         metafunc.parametrize(
             "lane", _selected_lanes(metafunc.config), indirect=True, ids=lambda one: one.name
         )
-    _selection(metafunc.config)
+    selection = _selection(metafunc.config)
+    _phase_selection(metafunc.config, selection)
 
 
 @pytest.fixture(scope="session")
 def selection(request: pytest.FixtureRequest) -> journey_module.Selection:
     """Which steps this run grades, and which it walks only to reach them."""
     return _selection(request.config)
+
+
+@pytest.fixture(scope="session")
+def phase_selection(
+    request: pytest.FixtureRequest, selection: journey_module.Selection
+) -> live_call_step.PhaseSelection:
+    """Which Live Call phases this run grades and which ground it arranges."""
+    return _phase_selection(request.config, selection)
 
 
 @pytest.fixture(scope="session")
@@ -654,6 +689,7 @@ class Arrangement:
     """
 
     selection: journey_module.Selection
+    phase_selection: live_call_step.PhaseSelection
     run_directory: Path
     journal: support.Journal
     verdict: support.Verdict
@@ -687,6 +723,7 @@ def lane_runs(
     preflight: None,  # noqa: ARG001 - the refusals happen before a thread is started
     selected_lanes: tuple[journey_module.Lane, ...],
     selection: journey_module.Selection,
+    phase_selection: live_call_step.PhaseSelection,
     run_directory: Path,
     journal: support.Journal,
     verdict: support.Verdict,
@@ -706,6 +743,7 @@ def lane_runs(
     configured = str(configured_channel["token_env"])
     arrangement = Arrangement(
         selection=selection,
+        phase_selection=phase_selection,
         run_directory=run_directory,
         journal=journal,
         verdict=verdict,
@@ -878,6 +916,7 @@ def _one_lane(run: LaneRun, arrangement: Arrangement) -> None:
                 environment=arrangement.environment,
                 started_at=started_at,
                 selection=arrangement.selection,
+                phase_selection=arrangement.phase_selection,
             ).walk()
         finally:
             # #44: the engine unlinked its socket but left its approval directory

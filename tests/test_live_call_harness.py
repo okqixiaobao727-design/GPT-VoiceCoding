@@ -31,8 +31,8 @@ import json
 import wave
 from pathlib import Path
 
-import journey
 import live_call
+import live_call_step
 import pytest
 import support
 
@@ -306,7 +306,7 @@ def played(cue: Cue, *, device: int | None = None) -> str:
 
 
 def test_a_call_that_marked_both_of_its_ends_is_accepted() -> None:
-    complaint = journey._cue_complaint(
+    complaint = live_call_step._cue_complaint(
         [played(Cue.CONNECTED), SPOKE, played(Cue.ENDED)], {SPOKE}, device=None
     )
     assert complaint == ""
@@ -315,12 +315,12 @@ def test_a_call_that_marked_both_of_its_ends_is_accepted() -> None:
 def test_a_call_that_made_no_sound_at_all_is_refused_by_name() -> None:
     """The likeliest failure: an output device the engine could not open. The
     adapter swallows that, so nothing else in the run would say so."""
-    complaint = journey._cue_complaint([SPOKE], {SPOKE}, device=None)
+    complaint = live_call_step._cue_complaint([SPOKE], {SPOKE}, device=None)
     assert "no connected cue, no ended cue" in complaint
 
 
 def test_a_call_that_only_marked_its_ending_is_refused() -> None:
-    complaint = journey._cue_complaint([SPOKE, played(Cue.ENDED)], {SPOKE}, device=None)
+    complaint = live_call_step._cue_complaint([SPOKE, played(Cue.ENDED)], {SPOKE}, device=None)
     assert "no connected cue" in complaint
     assert "no ended cue" not in complaint
 
@@ -328,40 +328,42 @@ def test_a_call_that_only_marked_its_ending_is_refused() -> None:
 def test_a_connect_cue_that_arrived_after_the_call_was_talked_into_is_refused() -> None:
     """Order, not presence. Both lines are there and they are the wrong way round."""
     lines = [SPOKE, played(Cue.CONNECTED), played(Cue.ENDED)]
-    assert "after the user speech" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "after the user speech" in live_call_step._cue_complaint(lines, {SPOKE}, device=None)
 
 
 def test_an_end_cue_from_before_this_calls_speech_is_not_this_calls_ending() -> None:
     lines = [played(Cue.ENDED), played(Cue.CONNECTED), SPOKE]
-    assert "that is not this call's ending" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "that is not this call's ending" in live_call_step._cue_complaint(
+        lines, {SPOKE}, device=None
+    )
 
 
 def test_a_second_cue_of_the_same_kind_does_not_unseat_the_first() -> None:
     """Two calls' worth of log read from one mark: the step grades the earliest
     connect and the latest ending, so a run that dialled twice still reads."""
     lines = [played(Cue.CONNECTED), SPOKE, played(Cue.ENDED), played(Cue.CONNECTED)]
-    assert journey._cue_complaint(lines, {SPOKE}, device=None) == ""
+    assert live_call_step._cue_complaint(lines, {SPOKE}, device=None) == ""
 
 
 def test_the_mid_call_cue_is_never_what_this_step_looks_for() -> None:
     """`EVENT` has no caller yet, and an EVENT line is not an ending."""
     lines = [played(Cue.CONNECTED), SPOKE, played(Cue.EVENT)]
-    assert "no ended cue" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "no ended cue" in live_call_step._cue_complaint(lines, {SPOKE}, device=None)
 
 
 def test_a_cue_line_that_names_no_device_or_span_is_not_the_record_asked_for() -> None:
     """The ticket wants the adapter's log to record the output device and the
     span written — so a line carrying only the phrase is not enough."""
     lines = ["played the connected cue", SPOKE, played(Cue.ENDED)]
-    complaint = journey._cue_complaint(lines, {SPOKE}, device=None)
+    complaint = live_call_step._cue_complaint(lines, {SPOKE}, device=None)
     assert "without the output device and the span written" in complaint
 
 
 def test_a_cue_played_to_a_stated_device_is_read_against_that_device() -> None:
     """A run that pinned `output_device` is graded on the line it really writes."""
     lines = [played(Cue.CONNECTED, device=4), SPOKE, played(Cue.ENDED, device=4)]
-    assert journey._cue_complaint(lines, {SPOKE}, device=4) == ""
-    assert "without the output device" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert live_call_step._cue_complaint(lines, {SPOKE}, device=4) == ""
+    assert "without the output device" in live_call_step._cue_complaint(lines, {SPOKE}, device=None)
 
 
 def test_the_span_in_the_line_is_the_one_the_cue_really_synthesises_to() -> None:
@@ -385,13 +387,15 @@ def test_a_thin_early_line_is_not_evidence_that_a_whole_later_one_is_in_order() 
         played(Cue.CONNECTED),
         played(Cue.ENDED),
     ]
-    assert "after the user speech" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "after the user speech" in live_call_step._cue_complaint(lines, {SPOKE}, device=None)
 
 
 def test_a_thin_late_end_line_is_not_evidence_for_a_whole_early_one() -> None:
     """The mirror: the whole `ended` record is from before this call's speech."""
     lines = [played(Cue.CONNECTED), played(Cue.ENDED), SPOKE, "played the ended cue"]
-    assert "that is not this call's ending" in journey._cue_complaint(lines, {SPOKE}, device=None)
+    assert "that is not this call's ending" in live_call_step._cue_complaint(
+        lines, {SPOKE}, device=None
+    )
 
 
 # --- the acceptance step's own "is a call up?" rule, graded at CI speed ------
@@ -431,23 +435,25 @@ def call_line(**data: object) -> str:
 
 
 def test_a_quiet_line_reads_as_no_call_up() -> None:
-    assert journey._no_call_is_up(call_line()) is True
+    assert live_call_step._no_call_is_up(call_line()) is True
 
 
 def test_a_running_cool_down_is_still_no_call_up() -> None:
     """The regression #218 is: the ceiling has released the call and the engine
     is counting the window out, which is precisely when the step must act."""
-    assert journey._no_call_is_up(call_line(cool_down_remaining=28.0)) is True
+    assert live_call_step._no_call_is_up(call_line(cool_down_remaining=28.0)) is True
 
 
 def test_a_cool_down_carrying_an_owed_dial_is_still_no_call_up() -> None:
-    assert journey._no_call_is_up(call_line(cool_down_remaining=12.0, dial_owed=True)) is True
+    assert (
+        live_call_step._no_call_is_up(call_line(cool_down_remaining=12.0, dial_owed=True)) is True
+    )
 
 
 def test_an_owed_dial_past_the_windows_expiry_is_still_no_call_up() -> None:
     """`_end_any_live_call` asks this same question, and an answer of "a call is
     up" here would have it dial one to clean up after a call that never was."""
-    assert journey._no_call_is_up(call_line(dial_owed=True)) is True
+    assert live_call_step._no_call_is_up(call_line(dial_owed=True)) is True
 
 
 def test_a_line_naming_a_call_reads_as_a_call_up() -> None:
@@ -455,13 +461,13 @@ def test_a_line_naming_a_call_reads_as_a_call_up() -> None:
     line = call_line(call_id="01a065e0-1a4f-7c10-9a9a-c2f3840f7953")
 
     assert line == "call: 01a065e0-1a4f-7c10-9a9a-c2f3840f7953"
-    assert journey._no_call_is_up(line) is False
+    assert live_call_step._no_call_is_up(line) is False
 
 
 def test_a_surface_that_answered_something_else_entirely_is_not_read_as_down() -> None:
     """`_call_line` falls back to the head of whatever `status` printed when no
     `call:` line is in it — a refusal must not read as a quiet keeper."""
-    assert journey._no_call_is_up("engine unreachable") is False
+    assert live_call_step._no_call_is_up("engine unreachable") is False
 
 
 # --- the playlist, and the second utterance on a call that is up (#196) -------
@@ -627,30 +633,37 @@ SPOKEN = (
     "2026-09-03 20:45:13,115 INFO gpt_voicecoding.core.call_keeper: spoke the Focus "
     "Session's brief into the gap in the Live Call: 二号工位 · Reply READY"
 )
-STARTED = f"2026-09-03 20:45:00,000 INFO gpt_voicecoding.core.bridge: {journey.VOICE_SPEAKING_LINE}"
-STOPPED = f"2026-09-03 20:45:10,000 INFO gpt_voicecoding.core.bridge: {journey.VOICE_QUIET_LINE}"
+STARTED = (
+    "2026-09-03 20:45:00,000 INFO gpt_voicecoding.core.bridge: "
+    f"{live_call_step.VOICE_SPEAKING_LINE}"
+)
+STOPPED = (
+    f"2026-09-03 20:45:10,000 INFO gpt_voicecoding.core.bridge: {live_call_step.VOICE_QUIET_LINE}"
+)
 
 
 def test_an_announcement_after_the_voice_closed_its_span_was_spoken_into_a_gap() -> None:
-    assert journey._announced_after_the_voice_fell_silent([STARTED, STOPPED, SPOKEN])
+    assert live_call_step._announced_after_the_voice_fell_silent([STARTED, STOPPED, SPOKEN])
 
 
 def test_an_announcement_over_an_open_span_was_not() -> None:
     """The wire truncates an utterance a second one is appended to (#175)."""
-    assert not journey._announced_after_the_voice_fell_silent([STARTED, STOPPED, STARTED, SPOKEN])
+    assert not live_call_step._announced_after_the_voice_fell_silent(
+        [STARTED, STOPPED, STARTED, SPOKEN]
+    )
 
 
 def test_a_voice_that_never_spoke_on_this_call_is_a_gap_of_its_own() -> None:
-    assert journey._announced_after_the_voice_fell_silent([SPOKEN])
+    assert live_call_step._announced_after_the_voice_fell_silent([SPOKEN])
 
 
 def test_an_edge_after_the_announcement_is_not_read_back_onto_it() -> None:
     """The announcement makes the Voice speak; that span is its own consequence."""
-    assert journey._announced_after_the_voice_fell_silent([STOPPED, SPOKEN, STARTED])
+    assert live_call_step._announced_after_the_voice_fell_silent([STOPPED, SPOKEN, STARTED])
 
 
 def test_no_announcement_at_all_is_not_this_rules_complaint() -> None:
-    assert journey._announced_after_the_voice_fell_silent([STARTED])
+    assert live_call_step._announced_after_the_voice_fell_silent([STARTED])
 
 
 # --- what a dial carried, and what the Voice said after a receipt (#198) ------
@@ -667,26 +680,26 @@ def _dial(kinds: str) -> str:
 
 def test_a_system_dial_names_the_kinds_it_carried() -> None:
     """The kinds are the whole of what a run can read about a hand-over's contents."""
-    assert journey._hand_over_kinds(
+    assert live_call_step._hand_over_kinds(
         _dial("DialReason, SpokenRosterBrief, SpokenBrief, SpokenBrief")
     ) == ["DialReason", "SpokenRosterBrief", "SpokenBrief", "SpokenBrief"]
 
 
 def test_a_dial_that_carried_nothing_names_no_kinds() -> None:
     """`none` is the adapter's own word for an empty hand-over, not a kind."""
-    assert journey._hand_over_kinds(_dial("none")) == []
+    assert live_call_step._hand_over_kinds(_dial("none")) == []
 
 
 def test_the_roster_brief_is_not_counted_as_a_session_brief() -> None:
     """#198 phase 5 subtracts two counts, and one name contains the other's."""
-    kinds = journey._hand_over_kinds(_dial("DialReason, SpokenRosterBrief, SpokenBrief"))
+    kinds = live_call_step._hand_over_kinds(_dial("DialReason, SpokenRosterBrief, SpokenBrief"))
 
-    assert kinds.count(journey.SESSION_BRIEF_KIND) == 1
-    assert kinds.count(journey.ROSTER_BRIEF_KIND) == 1
+    assert kinds.count(live_call_step.SESSION_BRIEF_KIND) == 1
+    assert kinds.count(live_call_step.ROSTER_BRIEF_KIND) == 1
 
 
 def test_a_line_that_is_not_a_dial_names_no_kinds() -> None:
-    assert journey._hand_over_kinds(STARTED) == []
+    assert live_call_step._hand_over_kinds(STARTED) == []
 
 
 def _said(words: str) -> str:
@@ -697,31 +710,31 @@ def _said(words: str) -> str:
     )
 
 
-RECEIPTS = journey.RECEIPT_SPOKEN_PATTERNS
+RECEIPTS = live_call_step.RECEIPT_SPOKEN_PATTERNS
 RECEIPT = _said("好的，已转达给二号工位。")
 
 
 def test_a_receipt_and_nothing_after_it_leaves_nothing_unaccounted() -> None:
-    assert journey._unaccounted_voice_turns([_said("在的"), RECEIPT], RECEIPTS) == 0
+    assert live_call_step._unaccounted_voice_turns([_said("在的"), RECEIPT], RECEIPTS) == 0
 
 
 def test_the_voice_going_on_by_itself_is_what_the_rule_counts() -> None:
     """The ticket's own sentence: the receipt, and then the Voice stops (#198)."""
     lines = [RECEIPT, _said("还有别的事吗"), _said("我再说一遍")]
 
-    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 2
+    assert live_call_step._unaccounted_voice_turns(lines, RECEIPTS) == 2
 
 
 def test_an_announcement_the_engine_handed_over_accounts_for_its_own_turn() -> None:
     """#196's mid-call payment is not the Voice going on by itself (#198)."""
     lines = [RECEIPT, SPOKEN, _said("二号工位说它可以继续了")]
 
-    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 0
+    assert live_call_step._unaccounted_voice_turns(lines, RECEIPTS) == 0
 
 
 def test_a_payment_whose_turn_has_not_landed_yet_is_not_a_violation() -> None:
     """The `speak` line is written when the brief is handed over, not when it is said."""
-    assert journey._unaccounted_voice_turns([RECEIPT, SPOKEN], RECEIPTS) == -1
+    assert live_call_step._unaccounted_voice_turns([RECEIPT, SPOKEN], RECEIPTS) == -1
 
 
 def test_turns_before_the_receipt_are_not_counted_against_it() -> None:
@@ -735,19 +748,19 @@ def test_turns_before_the_receipt_are_not_counted_against_it() -> None:
     """
     lines = [_said("好的"), _said("我来处理"), RECEIPT]
 
-    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 0
+    assert live_call_step._unaccounted_voice_turns(lines, RECEIPTS) == 0
 
 
 def test_a_queued_receipt_is_a_receipt_too() -> None:
     """A Session that happens to be mid-turn queues the relay, and the run cannot choose."""
     lines = [_said("收到，等它这一轮结束就转达。"), _said("还有别的事吗")]
 
-    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 1
+    assert live_call_step._unaccounted_voice_turns(lines, RECEIPTS) == 1
 
 
 def test_a_receipt_the_recogniser_put_a_space_inside_is_still_a_receipt() -> None:
     """Run `20260902T093755Z`'s inserted space, on the Voice's side (#181)."""
-    assert journey._unaccounted_voice_turns([_said("已转 达了")], RECEIPTS) == 0
+    assert live_call_step._unaccounted_voice_turns([_said("已转 达了")], RECEIPTS) == 0
 
 
 def test_a_refusal_to_bind_says_what_the_machine_was_doing() -> None:
@@ -771,7 +784,7 @@ def test_a_refusal_to_bind_says_what_the_machine_was_doing() -> None:
 
 def test_a_window_with_no_receipt_in_it_is_not_this_rules_complaint() -> None:
     """A relay nobody was told about fails on the receipt line, before this one reads."""
-    assert journey._unaccounted_voice_turns([_said("在的")], RECEIPTS) is None
+    assert live_call_step._unaccounted_voice_turns([_said("在的")], RECEIPTS) is None
 
 
 def test_the_other_spelling_of_delivered_is_the_same_receipt() -> None:
@@ -783,13 +796,13 @@ def test_the_other_spelling_of_delivered_is_the_same_receipt() -> None:
     """
     lines = [_said("已送达。"), _said("还有别的事吗")]
 
-    assert journey._unaccounted_voice_turns(lines, RECEIPTS) == 1
+    assert live_call_step._unaccounted_voice_turns(lines, RECEIPTS) == 1
 
 
 def test_a_receipt_is_not_read_out_of_a_sentence_that_only_mentions_delivery() -> None:
     """The pattern is the two verbs of *this* statement, not the word 送 anywhere."""
-    assert journey._unaccounted_voice_turns([_said("还没送到")], RECEIPTS) is None
-    assert journey._unaccounted_voice_turns([_said("我送你一句话")], RECEIPTS) is None
+    assert live_call_step._unaccounted_voice_turns([_said("还没送到")], RECEIPTS) is None
+    assert live_call_step._unaccounted_voice_turns([_said("我送你一句话")], RECEIPTS) is None
 
 
 # --- the two readings phase 3a compares the Voice against (#198) --------------
@@ -806,23 +819,23 @@ A_BRIEF = "\n".join(
 
 
 def test_the_newest_message_is_read_off_the_line_that_hands_it_over() -> None:
-    assert journey._newest_message(A_BRIEF) == "Should I continue?"
+    assert live_call_step._newest_message(A_BRIEF) == "Should I continue?"
 
 
 def test_a_brief_with_no_newest_line_hands_over_nothing() -> None:
     """Phase 3a blocks on this rather than comparing the Voice against an empty string."""
-    assert journey._newest_message("二号工位 · Reply READY\n  state: working\n") == ""
+    assert live_call_step._newest_message("二号工位 · Reply READY\n  state: working\n") == ""
 
 
 def test_the_fragment_the_voice_is_asked_for_is_short_and_whitespace_folded() -> None:
     """The Voice paraphrases a record into a sentence; #181 grades a substring."""
-    assert journey._spoken_fragment("Should   I\ncontinue?") == "Should I con"
+    assert live_call_step._spoken_fragment("Should   I\ncontinue?") == "Should I con"
 
 
 def test_a_message_shorter_than_the_fragment_is_the_whole_message() -> None:
-    assert journey._spoken_fragment("READY") == "READY"
+    assert live_call_step._spoken_fragment("READY") == "READY"
 
 
 def test_nothing_recorded_asks_the_voice_for_nothing() -> None:
     """An empty fragment is skipped by the caller rather than matching every line."""
-    assert journey._spoken_fragment("") == ""
+    assert live_call_step._spoken_fragment("") == ""

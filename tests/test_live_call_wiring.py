@@ -27,6 +27,7 @@ from pathlib import Path
 
 import journey
 import live_call
+import live_call_step
 import pytest
 import support
 
@@ -306,14 +307,16 @@ def test_a_recogniser_that_splits_a_word_still_counts_as_having_heard_it() -> No
         "2026-09-02 21:40:04,522 INFO gpt_voicecoding.core.bridge: user speech, "
         "for the voice thread to act on: '那个你把电话挂了吧,我想让你结束通 话'"
     )
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in heard
-    assert journey._unspaced(journey.LIVE_CALL_HEARD_SUBSTRING) in journey._unspaced(heard)
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in heard
+    assert live_call_step._unspaced(
+        live_call_step.LIVE_CALL_HEARD_SUBSTRING
+    ) in live_call_step._unspaced(heard)
 
 
 def test_the_substring_is_really_part_of_the_request_the_harness_speaks() -> None:
     """A fragment nothing puts on the track would never be heard at all."""
-    assert journey.LIVE_CALL_HEARD_SUBSTRING in live_call.REQUEST
-    assert journey.LIVE_CALL_LONG_HEARD_SUBSTRING in live_call.LONG_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING in live_call.REQUEST
+    assert live_call_step.LIVE_CALL_LONG_HEARD_SUBSTRING in live_call.LONG_REQUEST
 
 
 def test_the_long_request_asks_for_no_hang_up() -> None:
@@ -323,7 +326,7 @@ def test_the_long_request_asks_for_no_hang_up() -> None:
     #183's hand-off assertion went red for a reason that was not #184's. The two
     asks are two utterances now, and this is the half that must not carry one.
     """
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.LONG_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in live_call.LONG_REQUEST
     assert live_call.REQUEST != live_call.LONG_REQUEST
 
 
@@ -382,7 +385,7 @@ def test_the_verbs_are_read_off_the_wrapper_log_including_invented_ones(
         chat_id="1",
         cli_wrapper_log=log,
     )
-    assert walk._verbs_run() == ["live", "call end"]
+    assert live_call_step._LiveCallRun(walk)._verbs_run() == ["live", "call end"]
 
 
 def test_a_wrapper_log_of_only_options_names_no_verb(tmp_path: Path) -> None:
@@ -401,7 +404,7 @@ def test_a_wrapper_log_of_only_options_names_no_verb(tmp_path: Path) -> None:
         chat_id="1",
         cli_wrapper_log=log,
     )
-    assert walk._verbs_run() == []
+    assert live_call_step._LiveCallRun(walk)._verbs_run() == []
     assert len(support.cli_wrapper_runs(log)) == 1
 
 
@@ -416,13 +419,13 @@ def test_a_call_that_went_down_on_its_own_is_not_credited_to_the_agent() -> None
     the Call Agent ended it. The audio path is the one that knows.
     """
     lost = "the connection went away by itself: ICE failed"
-    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=True) == "lost"
-    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=False) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=False, by_agent=True) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=False, by_agent=False) == "lost"
 
 
 def test_an_ending_the_agent_asked_for_is_the_agents() -> None:
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=True) == "agent"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=False, by_agent=True) == "agent"
 
 
 def test_a_call_the_engines_own_ceiling_ended_is_not_the_agents() -> None:
@@ -433,25 +436,27 @@ def test_a_call_the_engines_own_ceiling_ended_is_not_the_agents() -> None:
     engine's own log line is the only thing that can (#184).
     """
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=True) == "ceiling"
-    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=False) == "ceiling"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=True, by_agent=True) == "ceiling"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=True, by_agent=False) == "ceiling"
 
 
 def test_a_connection_that_went_away_is_a_loss_before_it_is_a_ceiling() -> None:
     """The audio path is asked first, as it already was for the agent."""
     lost = "the connection went away by itself: ICE failed"
-    assert journey._ended_by(end_reason=lost, by_ceiling=True, by_agent=True) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=True, by_agent=True) == "lost"
 
 
 def test_an_ending_the_step_had_to_make_itself_is_the_harnesss() -> None:
     """Green does not depend on the verb guess, and the guess stays visible."""
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=False) == "harness"
+    assert (
+        live_call_step._ended_by(end_reason=closed, by_ceiling=False, by_agent=False) == "harness"
+    )
 
 
 def test_no_end_reason_at_all_still_says_who_was_waited_on() -> None:
-    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=True) == "agent"
-    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=False) == "harness"
+    assert live_call_step._ended_by(end_reason=None, by_ceiling=False, by_agent=True) == "agent"
+    assert live_call_step._ended_by(end_reason=None, by_ceiling=False, by_agent=False) == "harness"
 
 
 def test_every_answer_is_its_own_argument_rather_than_one_that_is_inferred() -> None:
@@ -462,7 +467,7 @@ def test_every_answer_is_its_own_argument_rather_than_one_that_is_inferred() -> 
     ended anything could not say so. Every answer is now keyword-only and
     stated (#184).
     """
-    parameters = inspect.signature(journey._ended_by).parameters
+    parameters = inspect.signature(live_call_step._ended_by).parameters
     assert [name for name in parameters] == ["end_reason", "by_ceiling", "by_agent"]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters.values()
@@ -483,7 +488,7 @@ class _Engine:
         return self._lines
 
 
-def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> journey.Walk:
+def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> live_call_step._LiveCallRun:
     walk = object.__new__(journey.Walk)
     walk.engine = _Engine(lines or [])
     walk.config = support.DerivedConfig(
@@ -496,7 +501,7 @@ def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> journey.Walk:
         token_variable="T",
         chat_id="1",
     )
-    return walk
+    return live_call_step._LiveCallRun(walk)
 
 
 def _said(message: str) -> str:
@@ -509,8 +514,8 @@ def test_both_edges_of_the_voice_are_counted_off_the_engine_log(tmp_path: Path) 
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
         ],
     )
     assert walk._voice_speech_edges() == {True: 1, False: 1}
@@ -523,7 +528,7 @@ def test_an_answer_cut_in_half_leaves_a_start_edge_with_no_stop(tmp_path: Path) 
     edges rather than measuring a duration — no pace the Voice counts at can
     produce a stop edge from a call that was already hung up.
     """
-    walk = _walk(tmp_path, lines=[_said(journey.VOICE_SPEAKING_LINE)])
+    walk = _walk(tmp_path, lines=[_said(live_call_step.VOICE_SPEAKING_LINE)])
     assert walk._voice_speech_edges() == {True: 1, False: 0}
 
 
@@ -540,10 +545,10 @@ def test_a_call_cut_after_an_earlier_answer_finished_still_reads_as_cut(
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
             _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
-            _said(journey.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
         ],
     )
     edges = walk._voice_speech_edges()
@@ -558,9 +563,9 @@ def test_an_utterance_that_ended_without_a_delta_is_not_a_span_left_open(
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
         ],
     )
     edges = walk._voice_speech_edges()
@@ -575,11 +580,11 @@ def test_a_step_reads_only_the_lines_its_own_call_produced(tmp_path: Path) -> No
     step resting on evidence from a different call (#184).
     """
     before = [
-        _said(journey.VOICE_SPEAKING_LINE),
-        _said(journey.VOICE_QUIET_LINE),
+        _said(live_call_step.VOICE_SPEAKING_LINE),
+        _said(live_call_step.VOICE_QUIET_LINE),
         _said("ended the Live Call after 60 seconds without call activity"),
     ]
-    walk = _walk(tmp_path, lines=[*before, _said(journey.VOICE_SPEAKING_LINE)])
+    walk = _walk(tmp_path, lines=[*before, _said(live_call_step.VOICE_SPEAKING_LINE)])
 
     assert walk._voice_speech_edges() == {True: 2, False: 1}
     assert walk._voice_speech_edges(since=len(before)) == {True: 1, False: 0}
@@ -615,7 +620,7 @@ def test_the_watch_measures_first_edge_to_last_across_a_broken_up_answer(
     """
     turns = []
     for _ in range(3):
-        turns += [_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)]
+        turns += [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
     walk = _walk(tmp_path)
     walk.engine = _Talking(turns)
     walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
@@ -655,7 +660,9 @@ def test_the_watch_can_stop_when_the_answer_closes_rather_than_when_the_call_doe
     condition: every span closed, and then no new edge for that long.
     """
     walk = _walk(tmp_path)
-    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)])
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
+    )
     walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
     walk._call_is_down = lambda: False  # type: ignore[method-assign]
 
@@ -669,7 +676,7 @@ def test_the_watch_can_stop_when_the_answer_closes_rather_than_when_the_call_doe
 def test_a_span_still_open_does_not_stop_the_watch_early(tmp_path: Path) -> None:
     """A start with no stop is #169's bug, and the phase has to see the whole stretch."""
     walk = _walk(tmp_path)
-    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE)])
+    walk.engine = _Talking([_said(live_call_step.VOICE_SPEAKING_LINE)])
     walk.bridgectl = lambda *_, **__: None
     walk._call_is_down = lambda: False  # type: ignore[method-assign]
 
@@ -693,7 +700,9 @@ def test_a_span_the_voice_had_open_before_the_mark_is_still_the_voice_answering(
     documented as asking exactly that.
     """
     walk = _walk(tmp_path)
-    walk.engine = _Talking([_said(journey.VOICE_SAID_LINE % "一二三"), _said("something else")])
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SAID_LINE % "一二三"), _said("something else")]
+    )
     walk.bridgectl = lambda *_, **__: None
     walk._call_is_down = lambda: False  # type: ignore[method-assign]
 
@@ -711,7 +720,9 @@ def test_without_the_quiet_window_the_watch_is_the_one_the_long_step_wrote(
 ) -> None:
     """`quiet_seconds=None` runs until the call goes down, which is #184's watch."""
     walk = _walk(tmp_path)
-    walk.engine = _Talking([_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)])
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
+    )
     walk.bridgectl = lambda *_, **__: None
     downs = iter([False] * 8 + [True] * 4)
     walk._call_is_down = lambda: next(downs, True)  # type: ignore[method-assign]
@@ -743,7 +754,7 @@ def test_a_lane_that_sets_no_ceiling_is_running_the_shipped_one(tmp_path: Path) 
     """The engine's default, not a copy of it — the step never types the number."""
     walk = _walk(tmp_path)
     walk.config.path.write_text(A_CONFIG)
-    assert walk._silence_ceiling_seconds() == journey.DEFAULT_SILENCE_END_SECONDS
+    assert walk._silence_ceiling_seconds() == live_call_step.DEFAULT_SILENCE_END_SECONDS
 
 
 def test_the_silence_the_ceiling_waits_out_is_graded_to_the_polls_granularity() -> None:
@@ -752,8 +763,8 @@ def test_the_silence_the_ceiling_waits_out_is_graded_to_the_polls_granularity() 
     A ceiling that waited its full sixty seconds must not read as an early
     ending because of which poll saw what.
     """
-    assert journey.LIVE_CALL_POLL_SECONDS > 0
-    assert journey.LIVE_CALL_POLL_SECONDS < journey.DEFAULT_SILENCE_END_SECONDS
+    assert live_call_step.LIVE_CALL_POLL_SECONDS > 0
+    assert live_call_step.LIVE_CALL_POLL_SECONDS < live_call_step.DEFAULT_SILENCE_END_SECONDS
 
 
 def test_the_long_step_waits_out_the_answer_and_the_silence_after_it(
@@ -765,8 +776,8 @@ def test_the_long_step_waits_out_the_answer_and_the_silence_after_it(
     silence on top before it fires. A step that gave up sooner would be the
     thing that decided how long the call lasted.
     """
-    assert journey.LIVE_CALL_ANSWER_SECONDS > 220.0
-    assert journey.LIVE_CALL_ANSWER_SECONDS > journey.LIVE_CALL_END_SECONDS
+    assert live_call_step.LIVE_CALL_ANSWER_SECONDS > 220.0
+    assert live_call_step.LIVE_CALL_ANSWER_SECONDS > live_call_step.LIVE_CALL_END_SECONDS
 
 
 # --- which utterance goes on the track --------------------------------------
@@ -859,7 +870,7 @@ def test_the_relay_utterance_names_the_workspace_the_step_creates() -> None:
     for lane in journey.LANES:
         focus = lane.call_workspaces.focus
         assert focus in live_call.relay_request(focus)
-        assert journey.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
+        assert live_call_step.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
 
 
 def test_every_utterance_that_asks_about_a_session_names_it(tmp_path: Path) -> None:  # noqa: ARG001
@@ -892,8 +903,8 @@ def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
     """
     said = live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
 
-    assert journey.LIVE_CALL_ANSWER_SUBSTRING in said
-    assert journey.RELAY_RECEIPT_QUEUED not in said
+    assert live_call_step.LIVE_CALL_ANSWER_SUBSTRING in said
+    assert live_call_step.RELAY_RECEIPT_QUEUED not in said
 
 
 def test_the_question_a_session_stops_on_is_one_the_voice_reads_out() -> None:
@@ -914,11 +925,11 @@ def test_the_question_a_session_stops_on_is_one_the_voice_reads_out() -> None:
     assert question.endswith("？")
     # Not a run of the answer to it, or the two could pass for each other.
     assert journey.QUESTION_ASKED_SPOKEN_SUBSTRING not in live_call.DICTATED_REPLY
-    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in question
+    assert live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in question
     # No punctuation in either graded fragment, for the same reason.
     for fragment in (
         journey.QUESTION_ASKED_SPOKEN_SUBSTRING,
-        journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
     ):
         assert not any(mark in fragment for mark in "?？。，,「」“”:：")
 
@@ -944,18 +955,21 @@ def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
     # And not in the payload, which stays the one clause the step follows through
     # the air, the Call Agent's argv and the Session's next turn.
     assert reply not in live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
-    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING in reply
+    assert live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING in reply
     # Neither receipt wording: an echo of the receipt would otherwise pass.
-    assert journey.RELAY_RECEIPT_QUEUED not in reply
-    assert journey.RELAY_RECEIPT_DELIVERED not in reply
+    assert live_call_step.RELAY_RECEIPT_QUEUED not in reply
+    assert live_call_step.RELAY_RECEIPT_DELIVERED not in reply
     # Nor any lane's workspace name, which the answer is graded on elsewhere.
     for lane in journey.LANES:
         for workspace in lane.call_workspaces:
             assert workspace not in reply
     # And no run shared with the relayed payload, so an answer that read the
     # words back rather than the Session's reply does not pass.
-    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in journey.LIVE_CALL_ANSWER_SUBSTRING
-    assert " " not in journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING
+    assert (
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING
+        not in live_call_step.LIVE_CALL_ANSWER_SUBSTRING
+    )
+    assert " " not in live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING
 
 
 def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
@@ -1001,8 +1015,8 @@ def test_the_grade_wording_the_voice_is_told_to_say_is_what_the_step_looks_for()
         )
     ).text
 
-    assert journey.RELAY_RECEIPT_DELIVERED in spoken
-    assert journey.RELAY_RECEIPT_QUEUED in spoken
+    assert live_call_step.RELAY_RECEIPT_DELIVERED in spoken
+    assert live_call_step.RELAY_RECEIPT_QUEUED in spoken
 
 
 def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> None:
@@ -1019,7 +1033,7 @@ def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> Non
 
 def test_the_relay_utterance_asks_for_no_hang_up() -> None:
     """This call has to outlive the relay by a whole turn (`LONG_REQUEST`'s reason)."""
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
 
 
 def test_the_hand_over_question_is_asked_the_way_the_voice_is_told_to_answer_it() -> None:
@@ -1053,8 +1067,8 @@ def test_a_counted_roster_brief_is_recognised_by_a_numeral_and_its_measure_word(
     counted = "有六个已经结束,还有一个停在无法读取的地方。你想看哪一个?"
     listed = "二号工位在等你,三号工位还在跑。"
 
-    assert re.search(journey.ROSTER_COUNT_PATTERN, counted)
-    assert not re.search(journey.ROSTER_COUNT_PATTERN, listed)
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, counted)
+    assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, listed)
 
 
 def test_the_folded_walk_is_the_tenth_step_and_the_only_one_that_dials() -> None:
@@ -1115,14 +1129,14 @@ def test_the_walk_asks_for_every_variant_it_speaks_and_no_others() -> None:
 
 def test_the_hand_over_kinds_the_step_grades_are_the_products_own_class_names() -> None:
     """The adapter writes `type(item).__name__`; a copy here could drift silently."""
-    assert journey.ROSTER_BRIEF_KIND == SpokenRosterBrief.__name__
-    assert journey.SESSION_BRIEF_KIND == SpokenBrief.__name__
-    assert journey.ROSTER_BRIEF_KIND != journey.SESSION_BRIEF_KIND
+    assert live_call_step.ROSTER_BRIEF_KIND == SpokenRosterBrief.__name__
+    assert live_call_step.SESSION_BRIEF_KIND == SpokenBrief.__name__
+    assert live_call_step.ROSTER_BRIEF_KIND != live_call_step.SESSION_BRIEF_KIND
 
 
 def test_the_paging_option_the_step_greps_for_is_the_one_the_surface_takes() -> None:
     """`--before` is graded on the Call Agent's argv, so it has to be the real flag (#171)."""
-    assert journey.HISTORY_CURSOR_OPTION == "--before"
+    assert live_call_step.HISTORY_CURSOR_OPTION == "--before"
     rendered = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "gpt_voicecoding.control_plane", "history", "--help"],
         capture_output=True,
@@ -1130,7 +1144,7 @@ def test_the_paging_option_the_step_greps_for_is_the_one_the_surface_takes() -> 
         check=False,
     )
     if rendered.returncode == 0:
-        assert journey.HISTORY_CURSOR_OPTION in rendered.stdout
+        assert live_call_step.HISTORY_CURSOR_OPTION in rendered.stdout
 
 
 def test_the_three_workspace_roles_are_named_rather_than_ordered() -> None:

@@ -90,7 +90,8 @@ SILENT_FRAME = b"\x00\x00" * FRAME_SAMPLES
 #: What the call is asked. #175 run 3's exact phrasing, which #179 and #181
 #: proved produces a `handoff_request`, and which the Call Agent answers by
 #: running `bridgectl live` — so the request is also what ends the call.
-REQUEST = "那个你把电话挂了吧,我想让你结束通话"
+PLAIN_HEARD_FRAGMENT = "结束通话"
+REQUEST = f"那个你把电话挂了吧,我想让你{PLAIN_HEARD_FRAGMENT}"
 
 #: What the *other* variant asks. #184 needs a call to outlive the Silence
 #: Ceiling while its own Voice is still speaking, and four seconds of answer
@@ -105,7 +106,10 @@ REQUEST = "那个你把电话挂了吧,我想让你结束通话"
 #: should end a call by itself (#195, deferred). So the two asks are two
 #: utterances rather than one sentence carrying both — `REQUEST` keeps #183's
 #: graded hand-off, and this one is only ever about the ceiling.
-LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,不要跳过也不要加快"
+LONG_HEARD_FRAGMENT = "一个数字"
+LONG_REQUEST = (
+    f"请你从一数到两百,{LONG_HEARD_FRAGMENT}{LONG_HEARD_FRAGMENT}地念出来,不要跳过也不要加快"
+)
 
 #: What the *third* variant asks, and it asks for nothing to be done. #194 dials
 #: the call from the system side and puts the whole briefing in `initialItems`,
@@ -122,7 +126,8 @@ LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,�
 #: sake: "什么需要我?" synthesises to 1.04 s against a 1.0 s floor, which is a
 #: run away from being read as the stub `say` writes for a voice that was never
 #: installed. This one is 2 s and change, and asks the same thing.
-NEEDS_REQUEST = "现在有哪些需要我的事情?"
+NEEDS_HEARD_FRAGMENT = "需要我"
+NEEDS_REQUEST = f"现在有哪些{NEEDS_HEARD_FRAGMENT}的事情?"
 
 #: What the Focus Session's workspace is called by default, and so — since the
 #: project half of a Session Name is the workspace directory's basename
@@ -208,7 +213,7 @@ class CallWorkspaces:
 #: it. The criterion passed on one lane by accident of language and failed
 #: correct behaviour on the other. Dictating the reply restores the harness's
 #: own premise, that graded fragments come from lines the walk put there
-#: (`journey._spoken_fragment`).
+#: (`live_call_step._spoken_fragment`).
 #:
 #: Lives here rather than in `journey` because it is spoken Chinese of the same
 #: kind as the utterances around it, and `journey` imports it for the one
@@ -218,7 +223,15 @@ class CallWorkspaces:
 #: neither `收到` nor `已转达` — both are receipt wordings
 #: (`instructions/voice.py`) an echo of which would pass this grade — and not
 #: the workspace name, which the answer is already graded on elsewhere.
-DICTATED_REPLY = "那我就接着往下做。"
+DICTATED_REPLY_FRAGMENT = "接着往下做"
+DICTATED_REPLY = f"那我就{DICTATED_REPLY_FRAGMENT}。"
+
+RELAY_HEARD_FRAGMENT = "回一句话"
+ANSWER_FRAGMENT = "可以继续"
+NARROWING_HEARD_FRAGMENT = "那个吧"
+DETAIL_HEARD_FRAGMENT = "详细说说"
+HISTORY_HEARD_FRAGMENT = "之前说了什么"
+EARLIER_HEARD_FRAGMENT = "再往前"
 
 
 def relay_request(focus_workspace: str) -> str:
@@ -239,7 +252,7 @@ def relay_request(focus_workspace: str) -> str:
     already: `journey.ASK_A_QUESTION_THEN_SAY` carries it, so it does not have to
     survive the air, the Call Agent's reading and the argv to get there.
     """
-    return f"请你给{focus_workspace}那个会话回一句话，内容是可以继续。"
+    return f"请你给{focus_workspace}那个会话{RELAY_HEARD_FRAGMENT}，内容是{ANSWER_FRAGMENT}。"
 
 
 def narrowing_request(focus_workspace: str) -> str:
@@ -258,7 +271,7 @@ def narrowing_request(focus_workspace: str) -> str:
     both rode `initialItems`, so a hand-off across either says the Voice went
     looking for what it was already holding (#194).
     """
-    return f"就说{focus_workspace}那个吧。"
+    return f"就说{focus_workspace}{NARROWING_HEARD_FRAGMENT}。"
 
 
 def detail_request(focus_workspace: str) -> str:
@@ -268,12 +281,12 @@ def detail_request(focus_workspace: str) -> str:
     `20260903T081717Z` had an utterance that named none send the Call Agent
     looking through nine Sessions this machine was running.
     """
-    return f"请你详细说说{focus_workspace}那个会话现在是什么情况。"
+    return f"请你{DETAIL_HEARD_FRAGMENT}{focus_workspace}那个会话现在是什么情况。"
 
 
 def history_request(focus_workspace: str) -> str:
     """ "What did it say before" — the utterance that asks for `history` (#198)."""
-    return f"那{focus_workspace}它之前说了什么？请你说说更早的记录。"
+    return f"那{focus_workspace}它{HISTORY_HEARD_FRAGMENT}？请你说说更早的记录。"
 
 
 def earlier_request(focus_workspace: str) -> str:
@@ -285,7 +298,7 @@ def earlier_request(focus_workspace: str) -> str:
     others, and a Call Agent that had lost the thread would page some other
     Session's record.
     """
-    return f"再往前，把{focus_workspace}更早的那一页也说一下。"
+    return f"{EARLIER_HEARD_FRAGMENT}，把{focus_workspace}更早的那一页也说一下。"
 
 
 #: What the *fourth* variant asks, and it asks for a verb the Call Agent owns.
@@ -340,6 +353,19 @@ NARROWING = "narrowing"
 DETAIL = "detail"
 HISTORY = "history"
 EARLIER = "earlier"
+
+#: Recognition fragments share their source with the sentences above. A change
+#: to spoken wording therefore cannot leave a second, stale literal behind.
+HEARD_FRAGMENTS = {
+    PLAIN: PLAIN_HEARD_FRAGMENT,
+    LONG: LONG_HEARD_FRAGMENT,
+    NEEDS: NEEDS_HEARD_FRAGMENT,
+    RELAY: RELAY_HEARD_FRAGMENT,
+    NARROWING: NARROWING_HEARD_FRAGMENT,
+    DETAIL: DETAIL_HEARD_FRAGMENT,
+    HISTORY: HISTORY_HEARD_FRAGMENT,
+    EARLIER: EARLIER_HEARD_FRAGMENT,
+}
 
 #: What the *current or next* call plays, as a file in `wav_directory` holding
 #: one variant name a line. Two things force a per-call channel rather than a
