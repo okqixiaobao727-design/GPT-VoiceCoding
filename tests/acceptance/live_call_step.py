@@ -1334,6 +1334,21 @@ class _LiveCallRun:
             deadline_seconds=LIVE_CALL_CUE_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
+        # What the machine itself was doing at the moment a call came up (#230).
+        # It grades nothing and blocks nothing: the undrained playouts it exists
+        # to explain happen minutes later and on the engine's side of the seam,
+        # and what a reader needs is a number to set beside the stall's own rows
+        # — which is what the journal already holds, timestamped. The preflight
+        # `environment` block says what this machine looked like *before* the
+        # run; this says what it looked like *under* one, in the same three
+        # field names so the two compare without translation. A reading that
+        # will not answer is `None` here rather than a step failed for want of
+        # `vm_stat`.
+        self.journal(
+            "live.call.dial.host",
+            lane=self.lane.name,
+            **support.HostPressure.read().as_facts(),
+        )
         hand_over = support.matching_lines(self._log_since(mark), HAND_OVER_LINE)
         facts.record("dial lines", [line.strip() for line in hand_over])
         facts.record("cues", self._cue_order(since=mark))

@@ -2210,3 +2210,288 @@ class TestWhatALostConnectionReleases:
         made = asyncio.run(scenario())
         assert made._microphone.stops == 1
         assert made._pc.closed == 1
+
+
+class _Clock:
+    """`time.monotonic`, moved by hand, so a 60ms bound costs no wall time.
+
+    Swapped in for `webrtc.time` rather than for the `time` module itself: what
+    is under test is one module's arithmetic on one clock, and patching the
+    process's clock to prove it would be a far larger claim than the one being
+    made.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _TrackEnded(Exception):
+    """What the far side going away looks like from inside `recv`."""
+
+
+class _Resampled:
+    """One resampled plane, padded the way `av`'s really is."""
+
+    def __init__(self, samples: int) -> None:
+        self.samples = samples
+        self.planes = [b"\xff" * (samples * webrtc.SAMPLE_BYTES + 64)]
+
+
+class _InboundTrack:
+    """The Voice's audio, arriving on a schedule the test writes.
+
+    Each entry is the gap *before* that frame arrives, so a list is the inbound
+    pacing the remote peer — or a starved event loop — would have produced.
+    Running out of them is the call going away, which is what `_playing` returns
+    on, so a scenario ends by itself with every frame accounted for.
+    """
+
+    def __init__(self, gaps: list[float], clock: _Clock) -> None:
+        self._gaps = list(gaps)
+        self._clock = clock
+
+    async def recv(self) -> Any:
+        if not self._gaps:
+            raise _TrackEnded
+        self._clock.advance(self._gaps.pop(0))
+        return object()
+
+
+@contextmanager
+def _av(*, samples: int = 0) -> Iterator[None]:
+    """`av`, for the length of a test. CI does not install the real one."""
+    resampler = types.SimpleNamespace(
+        resample=lambda _frame: [_Resampled(samples)] if samples else []
+    )
+    stood_in = types.SimpleNamespace(AudioResampler=lambda **_parameters: resampler)
+    was = sys.modules.get("av")
+    sys.modules["av"] = stood_in  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        if was is None:
+            del sys.modules["av"]
+        else:
+            sys.modules["av"] = was
+
+
+class TestWhatAPlayoutSaysAboutItself:
+    """#230: a stalled stop edge has to be explainable from the engine log alone.
+
+    `drained` is two facts — nothing inbound for `PLAYBACK_QUIET_FRAMES` frames,
+    and nothing still queued for the device — and the timeout line reported
+    neither. A remote peer that keeps RTP flowing through silence and an event
+    loop starved into delivering frames in bursts produce the same 180s wait and
+    the same single line, so no run could tell the two apart. The largest gap in
+    the window is the fact that separates them, and it is only worth anything
+    beside the frame count, the trailing gap and the bytes still buffered.
+
+    Built without `aiortc`, `av` or `sounddevice` — CI installs none of them —
+    and on a clock the test moves by hand.
+    """
+
+    def speaker(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, _Clock]:
+        clock = _Clock()
+        monkeypatch.setattr(webrtc, "time", clock)
+        return webrtc._Speaker(silent=True, device=None), clock
+
+    def heard(self, speaker: Any, gaps: list[float], clock: _Clock) -> None:
+        """Play one stretch of inbound audio into the speaker, to its end."""
+
+        async def scenario() -> None:
+            speaker.attach(_InboundTrack(gaps, clock))
+            await speaker._task
+
+        with _av():
+            asyncio.run(scenario())
+
+    def transport(self, speaker: Any) -> Any:
+        made = object.__new__(webrtc._WebRtcTransport)
+        made._speaker = speaker
+        return made
+
+    def drained(self, transport: Any, timeout_seconds: float) -> None:
+        asyncio.run(transport.playback_drained(timeout_seconds))
+
+    def test_a_timed_out_playout_says_what_the_inbound_stream_did(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The peer never stopped sending, so the wait ran out. Say so, with numbers.
+
+        The clock is left where the last frame landed, which is the stall the
+        ticket describes: `_last_frame_at` is continuously fresh, the 60ms gap
+        never opens and `drained` stays False for the whole bound.
+        """
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02] * 5, clock)
+
+        with caplog.at_level(logging.INFO):
+            self.drained(self.transport(speaker), 0.05)
+
+        line = next(
+            said for said in (record.getMessage() for record in caplog.records) if "drained" in said
+        )
+        assert "had not drained" in line
+        assert "5 inbound frames" in line
+        assert "last 0.000s ago" in line
+        assert "largest gap 0.020s" in line
+        assert "0 bytes still buffered" in line
+
+    def test_an_ordinary_stop_edge_says_the_same_four_things(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A clean run and a stalled run are only comparable if both are written down."""
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02] * 5, clock)
+        # Past the quiet bound rather than exactly on it: `drained` compares two
+        # accumulated floats, and a test that sits on the boundary is deciding
+        # its own outcome by the last bit of 0.02.
+        clock.advance((webrtc.PLAYBACK_QUIET_FRAMES + 1) * webrtc.FRAME_SECONDS)
+
+        with caplog.at_level(logging.INFO):
+            self.drained(self.transport(speaker), 5.0)
+
+        line = next(
+            said for said in (record.getMessage() for record in caplog.records) if "drained" in said
+        )
+        assert "had not drained" not in line
+        assert "5 inbound frames" in line
+        assert "last 0.080s ago" in line
+        assert "largest gap 0.020s" in line
+        assert "0 bytes still buffered" in line
+
+    def test_a_burst_after_a_silence_is_the_fact_that_separates_the_two_causes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Frames kept arriving *and* there was a 1.4s hole: the loop was starved.
+
+        A count on its own cannot say this — eleven frames is eleven frames
+        whether they came evenly or in two bursts — and the trailing gap cannot
+        either, because the burst refreshed it. The largest gap is the whole
+        reason it is measured.
+        """
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02] * 5 + [1.4] + [0.02] * 5, clock)
+
+        playout = speaker.playout
+
+        assert playout.frames == 11
+        assert playout.largest_gap_seconds == pytest.approx(1.4)
+        assert playout.since_last_frame_seconds == pytest.approx(0.0)
+
+    def test_each_playout_is_measured_over_its_own_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Taking the window is what closes it, so two stop edges on one call compare."""
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02, 0.02], clock)
+
+        first = speaker.take_playout()
+        self.heard(speaker, [0.02, 0.3], clock)
+        second = speaker.take_playout()
+        third = speaker.take_playout()
+
+        assert (first.frames, first.largest_gap_seconds) == (2, pytest.approx(0.02))
+        assert (second.frames, second.largest_gap_seconds) == (2, pytest.approx(0.3))
+        assert (third.frames, third.largest_gap_seconds) == (0, None)
+
+    def test_the_silence_between_two_stretches_of_speech_is_not_a_gap_in_either(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The user's whole turn sits between two windows, and is not a fault.
+
+        Measuring from the previous window's last frame would make that idle the
+        maximum on every healthy call — an eight-second "largest gap" on a turn
+        that went perfectly — and a real 1.4s hole inside a stall would never be
+        the maximum again. The one measurement that separates the two causes
+        would then separate nothing.
+        """
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02] * 3, clock)
+        speaker.take_playout()
+
+        # The user speaks for eight seconds; nothing inbound arrives, and then
+        # the Voice's next stretch comes back cleanly paced.
+        self.heard(speaker, [8.0] + [0.02] * 3, clock)
+        second = speaker.take_playout()
+
+        assert second.frames == 4
+        assert second.largest_gap_seconds == pytest.approx(0.02)
+        assert second.since_last_frame_seconds == pytest.approx(0.0)
+
+    def test_what_is_still_queued_for_the_device_is_counted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of `drained`, and the alternative cause triage named.
+
+        A device callback that stalls with residual bytes queued leaves `drained`
+        False with no `dropped` line either, so the timeout log has to say how
+        much is still waiting. This stream never calls its callback, which is
+        that stall exactly.
+        """
+        _, clock = self.speaker(monkeypatch)
+        # The one test here that plays out for real: a silent run buffers
+        # nothing, and nothing is what would be under test.
+        speaker = webrtc._Speaker(silent=False, device=None)
+
+        async def scenario() -> None:
+            speaker.attach(_InboundTrack([0.02] * 3, clock))
+            await speaker._task
+
+        with _sounddevice(_Streams(blocks_on=None)), _av(samples=480):
+            asyncio.run(scenario())
+
+        playout = speaker.playout
+
+        assert playout.frames == 3
+        assert playout.buffered_bytes == 3 * 480 * webrtc.SAMPLE_BYTES
+
+    def test_looking_at_the_window_does_not_empty_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reading and closing are separate, so reading is safe.
+
+        Part 2 of #230 will want a second reader of these numbers, and a look
+        that silently emptied the window would take them out of the stop edge's
+        own line — the one place the ticket asks for them.
+        """
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02] * 4, clock)
+
+        assert speaker.playout.frames == 4
+        assert speaker.playout.frames == 4
+        assert speaker.take_playout().frames == 4
+        assert speaker.playout.frames == 0
+
+    def test_one_frame_is_one_frame(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A log line is prose, and "1 inbound frames" is a line nobody proofread."""
+        speaker, clock = self.speaker(monkeypatch)
+        self.heard(speaker, [0.02], clock)
+
+        assert "1 inbound frame," in str(speaker.playout)
+
+    def test_a_playout_that_never_heard_a_frame_says_so(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No audio ever arrived is a different fact from a gap of zero.
+
+        `drained` answers True for it — there is nothing playing that has not
+        finished — so this is the shape of a stop edge on a call whose inbound
+        audio never reached this side at all, and the line must not read as a
+        healthy one.
+        """
+        speaker, _ = self.speaker(monkeypatch)
+
+        with caplog.at_level(logging.INFO):
+            self.drained(self.transport(speaker), 5.0)
+
+        line = next(
+            said for said in (record.getMessage() for record in caplog.records) if "drained" in said
+        )
+        assert "0 inbound frames" in line
+        assert "none has arrived" in line
+        assert "no gap measured" in line

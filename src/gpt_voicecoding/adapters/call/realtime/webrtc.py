@@ -31,6 +31,7 @@ import fractions
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from gpt_voicecoding.adapters.call.realtime.transport import (
@@ -91,6 +92,61 @@ REQUIRED = ("aiortc", "av", "sounddevice")
 
 class VoiceDependencyError(Exception):
     """The voice extra is not installed, so there is no audio path to build."""
+
+
+@dataclass(frozen=True)
+class Playout:
+    """What the speaker saw over one stretch of waiting — the four facts (#230).
+
+    `drained` is decided by two things this side cannot influence and did not
+    report: whether inbound frames stopped for `PLAYBACK_QUIET_FRAMES` frames,
+    and whether the device still has audio queued. So a stop edge that ran out
+    its bound said only that it had, and two entirely different causes — a
+    remote peer that keeps RTP flowing through silence, and an event loop
+    starved into delivering frames in bursts — arrived at the same one line.
+
+    The four together are what tells them apart. A large `largest_gap_seconds`
+    with `frames` still climbing is a starved loop: the pauses were real, and
+    the burst that followed refreshed the trailing gap before anyone looked. A
+    small one beside a small `since_last_frame_seconds` is a peer that never
+    stopped sending. Either beside a non-zero `buffered_bytes` is neither: the
+    device stalled with audio still queued, which leaves no `dropped` line
+    either, and was the one candidate the ticket's own reasoning did not
+    exclude.
+
+    Read as a value, never as live attributes: every field is measured at the
+    same instant, and a reader comparing two of them sampled a moment apart
+    would be comparing two different stalls.
+    """
+
+    #: Inbound frames over the window — see `_Speaker.take_playout` for which.
+    frames: int
+    #: How long ago the last inbound frame arrived, `None` if none ever has.
+    #: Measured from the whole call, not the window: a window with no frames in
+    #: it still has a meaningful answer, and it is the interesting one.
+    since_last_frame_seconds: float | None
+    #: The longest silence between two consecutive frames in the window, `None`
+    #: when the window holds no gap to measure.
+    largest_gap_seconds: float | None
+    #: What was still queued for the device, and so still unplayed.
+    buffered_bytes: int
+
+    def __str__(self) -> str:
+        """One clause per fact, in the order a reader needs them.
+
+        Rendered here rather than at each log call so the two lines that carry
+        this cannot drift into two vocabularies for one measurement. Absent is
+        spelled out rather than printed as zero: "no frame ever arrived" and "a
+        gap of zero" are opposite diagnoses.
+        """
+        last = self.since_last_frame_seconds
+        widest = self.largest_gap_seconds
+        return (
+            f"{self.frames} inbound frame{'' if self.frames == 1 else 's'}, "
+            f"{'none has arrived' if last is None else f'last {last:.3f}s ago'}, "
+            f"{'no gap measured' if widest is None else f'largest gap {widest:.3f}s'}, "
+            f"{self.buffered_bytes} bytes still buffered"
+        )
 
 
 def probe() -> None:
@@ -202,17 +258,32 @@ class _WebRtcTransport:
         return bool(self._pc.connectionState == "connected")
 
     async def playback_drained(self, timeout_seconds: float) -> None:
-        """Wait out the speaker, within a bound. See `CallTransport.playback_drained`."""
+        """Wait out the speaker, within a bound. See `CallTransport.playback_drained`.
+
+        **Both exits say what the speaker saw** (#230). The timeout line used to
+        report that a thing had not happened and nothing about why, which left
+        the one measurement that distinguishes a peer still sending from a
+        starved event loop unrecorded on the only run that needed it. The
+        ordinary exit carries the same four facts for the same reason a control
+        needs to be measured too: a stalled run is only diagnosable against what
+        a clean one on this machine looks like.
+
+        The window is closed on the way past either exit and never twice, so
+        each line describes exactly the wait it ends. `Playout` renders itself,
+        so this decides nothing about wording.
+        """
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while not self._speaker.drained:
             if asyncio.get_running_loop().time() >= deadline:
                 _log.info(
                     "playout had not drained %gs after the Voice stopped generating; "
-                    "reporting the stop edge anyway",
+                    "reporting the stop edge anyway — %s",
                     timeout_seconds,
+                    self._speaker.take_playout(),
                 )
                 return
             await asyncio.sleep(PLAYBACK_POLL_SECONDS)
+        _log.info("the Voice's playout drained — %s", self._speaker.take_playout())
 
     def on_lost(self, handler: LostHandler) -> None:
         self._on_lost = handler
@@ -460,11 +531,21 @@ class _Speaker:
         self._task: asyncio.Task[None] | None = None
         self._buffer = bytearray()
         self._lock = threading.Lock()
-        self._frames = 0
         self._dropped = 0
         #: When the last inbound frame arrived. `None` while none has, which
         #: reads as drained: there is nothing playing that has not finished.
         self._last_frame_at: float | None = None
+        #: The window `take_playout` reports and then clears. All three are
+        #: touched only from the receive loop and read only from
+        #: `playback_drained`, which runs on the same event loop — so unlike
+        #: `_buffer`, which a device callback thread also drains, they need no
+        #: lock. `_lock` guards the buffer and nothing else.
+        self._window_frames = 0
+        self._window_largest_gap: float | None = None
+        #: The frame the next gap is measured from, cleared at every window
+        #: boundary — which is what keeps `_window_largest_gap` a gap *between
+        #: two frames of this window* and not the idle since the last one.
+        self._window_gap_from: float | None = None
 
     @property
     def drained(self) -> bool:
@@ -483,6 +564,46 @@ class _Speaker:
                 return False
         return time.monotonic() - self._last_frame_at >= PLAYBACK_QUIET_FRAMES * FRAME_SECONDS
 
+    @property
+    def playout(self) -> Playout:
+        """What the open window holds right now, taking nothing from it.
+
+        Reading and closing are separate so that reading is safe: a second
+        caller — part 2 of #230 will want one — must be able to look without
+        silently emptying the window the stop edge is about to report.
+
+        `since_last_frame_seconds` deliberately spans windows: a window with no
+        frames in it at all still has an answer, and "nothing has arrived for
+        four minutes" is exactly the reading that matters there.
+        """
+        with self._lock:
+            buffered = len(self._buffer)
+        now = time.monotonic()
+        return Playout(
+            frames=self._window_frames,
+            since_last_frame_seconds=(
+                None if self._last_frame_at is None else now - self._last_frame_at
+            ),
+            largest_gap_seconds=self._window_largest_gap,
+            buffered_bytes=buffered,
+        )
+
+    def take_playout(self) -> Playout:
+        """The window just ended, and the start of the next one (#230).
+
+        `playback_drained` calls this exactly once per wait, so a window is one
+        stretch of the Voice speaking and two of them on one call are directly
+        comparable — which is the whole point, since the question a reader
+        brings to these numbers is why *this* stretch stalled when the last one
+        did not. A cumulative count over a call could not answer it: by the
+        third stall the totals are dominated by the audio that played correctly.
+        """
+        taken = self.playout
+        self._window_frames = 0
+        self._window_largest_gap = None
+        self._window_gap_from = None
+        return taken
+
     def attach(self, track: Any) -> None:
         if not self._silent and self._stream is None:
             self._open()
@@ -497,8 +618,20 @@ class _Speaker:
                 frame = await track.recv()
             except Exception:
                 return
-            self._frames += 1
-            self._last_frame_at = time.monotonic()
+            arrived = time.monotonic()
+            if self._window_gap_from is not None:
+                # Between two frames of *this* window, never across its opening
+                # edge. The interval from the previous window's last frame to
+                # this one's first is the user's whole turn — several seconds of
+                # perfectly correct silence — and letting it in would make it
+                # the maximum on every healthy call, burying the 1.4s hole this
+                # measurement exists to find (#230).
+                gap = arrived - self._window_gap_from
+                if self._window_largest_gap is None or gap > self._window_largest_gap:
+                    self._window_largest_gap = gap
+            self._window_gap_from = arrived
+            self._window_frames += 1
+            self._last_frame_at = arrived
             if self._silent:
                 continue
             for out in resampler.resample(frame):
