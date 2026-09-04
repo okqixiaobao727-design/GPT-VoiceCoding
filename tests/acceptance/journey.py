@@ -1895,6 +1895,15 @@ class Walk:
             mark=mark, evidence=f"a Relay held past {ceiling:.0f}s reads back as {line!r}"
         )
 
+    def _log_since(self, mark: int) -> list[str]:
+        """The engine's log from a mark on — one step's worth, not the run's.
+
+        The `live call` step took a copy of this into `live_call_step.py` when
+        it was re-cut (#223); `relay` reads the engine's own lines too (#197),
+        and it is the only other step that does, so the walk keeps its own.
+        """
+        return self.engine.log_lines()[mark:]
+
     def _brief_text(self) -> str:
         """What `bridgectl brief <address>` says about this walk's Session, whole."""
         if self.address is None:  # pragma: no cover - the caller checked
