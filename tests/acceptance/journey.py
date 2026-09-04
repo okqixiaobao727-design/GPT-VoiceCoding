@@ -3071,6 +3071,26 @@ class Walk:
         Then #197's phase, which holds a call of its own: a Relay that finally
         failed reaching the user through Briefing.
 
+        **What this walk grades, and what it only records.** Read this before
+        adding an assertion. A fact is *graded* when one of three things holds:
+        a rule in `src/` says it must or must not happen (an instruction block, a
+        Keeper rule, an ADR); it is engine-side (the dial, the hand-over, the
+        Cool-down, the ceiling, `speak`, the wrapper log); or it is content the
+        map's destination names and this harness dictated so that it can be
+        matched — the receipt wording, `ASK_A_QUESTION`'s question and
+        `live_call.DICTATED_REPLY`, an older-page entry, `--before`. Everything
+        else is about *how* the Voice or the Call Agent got there: which half
+        answered a read question, which utterance provoked a verb, whether an
+        answer volunteered one more true thing, how many times it paged. Those go
+        to the verdict and are never graded. An **absence** is graded only on the
+        first footing, where the product's own text forbids the thing — phase 3's
+        "no further `bridgectl` once the words have gone" is the Call Agent's own
+        instruction and stays; phase 2's "the general answer names nobody" was
+        never a rule anywhere and is gone. Runs `20260904T012548Z` and the four
+        before it are what this paragraph cost: an absence over the model's
+        discretion does not fail once, it flakes, and a walk that flakes proves
+        nothing about the product.
+
         **Three extra Sessions, and each phase is graded against one no other
         phase has moved.** The Focus one is dialled about, relayed into, briefed,
         paged and announced — one chain through one Session, which is what makes
@@ -3516,7 +3536,10 @@ class Walk:
             f"{answered_narrowly or 'nothing recorded'}; `bridgectl` runs across both: "
             f"{runs or 'none'} after the narrowing, {asked_generally or 'none'} for the "
             f"general question — the second is recorded and not graded, beside the dial's own "
-            f"{len(dialled_with)} hand-over item(s) ({dialled_with}); whether the "
+            f"{len(dialled_with)} hand-over item(s) ({dialled_with}); whether the general "
+            f"answer also named {focus_name!r} — recorded, not graded, since volunteering one "
+            f"more true thing is not something the product's text forbids: "
+            f"{any(focus_name in line for line in answered_generally)}; whether the "
             f"narrowed answer carried a fragment of what that "
             f"Session stopped on ({stopped_on!r}) — recorded, not graded: "
             f"{self._voice_said_something_carrying(stopped_on, since=narrowing)}",
@@ -3542,12 +3565,6 @@ class Walk:
                 f"{answered_generally}. Asked generally the Voice "
                 f"gives the counts rather than the list (`core/instructions/voice.py`), and a "
                 f"counted answer is what says the roster it was handed at dial time arrived"
-            )
-        if any(focus_name in line for line in answered_generally):
-            raise StepFailed(
-                f"the *general* question was answered by naming {focus_name!r}: "
-                f"{answered_generally}. Counts rather than the list is the rule "
-                f"(`core/instructions/voice.py`), and the names come when the user narrows"
             )
         if not named.heard:
             raise StepFailed(
@@ -3912,6 +3929,7 @@ class Walk:
         # Which sentence provoked the fetch is the Call Agent's working order,
         # the same class as Detail's verb (#220) and phase 2's half.
         runs_before_history = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
+        asking_history = len(self.engine.log_lines())
         history = self._one_read_asked_for_by_voice(
             variant=live_call.HISTORY,
             heard=LIVE_CALL_HISTORY_HEARD_SUBSTRING,
@@ -3929,6 +3947,7 @@ class Walk:
                 f"dials, so an empty older page is the fill not having taken"
             )
         runs_before_earlier = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
+        asking_earlier = len(self.engine.log_lines())
         earlier = self._one_read_asked_for_by_voice(
             variant=live_call.EARLIER,
             heard=LIVE_CALL_EARLIER_HEARD_SUBSTRING,
@@ -3937,7 +3956,28 @@ class Walk:
             wanted=tuple(_spoken_fragment(text) for _, text in older_page.entries),
             about=f"an entry on the page before ordinal {cursor} ({older_page.entries!r})",
             verb_is_graded=False,
+            answer_is_graded=False,
         )
+        # **The older page's content is graded across the two History questions,
+        # like the verb.** A Call Agent that pages ahead reads the older entries
+        # out under `它之前说了什么`, and then `再往前` is answered truthfully with
+        # `没有了` — run `20260904T012548Z`'s claude lane, whose History answer
+        # named the earliest `READY` entries and said so. Which answer carried
+        # them is the Call Agent's working order and is recorded; that the user
+        # heard the page before the newest one is §3a's fact and is graded.
+        older_fragments = [
+            fragment for _, text in older_page.entries if (fragment := _spoken_fragment(text))
+        ]
+        older_said = [
+            fragment
+            for fragment in older_fragments
+            if self._voice_said_something_carrying(fragment, since=asking_history)
+        ]
+        under_earlier_answer = [
+            fragment
+            for fragment in older_said
+            if self._voice_said_something_carrying(fragment, since=asking_earlier)
+        ]
         paged = [
             verb
             for verb in self._verbs_since(runs_before_history, Action.HISTORY)
@@ -3952,8 +3992,18 @@ class Walk:
             "live call the older page paged for",
             f"the Call Agent paged {address} with {HISTORY_CURSOR_OPTION} {len(paged)} time(s) "
             f"across the two History questions ({paged or 'none'}); {len(under_earlier)} of "
-            f"them under `再往前` — which question provoked the fetch is recorded, not graded",
+            f"them under `再往前` — which question provoked the fetch is recorded, not graded; "
+            f"the older page's entries the Voice read out across both questions: "
+            f"{older_said or 'none'}, of which {under_earlier_answer or 'none'} under `再往前`",
         )
+        if not older_said:
+            raise StepFailed(
+                f"the user asked for the older page and the Voice never read an entry from it "
+                f"out, under either History question. The page before ordinal {cursor} holds "
+                f"{older_page.entries!r}, and the fragments looked for were {older_fragments}. "
+                f"What the Voice said across both: "
+                f"{self._voice_said_lines(since=asking_history) or 'nothing this call recorded'}"
+            )
         if not paged:
             raise StepFailed(
                 f"the user asked for the older page and the Call Agent never ran `"
@@ -3973,6 +4023,7 @@ class Walk:
         address: str,
         wanted: tuple[str, ...],
         about: str,
+        answer_is_graded: bool = True,
         verb_is_graded: bool = True,
         without: str | None = None,
     ) -> str:
@@ -4028,12 +4079,23 @@ class Walk:
                 lambda: bool(self._verbs_since(runs_before, action)),
                 deadline_seconds=LIVE_CALL_HANDOFF_SECONDS,
             )
-        answered = self._while_the_call_is_up(
-            lambda: any(
+
+        # **When the answer is not this question's to carry, wait for the Voice
+        # to say *something*.** Waiting for a fragment the previous answer
+        # already read out would sit here until the Silence Ceiling took the
+        # call — and the walk speaks into this call again afterwards.
+        def carried_the_answer() -> bool:
+            return any(
                 self._voice_said_something_carrying(fragment, since=asking)
                 for fragment in wanted
                 if fragment
-            ),
+            )
+
+        def said_anything() -> bool:
+            return bool(self._voice_said_lines(since=asking))
+
+        answered = self._while_the_call_is_up(
+            carried_the_answer if answer_is_graded else said_anything,
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
         )
         verbs = self._verbs_since(runs_before, action)
@@ -4073,9 +4135,14 @@ class Walk:
             )
         if not answered:
             raise StepFailed(
-                f"the Call Agent ran {verbs or 'nothing'} and the Voice never said anything "
-                f"carrying {[fragment for fragment in wanted if fragment]!r} — {about}. What "
-                f"it said: {said or 'nothing this call recorded'}"
+                f"the Call Agent ran {verbs or 'nothing'} and the Voice never said "
+                + (
+                    f"anything carrying {[fragment for fragment in wanted if fragment]!r} — "
+                    f"{about}."
+                    if answer_is_graded
+                    else "anything at all."
+                )
+                + f" What it said: {said or 'nothing this call recorded'}"
             )
         return f"{variant} answered out of {about_it or 'the hand-over'} and read back to the user"
 
