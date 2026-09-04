@@ -76,6 +76,22 @@ PHASE_GROUND: Mapping[str, tuple[str, ...]] = {
     "undelivered": (),
 }
 
+#: The one phase that holds a call of its own rather than running inside the
+#: walk's first one ("one flow, three calls", #223), which is why its ground is
+#: empty above rather than naming `dial`.
+OUTSIDE_THE_FIRST_CALL = "undelivered"
+
+
+def in_call_phases(phases: Sequence[str]) -> tuple[str, ...]:
+    """The selected phases that run inside the first call, in the given order.
+
+    Named once because two readers need the same answer and disagreeing is a
+    silent red: the loop that drives the first call, and the step-level transport
+    fact, which asks whether a wav utterance could have reached the track at all
+    — only an in-call phase puts one there (#198).
+    """
+    return tuple(phase for phase in phases if phase != OUTSIDE_THE_FIRST_CALL)
+
 
 class UnknownPhase(Exception):
     """`--phase` named something that is not a Live Call phase."""
@@ -803,7 +819,7 @@ class _LiveCallRun:
                 speech_settle_seconds=settle,
                 opening_mark=mark,
             )
-            in_call = tuple(phase for phase in self.selection.phases if phase != "undelivered")
+            in_call = in_call_phases(self.selection.phases)
             if in_call:
                 with self._voice_route_only():
                     for phase in in_call:
@@ -822,18 +838,36 @@ class _LiveCallRun:
 
         self._measured("live call", started, self._call_is_down())
         seen = live_call.observed(self.config.call_observations)
+        # A wav utterance reaches the track only from an in-call phase, so a
+        # selection holding none of them cannot produce a variant. `undelivered`
+        # is such a selection by design — it holds its own call and its ground is
+        # empty ("one flow, three calls", #223) — and grading the variant there
+        # failed a run for not exercising what it never selected: run
+        # `20260904T102740Z` graded `Voice spoke undelivered reason` true on both
+        # lanes and still came back FAIL (#198). The variant is recorded with that
+        # reason instead. The whole run always selects in-call phases, so every
+        # fact it grades is unchanged.
+        grades_the_variant = bool(in_call)
         missing = [
             name
             for name, value in (
                 ("transport factory", seen.transport_factory),
-                ("wav variant", seen.variant),
+                *((("wav variant", seen.variant),) if grades_the_variant else ()),
                 ("end reason", seen.end_reason),
             )
             if not value
         ]
         transport = {
             "transport factory": seen.transport_factory or "none recorded",
-            "last wav variant": seen.variant or "none recorded",
+            "last wav variant": (
+                seen.variant
+                or (
+                    "none recorded"
+                    if grades_the_variant
+                    else "not graded: no in-call phase was selected, and only an "
+                    "in-call phase puts a wav utterance on the track"
+                )
+            ),
             "last end reason": seen.end_reason or "none recorded",
             "transport observations": str(self.config.call_observations),
             "wrapper runs": len(support.cli_wrapper_runs(self.config.cli_wrapper_log)),

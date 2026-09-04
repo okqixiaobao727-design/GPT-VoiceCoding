@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import journey
 import live_call
@@ -134,6 +135,59 @@ def test_phase_without_the_live_call_step_is_a_usage_error() -> None:
     assert collected.returncode != pytest.ExitCode.OK
     assert "--phase requires --step 'live call'" in refusal
     assert ", ".join(live_call_step.PHASES) in refusal
+
+
+def test_the_phase_usage_error_does_not_need_the_acceptance_extra() -> None:
+    """The refusal above is a fact about the command line, not about the venv.
+
+    `tests/acceptance/conftest.py` used to `importorskip("telethon")` at import,
+    which aborts the conftest before the hook carrying that refusal is registered.
+    CI installs `.[dev]` and never `.[acceptance]`, so the refusal was unreachable
+    in the one place it is graded (#198). The import is what this pins: a conftest
+    that imports without the actor is what keeps the refusal reachable.
+    """
+    # A finder that refuses telethon the way an uninstalled package does. Assigning
+    # `sys.modules['telethon'] = None` raises a bare `ImportError` instead, which is
+    # not what a venv without the extra does and would prove the wrong thing.
+    without_the_actor = (
+        "import sys\n"
+        "class Refuse:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name == 'telethon' or name.startswith('telethon.'):\n"
+        "            raise ModuleNotFoundError(f'No module named {name!r}', name=name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Refuse())\n"
+        "import conftest\n"
+        "assert conftest.telegram_person is None\n"
+        "assert conftest.pytest_runtest_setup is not None\n"
+    )
+    imported = subprocess.run(
+        [sys.executable, "-c", without_the_actor],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=Path(live_call_step.__file__).parent,
+    )
+
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+
+
+def test_only_an_in_call_phase_runs_inside_the_walks_first_call() -> None:
+    """`undelivered` holds its own call, so a selection of it alone has no in-call phase.
+
+    The step-level transport fact asks whether a wav utterance could have reached
+    the track, and only an in-call phase puts one there. Grading it against a
+    selection that chose no in-call phase failed run `20260904T102740Z` for not
+    exercising what it never selected, while the fact it did select was green.
+    """
+    assert live_call_step.OUTSIDE_THE_FIRST_CALL == "undelivered"
+    assert live_call_step.in_call_phases(("undelivered",)) == ()
+    assert live_call_step.in_call_phases(("detail", "undelivered")) == ("detail",)
+    assert live_call_step.in_call_phases(live_call_step.PHASES) == tuple(
+        phase for phase in live_call_step.PHASES if phase != "undelivered"
+    )
+    # The whole run always selects in-call phases, so it still grades the fact.
+    assert live_call_step.in_call_phases(live_call_step.select_phases().phases)
 
 
 class _Journey:
