@@ -83,6 +83,7 @@ import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -520,6 +521,127 @@ UNDELIVERED_PATTERN = rf"undelivered:.*\b{RelayReason.CEILING_PASSED}\b"
 TERMINAL_REPORT_PATTERN = r"state=reported_failed"
 
 
+def _undelivered_cleared_pattern(address: str) -> str:
+    """What the engine writes when a Relay's own row stops saying it never arrived.
+
+    `core/bridge.py::_fold_undelivered` (#226), mirrored rather than imported —
+    the same rule the attribution patterns above are mirrored under, and
+    `tests/test_journey_undelivered.py` is what breaks loudly when the mirror
+    drifts. **Anchored on the address**, because the engine bridges every
+    Session on the machine and a clearing for somebody else's row explains
+    nothing about this one (#109's rule, applied to the log).
+    """
+    return rf"a Relay to {re.escape(address)} arrived after all, and its brief no longer says so"
+
+
+class _StopNoticeReading(StrEnum):
+    """How the Stop Notice published after the `brief` reading read that one row.
+
+    #226: `brief` and the Stop Notice are two readings of one field, and a late
+    proof of delivery clears it between them by design (#197,
+    `core/bridge.py::_relay_receipt`). So "the Stop did not carry it" is not by
+    itself a defect — it is a defect only while the Relay still stands
+    undelivered. The step therefore reads both surfaces against **one receipt
+    state**, and the engine's own clearing line is what says which state that
+    was. The members are the sentence the step reports, so a failure says which
+    of the two it saw rather than leaving a reader to guess.
+    """
+
+    CARRIED = "the Stop Notice carried the undelivered Relay too"
+    CLEARED = (
+        "the Stop Notice did not carry the undelivered Relay, and the engine had cleared the "
+        "row after the `brief` reading because the words arrived after all"
+    )
+    DISAGREED = (
+        "the Stop Notice did not carry the undelivered Relay and nothing cleared the row — "
+        "two readings of one row disagree (#197)"
+    )
+    UNPUBLISHED = "no Stop Notice was published at all after the `brief` reading carried it"
+
+
+#: The two readings the `relay` step passes on. Both are one honest receipt
+#: state read twice; the other two are a disagreement and a missing surface.
+_STOP_NOTICE_PASSES = (_StopNoticeReading.CARRIED, _StopNoticeReading.CLEARED)
+
+
+#: A Stop Notice's header, and where the Session it is about is written on it.
+#: The log's own opener (`core/bridge.py`) then the brief's headline —
+#: `[<name> — ]<address> — <state>` (`core/briefing.py::_headline`).
+_STOP_HEADLINE = re.compile(ENGINE_STOP_LINE + r"\s*(?P<headline>.*)$")
+
+#: What `_headline` puts between its fields.
+_HEADLINE_SEPARATOR = " — "
+
+
+def _stop_notice_names(header: str, address: str) -> bool:
+    """Whether that Stop header is about `address` — its **field**, not its text.
+
+    A substring match on the whole line is not attribution (#109): a stranger's
+    workspace path or Session Name has only to contain this address for the walk
+    to grade somebody else's Stop as its own, and both are strings this run does
+    not choose. So the headline is split into the fields `_headline` wrote and
+    the address has to be one of them whole.
+    """
+    found = _STOP_HEADLINE.search(header)
+    if found is None:
+        return False
+    return address in [field.strip() for field in found["headline"].split(_HEADLINE_SEPARATOR)]
+
+
+def _stop_notices(lines: Sequence[str], *, address: str) -> list[tuple[int, list[str]]]:
+    """Every Stop Notice about `address` in `lines`, as its header index and whole.
+
+    One Stop Notice is one log record: the header `ENGINE_STOP_LINE` matches,
+    and the brief's own labelled lines follow it indented under it
+    (`core/briefing.py::text`). Read as **blocks**, because the engine bridges
+    every Session on the machine (#109): a stranger's Stop and this Session's
+    field are two lines that a line-by-line grep is happy to read as one notice,
+    and the walk would then grade somebody else's turn as this one's.
+    """
+    notices: list[tuple[int, list[str]]] = []
+    for index, line in enumerate(lines):
+        if not _stop_notice_names(line, address):
+            continue
+        block = [line]
+        for following in lines[index + 1 :]:
+            if following.strip() and not following[:1].isspace():
+                break
+            block.append(following)
+        notices.append((index, block))
+    return notices
+
+
+def _stop_notice_reading(lines: Sequence[str], *, address: str) -> _StopNoticeReading:
+    """Read #226's outcomes off one window of the engine's log.
+
+    `lines` starts at the `brief` reading that carried the field, so everything
+    in it is dated after that reading and no line needs its own timestamp
+    compared. Order within the window is the engine's own execution order — the
+    clear and the Stop's rendering are two turns of one event loop
+    (`core/bridge.py`) — which is what lets the position of a clearing line
+    stand for "before that Stop was rendered".
+
+    A clearing **after** the fieldless Stop explains nothing about it: the row
+    still said the words had not arrived at the moment that notice was written,
+    so the two readings really did disagree and the clearing is later news.
+
+    **The first notice is the one graded**, and a later one may not overturn it.
+    It is the reading the step is about — the next time that row was published
+    after `brief` read it — and letting any subsequent Stop supply the field
+    would let a fieldless Stop that nothing cleared pass on a notice from a
+    later turn, which is the disagreement itself.
+    """
+    notices = _stop_notices(lines, address=address)
+    if not notices:
+        return _StopNoticeReading.UNPUBLISHED
+    first, published = notices[0]
+    if support.matching_lines(published, UNDELIVERED_PATTERN):
+        return _StopNoticeReading.CARRIED
+    if support.matching_lines(lines[:first], _undelivered_cleared_pattern(address)):
+        return _StopNoticeReading.CLEARED
+    return _StopNoticeReading.DISAGREED
+
+
 def _receipt_fields(answer: str) -> dict[str, str]:
     """One `bridgectl` receipt, as the fields it is made of.
 
@@ -537,10 +659,17 @@ class _UndeliveredObservation:
     """What #197's half of the `relay` step saw, carried to the step's own line.
 
     `mark` is where the engine log stood when the held Relay went in, so the
-    Stop Notice read afterwards is read from the same place.
+    ceiling's own lines are read from the same place.
+
+    `brief_mark` is where it stood when `brief` came back **carrying** the
+    field, and it is the later of the two on purpose (#226): the Stop Notice the
+    step grades is the one published after that reading, and a clearing line
+    counts only if it too came after it. A clearing from before the reading
+    cannot explain a field the reading still saw.
     """
 
     mark: int
+    brief_mark: int
     evidence: str
 
 
@@ -1812,16 +1941,14 @@ class Walk:
                 f"{self.approval_resolution.effect_observed}; {target} contains "
                 f"{relayed.effect_in(self.config.workspace)!r}"
             )
-        stop_notice = self._stop_notice_carrying_the_undelivered_relay(since=undelivered.mark)
-        if not stop_notice:
+        reading = self._how_the_stop_notice_read_the_row(since=undelivered.brief_mark)
+        if reading not in _STOP_NOTICE_PASSES:
             raise StepFailed(
-                "the Relay that passed its ceiling reached `brief`, and the Stop Notice this "
-                "turn published afterwards did not carry it — the two readings of one row "
-                f"disagree (#197). Engine log tail: {self._log_since(undelivered.mark)[-8:]}"
+                "the Relay that passed its ceiling reached `brief`, and then "
+                f"{reading}. Engine log tail: {self._log_since(undelivered.mark)[-8:]}"
             )
         return (
-            f"{answer.text}; {target} contains {relayed.content}; "
-            f"{undelivered.evidence}; the Stop Notice carried it too"
+            f"{answer.text}; {target} contains {relayed.content}; {undelivered.evidence}; {reading}"
         )
 
     # --- a relay that finally failed (#197) --------------------------------
@@ -1870,12 +1997,26 @@ class Walk:
                 "no held Relay to grade"
             )
         time.sleep(ceiling + TURN_POLL_SECONDS)
+        # The reading and the mark are taken in **one** polling round, with the
+        # mark first (#226). They are one observation: the mark is where the
+        # Stop Notice and any clearing line are read from, so a clearing written
+        # between the reading that passed and a mark taken afterwards would fall
+        # outside the window — and the step would fail the very behaviour it was
+        # just taught to accept. Re-reading `brief` for the evidence would have
+        # the same hole, and a second read is not the read that was graded.
+        brief_mark, text = mark, ""
+
+        def brief_carries_it() -> bool:
+            nonlocal brief_mark, text
+            brief_mark = len(self.engine.log_lines())
+            text = self._brief_text()
+            return bool(re.search(UNDELIVERED_PATTERN, text))
+
         briefed = support.wait_for(
-            lambda: bool(re.search(UNDELIVERED_PATTERN, self._brief_text())),
+            brief_carries_it,
             deadline_seconds=TURN_SETTLE_SECONDS,
             poll_seconds=TURN_POLL_SECONDS,
         )
-        text = self._brief_text()
         if not briefed:
             raise StepFailed(
                 f"a Relay to {self.address} passed its {ceiling:.0f}s ceiling and "
@@ -1892,7 +2033,9 @@ class Walk:
             "",
         )
         return _UndeliveredObservation(
-            mark=mark, evidence=f"a Relay held past {ceiling:.0f}s reads back as {line!r}"
+            mark=mark,
+            brief_mark=brief_mark,
+            evidence=f"a Relay held past {ceiling:.0f}s reads back as {line!r}",
         )
 
     def _log_since(self, mark: int) -> list[str]:
@@ -1911,28 +2054,41 @@ class Walk:
         answer = self.bridgectl("brief", self.address)
         return answer.text if answer.ok else ""
 
-    def _stop_notice_carrying_the_undelivered_relay(self, *, since: int) -> bool:
-        """Whether a Stop published since `since` carried the undelivered field.
+    def _how_the_stop_notice_read_the_row(self, *, since: int) -> _StopNoticeReading:
+        """How a Stop published since `since` read the field `brief` had just read.
 
         The second half of #197's `relay` observation: the field is on the row,
         so **every** reading of that row carries it — the one `brief` takes and
         the one the Stop Notice is rendered from, which is the same `briefing`
         call and must not be able to disagree with it.
+
+        **Against one receipt state, not against a deadline** (#226). A late
+        proof of delivery clears the row between the two readings by design, and
+        that made this a race the step could not attribute: it has been red then
+        green on the same code, the green one only because the Stop landed
+        seconds after the ceiling and nothing had time to clear it
+        (`20260903T105429Z`, `20260903T105816Z`). So the engine's own clearing
+        line is a second accepted outcome, and what is graded is whether the two
+        readings can be explained by one state of the Relay.
+
+        Waited on the same budget as before, and still waiting past a Stop that
+        arrives without the field: only a passing reading ends the poll, so a
+        clearing line written a moment behind its Stop is not read as a
+        disagreement.
         """
+        reading = _StopNoticeReading.UNPUBLISHED
 
-        def carried() -> bool:
-            lines = self._log_since(since)
-            if not support.matching_lines(lines, ENGINE_STOP_LINE):
-                return False
-            return bool(support.matching_lines(lines, UNDELIVERED_PATTERN))
+        def settled() -> _StopNoticeReading | None:
+            nonlocal reading
+            reading = _stop_notice_reading(self._log_since(since), address=self.address or "")
+            return reading if reading in _STOP_NOTICE_PASSES else None
 
-        return bool(
-            support.wait_for(
-                carried,
-                deadline_seconds=TURN_SETTLE_SECONDS + TURN_POLL_SECONDS,
-                poll_seconds=TURN_POLL_SECONDS,
-            )
+        support.wait_for(
+            settled,
+            deadline_seconds=TURN_SETTLE_SECONDS + TURN_POLL_SECONDS,
+            poll_seconds=TURN_POLL_SECONDS,
         )
+        return reading
 
     def _relay_ceiling_seconds(self) -> float:
         """The Relay ceiling this lane's engine is actually running.
