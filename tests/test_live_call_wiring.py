@@ -798,6 +798,63 @@ def test_a_span_still_open_does_not_stop_the_watch_early(tmp_path: Path) -> None
     assert watch.went_down is False
 
 
+def test_the_long_answer_watch_includes_a_voice_start_before_user_speech_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run `20260904T043017Z`: Voice started 0.5s before the request landed.
+
+    Starting the watch at `landed_at` missed that opening edge. The first
+    transcript fragment then looked like a closed answer after one quiet
+    window, even though Voice did not close its span until almost a minute
+    later. The quiet-track gate makes `engine_mark` the clean pre-request
+    boundary, so the long-answer watch must use that mark.
+    """
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    walk = _walk(tmp_path)
+
+    class _PreLandingVoice(_Engine):
+        def log_lines(self) -> list[str]:
+            lines = [
+                _said(live_call_step.VOICE_SPEAKING_LINE),
+                _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
+                _said(live_call_step.VOICE_SAID_LINE % "一二三"),
+            ]
+            # The transcript has been quiet for longer than the 10s cue window
+            # before Voice closes its span at 12s.
+            if clock.now >= 12.0:
+                lines.append(_said(live_call_step.VOICE_QUIET_LINE))
+            return lines
+
+    walk.engine = _PreLandingVoice([])
+    ask = live_call_step._SpokenAsk(
+        engine_mark=0,
+        wrapper_mark=3,
+        landed_at=1,
+        heard=True,
+    )
+    watched_from: list[int] = []
+    monkeypatch.setattr(walk, "_ask_by_voice", lambda _variant, _facts: ask)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_call_line", lambda: "call: active")
+    real_watch = walk._watch_the_voice
+
+    def watch(mark: int, **kwargs: object) -> live_call_step._VoiceWatch:
+        watched_from.append(mark)
+        return real_watch(mark, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(walk, "_watch_the_voice", watch)
+
+    detail = walk._the_voice_holds_the_call_open(
+        1.0, live_call_step._PhaseFacts("graded", phase="long answer")
+    )
+
+    assert watched_from == [ask.engine_mark]
+    assert clock.now == pytest.approx(22.0)
+    assert "1 start / 1 stop" in detail
+
+
 def test_a_span_the_voice_had_open_before_the_mark_is_still_the_voice_answering(
     tmp_path: Path,
 ) -> None:

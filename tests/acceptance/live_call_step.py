@@ -507,7 +507,7 @@ class _ReadAnswer:
 
 @dataclass(frozen=True)
 class _VoiceWatch:
-    """Post-landing Voice edges and activity measured on the walk's clock (#184)."""
+    """Voice edges and activity after one engine-log mark, on the walk's clock (#184)."""
 
     #: Whether the call went down before the step gave up waiting for it.
     went_down: bool
@@ -1820,11 +1820,13 @@ class _LiveCallRun:
         """Grade Voice activity holding a call beyond its Silence Ceiling (#184)."""
         ask = self._ask_by_voice(live_call.LONG, facts)
         asking = ask.landed_at
-        # The watch starts where the request landed, excluding the previous
-        # answer's tail (#223 story 5).
+        # Voice can start answering just before the recogniser logs the user's
+        # speech. The quiet-track gate closed the previous answer before this
+        # pre-request mark, so it includes that first edge without borrowing an
+        # earlier answer's tail (#223 story 5; run 20260904T043017Z).
         watching = time.monotonic()
         watch = self._watch_the_voice(
-            asking,
+            ask.engine_mark,
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling,
             quiet_seconds=LIVE_CALL_CUE_SECONDS,
         )
@@ -2665,11 +2667,11 @@ class _LiveCallRun:
         poll_seconds: float = LIVE_CALL_POLL_SECONDS,
         quiet_seconds: float | None = None,
     ) -> _VoiceWatch:
-        """Watch post-landing Voice activity until quiet or call-down (#184, #223)."""
+        """Watch Voice activity after an engine-log mark until quiet or call-down (#184)."""
 
         def activity() -> tuple[dict[bool, int], int]:
-            # A transcript turn counts as activity because its speaking edge
-            # may precede the post-landing window (#184, #223).
+            # A transcript turn is activity, but the closed-edge guard below
+            # keeps one intermediate fragment from proving completion (#184).
             return self._voice_speech_edges(since=mark), len(self._voice_said_lines(since=mark))
 
         edges, said = activity()
