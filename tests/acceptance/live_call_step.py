@@ -6,6 +6,7 @@ import os
 import re
 import time
 import tomllib
+import unicodedata
 from collections.abc import Callable, Container, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -445,7 +446,8 @@ def _spoken_fragment(said: str, *, longest: int = 12) -> str:
     *speaking* side can plausibly reproduce: a Session's newest message is a
     whole answer, and the Voice paraphrases it into a sentence rather than
     reciting it. So what is looked for in the transcript is the opening of the
-    message, whitespace-folded, and short.
+    message, whitespace-folded, short, and without terminal punctuation whose
+    width or style the Voice may change.
 
     Twelve characters because both lanes' driven turns answer with a dictated
     line (`ACKNOWLEDGE`, `ASK_A_QUESTION`) whose opening words are the whole of
@@ -453,7 +455,10 @@ def _spoken_fragment(said: str, *, longest: int = 12) -> str:
     fragment long enough to span a clause boundary is one the Voice will have
     reworded. Empty in, empty out: the caller checks.
     """
-    return " ".join(said.split())[:longest]
+    fragment = " ".join(said.split())[:longest]
+    while fragment and unicodedata.category(fragment[-1]).startswith("P"):
+        fragment = fragment[:-1]
+    return fragment
 
 
 def _hand_over_of_more_than_one(line: str) -> bool:

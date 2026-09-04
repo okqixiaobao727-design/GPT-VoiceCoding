@@ -832,6 +832,14 @@ def test_the_fragment_the_voice_is_asked_for_is_short_and_whitespace_folded() ->
     assert live_call_step._spoken_fragment("Should   I\ncontinue?") == "Should I con"
 
 
+def test_the_spoken_fragment_drops_terminal_punctuation_the_voice_changes() -> None:
+    """Run `20260904T055701Z`: Voice rendered the recorded `？` as `?`."""
+    words = live_call_step.QUESTION_ASKED_SPOKEN_SUBSTRING
+
+    assert live_call_step._spoken_fragment(f"{words}？") == words
+    assert live_call_step._spoken_fragment(f"{words}?") == words
+
+
 def test_a_message_shorter_than_the_fragment_is_the_whole_message() -> None:
     assert live_call_step._spoken_fragment("READY") == "READY"
 
