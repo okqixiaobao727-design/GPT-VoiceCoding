@@ -947,6 +947,9 @@ class _LiveCallRun:
 
         def track_settled() -> bool:
             nonlocal quiet_since
+            if not self._voice_was_active(since=since):
+                quiet_since = None
+                return False
             if self._a_voice_span_is_open(since=since):
                 quiet_since = None
                 return False
@@ -972,6 +975,13 @@ class _LiveCallRun:
                 f"track had not settled after it waited {waited:.1f}s; the Voice's last line "
                 f"was {said[-1] if said else 'nothing since the previous ask'}"
             )
+
+    def _voice_was_active(self, *, since: int) -> bool:
+        """Whether Voice produced an edge or transcript after one stimulus (#223)."""
+        return any(
+            VOICE_SPEAKING_LINE in line or VOICE_QUIET_LINE in line
+            for line in self._log_since(since)
+        ) or bool(self._voice_said_lines(since=since))
 
     def _a_voice_span_is_open(self, *, since: int) -> bool:
         """Whether a Voice span after one ask's mark remains unclosed (#223)."""
@@ -1014,6 +1024,8 @@ class _LiveCallRun:
     def _arrange_relay(self, state: _LiveCallState, facts: _PhaseFacts) -> str:
         """A direct Relay settles both History and Brief ground (#223 story 15)."""
         address = state.focus.address(self)
+        assert self._voice_track_mark is not None
+        stimulus_mark = len(self.engine.log_lines())
         relayed = self.bridgectl(
             "relay",
             address,
@@ -1074,10 +1086,38 @@ class _LiveCallRun:
                 f"{readings['brief'][:240]!r} at {read_at.get('brief')}"
             ),
         )
+        decision = support.wait_for(
+            lambda: self._mid_call_speech_decision(since=stimulus_mark),
+            deadline_seconds=(
+                state.turn_seconds
+                + state.cool_down_seconds
+                + state.speech_settle_seconds
+                + LIVE_CALL_CUE_SECONDS
+            ),
+            poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        if decision is None:
+            raise LaneBlocked(
+                f"arranged relay to {address} settled History and Brief, but no mid-call "
+                "speech decision followed it"
+            )
+        outcome, line = decision
+        facts.record("mid-call decision", line)
+        if outcome == "spoken":
+            self._voice_track_mark = stimulus_mark
         return (
             f"direct Relay to {address} answered {relayed.text!r}; History and Brief newest "
             f"both carried {LIVE_CALL_DICTATED_REPLY_SUBSTRING!r} at {read_at}"
         )
+
+    def _mid_call_speech_decision(self, *, since: int) -> tuple[str, str] | None:
+        """Read whether Keeper spoke or declined one mid-call brief (#223)."""
+        for line in self._log_since(since):
+            if re.search(MID_CALL_SPOKEN_PATTERN, line):
+                return "spoken", line.strip()
+            if re.search(MID_CALL_NOTHING_PATTERN, line):
+                return "nothing", line.strip()
+        return None
 
     def _phase_detail(self, state: _LiveCallState, facts: _PhaseFacts) -> str:
         """Detail speaks the Session Brief's dictated newest (#198 ruling 5)."""
@@ -2179,6 +2219,7 @@ class _LiveCallRun:
         # a Session the reading finds no longer needs the user cancels the word
         # silently and correctly (`call_keeper.py::nothing_to_speak`).
         owing = len(self.engine.log_lines())
+        self._voice_track_mark = owing
         self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
         # **What the brief will be about**, waited for rather than read once: the
         # announcement is spoken from a reading taken at the gap (ADR 0017), so
