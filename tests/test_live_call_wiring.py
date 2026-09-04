@@ -509,6 +509,116 @@ def _said(message: str) -> str:
     return f"2026-09-03 10:00:00,000 INFO gpt_voicecoding.core.bridge: {message}"
 
 
+def test_only_an_open_voice_span_after_the_previous_ask_mark_blocks_the_next(
+    tmp_path: Path,
+) -> None:
+    """Each ask owns the spans after its mark; an older call cannot block this one (#223)."""
+    before = [_said(live_call_step.VOICE_SPEAKING_LINE)]
+    after = [
+        _said(live_call_step.VOICE_QUIET_LINE),
+        _said(live_call_step.VOICE_SPEAKING_LINE),
+    ]
+    walk = _walk(tmp_path, lines=[*before, *after])
+
+    assert walk._a_voice_span_is_open(since=len(before)) is True
+
+    walk.engine._lines.append(_said(live_call_step.VOICE_QUIET_LINE))
+    assert walk._a_voice_span_is_open(since=len(before)) is False
+
+
+class _PacingClock:
+    """A monotonic clock advanced only by the harness sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_a_new_voice_span_restarts_the_settle_window_before_the_next_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A momentary gap is not settled if the Voice starts speaking in it (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    monkeypatch.setattr(
+        walk,
+        "_a_voice_span_is_open",
+        lambda *, since: clock.now < 2.0 or 3.5 <= clock.now < 4.5,
+    )
+    facts = live_call_step._PhaseFacts("graded")
+
+    walk._wait_for_a_quiet_track(live_call.LONG, since=17, facts=facts)
+
+    assert clock.now == pytest.approx(6.5)
+    assert facts.graded == {}
+    assert facts.failed == []
+    assert facts.recorded["voice track waits"] == [f"{live_call.LONG}: settled=True, waited=6.5s"]
+
+
+def test_an_unsettled_voice_track_blocks_the_phase_before_the_next_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dirty track proves nothing about the product, so the next WAV stays out (#223)."""
+    clock = _PacingClock()
+    last_words = "还在回答上一句"
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_ANSWER_SECONDS", 1.0)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(
+        tmp_path,
+        lines=[
+            _said(live_call_step.VOICE_SAID_LINE % last_words),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+        ],
+    )
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="long answer")
+
+    with pytest.raises(support.LaneBlocked) as blocked:
+        walk._wait_for_a_quiet_track(live_call.PLAIN, since=0, facts=facts)
+
+    assert "phase 'long answer'" in str(blocked.value)
+    assert f"variant {live_call.PLAIN!r}" in str(blocked.value)
+    assert "waited 3.5s" in str(blocked.value)
+    assert last_words in str(blocked.value)
+    assert facts.recorded["voice track waits"] == [f"{live_call.PLAIN}: settled=False, waited=3.5s"]
+
+
+def test_ask_by_voice_never_queues_after_the_track_wait_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pacing gate is inside the one ask primitive, ahead of its only queue (#223)."""
+    walk = _walk(tmp_path)
+    walk._voice_track_mark = 23
+    waited: list[tuple[str, int]] = []
+    queued: list[str] = []
+
+    def block(variant: str, *, since: int, facts: object) -> None:  # noqa: ARG001
+        waited.append((variant, since))
+        raise support.LaneBlocked("the Voice track did not settle")
+
+    monkeypatch.setattr(walk, "_wait_for_a_quiet_track", block)
+    monkeypatch.setattr(live_call, "ask_next", lambda _directory, variant: queued.append(variant))
+
+    with pytest.raises(support.LaneBlocked):
+        walk._ask_by_voice(live_call.LONG, live_call_step._PhaseFacts("graded"))
+
+    assert waited == [(live_call.LONG, 23)]
+    assert queued == []
+
+
 def test_both_edges_of_the_voice_are_counted_off_the_engine_log(tmp_path: Path) -> None:
     """A finished answer: the span opened once and closed once (#184)."""
     walk = _walk(

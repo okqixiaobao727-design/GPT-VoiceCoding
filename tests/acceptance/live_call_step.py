@@ -97,6 +97,7 @@ class _PhaseFacts:
     """Named facts collected before the phase's one fixed record outlet (#223)."""
 
     disposition: str
+    phase: str = ""
     graded: dict[str, object] = field(default_factory=dict)
     recorded: dict[str, object] = field(default_factory=dict)
     failed: list[str] = field(default_factory=list)
@@ -701,6 +702,7 @@ class _LiveCallRun:
     def __init__(self, walk: journey_module.Walk, selection: PhaseSelection | None = None) -> None:
         self.walk = walk
         self.selection = selection if selection is not None else select_phases()
+        self._voice_track_mark: int | None = None
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.walk, name)
@@ -766,6 +768,7 @@ class _LiveCallRun:
                 live_call.ask_for_nothing(self.config.call_wav_directory)
                 mark = len(self.engine.log_lines())
 
+            self._voice_track_mark = mark
             state = _LiveCallState(
                 focus=_ExtraSession(focus, focus_at, focus_address),
                 ringing=_ExtraSession(ringing, ringing_at, ringing_address),
@@ -877,7 +880,7 @@ class _LiveCallRun:
 
     def _run_phase(self, phase: str, state: _LiveCallState) -> _PhaseOutcome:
         disposition = "graded" if self.selection.is_graded(phase) else "arranged"
-        facts = _PhaseFacts(disposition)
+        facts = _PhaseFacts(disposition, phase=phase)
         handler_name = (
             f"_phase_{phase.replace('-', '_').replace(' ', '_')}"
             if disposition == "graded"
@@ -916,11 +919,14 @@ class _LiveCallRun:
             f"log tail={[line.strip() for line in self.engine.log_lines()[-4:]]!r}"
         )
 
-    def _ask_by_voice(self, variant: str) -> _SpokenAsk:
-        """Queue one WAV and return both marks plus its user-speech landing (#223)."""
+    def _ask_by_voice(self, variant: str, facts: _PhaseFacts) -> _SpokenAsk:
+        """Queue one WAV into a quiet track and return both marks plus its landing (#223)."""
+        assert self._voice_track_mark is not None
+        self._wait_for_a_quiet_track(variant, since=self._voice_track_mark, facts=facts)
         engine_mark = len(self.engine.log_lines())
         wrapper_mark = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         heard_fragment = HEARD_FRAGMENTS[variant]
+        self._voice_track_mark = engine_mark
         live_call.ask_next(self.config.call_wav_directory, variant)
         heard = self._while_the_call_is_up(
             lambda: bool(self._user_speech_lines(heard_fragment, since=engine_mark)),
@@ -932,6 +938,50 @@ class _LiveCallRun:
             landed_at=self._user_speech_landed_at(heard_fragment, since=engine_mark),
             heard=heard,
         )
+
+    def _wait_for_a_quiet_track(self, variant: str, *, since: int, facts: _PhaseFacts) -> None:
+        """Hold the next utterance until prior Voice spans and their gap settle (#223)."""
+        started = time.monotonic()
+        settle = self._speech_settle_seconds()
+        quiet_since: float | None = None
+
+        def track_settled() -> bool:
+            nonlocal quiet_since
+            if self._a_voice_span_is_open(since=since):
+                quiet_since = None
+                return False
+            now = time.monotonic()
+            if quiet_since is None:
+                quiet_since = now
+            return now - quiet_since >= settle
+
+        settled = self._while_the_call_is_up(
+            track_settled,
+            deadline_seconds=LIVE_CALL_ANSWER_SECONDS + settle,
+        )
+        waited = time.monotonic() - started
+        waits = facts.recorded.get("voice track waits")
+        if not isinstance(waits, list):
+            waits = []
+            facts.record("voice track waits", waits)
+        waits.append(f"{variant}: settled={settled}, waited={waited:.1f}s")
+        if not settled:
+            said = self._voice_said_lines(since=since)
+            raise LaneBlocked(
+                f"live call phase {facts.phase!r} could not queue variant {variant!r}: the Voice "
+                f"track had not settled after it waited {waited:.1f}s; the Voice's last line "
+                f"was {said[-1] if said else 'nothing since the previous ask'}"
+            )
+
+    def _a_voice_span_is_open(self, *, since: int) -> bool:
+        """Whether a Voice span after one ask's mark remains unclosed (#223)."""
+        speaking = False
+        for line in self._log_since(since):
+            if VOICE_SPEAKING_LINE in line:
+                speaking = True
+            elif VOICE_QUIET_LINE in line:
+                speaking = False
+        return speaking
 
     def _phase_dial(self, state: _LiveCallState, facts: _PhaseFacts) -> str:
         """The engine dials on the Session's stopped question (#195, #198)."""
@@ -1239,13 +1289,13 @@ class _LiveCallRun:
                 f"({THE_QUESTION_ASKED!r}), so there is nothing for the narrowed answer to be "
                 f"compared against"
             )
-        counted = self._one_question_the_hand_over_answers(variant=live_call.NEEDS)
+        counted = self._one_question_the_hand_over_answers(variant=live_call.NEEDS, facts=facts)
         runs_before = counted.ask.wrapper_mark
         asking = counted.ask.landed_at
         # **The absence is the narrowing question's**, and the mark is taken
         # here. See the complaint below for why the general question's runs are
         # recorded rather than graded.
-        named = self._one_question_the_hand_over_answers(variant=live_call.NARROWING)
+        named = self._one_question_the_hand_over_answers(variant=live_call.NARROWING, facts=facts)
         narrowing = named.ask.landed_at
         runs_before_narrowing = named.ask.wrapper_mark
         # **The absence is read after both answers have closed**, and only then.
@@ -1366,9 +1416,11 @@ class _LiveCallRun:
             "both questions were recorded"
         )
 
-    def _one_question_the_hand_over_answers(self, *, variant: str) -> _HandOverAnswer:
+    def _one_question_the_hand_over_answers(
+        self, *, variant: str, facts: _PhaseFacts
+    ) -> _HandOverAnswer:
         """Ask once and wait for a complete Voice answer after its landing (#198, #223)."""
-        ask = self._ask_by_voice(variant)
+        ask = self._ask_by_voice(variant, facts)
         answered = self._while_the_call_is_up(
             lambda: bool(self._voice_said_lines(since=ask.landed_at)),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
@@ -1388,7 +1440,7 @@ class _LiveCallRun:
         facts: _PhaseFacts,
     ) -> str:
         """Grade the spoken Relay, Session effect, receipt, and silence after it (#193, #198)."""
-        ask = self._ask_by_voice(live_call.RELAY)
+        ask = self._ask_by_voice(live_call.RELAY, facts)
         runs_before = ask.wrapper_mark
         relaying = ask.landed_at
         relayed = support.wait_for(
@@ -1681,7 +1733,7 @@ class _LiveCallRun:
         facts: _PhaseFacts,
     ) -> _ReadAnswer:
         """Grade or record one spoken read from its actual landing (#171, #198, #223)."""
-        ask = self._ask_by_voice(variant)
+        ask = self._ask_by_voice(variant, facts)
         runs_before = ask.wrapper_mark
         asking = ask.landed_at
         heard = HEARD_FRAGMENTS[variant]
@@ -1766,7 +1818,7 @@ class _LiveCallRun:
 
     def _the_voice_holds_the_call_open(self, ceiling: float, facts: _PhaseFacts) -> str:
         """Grade Voice activity holding a call beyond its Silence Ceiling (#184)."""
-        ask = self._ask_by_voice(live_call.LONG)
+        ask = self._ask_by_voice(live_call.LONG, facts)
         asking = ask.landed_at
         # The watch starts where the request landed, excluding the previous
         # answer's tail (#223 story 5).
@@ -2254,7 +2306,7 @@ class _LiveCallRun:
     ) -> str:
         """Grade hang-up, Cool-down payment, and a silent ceiling end (#186, #195)."""
         opening = support.matching_lines(self._log_since(mark), HAND_OVER_LINE)
-        ask = self._ask_by_voice(live_call.PLAIN)
+        ask = self._ask_by_voice(live_call.PLAIN, facts)
         runs_before = ask.wrapper_mark
         hanging = ask.landed_at
         ran = support.wait_for(
