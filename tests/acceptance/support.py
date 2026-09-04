@@ -390,9 +390,13 @@ CALL_SETTINGS_KEY = "call"
 HARNESS_CALL_REFERENCE = live_call.REFERENCE
 
 #: The workspace names a run that names none gets — the harness's own defaults,
-#: so a caller that does not care about `live call` v2's pinning still writes a
+#: so a caller that does not care about the folded `live call`'s pinning still writes a
 #: complete table. A lane says its own (`journey.Lane`).
-DEFAULT_CALL_WORKSPACES = (live_call.FOCUS_WORKSPACE_NAME, live_call.RINGING_WORKSPACE_NAME)
+DEFAULT_CALL_WORKSPACES = live_call.CallWorkspaces(
+    focus=live_call.FOCUS_WORKSPACE_NAME,
+    ringing=live_call.RINGING_WORKSPACE_NAME,
+    waiting=live_call.WAITING_WORKSPACE_NAME,
+)
 
 #: The Relay ceiling every run is given, in seconds, in place of the one the user
 #: configured. The shipped default is ten minutes (`core/policy.py`), and #197
@@ -425,11 +429,14 @@ class DerivedConfig:
     cli_wrapper: Path | None = None
     #: Where that wrapper logs the runs the Call Agent made.
     cli_wrapper_log: Path | None = None
-    #: What this lane's two extra Sessions' workspaces are called (#196). The
-    #: step creates the directories and the harness's Call adapter says the
-    #: first of them out loud, so both halves read this one value.
+    #: What this lane's three extra Sessions' workspaces are called (#196,
+    #: #198). The step creates the directories and the harness's Call adapter
+    #: says the first of them out loud, so both halves read this one value.
     call_focus_workspace: str | None = None
     call_ringing_workspace: str | None = None
+    #: The one that stops inside the Cool-down after the hang-up (#198). Nothing
+    #: says it out loud; it is here so one value names it on both sides.
+    call_waiting_workspace: str | None = None
 
 
 def derive_config(
@@ -443,7 +450,7 @@ def derive_config(
     codex_socket_directory: Path | None = None,
     dropped_agents: tuple[AgentKind, ...] = (),
     harness_live_call: bool = False,
-    call_workspaces: tuple[str, str] | None = None,
+    call_workspaces: live_call.CallWorkspaces | None = None,
     control_plane_cli: Path | None = None,
 ) -> DerivedConfig:
     """The user's real config, with only what a run must not share redirected.
@@ -586,19 +593,25 @@ def derive_config(
         settings[CODEX_SETTINGS_KEY] = codex
 
     observations = wav_directory = wrapper = wrapper_log = None
-    focus_workspace = ringing_workspace = None
+    focus_workspace = ringing_workspace = waiting_workspace = None
     if harness_live_call:
         observations = run_directory / "live-call.jsonl"
         wav_directory = run_directory / "live-call-wav"
-        # **The two extra Sessions' workspace names are per lane, and they come
-        # from here** (#196). The project half of a Session Name is the workspace
-        # directory's basename, and `live call` v2 says one of those names out
-        # loud to pin the Session a relay must land in — so a name shared by two
+        # **The three extra Sessions' workspace names are per lane, and they
+        # come from here** (#196, #198). The project half of a Session Name is
+        # the workspace directory's basename, and the `live call` walk says the
+        # first of them out loud to pin the Session a relay must land in, and the
+        # second to grade that nothing spoken ever names it — so a name shared by two
         # lanes stops pinning anything. It has to: the Codex daemon is
         # machine-wide, so the Claude lane's engine holds the Codex lane's
         # Sessions too, and run `20260903T093813Z` had it looking at two rows
         # called `二号工位 · Reply READY` and answering with `brief`.
-        focus_workspace, ringing_workspace = call_workspaces or DEFAULT_CALL_WORKSPACES
+        named = call_workspaces or DEFAULT_CALL_WORKSPACES
+        focus_workspace, ringing_workspace, waiting_workspace = (
+            named.focus,
+            named.ringing,
+            named.waiting,
+        )
         adapters["call"] = HARNESS_CALL_REFERENCE
         settings[CALL_SETTINGS_KEY] = {
             **settings.get(CALL_SETTINGS_KEY, {}),
@@ -606,6 +619,7 @@ def derive_config(
             "wav_directory": str(wav_directory),
             "focus_workspace": focus_workspace,
             "ringing_workspace": ringing_workspace,
+            "waiting_workspace": waiting_workspace,
         }
         wrapper_log = run_directory / "bridgectl-runs.log"
         wrapper = write_cli_wrapper(
@@ -635,6 +649,7 @@ def derive_config(
         cli_wrapper_log=wrapper_log,
         call_focus_workspace=focus_workspace,
         call_ringing_workspace=ringing_workspace,
+        call_waiting_workspace=waiting_workspace,
     )
 
 
@@ -760,10 +775,32 @@ def _as_value(value: Any) -> str:
 # --- the engine under test --------------------------------------------------
 
 #: How long the engine gets to bind its socket before the run gives up on it.
-#: The engine's start is a config load, an adapter import and a bind — no network
-#: and no subprocess — so this is generous rather than derived; a slow one is a
-#: finding, and the log says why.
+#: Generous rather than derived; a slow one is a finding, and the log says why.
+#:
+#: **Deliberately not raised for a loaded machine.** On 2026-09-04 three runs
+#: refused here at 22–31s while another session held this Mac at load 20–49; a
+#: `sample` of a starting engine sat in `waitpid`, which is fork/exec starvation
+#: rather than a child slow by design. A deadline long enough to pass under that
+#: load would also have to stretch the Cool-down window, the Silence Ceiling and
+#: the Voice watch — every one of which is a *measurement*, not a wait. A walk
+#: that passed by widening them would be grading the machine. So the refusal
+#: says what the load was (`load_now`) and the run is made again when it drops.
 ENGINE_START_SECONDS = 30.0
+
+
+def load_now() -> str:
+    """The machine's load averages, so a refusal can say whether it was the machine.
+
+    Read at the moment of the complaint rather than at the start of the run: what
+    a reader needs to know is what this engine was competing with while it failed
+    to bind.
+    """
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:  # pragma: no cover - POSIX always has it; a refusal still reads
+        return "load unavailable"
+    return f"load {one:.1f} / {five:.1f} / {fifteen:.1f} (1/5/15 min)"
+
 
 #: The grace a stopped engine gets to unlink its socket and let its Sessions go.
 ENGINE_STOP_SECONDS = 20.0
@@ -874,9 +911,17 @@ class Engine:
                     f"its own log is discarded, and this silence is how that surfaces)"
                 )
             time.sleep(0.2)
+        # **A refusal takes the engine with it.** Without this the process goes
+        # on starting after the walk has given up on it, and the next run meets
+        # a second bridge over every Session on this machine: run
+        # `20260904T002514Z` refused and left two engines holding the published
+        # approval address, and `20260904T002637Z` refused behind them. The
+        # start that failed is this object's to clean up, because nothing else
+        # has a handle on it.
+        self.stop()
         raise EngineRefused(
             f"the engine did not bind {self._config.socket_path} within "
-            f"{ENGINE_START_SECONDS:.0f}s; log at {self._config.log_path}"
+            f"{ENGINE_START_SECONDS:.0f}s at {load_now()}; log at {self._config.log_path}"
         )
 
     def stop(self) -> None:

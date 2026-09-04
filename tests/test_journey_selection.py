@@ -23,6 +23,7 @@ exactly what a test can pin.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -84,6 +85,44 @@ def test_every_step_name_is_bound_to_a_method() -> None:
     """`Walk.bound_steps` is where a name becomes code; it covers them exactly."""
     walk = object.__new__(journey.Walk)
     assert tuple(walk.bound_steps()) == journey.STEPS
+
+
+def test_every_attribute_a_step_reaches_for_is_one_the_walk_has() -> None:
+    """A helper another module took with it is a red nine steps into a real run.
+
+    The `live call` re-cut (#223) moved `_log_since` into `live_call_step.py`,
+    and `relay` — the only other step that reads the engine's own lines (#197) —
+    kept calling it. Nothing in the fast suite touches those methods, so the
+    first thing that said so was `AttributeError` four minutes into the
+    ten-step run, with both lanes lost. The names are readable without running
+    anything, so they are read here.
+    """
+    source = ast.parse(Path(journey.__file__).read_text(encoding="utf-8"))
+    walk = next(
+        node for node in ast.walk(source) if isinstance(node, ast.ClassDef) and node.name == "Walk"
+    )
+    held = {node.name for node in walk.body if isinstance(node, ast.FunctionDef)}
+    for node in ast.walk(walk):
+        if isinstance(node, ast.Assign):
+            held |= {
+                target.attr
+                for target in node.targets
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            }
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute):
+            held.add(node.target.attr)
+
+    reached = {
+        node.attr: node.lineno
+        for node in ast.walk(walk)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+    missing = {name: line for name, line in reached.items() if name not in held}
+    assert not missing, f"`Walk` reaches for what it does not have: {missing}"
 
 
 # --- selection --------------------------------------------------------------

@@ -63,7 +63,7 @@ import subprocess
 import time
 import wave
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,7 +90,8 @@ SILENT_FRAME = b"\x00\x00" * FRAME_SAMPLES
 #: What the call is asked. #175 run 3's exact phrasing, which #179 and #181
 #: proved produces a `handoff_request`, and which the Call Agent answers by
 #: running `bridgectl live` — so the request is also what ends the call.
-REQUEST = "那个你把电话挂了吧,我想让你结束通话"
+PLAIN_HEARD_FRAGMENT = "结束通话"
+REQUEST = f"那个你把电话挂了吧,我想让你{PLAIN_HEARD_FRAGMENT}"
 
 #: What the *other* variant asks. #184 needs a call to outlive the Silence
 #: Ceiling while its own Voice is still speaking, and four seconds of answer
@@ -105,7 +106,10 @@ REQUEST = "那个你把电话挂了吧,我想让你结束通话"
 #: should end a call by itself (#195, deferred). So the two asks are two
 #: utterances rather than one sentence carrying both — `REQUEST` keeps #183's
 #: graded hand-off, and this one is only ever about the ceiling.
-LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,不要跳过也不要加快"
+LONG_HEARD_FRAGMENT = "一个数字"
+LONG_REQUEST = (
+    f"请你从一数到两百,{LONG_HEARD_FRAGMENT}{LONG_HEARD_FRAGMENT}地念出来,不要跳过也不要加快"
+)
 
 #: What the *third* variant asks, and it asks for nothing to be done. #194 dials
 #: the call from the system side and puts the whole briefing in `initialItems`,
@@ -122,7 +126,8 @@ LONG_REQUEST = "请你从一数到两百,一个数字一个数字地念出来,�
 #: sake: "什么需要我?" synthesises to 1.04 s against a 1.0 s floor, which is a
 #: run away from being read as the stub `say` writes for a voice that was never
 #: installed. This one is 2 s and change, and asks the same thing.
-NEEDS_REQUEST = "现在有哪些需要我的事情?"
+NEEDS_HEARD_FRAGMENT = "需要我"
+NEEDS_REQUEST = f"现在有哪些{NEEDS_HEARD_FRAGMENT}的事情?"
 
 #: What the Focus Session's workspace is called by default, and so — since the
 #: project half of a Session Name is the workspace directory's basename
@@ -147,9 +152,153 @@ FOCUS_WORKSPACE_NAME = "二号工位"
 RINGING_WORKSPACE_NAME = "三号工位"
 
 
+#: And what the *waiting* Session's workspace is called. #198's walk hangs the
+#: call up and then has a Session stop **inside the Cool-down**, which the paid
+#: dial must be about — so it has to be a Session no earlier phase has moved.
+#: Never named in any utterance: nobody speaks on the call it earns. Per lane for
+#: `FOCUS_WORKSPACE_NAME`'s reason.
+WAITING_WORKSPACE_NAME = "四号工位"
+
+
+@dataclass(frozen=True, slots=True)
+class CallWorkspaces:
+    """The three roles one lane's extra Sessions play, named rather than ordered.
+
+    They were a `tuple[str, str, str]` until the third arrived and every reader
+    of it — the lane, `derive_config`'s unpacking, the settings table it writes
+    and the `DerivedConfig` it returns — had to be changed in step. The roles are
+    what those readers actually mean, so they are what is carried: `workspaces
+    .focus` cannot be read as `workspaces.ringing` the way `[0]` can be read as
+    `[1]`, and a fourth role would be a field rather than a fourth position
+    threaded through four files.
+
+    Kept out of `HarnessSettings`, which stays flat: its fields are
+    `[adapters.settings.call]` keys, and that table crosses a process boundary
+    as TOML.
+    """
+
+    #: The one every call is dialled about, relayed into, briefed, paged and
+    #: announced. Said out loud by the utterances, which is why it is per lane.
+    focus: str
+    #: The one that only ever rings. The run's proof about it is that nothing
+    #: spoken ever names it.
+    ringing: str
+    #: The one that stops inside the Cool-down after the hang-up. Nothing says it
+    #: out loud either.
+    waiting: str
+
+    def __post_init__(self) -> None:
+        named = (self.focus, self.ringing, self.waiting)
+        if len(set(named)) != len(named):
+            raise ValueError(
+                f"a lane's three extra Sessions need three names it can tell apart: {named}"
+            )
+
+    def __iter__(self) -> Iterator[str]:
+        """The three names, for a caller that wants to check them as a set."""
+        return iter((self.focus, self.ringing, self.waiting))
+
+
+#: The sentence the Focus Session is told to answer a relay with, and so what
+#: that Session's `newest` is by the time Detail asks about it (#198 §3a). It
+#: reaches the Session through its own driving instruction
+#: (`journey.ASK_A_QUESTION_THEN_SAY`), not through the relayed payload.
+#:
+#: **Dictated, because a free-form reply is not gradeable.** §3a asks that the
+#: Voice's Detail answer carry a substring of the Session's `newest`. The Voice
+#: speaks Chinese; `newest` is whatever language that agent chose. Run
+#: `20260903T231626Z` had the Codex lane answer in Chinese (substring held) and
+#: the Claude lane in English — `A teammate session replied "可以继续" …` — which
+#: the Voice **translated** faithfully into Chinese, sharing no character with
+#: it. The criterion passed on one lane by accident of language and failed
+#: correct behaviour on the other. Dictating the reply restores the harness's
+#: own premise, that graded fragments come from lines the walk put there
+#: (`live_call_step._spoken_fragment`).
+#:
+#: Lives here rather than in `journey` because it is spoken Chinese of the same
+#: kind as the utterances around it, and `journey` imports it for the one
+#: instruction that dictates it.
+#:
+#: Chinese, so the Voice reads it out rather than translating it. It spells
+#: neither `收到` nor `已转达` — both are receipt wordings
+#: (`instructions/voice.py`) an echo of which would pass this grade — and not
+#: the workspace name, which the answer is already graded on elsewhere.
+DICTATED_REPLY_FRAGMENT = "接着往下做"
+DICTATED_REPLY = f"那我就{DICTATED_REPLY_FRAGMENT}。"
+
+RELAY_HEARD_FRAGMENT = "回一句话"
+ANSWER_FRAGMENT = "可以继续"
+NARROWING_HEARD_FRAGMENT = "那个吧"
+DETAIL_HEARD_FRAGMENT = "详细说说"
+HISTORY_HEARD_FRAGMENT = "之前说了什么"
+EARLIER_HEARD_FRAGMENT = "再往前"
+
+
 def relay_request(focus_workspace: str) -> str:
-    """The relay utterance, naming one lane's own Focus Session's workspace."""
-    return f"请你给{focus_workspace}那个会话回一句话，内容是收到。"
+    """The answer utterance, naming one lane's own Focus Session's workspace.
+
+    **It is an answer**, since #198: the Session stopped on `Should I continue?`
+    (`journey.ASK_A_QUESTION`), and what the user says back is what the Call
+    Agent relays and what that Session's next turn then carries. The payload is
+    deliberately not `收到` — that is the wording the Voice says for a *queued*
+    receipt (`instructions/voice.py`), and a payload spelling it would make the
+    receipt and its echo one string the step could not tell apart.
+
+    **The payload stays one clause**, and `DICTATED_REPLY` is not in it. Run
+    `20260903T233723Z` said the dictation out loud here — `内容是可以继续，并且请
+    它只回复这一句：…` — and both lanes' Call Agents relayed `可以继续` alone,
+    reading the rest as an instruction to themselves. What the walk needs
+    dictated is the *Session's* reply, and the Session is driven by the walk
+    already: `journey.ASK_A_QUESTION_THEN_SAY` carries it, so it does not have to
+    survive the air, the Call Agent's reading and the argv to get there.
+    """
+    return f"请你给{focus_workspace}那个会话{RELAY_HEARD_FRAGMENT}，内容是{ANSWER_FRAGMENT}。"
+
+
+def narrowing_request(focus_workspace: str) -> str:
+    """ "Just that one" — the second half of the hand-over question (#198).
+
+    The Voice's own rule is counts first and names only when narrowed: *"Asked
+    what is going on generally, give the counts rather than the list … When they
+    narrow it, by name or by state, speak each one that matches"*
+    (`core/instructions/voice.py`). `NEEDS_REQUEST` asks generally and is answered
+    with counts; this narrows, and is where a Session name belongs. Run
+    `20260903T222129Z` is the step asking generally and grading the absence of a
+    name, which is the product obeying its own instruction.
+
+    **No verb in it either.** The point of both questions is that the Call Agent
+    runs nothing for them: the counted roster and this one Session's whole brief
+    both rode `initialItems`, so a hand-off across either says the Voice went
+    looking for what it was already holding (#194).
+    """
+    return f"就说{focus_workspace}{NARROWING_HEARD_FRAGMENT}。"
+
+
+def detail_request(focus_workspace: str) -> str:
+    """ "Tell me more" — the utterance that asks the Call Agent for `brief` (#198).
+
+    It **names the Session** for `relay_request`'s reason: run
+    `20260903T081717Z` had an utterance that named none send the Call Agent
+    looking through nine Sessions this machine was running.
+    """
+    return f"请你{DETAIL_HEARD_FRAGMENT}{focus_workspace}那个会话现在是什么情况。"
+
+
+def history_request(focus_workspace: str) -> str:
+    """ "What did it say before" — the utterance that asks for `history` (#198)."""
+    return f"那{focus_workspace}它{HISTORY_HEARD_FRAGMENT}？请你说说更早的记录。"
+
+
+def earlier_request(focus_workspace: str) -> str:
+    """ "Further back" — the utterance that asks for the older page (#198, #171).
+
+    Paging is on the map's destination, and the page before the newest one is
+    what `bridgectl history <address> --before <ordinal>` answers. The Session is
+    named again rather than left to context: this sentence arrives after two
+    others, and a Call Agent that had lost the thread would page some other
+    Session's record.
+    """
+    return f"{EARLIER_HEARD_FRAGMENT}，把{focus_workspace}更早的那一页也说一下。"
 
 
 #: What the *fourth* variant asks, and it asks for a verb the Call Agent owns.
@@ -196,6 +345,27 @@ PLAIN = "plain"
 LONG = "long"
 NEEDS = "needs"
 RELAY = "relay"
+#: The second half of the hand-over question: the narrowing the Voice's own rule
+#: says a Session name belongs to (#198).
+NARROWING = "narrowing"
+#: #198's three: Detail, History and History's older page, each of which the
+#: Call Agent has to answer with a verb of its own.
+DETAIL = "detail"
+HISTORY = "history"
+EARLIER = "earlier"
+
+#: Recognition fragments share their source with the sentences above. A change
+#: to spoken wording therefore cannot leave a second, stale literal behind.
+HEARD_FRAGMENTS = {
+    PLAIN: PLAIN_HEARD_FRAGMENT,
+    LONG: LONG_HEARD_FRAGMENT,
+    NEEDS: NEEDS_HEARD_FRAGMENT,
+    RELAY: RELAY_HEARD_FRAGMENT,
+    NARROWING: NARROWING_HEARD_FRAGMENT,
+    DETAIL: DETAIL_HEARD_FRAGMENT,
+    HISTORY: HISTORY_HEARD_FRAGMENT,
+    EARLIER: EARLIER_HEARD_FRAGMENT,
+}
 
 #: What the *current or next* call plays, as a file in `wav_directory` holding
 #: one variant name a line. Two things force a per-call channel rather than a
@@ -263,6 +433,9 @@ class HarnessSettings:
     #: the name that is said and the name that is created cannot drift.
     focus_workspace: str = FOCUS_WORKSPACE_NAME
     ringing_workspace: str = RINGING_WORKSPACE_NAME
+    #: The third one (#198). Nothing here says it out loud; it is carried so the
+    #: engine-side half and the step agree on every workspace one run creates.
+    waiting_workspace: str = WAITING_WORKSPACE_NAME
     voice: str = WAV_VOICE
     wav_sample_rate: int = WAV_SAMPLE_RATE
     settle_seconds: float = SETTLE_SECONDS
@@ -275,6 +448,10 @@ class HarnessSettings:
             LONG: self.long_request,
             NEEDS: self.needs_request,
             RELAY: relay_request(self.focus_workspace),
+            NARROWING: narrowing_request(self.focus_workspace),
+            DETAIL: detail_request(self.focus_workspace),
+            HISTORY: history_request(self.focus_workspace),
+            EARLIER: earlier_request(self.focus_workspace),
         }
 
     @property

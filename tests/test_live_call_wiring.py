@@ -18,14 +18,26 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import journey
 import live_call
+import live_call_step
+import pytest
 import support
+
+from gpt_voicecoding.core.instructions import (
+    ControlPlaneCli,
+    InstructionContext,
+    voice_instructions,
+)
+from gpt_voicecoding.seams.call import SpokenBrief, SpokenRosterBrief
 
 A_CONFIG = """
 [engine]
@@ -258,14 +270,20 @@ def test_the_step_is_bound_to_a_method_like_every_other_name(tmp_path: Path) -> 
         assert step in journey.PREREQUISITES
         assert step in journey.STEPS
     assert hasattr(journey.Walk, "live_call")
-    assert hasattr(journey.Walk, "live_call_long")
 
 
-def test_the_long_step_runs_alone_too(tmp_path: Path) -> None:  # noqa: ARG001
-    """#184's Red is one call's own clock; a turn-driving step before it is minutes."""
-    chosen = journey.select(["live call long"])
-    assert chosen.selected == ("live call long",)
-    assert chosen.setup == ()
+def test_the_three_call_steps_are_one_walk(tmp_path: Path) -> None:  # noqa: ARG001
+    """#198 folds v0's route, v1's dial and v2's mid-call news into one step.
+
+    The names went with them: a run asking for `live call long` used to get one
+    call's worth of the flow, and what proves the 0901 flow is the whole walk.
+    Selecting a name nothing answers to is a refusal rather than an empty run.
+    """
+    assert journey.LIVE_CALL_STEPS == ("live call",)
+    assert "live call long" not in journey.STEPS
+    assert "live call briefed" not in journey.STEPS
+    assert not hasattr(journey.Walk, "live_call_long")
+    assert not hasattr(journey.Walk, "live_call_briefed")
 
 
 def test_only_a_run_that_walks_the_step_swaps_the_users_call_adapter(tmp_path: Path) -> None:
@@ -290,14 +308,16 @@ def test_a_recogniser_that_splits_a_word_still_counts_as_having_heard_it() -> No
         "2026-09-02 21:40:04,522 INFO gpt_voicecoding.core.bridge: user speech, "
         "for the voice thread to act on: '那个你把电话挂了吧,我想让你结束通 话'"
     )
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in heard
-    assert journey._unspaced(journey.LIVE_CALL_HEARD_SUBSTRING) in journey._unspaced(heard)
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in heard
+    assert live_call_step._unspaced(
+        live_call_step.LIVE_CALL_HEARD_SUBSTRING
+    ) in live_call_step._unspaced(heard)
 
 
 def test_the_substring_is_really_part_of_the_request_the_harness_speaks() -> None:
     """A fragment nothing puts on the track would never be heard at all."""
-    assert journey.LIVE_CALL_HEARD_SUBSTRING in live_call.REQUEST
-    assert journey.LIVE_CALL_LONG_HEARD_SUBSTRING in live_call.LONG_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING in live_call.REQUEST
+    assert live_call_step.LIVE_CALL_LONG_HEARD_SUBSTRING in live_call.LONG_REQUEST
 
 
 def test_the_long_request_asks_for_no_hang_up() -> None:
@@ -307,7 +327,7 @@ def test_the_long_request_asks_for_no_hang_up() -> None:
     #183's hand-off assertion went red for a reason that was not #184's. The two
     asks are two utterances now, and this is the half that must not carry one.
     """
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.LONG_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in live_call.LONG_REQUEST
     assert live_call.REQUEST != live_call.LONG_REQUEST
 
 
@@ -366,7 +386,7 @@ def test_the_verbs_are_read_off_the_wrapper_log_including_invented_ones(
         chat_id="1",
         cli_wrapper_log=log,
     )
-    assert walk._verbs_run() == ["live", "call end"]
+    assert live_call_step._LiveCallRun(walk)._verbs_run() == ["live", "call end"]
 
 
 def test_a_wrapper_log_of_only_options_names_no_verb(tmp_path: Path) -> None:
@@ -385,7 +405,7 @@ def test_a_wrapper_log_of_only_options_names_no_verb(tmp_path: Path) -> None:
         chat_id="1",
         cli_wrapper_log=log,
     )
-    assert walk._verbs_run() == []
+    assert live_call_step._LiveCallRun(walk)._verbs_run() == []
     assert len(support.cli_wrapper_runs(log)) == 1
 
 
@@ -400,13 +420,13 @@ def test_a_call_that_went_down_on_its_own_is_not_credited_to_the_agent() -> None
     the Call Agent ended it. The audio path is the one that knows.
     """
     lost = "the connection went away by itself: ICE failed"
-    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=True) == "lost"
-    assert journey._ended_by(end_reason=lost, by_ceiling=False, by_agent=False) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=False, by_agent=True) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=False, by_agent=False) == "lost"
 
 
 def test_an_ending_the_agent_asked_for_is_the_agents() -> None:
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=True) == "agent"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=False, by_agent=True) == "agent"
 
 
 def test_a_call_the_engines_own_ceiling_ended_is_not_the_agents() -> None:
@@ -417,25 +437,27 @@ def test_a_call_the_engines_own_ceiling_ended_is_not_the_agents() -> None:
     engine's own log line is the only thing that can (#184).
     """
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=True) == "ceiling"
-    assert journey._ended_by(end_reason=closed, by_ceiling=True, by_agent=False) == "ceiling"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=True, by_agent=True) == "ceiling"
+    assert live_call_step._ended_by(end_reason=closed, by_ceiling=True, by_agent=False) == "ceiling"
 
 
 def test_a_connection_that_went_away_is_a_loss_before_it_is_a_ceiling() -> None:
     """The audio path is asked first, as it already was for the agent."""
     lost = "the connection went away by itself: ICE failed"
-    assert journey._ended_by(end_reason=lost, by_ceiling=True, by_agent=True) == "lost"
+    assert live_call_step._ended_by(end_reason=lost, by_ceiling=True, by_agent=True) == "lost"
 
 
 def test_an_ending_the_step_had_to_make_itself_is_the_harnesss() -> None:
     """Green does not depend on the verb guess, and the guess stays visible."""
     closed = "this side closed the audio path"
-    assert journey._ended_by(end_reason=closed, by_ceiling=False, by_agent=False) == "harness"
+    assert (
+        live_call_step._ended_by(end_reason=closed, by_ceiling=False, by_agent=False) == "harness"
+    )
 
 
 def test_no_end_reason_at_all_still_says_who_was_waited_on() -> None:
-    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=True) == "agent"
-    assert journey._ended_by(end_reason=None, by_ceiling=False, by_agent=False) == "harness"
+    assert live_call_step._ended_by(end_reason=None, by_ceiling=False, by_agent=True) == "agent"
+    assert live_call_step._ended_by(end_reason=None, by_ceiling=False, by_agent=False) == "harness"
 
 
 def test_every_answer_is_its_own_argument_rather_than_one_that_is_inferred() -> None:
@@ -446,7 +468,7 @@ def test_every_answer_is_its_own_argument_rather_than_one_that_is_inferred() -> 
     ended anything could not say so. Every answer is now keyword-only and
     stated (#184).
     """
-    parameters = inspect.signature(journey._ended_by).parameters
+    parameters = inspect.signature(live_call_step._ended_by).parameters
     assert [name for name in parameters] == ["end_reason", "by_ceiling", "by_agent"]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in parameters.values()
@@ -467,7 +489,7 @@ class _Engine:
         return self._lines
 
 
-def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> journey.Walk:
+def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> live_call_step._LiveCallRun:
     walk = object.__new__(journey.Walk)
     walk.engine = _Engine(lines or [])
     walk.config = support.DerivedConfig(
@@ -480,7 +502,7 @@ def _walk(tmp_path: Path, *, lines: list[str] | None = None) -> journey.Walk:
         token_variable="T",
         chat_id="1",
     )
-    return walk
+    return live_call_step._LiveCallRun(walk)
 
 
 def _said(message: str) -> str:
@@ -488,13 +510,385 @@ def _said(message: str) -> str:
     return f"2026-09-03 10:00:00,000 INFO gpt_voicecoding.core.bridge: {message}"
 
 
+def test_only_an_open_voice_span_after_the_previous_ask_mark_blocks_the_next(
+    tmp_path: Path,
+) -> None:
+    """Each ask owns the spans after its mark; an older call cannot block this one (#223)."""
+    before = [_said(live_call_step.VOICE_SPEAKING_LINE)]
+    after = [
+        _said(live_call_step.VOICE_QUIET_LINE),
+        _said(live_call_step.VOICE_SPEAKING_LINE),
+    ]
+    walk = _walk(tmp_path, lines=[*before, *after])
+
+    assert walk._a_voice_span_is_open(since=len(before)) is True
+
+    walk.engine._lines.append(_said(live_call_step.VOICE_QUIET_LINE))
+    assert walk._a_voice_span_is_open(since=len(before)) is False
+
+
+@pytest.mark.parametrize(
+    "activity",
+    (
+        live_call_step.VOICE_SPEAKING_LINE,
+        live_call_step.VOICE_QUIET_LINE,
+        live_call_step.VOICE_SAID_LINE % "回答",
+    ),
+)
+def test_each_voice_signal_counts_as_activity_after_the_stimulus(
+    tmp_path: Path, activity: str
+) -> None:
+    walk = _walk(tmp_path, lines=[_said("older noise"), _said(activity)])
+
+    assert walk._voice_was_active(since=1) is True
+    assert walk._voice_was_active(since=2) is False
+
+
+class _PacingClock:
+    """A monotonic clock advanced only by the harness sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_a_new_voice_span_restarts_the_settle_window_before_the_next_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A momentary gap is not settled if the Voice starts speaking in it (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    monkeypatch.setattr(
+        walk,
+        "_a_voice_span_is_open",
+        lambda *, since: clock.now < 2.0 or 3.5 <= clock.now < 4.5,
+    )
+    monkeypatch.setattr(walk, "_voice_was_active", lambda *, since: True, raising=False)
+    facts = live_call_step._PhaseFacts("graded")
+
+    walk._wait_for_a_quiet_track(live_call.LONG, since=17, activity_owed=True, facts=facts)
+
+    assert clock.now == pytest.approx(6.5)
+    assert facts.graded == {}
+    assert facts.failed == []
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.LONG}: owed=True, settled=True, waited=6.5s"
+    ]
+
+
+def test_no_edges_wait_for_the_delayed_voice_answer_before_settling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run `20260904T050406Z`: 0/0 edges preceded a delayed Voice start.
+
+    A bare settle window is not proof that the previous answer finished when
+    the backend has not started it yet. The gate must first observe activity,
+    then the closing edge, then one uninterrupted settle window.
+    """
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+
+    class _DelayedVoice(_Engine):
+        def log_lines(self) -> list[str]:
+            if clock.now < 3.0:
+                return []
+            if clock.now < 4.0:
+                return [_said(live_call_step.VOICE_SPEAKING_LINE)]
+            return [
+                _said(live_call_step.VOICE_SPEAKING_LINE),
+                _said(live_call_step.VOICE_QUIET_LINE),
+            ]
+
+    walk.engine = _DelayedVoice([])
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="history")
+
+    walk._wait_for_a_quiet_track(live_call.HISTORY, since=0, activity_owed=True, facts=facts)
+
+    assert clock.now == pytest.approx(6.0)
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.HISTORY}: owed=True, settled=True, waited=6.0s"
+    ]
+
+
+def test_a_mark_that_owes_no_activity_settles_on_an_empty_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call opened under `ask_for_nothing` is quiet by contract (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="hand-over")
+
+    walk._wait_for_a_quiet_track(live_call.NEEDS, since=0, activity_owed=False, facts=facts)
+
+    assert clock.now == pytest.approx(2.0)
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.NEEDS}: owed=False, settled=True, waited=2.0s"
+    ]
+
+
+def test_a_mark_that_owes_activity_still_blocks_when_voice_never_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The silent-opening carve-out cannot weaken a real stimulus (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_ANSWER_SECONDS", 1.0)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="history")
+
+    with pytest.raises(support.LaneBlocked):
+        walk._wait_for_a_quiet_track(live_call.HISTORY, since=0, activity_owed=True, facts=facts)
+
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.HISTORY}: owed=True, settled=False, waited=3.5s"
+    ]
+
+
+def _arranged_relay(
+    tmp_path: Path, decision: str | None
+) -> tuple[live_call_step._LiveCallRun, live_call_step._LiveCallState]:
+    walk = _walk(
+        tmp_path,
+        lines=[_said("older activity"), _said(live_call_step.VOICE_QUIET_LINE)],
+    )
+    walk._voice_track = live_call_step._VoiceTrackMark(at=1, activity_owed=False)
+    walk.lane = SimpleNamespace(name="claude")
+    walk.journal = lambda *_, **__: None
+
+    focus = SimpleNamespace(workspace=tmp_path, address=lambda _run: "claude:session")
+    state = live_call_step._LiveCallState(
+        focus=focus,  # type: ignore[arg-type]
+        ringing=focus,  # type: ignore[arg-type]
+        waiting=focus,  # type: ignore[arg-type]
+        turn_seconds=1.0,
+        ceiling_seconds=10.0,
+        cool_down_seconds=1.0,
+        speech_settle_seconds=1.0,
+        opening_mark=0,
+    )
+
+    def bridgectl(verb: str, *_args: object, **_kwargs: object) -> support.Answer:
+        if verb == "relay":
+            if decision is not None:
+                walk.engine._lines.append(_said(decision))
+            return support.Answer((), 0, "state=delivered", "")
+        if verb == "history":
+            return support.Answer((), 0, live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING, "")
+        assert verb == "brief"
+        return support.Answer(
+            (), 0, f"newest: {live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING}", ""
+        )
+
+    walk.bridgectl = bridgectl
+    return walk, state
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_mark"),
+    (
+        (
+            live_call_step.MID_CALL_SPOKEN_LINE % ("the dictated reply", "none"),
+            live_call_step._VoiceTrackMark(at=2, activity_owed=True),
+        ),
+        (
+            live_call_step.MID_CALL_NOTHING_LINE,
+            live_call_step._VoiceTrackMark(at=1, activity_owed=False),
+        ),
+    ),
+)
+def test_arranged_relay_marks_only_a_decision_that_made_voice_speak(
+    tmp_path: Path,
+    decision: str,
+    expected_mark: live_call_step._VoiceTrackMark,
+) -> None:
+    """The relay invocation is the latest stimulus only when Keeper spoke it (#223)."""
+    walk, state = _arranged_relay(tmp_path, decision)
+    facts = live_call_step._PhaseFacts("arranged", phase="relay")
+
+    walk._arrange_relay(state, facts)
+
+    assert walk._voice_track == expected_mark
+    assert decision in facts.recorded["mid-call decision"]
+
+
+def test_arranged_relay_blocks_when_keeper_makes_no_speech_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reply surfaces cannot tell whether the direct Relay made Voice speak (#223)."""
+    walk, state = _arranged_relay(tmp_path, None)
+    monkeypatch.setattr(support, "wait_for", lambda predicate, **_kwargs: predicate())
+
+    with pytest.raises(support.LaneBlocked, match="no mid-call speech decision"):
+        walk._arrange_relay(state, live_call_step._PhaseFacts("arranged", phase="relay"))
+
+
+def test_focus_stop_becomes_the_latest_voice_stimulus_before_it_is_driven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next ask must wait on Voice activity caused by mid-call Focus news (#223)."""
+    walk = _walk(tmp_path)
+    walk._voice_track = live_call_step._VoiceTrackMark(at=0, activity_owed=False)
+    focus = object()
+    ringing = object()
+
+    def drive(session: object, *_args: object) -> None:
+        if session is ringing:
+            walk.engine._lines.append(_said("the non-Focus Session rang"))
+            return
+        assert session is focus
+        assert walk._voice_track == live_call_step._VoiceTrackMark(
+            at=len(walk.engine.log_lines()), activity_owed=True
+        )
+        walk.engine._lines.extend(
+            (
+                _said(live_call_step.VOICE_QUIET_LINE),
+                _said(
+                    live_call_step.MID_CALL_SPOKEN_LINE
+                    % (live_call_step.THE_QUESTION_ASKED, "none")
+                ),
+                _said(live_call_step.VOICE_SAID_LINE % live_call_step.THE_QUESTION_ASKED),
+            )
+        )
+
+    monkeypatch.setattr(walk, "_drive_extra_session", drive)
+    monkeypatch.setattr(walk, "_cue_lines", lambda *_args, **_kwargs: ["EVENT"])
+    monkeypatch.setattr(walk, "_cue_order", lambda **_kwargs: ["EVENT"])
+    monkeypatch.setattr(walk, "_call_line", lambda: "call: up")
+    monkeypatch.setattr(
+        walk, "_await_the_question", lambda *_args: live_call_step.THE_QUESTION_ASKED
+    )
+    monkeypatch.setattr(walk, "_while_the_call_is_up", lambda condition, **_kwargs: condition())
+
+    facts = live_call_step._PhaseFacts("graded", phase="mid-call news")
+    walk._mid_call_the_focus_session_speaks_and_the_rest_rings(
+        mark=0,
+        focus=focus,  # type: ignore[arg-type]
+        focus_at=tmp_path / "focus",
+        focus_address="claude:focus",
+        ringing=ringing,  # type: ignore[arg-type]
+        ringing_at=tmp_path / "ringing",
+        ringing_address="claude:ringing",
+        ringing_name="ringing",
+        turn=1.0,
+        cool_down=1.0,
+        settle=1.0,
+        facts=facts,
+    )
+
+    assert facts.failed == []
+
+
+def test_an_unsettled_voice_track_blocks_the_phase_before_the_next_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dirty track proves nothing about the product, so the next WAV stays out (#223)."""
+    clock = _PacingClock()
+    last_words = "还在回答上一句"
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_ANSWER_SECONDS", 1.0)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(
+        tmp_path,
+        lines=[
+            _said(live_call_step.VOICE_SAID_LINE % last_words),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+        ],
+    )
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="long answer")
+
+    with pytest.raises(support.LaneBlocked) as blocked:
+        walk._wait_for_a_quiet_track(live_call.PLAIN, since=0, activity_owed=True, facts=facts)
+
+    assert "phase 'long answer'" in str(blocked.value)
+    assert f"variant {live_call.PLAIN!r}" in str(blocked.value)
+    assert "waited 3.5s" in str(blocked.value)
+    assert last_words in str(blocked.value)
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.PLAIN}: owed=True, settled=False, waited=3.5s"
+    ]
+
+
+def test_ask_by_voice_never_queues_after_the_track_wait_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pacing gate is inside the one ask primitive, ahead of its only queue (#223)."""
+    walk = _walk(tmp_path)
+    walk._voice_track = live_call_step._VoiceTrackMark(at=23, activity_owed=False)
+    waited: list[tuple[str, int, bool]] = []
+    queued: list[str] = []
+
+    def block(variant: str, *, since: int, activity_owed: bool, facts: object) -> None:  # noqa: ARG001
+        waited.append((variant, since, activity_owed))
+        raise support.LaneBlocked("the Voice track did not settle")
+
+    monkeypatch.setattr(walk, "_wait_for_a_quiet_track", block)
+    monkeypatch.setattr(live_call, "ask_next", lambda _directory, variant: queued.append(variant))
+
+    with pytest.raises(support.LaneBlocked):
+        walk._ask_by_voice(live_call.LONG, live_call_step._PhaseFacts("graded"))
+
+    assert waited == [(live_call.LONG, 23, False)]
+    assert queued == []
+
+
+def test_a_queued_ask_becomes_the_next_activity_owed_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    walk = _walk(tmp_path, lines=[_said("before"), _said("opening")])
+    walk._voice_track = live_call_step._VoiceTrackMark(at=1, activity_owed=False)
+    waited: list[tuple[int, bool]] = []
+
+    monkeypatch.setattr(
+        walk,
+        "_wait_for_a_quiet_track",
+        lambda _variant, *, since, activity_owed, facts: waited.append(  # noqa: ARG005
+            (since, activity_owed)
+        ),
+    )
+    monkeypatch.setattr(live_call, "ask_next", lambda *_args: None)
+    monkeypatch.setattr(walk, "_while_the_call_is_up", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(walk, "_user_speech_landed_at", lambda *_args, **_kwargs: 2)
+
+    walk._ask_by_voice(live_call.LONG, live_call_step._PhaseFacts("graded"))
+
+    assert waited == [(1, False)]
+    assert walk._voice_track == live_call_step._VoiceTrackMark(at=2, activity_owed=True)
+
+
 def test_both_edges_of_the_voice_are_counted_off_the_engine_log(tmp_path: Path) -> None:
     """A finished answer: the span opened once and closed once (#184)."""
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
         ],
     )
     assert walk._voice_speech_edges() == {True: 1, False: 1}
@@ -507,7 +901,7 @@ def test_an_answer_cut_in_half_leaves_a_start_edge_with_no_stop(tmp_path: Path) 
     edges rather than measuring a duration — no pace the Voice counts at can
     produce a stop edge from a call that was already hung up.
     """
-    walk = _walk(tmp_path, lines=[_said(journey.VOICE_SPEAKING_LINE)])
+    walk = _walk(tmp_path, lines=[_said(live_call_step.VOICE_SPEAKING_LINE)])
     assert walk._voice_speech_edges() == {True: 1, False: 0}
 
 
@@ -524,10 +918,10 @@ def test_a_call_cut_after_an_earlier_answer_finished_still_reads_as_cut(
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
             _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
-            _said(journey.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
         ],
     )
     edges = walk._voice_speech_edges()
@@ -542,9 +936,9 @@ def test_an_utterance_that_ended_without_a_delta_is_not_a_span_left_open(
     walk = _walk(
         tmp_path,
         lines=[
-            _said(journey.VOICE_SPEAKING_LINE),
-            _said(journey.VOICE_QUIET_LINE),
-            _said(journey.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
+            _said(live_call_step.VOICE_QUIET_LINE),
         ],
     )
     edges = walk._voice_speech_edges()
@@ -559,11 +953,11 @@ def test_a_step_reads_only_the_lines_its_own_call_produced(tmp_path: Path) -> No
     step resting on evidence from a different call (#184).
     """
     before = [
-        _said(journey.VOICE_SPEAKING_LINE),
-        _said(journey.VOICE_QUIET_LINE),
+        _said(live_call_step.VOICE_SPEAKING_LINE),
+        _said(live_call_step.VOICE_QUIET_LINE),
         _said("ended the Live Call after 60 seconds without call activity"),
     ]
-    walk = _walk(tmp_path, lines=[*before, _said(journey.VOICE_SPEAKING_LINE)])
+    walk = _walk(tmp_path, lines=[*before, _said(live_call_step.VOICE_SPEAKING_LINE)])
 
     assert walk._voice_speech_edges() == {True: 2, False: 1}
     assert walk._voice_speech_edges(since=len(before)) == {True: 1, False: 0}
@@ -599,7 +993,7 @@ def test_the_watch_measures_first_edge_to_last_across_a_broken_up_answer(
     """
     turns = []
     for _ in range(3):
-        turns += [_said(journey.VOICE_SPEAKING_LINE), _said(journey.VOICE_QUIET_LINE)]
+        turns += [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
     walk = _walk(tmp_path)
     walk.engine = _Talking(turns)
     walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
@@ -630,6 +1024,144 @@ def test_a_call_whose_voice_never_speaks_is_watched_without_a_stretch(
     assert watch.last_voice_at is None
 
 
+def test_the_watch_can_stop_when_the_answer_closes_rather_than_when_the_call_does(
+    tmp_path: Path,
+) -> None:
+    """#198's stretch runs on a call the walk speaks into again afterwards.
+
+    So it cannot wait for the ending. `quiet_seconds` is the other stopping
+    condition: every span closed, and then no new edge for that long.
+    """
+    walk = _walk(tmp_path)
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
+    )
+    walk.bridgectl = lambda *_, **__: None  # never asked: the call is read below
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01, quiet_seconds=0.05)
+
+    assert watch.went_down is False
+    assert watch.edges == {True: 1, False: 1}
+    assert watch.first_voice_at is not None
+
+
+def test_a_span_still_open_does_not_stop_the_watch_early(tmp_path: Path) -> None:
+    """A start with no stop is #169's bug, and the phase has to see the whole stretch."""
+    walk = _walk(tmp_path)
+    walk.engine = _Talking([_said(live_call_step.VOICE_SPEAKING_LINE)])
+    walk.bridgectl = lambda *_, **__: None
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=0.3, poll_seconds=0.01, quiet_seconds=0.05)
+
+    # It ran to its deadline rather than stopping on the quiet, because the span
+    # the Voice opened never closed.
+    assert watch.edges == {True: 1, False: 0}
+    assert watch.went_down is False
+
+
+def test_the_long_answer_watch_includes_a_voice_start_before_user_speech_lands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run `20260904T043017Z`: Voice started 0.5s before the request landed.
+
+    Starting the watch at `landed_at` missed that opening edge. The first
+    transcript fragment then looked like a closed answer after one quiet
+    window, even though Voice did not close its span until almost a minute
+    later. The quiet-track gate makes `engine_mark` the clean pre-request
+    boundary, so the long-answer watch must use that mark.
+    """
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    walk = _walk(tmp_path)
+
+    class _PreLandingVoice(_Engine):
+        def log_lines(self) -> list[str]:
+            lines = [
+                _said(live_call_step.VOICE_SPEAKING_LINE),
+                _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
+                _said(live_call_step.VOICE_SAID_LINE % "一二三"),
+            ]
+            # The transcript has been quiet for longer than the 10s cue window
+            # before Voice closes its span at 12s.
+            if clock.now >= 12.0:
+                lines.append(_said(live_call_step.VOICE_QUIET_LINE))
+            return lines
+
+    walk.engine = _PreLandingVoice([])
+    ask = live_call_step._SpokenAsk(
+        engine_mark=0,
+        wrapper_mark=3,
+        landed_at=1,
+        heard=True,
+    )
+    watched_from: list[int] = []
+    monkeypatch.setattr(walk, "_ask_by_voice", lambda _variant, _facts: ask)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_call_line", lambda: "call: active")
+    real_watch = walk._watch_the_voice
+
+    def watch(mark: int, **kwargs: object) -> live_call_step._VoiceWatch:
+        watched_from.append(mark)
+        return real_watch(mark, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(walk, "_watch_the_voice", watch)
+
+    detail = walk._the_voice_holds_the_call_open(
+        1.0, live_call_step._PhaseFacts("graded", phase="long answer")
+    )
+
+    assert watched_from == [ask.engine_mark]
+    assert clock.now == pytest.approx(22.0)
+    assert "1 start / 1 stop" in detail
+
+
+def test_a_span_the_voice_had_open_before_the_mark_is_still_the_voice_answering(
+    tmp_path: Path,
+) -> None:
+    """Run `20260904T004431Z`: one span covered the previous answer and this one.
+
+    Both lanes. The span opened before the counting request landed and closed
+    only when the answer ended, so no start edge fell inside the window and a
+    watch counting edges alone saw nothing happen through minutes of speech. A
+    `transcript/done` is the Voice saying something, and `_VoiceWatch` is
+    documented as asking exactly that.
+    """
+    walk = _walk(tmp_path)
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SAID_LINE % "一二三"), _said("something else")]
+    )
+    walk.bridgectl = lambda *_, **__: None
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01, quiet_seconds=0.05)
+
+    # No edge at all, and the watch still knows the Voice answered — and still
+    # stops on the quiet rather than running to its deadline.
+    assert watch.edges == {True: 0, False: 0}
+    assert watch.last_voice_at is not None
+    assert watch.went_down is False
+
+
+def test_without_the_quiet_window_the_watch_is_the_one_the_long_step_wrote(
+    tmp_path: Path,
+) -> None:
+    """`quiet_seconds=None` runs until the call goes down, which is #184's watch."""
+    walk = _walk(tmp_path)
+    walk.engine = _Talking(
+        [_said(live_call_step.VOICE_SPEAKING_LINE), _said(live_call_step.VOICE_QUIET_LINE)]
+    )
+    walk.bridgectl = lambda *_, **__: None
+    downs = iter([False] * 8 + [True] * 4)
+    walk._call_is_down = lambda: next(downs, True)  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01)
+
+    assert watch.went_down is True
+
+
 def test_the_engines_own_line_is_what_names_the_ceiling_as_the_ender(tmp_path: Path) -> None:
     """The number in it is configuration, so the sentence around it is matched."""
     walk = _walk(tmp_path, lines=[_said("ended the Live Call after 12.5 seconds")])
@@ -652,7 +1184,7 @@ def test_a_lane_that_sets_no_ceiling_is_running_the_shipped_one(tmp_path: Path) 
     """The engine's default, not a copy of it — the step never types the number."""
     walk = _walk(tmp_path)
     walk.config.path.write_text(A_CONFIG)
-    assert walk._silence_ceiling_seconds() == journey.DEFAULT_SILENCE_END_SECONDS
+    assert walk._silence_ceiling_seconds() == live_call_step.DEFAULT_SILENCE_END_SECONDS
 
 
 def test_the_silence_the_ceiling_waits_out_is_graded_to_the_polls_granularity() -> None:
@@ -661,8 +1193,8 @@ def test_the_silence_the_ceiling_waits_out_is_graded_to_the_polls_granularity() 
     A ceiling that waited its full sixty seconds must not read as an early
     ending because of which poll saw what.
     """
-    assert journey.LIVE_CALL_POLL_SECONDS > 0
-    assert journey.LIVE_CALL_POLL_SECONDS < journey.DEFAULT_SILENCE_END_SECONDS
+    assert live_call_step.LIVE_CALL_POLL_SECONDS > 0
+    assert live_call_step.LIVE_CALL_POLL_SECONDS < live_call_step.DEFAULT_SILENCE_END_SECONDS
 
 
 def test_the_long_step_waits_out_the_answer_and_the_silence_after_it(
@@ -674,8 +1206,8 @@ def test_the_long_step_waits_out_the_answer_and_the_silence_after_it(
     silence on top before it fires. A step that gave up sooner would be the
     thing that decided how long the call lasted.
     """
-    assert journey.LIVE_CALL_ANSWER_SECONDS > 220.0
-    assert journey.LIVE_CALL_ANSWER_SECONDS > journey.LIVE_CALL_END_SECONDS
+    assert live_call_step.LIVE_CALL_ANSWER_SECONDS > 220.0
+    assert live_call_step.LIVE_CALL_ANSWER_SECONDS > live_call_step.LIVE_CALL_END_SECONDS
 
 
 # --- which utterance goes on the track --------------------------------------
@@ -748,6 +1280,10 @@ def test_every_variant_the_settings_carry_is_one_the_step_can_ask_for() -> None:
         live_call.LONG,
         live_call.NEEDS,
         live_call.RELAY,
+        live_call.DETAIL,
+        live_call.HISTORY,
+        live_call.EARLIER,
+        live_call.NARROWING,
     }
     assert settings.requests[live_call.PLAIN] == live_call.REQUEST
     assert settings.requests[live_call.LONG] == live_call.LONG_REQUEST
@@ -762,9 +1298,108 @@ def test_the_relay_utterance_names_the_workspace_the_step_creates() -> None:
     what stops one of them being renamed alone.
     """
     for lane in journey.LANES:
-        focus, _ = lane.call_workspaces
+        focus = lane.call_workspaces.focus
         assert focus in live_call.relay_request(focus)
-        assert journey.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
+        assert live_call_step.LIVE_CALL_RELAY_HEARD_SUBSTRING in live_call.relay_request(focus)
+
+
+def test_every_utterance_that_asks_about_a_session_names_it(tmp_path: Path) -> None:  # noqa: ARG001
+    """Detail and History ask about one Session, and the Call Agent picks the target.
+
+    Run `20260903T081717Z` is the precedent the relay utterance already carries:
+    an utterance that named no Session had the Call Agent go looking, and on one
+    lane it briefed two of the nine Sessions this machine was running. Detail,
+    History and its older page ask about the same Session, so each says which.
+    """
+    for lane in journey.LANES:
+        focus = lane.call_workspaces.focus
+        for utterance in (
+            live_call.detail_request(focus),
+            live_call.history_request(focus),
+            live_call.earlier_request(focus),
+        ):
+            assert focus in utterance
+
+
+def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
+    """Phase 3 is an *answer* to the question the Session stopped on (#198).
+
+    The Session asked `journey.THE_QUESTION_ASKED`, so the
+    payload is what the user says back — and what the Session's next turn then
+    carries, which is what the step reads. Deliberately not `收到`: that is the
+    wording the Voice says for a **queued** receipt (`instructions/voice.py`),
+    and a payload spelling it would make the receipt and its echo the same
+    string.
+    """
+    said = live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
+
+    assert live_call_step.LIVE_CALL_ANSWER_SUBSTRING in said
+    assert live_call_step.RELAY_RECEIPT_QUEUED not in said
+
+
+def test_the_question_a_session_stops_on_is_one_the_voice_reads_out() -> None:
+    """The Voice speaks the user's language, so an English line it quotes it renders.
+
+    Run `20260903T235107Z`'s claude lane answered `它最近问:「要继续吗?」` of a
+    Session told to say `Should I continue?` — a faithful translation, graded as
+    the Voice failing to say what the Session last said. The dictated question is
+    Chinese for `live_call.DICTATED_REPLY`'s reason, and what is graded is its
+    words without the punctuation the Voice has been seen to change.
+    """
+    question = journey.THE_QUESTION_ASKED
+
+    assert question in journey.ASK_A_QUESTION.words
+    assert journey.QUESTION_ASKED_SPOKEN_SUBSTRING in question
+    # Either width satisfies `core/briefing.py::_ASKS`; the full-width mark is
+    # the one that rule's own comment is surest of (#176 §1.2).
+    assert question.endswith("？")
+    # Not a run of the answer to it, or the two could pass for each other.
+    assert journey.QUESTION_ASKED_SPOKEN_SUBSTRING not in live_call.DICTATED_REPLY
+    assert live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in question
+    # No punctuation in either graded fragment, for the same reason.
+    for fragment in (
+        journey.QUESTION_ASKED_SPOKEN_SUBSTRING,
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
+    ):
+        assert not any(mark in fragment for mark in "?？。，,「」“”:：")
+
+
+def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
+    """#198 §3a grades the Voice's Detail answer against the Session's `newest`.
+
+    The Voice speaks Chinese and `newest` is whatever language that agent chose,
+    so a free-form reply makes the criterion a test of which lane answered in
+    which language: run `20260903T231626Z` passed on Codex and failed the Claude
+    lane for translating its English `newest` faithfully. So the reply is
+    dictated — through the Session's own driving instruction, because run
+    `20260903T233723Z` put it in the spoken payload and both lanes' Call Agents
+    relayed `可以继续` alone. These are the exclusions that keep it gradeable.
+    """
+    reply = live_call.DICTATED_REPLY
+
+    assert reply in journey.ASK_A_QUESTION_THEN_SAY.words
+    assert journey.THE_QUESTION_ASKED in journey.ASK_A_QUESTION_THEN_SAY.words
+    # Not the plain turn: phases 4 and 5 re-drive with it and their turn has to
+    # end on the question, not on an answer to the drive itself.
+    assert reply not in journey.ASK_A_QUESTION.words
+    # And not in the payload, which stays the one clause the step follows through
+    # the air, the Call Agent's argv and the Session's next turn.
+    assert reply not in live_call.relay_request(live_call.FOCUS_WORKSPACE_NAME)
+    assert live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING in reply
+    # Neither receipt wording: an echo of the receipt would otherwise pass.
+    assert live_call_step.RELAY_RECEIPT_QUEUED not in reply
+    assert live_call_step.RELAY_RECEIPT_DELIVERED not in reply
+    # Nor any lane's workspace name, which the answer is graded on elsewhere.
+    for lane in journey.LANES:
+        for workspace in lane.call_workspaces:
+            assert workspace not in reply
+    # And no run shared with the relayed payload, so an answer that read the
+    # words back rather than the Session's reply does not pass.
+    assert (
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING
+        not in live_call_step.LIVE_CALL_ANSWER_SUBSTRING
+    )
+    assert " " not in live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING
 
 
 def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
@@ -777,6 +1412,41 @@ def test_no_two_lanes_answer_to_the_same_spoken_name() -> None:
     spoken = [name for lane in journey.LANES for name in lane.call_workspaces]
 
     assert len(set(spoken)) == len(spoken), spoken
+
+
+def test_every_lane_names_three_extra_sessions(tmp_path: Path) -> None:  # noqa: ARG001
+    """#198's walk drives three Sessions besides the lane's own.
+
+    The one the call is dialled about and relayed into, the one that rings while
+    it is up, and the one that stops **inside the Cool-down** after the hang-up —
+    which the paid dial then has to be about. Three names, so no phase is graded
+    against a Session another phase already moved.
+    """
+    for lane in journey.LANES:
+        named = tuple(lane.call_workspaces)
+        assert len(named) == 3
+        assert len(set(named)) == 3
+
+
+def test_the_grade_wording_the_voice_is_told_to_say_is_what_the_step_looks_for() -> None:
+    """The receipt wording is the product's, and the step quotes it (#193 §Voice).
+
+    `已转达` for a delivered relay and `收到` for a queued one are shipped in the
+    Voice's own instructions; a copy in the harness that nothing checks would
+    pass a run where the product had stopped saying either.
+    """
+    spoken = voice_instructions(
+        InstructionContext(
+            cli=ControlPlaneCli(
+                command=Path("/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"),
+                version="1.4.2",
+                socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
+            )
+        )
+    ).text
+
+    assert live_call_step.RELAY_RECEIPT_DELIVERED in spoken
+    assert live_call_step.RELAY_RECEIPT_QUEUED in spoken
 
 
 def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> None:
@@ -793,4 +1463,134 @@ def test_the_settings_build_the_utterance_from_the_workspace_they_carry() -> Non
 
 def test_the_relay_utterance_asks_for_no_hang_up() -> None:
     """This call has to outlive the relay by a whole turn (`LONG_REQUEST`'s reason)."""
-    assert journey.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
+    assert live_call_step.LIVE_CALL_HEARD_SUBSTRING not in live_call.RELAY_REQUEST
+
+
+def test_the_hand_over_question_is_asked_the_way_the_voice_is_told_to_answer_it() -> None:
+    """Counts first, names when narrowed — the Voice's own rule, so phase 2 asks twice.
+
+    Run `20260903T222129Z` asked only the general question and graded the missing
+    Session name: the Voice had answered `有六个已经结束…`, which is
+    `core/instructions/voice.py`'s counted Roster Brief, exactly as shipped.
+    """
+    spoken = voice_instructions(
+        InstructionContext(
+            cli=ControlPlaneCli(
+                command=Path("/Applications/GPT-VoiceCoding.app/Contents/MacOS/bridgectl"),
+                version="1.4.2",
+                socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
+            )
+        )
+    ).text
+
+    assert "give the counts rather than the list" in spoken
+    assert "narrow it" in spoken
+    # The narrowing utterance says the name; the general one must not.
+    assert live_call.FOCUS_WORKSPACE_NAME in live_call.narrowing_request(
+        live_call.FOCUS_WORKSPACE_NAME
+    )
+    assert live_call.FOCUS_WORKSPACE_NAME not in live_call.NEEDS_REQUEST
+
+
+def test_a_counted_roster_brief_is_recognised_by_a_numeral_and_its_measure_word() -> None:
+    """What the Voice actually said on `20260903T222129Z`, and what a list is not."""
+    counted = "有六个已经结束,还有一个停在无法读取的地方。你想看哪一个?"
+    listed = "二号工位在等你,三号工位还在跑。"
+
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, counted)
+    assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, listed)
+
+
+def test_the_folded_walk_is_the_tenth_step_and_the_only_one_that_dials() -> None:
+    """#198's fold, read off the contract every build ticket's "Red first" line cites.
+
+    Ten names, `live call` last, and it is the whole of `LIVE_CALL_STEPS`: a run
+    that walks it gets the harness's own Call adapter and the `bridgectl`
+    wrapper, and a run that does not keeps the Call adapter the user configured
+    (`conftest.py`, #183).
+    """
+    assert len(journey.STEPS) == 10
+    assert journey.STEPS[-1] == "live call"
+    assert set(journey.LIVE_CALL_STEPS) <= set(journey.STEPS)
+
+
+def test_every_step_the_walk_can_be_asked_for_has_a_prerequisite_row() -> None:
+    """A name with no row is a name `select` cannot close over (#182)."""
+    assert set(journey.PREREQUISITES) == set(journey.STEPS)
+
+
+def test_the_folded_step_still_stands_on_the_roster(tmp_path: Path) -> None:  # noqa: ARG001
+    """Phase 1 grades a dial for carrying the Roster Brief (#198).
+
+    The three Sessions the walk is graded against are its own to start, so no
+    address is owed — but a roster the lane has never proved it can read is not
+    something to grade a hand-over against, and `roster` is one step rather than
+    a walk, so #183's "runnable alone" clause is satisfied by it.
+    """
+    chosen = journey.select(["live call"])
+
+    assert chosen.selected == ("live call",)
+    assert chosen.setup == ("roster",)
+
+
+def test_the_walk_asks_for_every_variant_it_speaks_and_no_others() -> None:
+    """Seven sentences go on one call's track, and each is named once (#198).
+
+    The playlist is a per-call file the transport reads while the call is up
+    (`live_call.NEXT_VARIANT_FILE`, #196), so a variant the step appends and the
+    settings cannot build is a call that falls silent at that phase.
+    """
+    spoken = (
+        live_call.NEEDS,
+        live_call.NARROWING,
+        live_call.RELAY,
+        live_call.DETAIL,
+        live_call.HISTORY,
+        live_call.EARLIER,
+        live_call.LONG,
+        live_call.PLAIN,
+    )
+    settings = live_call.HarnessSettings(observations=Path("/o.jsonl"), wav_directory=Path("/w"))
+
+    assert len(set(spoken)) == len(spoken)
+    for variant in spoken:
+        assert settings.requests[variant]
+
+
+def test_the_hand_over_kinds_the_step_grades_are_the_products_own_class_names() -> None:
+    """The adapter writes `type(item).__name__`; a copy here could drift silently."""
+    assert live_call_step.ROSTER_BRIEF_KIND == SpokenRosterBrief.__name__
+    assert live_call_step.SESSION_BRIEF_KIND == SpokenBrief.__name__
+    assert live_call_step.ROSTER_BRIEF_KIND != live_call_step.SESSION_BRIEF_KIND
+
+
+def test_the_paging_option_the_step_greps_for_is_the_one_the_surface_takes() -> None:
+    """`--before` is graded on the Call Agent's argv, so it has to be the real flag (#171)."""
+    assert live_call_step.HISTORY_CURSOR_OPTION == "--before"
+    rendered = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "gpt_voicecoding.control_plane", "history", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rendered.returncode == 0:
+        assert live_call_step.HISTORY_CURSOR_OPTION in rendered.stdout
+
+
+def test_the_three_workspace_roles_are_named_rather_than_ordered() -> None:
+    """A third role arrived and four readers of a 3-tuple had to change in step (#198).
+
+    The roles are what those readers mean, so they are what is carried:
+    `workspaces.focus` cannot be misread as `workspaces.ringing` the way `[0]`
+    can be misread as `[1]`.
+    """
+    named = live_call.CallWorkspaces(focus="a", ringing="b", waiting="c")
+
+    assert (named.focus, named.ringing, named.waiting) == ("a", "b", "c")
+    assert tuple(named) == ("a", "b", "c")
+
+
+def test_a_lane_cannot_name_two_of_its_sessions_the_same() -> None:
+    """Two roles sharing a name is a phase graded against a Session another moved."""
+    with pytest.raises(ValueError, match="three names"):
+        live_call.CallWorkspaces(focus="二号工位", ringing="二号工位", waiting="四号工位")
