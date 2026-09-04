@@ -91,7 +91,15 @@ class TestTheLineItSends:
 
 
 class TestWhenNoEngineIsHoldingThisSession:
-    def test_it_opens_no_socket_and_does_nothing(self, tmp_path: Path) -> None:
+    """No engine is holding this Session because `conftest.published_address`
+    arranged it, not because the developer's machine happened to be quiet.
+
+    `register` takes no `base_dir`, so a call with neither a channel-config
+    variable nor one resolves the machine's own published address — and while an
+    acceptance engine was publishing, the first test here went red and the third
+    handed a fake Session to a real engine (#229)."""
+
+    def test_it_opens_no_socket_and_does_nothing(self) -> None:
         """The first gate, and the reason the cost to an unheld Session is ~33 ms."""
         assert registration.register(PAYLOAD, {}) is False
 
