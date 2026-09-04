@@ -889,6 +889,14 @@ class Engine:
                     f"its own log is discarded, and this silence is how that surfaces)"
                 )
             time.sleep(0.2)
+        # **A refusal takes the engine with it.** Without this the process goes
+        # on starting after the walk has given up on it, and the next run meets
+        # a second bridge over every Session on this machine: run
+        # `20260904T002514Z` refused and left two engines holding the published
+        # approval address, and `20260904T002637Z` refused behind them. The
+        # start that failed is this object's to clean up, because nothing else
+        # has a handle on it.
+        self.stop()
         raise EngineRefused(
             f"the engine did not bind {self._config.socket_path} within "
             f"{ENGINE_START_SECONDS:.0f}s; log at {self._config.log_path}"
