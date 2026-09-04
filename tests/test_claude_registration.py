@@ -29,7 +29,7 @@ from pathlib import Path
 import pytest
 
 from fakes import PROGRESS_CAPTURE
-from gpt_voicecoding.adapters.agent.claude import bootstrap, registration
+from gpt_voicecoding.adapters.agent.claude import registration
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.claude.approval import REGISTRATION_TYPE, TYPE_FIELD
 from gpt_voicecoding.adapters.agent.claude.bootstrap import publish_address
@@ -91,43 +91,13 @@ class TestTheLineItSends:
 
 
 class TestWhenNoEngineIsHoldingThisSession:
-    @pytest.fixture(autouse=True)
-    def _nobody_published_an_address(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The premise of this class, arranged rather than hoped for.
+    """No engine is holding this Session because `conftest.published_address`
+    arranged it, not because the developer's machine happened to be quiet.
 
-        `register` takes no `base_dir`, so a call with neither a channel-config
-        variable nor a published address of its own resolves the machine's real
-        `~/Library/Application Support/GPT-VoiceCoding/engine/address.json` —
-        whichever engine the developer has up. #229 caught these tests reading
-        it: while an acceptance engine was publishing, the first one went red
-        and the third handed a fake Session to a real engine. So every test in
-        this class resolves inside a directory it owns, where nothing published.
-
-        Autouse rather than requested, because "no engine is holding this
-        Session" is the class's subject and not any one test's arrangement.
-
-        The seam is `bootstrap.address_path` rather than the channel-config
-        variable the second test hands in, because that variable answers inside
-        `_told` before the published file is ever read — and the fall-through to
-        that file is the path a Session with no variable takes, which is the
-        path #229 is about. `test_claude_unpublished_address.py:44` and
-        `test_claude_address_claim.py:39` take the same question away from the
-        machine at the same seam.
-
-        The patch binds `bootstrap`'s own global, so a `published_address`
-        rewritten to call `locations.address_path` directly would leave it
-        inert — and these tests would pass while reading the developer's engine
-        again, which is #229 coming back saying nothing. So the arrangement is
-        read back through the seam before any test runs.
-        """
-        engine = tmp_path / "engine"
-        published = engine / "address.json"
-        monkeypatch.setattr(bootstrap, "address_path", lambda base_dir=None: published)
-        engine.mkdir()
-        unreached = tmp_path / "unreached.sock"
-        published.write_text(json.dumps({"approvalSocketPath": str(unreached)}))
-        assert bootstrap.approval_socket_path_in({}) == unreached
-        published.unlink()
+    `register` takes no `base_dir`, so a call with neither a channel-config
+    variable nor one resolves the machine's own published address — and while an
+    acceptance engine was publishing, the first test here went red and the third
+    handed a fake Session to a real engine (#229)."""
 
     def test_it_opens_no_socket_and_does_nothing(self) -> None:
         """The first gate, and the reason the cost to an unheld Session is ~33 ms."""

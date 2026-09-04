@@ -13,9 +13,9 @@ registered, so there is no inbox to reach". That is the guard that says nothing
 while the route is dead, which is what ADR 0003 exists to prevent. The peer cause
 is pinned in `test_claude_address_claim.py`; the other two are pinned here.
 
-Every test runs under a `base_dir` of its own: the real
-`~/Library/Application Support/GPT-VoiceCoding/engine/address.json` belongs to
-whatever engine the developer has running.
+Every test reads the address file `conftest.published_address` hands it: the
+real `~/Library/Application Support/GPT-VoiceCoding/engine/address.json`
+belongs to whatever engine the developer has running.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import pytest
 
 from fakes import PROGRESS_CAPTURE
 from gpt_voicecoding.adapters.agent.claude import adapter as adapter_module
-from gpt_voicecoding.adapters.agent.claude import bootstrap
 from gpt_voicecoding.adapters.agent.claude.adapter import ClaudeAgentAdapter
 from gpt_voicecoding.adapters.agent.claude.approval import ApprovalError, ApprovalListener
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
@@ -35,14 +34,6 @@ from gpt_voicecoding.installation import claude_hooks
 
 BIND_REFUSED = "/nowhere/approval.sock is 264 bytes, and a Unix socket path may not exceed 103"
 UNWRITABLE = "[Errno 13] Permission denied: 'address.json'"
-
-
-@pytest.fixture
-def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """The published address, moved off this machine's real one for the test."""
-    path = tmp_path / "engine" / "address.json"
-    monkeypatch.setattr(bootstrap, "address_path", lambda base_dir=None: path)
-    return path
 
 
 def adapter_for(socket_root: Path, claude_config_directory: Path) -> ClaudeAgentAdapter:
@@ -88,7 +79,7 @@ def verify_after_connect(adapter: ClaudeAgentAdapter) -> tuple[str, str]:
 
 
 def test_a_bind_failure_with_an_empty_roster_does_not_report_pass(
-    published: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    published_address: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An engine whose approval socket would not bind published no address, so no
     Session can register with it — and its empty roster is that failure, not a
@@ -102,11 +93,11 @@ def test_a_bind_failure_with_an_empty_roster_does_not_report_pass(
     assert outcome == "fail", "an engine nothing can register with is not passing"
     assert BIND_REFUSED in detail, "the report names the bind error verbatim"
     assert "can register" in detail, "the report says why the roster is empty"
-    assert not published.exists(), "a socket that never bound publishes no address"
+    assert not published_address.exists(), "a socket that never bound publishes no address"
 
 
 def test_an_unwritable_address_with_an_empty_roster_does_not_report_pass(
-    published: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    published_address: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The third cause: the socket bound, but the claim could not be written."""
 
@@ -121,12 +112,12 @@ def test_an_unwritable_address_with_an_empty_roster_does_not_report_pass(
 
     assert outcome == "fail"
     assert UNWRITABLE in detail, "the report names the write error verbatim"
-    assert str(published) in detail, "and the address file it was about"
+    assert str(published_address) in detail, "and the address file it was about"
     assert "can register" in detail
 
 
 def test_a_bind_failure_does_not_replace_a_missing_hook_block(
-    published: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    published_address: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The substitution is the empty-roster PASS and nothing else (ADR 0019).
 

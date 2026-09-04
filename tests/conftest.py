@@ -30,6 +30,17 @@ publish that key, and a key in that directory is this process announcing itself
 as a peer of their open work. Passing a `registry_directory` is the design;
 refusing the real one is what makes forgetting it fail loudly.
 
+**The machine's published engine address.** One file per user per machine says
+where this machine's engine parks permission dialogs (ADR 0019), and both Claude
+hook routes read it with no configuration to go on: with neither a variable nor
+a `base_dir`, `bootstrap.approval_socket_path_in` falls through to it. So a test
+that arranged nothing was asserting against whichever engine the developer had
+up — #229 caught two, which went red and sent a fake Session's registration to a
+real engine whenever an acceptance run was publishing. Passing a `base_dir` is
+the design, and a test that names one still gets the directory it named; what is
+taken away is the machine-wide answer, so forgetting reaches a `tmp_path`
+instead of the developer's own route.
+
 **This file holds fixtures and nothing else.** The fake and the helpers it needs
 live in `launchd_fake.py`, because a test module that imports a `conftest` by
 name is importing whichever `conftest` reached `sys.path` first — and with the
@@ -50,6 +61,8 @@ from pathlib import Path
 
 import pytest
 
+from gpt_voicecoding import locations
+from gpt_voicecoding.adapters.agent.claude import bootstrap
 from gpt_voicecoding.adapters.agent.claude.inbox import ReplyInbox
 from gpt_voicecoding.adapters.agent.claude.registry import DEFAULT_REGISTRY_DIRECTORY
 from gpt_voicecoding.adapters.agent.codex import shared_daemon
@@ -111,6 +124,38 @@ def _no_real_claude_registry(monkeypatch: pytest.MonkeyPatch) -> None:
         real(self)
 
     monkeypatch.setattr(ReplyInbox, "_publish_key", refuse)
+
+
+@pytest.fixture(autouse=True)
+def published_address(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Where the engine says it is, moved off this machine for every test.
+
+    Returned as well as installed, because the tests that pin what a refused or
+    unwritable publish leaves behind have to read the file they moved
+    (`test_claude_address_claim.py`, `test_claude_unpublished_address.py`), and
+    a fixture each of them defined for itself is how #229's two unpinned tests
+    went unnoticed beside them.
+
+    **A `base_dir` a test named is still that directory.** Only the machine-wide
+    answer moves, so `publish_address(..., base_dir=tmp_path)` and every test
+    that checks a path against `locations.address_path(base_dir)` reads exactly
+    what it did before; what changes is the answer to the question no test asked.
+
+    Both spellings are taken, and the second is what keeps this from going
+    quietly inert: `bootstrap` bound `address_path` at import, so patching the
+    module global is what the hook's own lookup goes through today — and
+    patching `locations` is what covers a caller that reaches the source
+    function instead, including one written after this fixture.
+    """
+    path = tmp_path / "engine" / "address.json"
+    real = locations.address_path
+
+    def moved(base_dir: Path | None = None) -> Path:
+        return path if base_dir is None else real(base_dir)
+
+    monkeypatch.setattr(locations, "address_path", moved)
+    monkeypatch.setattr(bootstrap, "address_path", moved)
+    return path
 
 
 @pytest.fixture
