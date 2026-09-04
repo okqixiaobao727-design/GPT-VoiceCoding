@@ -681,6 +681,31 @@ def test_a_span_still_open_does_not_stop_the_watch_early(tmp_path: Path) -> None
     assert watch.went_down is False
 
 
+def test_a_span_the_voice_had_open_before_the_mark_is_still_the_voice_answering(
+    tmp_path: Path,
+) -> None:
+    """Run `20260904T004431Z`: one span covered the previous answer and this one.
+
+    Both lanes. The span opened before the counting request landed and closed
+    only when the answer ended, so no start edge fell inside the window and a
+    watch counting edges alone saw nothing happen through minutes of speech. A
+    `transcript/done` is the Voice saying something, and `_VoiceWatch` is
+    documented as asking exactly that.
+    """
+    walk = _walk(tmp_path)
+    walk.engine = _Talking([_said(journey.VOICE_SAID_LINE % "一二三"), _said("something else")])
+    walk.bridgectl = lambda *_, **__: None
+    walk._call_is_down = lambda: False  # type: ignore[method-assign]
+
+    watch = walk._watch_the_voice(0, deadline_seconds=30.0, poll_seconds=0.01, quiet_seconds=0.05)
+
+    # No edge at all, and the watch still knows the Voice answered — and still
+    # stops on the quiet rather than running to its deadline.
+    assert watch.edges == {True: 0, False: 0}
+    assert watch.last_voice_at is not None
+    assert watch.went_down is False
+
+
 def test_without_the_quiet_window_the_watch_is_the_one_the_long_step_wrote(
     tmp_path: Path,
 ) -> None:

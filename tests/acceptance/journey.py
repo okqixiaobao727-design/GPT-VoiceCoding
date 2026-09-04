@@ -4093,10 +4093,13 @@ class Walk:
         Two facts, and each is one moment on this step's own clock subtracted
         from another rather than a stamp parsed out of the log:
 
-        * **it went on answering for longer than the ceiling.** First edge to
-          last, watched across the stretch (`_VoiceWatch`). Before #184 the only
-          activity the engine counted was the user's transcript, so the call
-          would have gone sixty seconds into this;
+        * **it went on answering for longer than the ceiling.** The request's
+          landing to the Voice's last activity, watched across the stretch
+          (`_VoiceWatch`). Not first edge to last: the Voice need not have
+          stopped speaking since the answer before this one, and on run
+          `20260904T004431Z` one span covered both on either lane. Before #184
+          the only activity the engine counted was the user's transcript, so the
+          call would have gone sixty seconds into this;
         * **every span it opened closed.** A start with no stop is precisely the
           bug (#169): the ceiling firing mid-answer takes the call away before
           the `transcript/done` that would have closed the span. Counted rather
@@ -4123,17 +4126,21 @@ class Walk:
         # watch that counted its tail closes on the quiet after it — run
         # `20260904T000509Z`'s codex lane measured this answer as zero seconds
         # long off a span opened 0.9s before its request was even heard.
+        watching = time.monotonic()
         watch = self._watch_the_voice(
             self._user_speech_landed_at(LIVE_CALL_LONG_HEARD_SUBSTRING, since=asking),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling,
             quiet_seconds=LIVE_CALL_CUE_SECONDS,
         )
         edges = watch.edges
-        answered_for = (
-            0.0
-            if watch.first_voice_at is None or watch.last_voice_at is None
-            else watch.last_voice_at - watch.first_voice_at
-        )
+        # **Measured from the request, not from the Voice's first edge.** The
+        # Voice may not have stopped speaking since the answer before this one:
+        # run `20260904T004431Z` had one span cover the previous answer and this
+        # one on both lanes, so there was no first edge inside the window and the
+        # difference between edges was zero through six minutes of counting. What
+        # the ceiling would have had to hold the call open through is the stretch
+        # since the request, and that is what this measures.
+        answered_for = 0.0 if watch.last_voice_at is None else watch.last_voice_at - watching
         self.journey.observe(
             "live call the voice holds the call open",
             f"ceiling {ceiling:.0f}s; the Voice was answering for {answered_for:.0f}s across "
@@ -4148,11 +4155,11 @@ class Walk:
                 f"{LIVE_CALL_LONG_HEARD_SUBSTRING!r}. Engine log tail: "
                 f"{self._log_since(asking)[-8:]}"
             )
-        if not edges[True]:
+        if watch.last_voice_at is None:
             raise StepFailed(
-                f"the engine never wrote a {VOICE_SPEAKING_LINE!r} line: the words arrived and "
-                f"the Voice answered nothing, so there is no answer for the ceiling to have "
-                f"counted. Engine log tail: {self._log_since(asking)[-5:]}"
+                f"the words arrived and the Voice neither spoke nor closed a span it already "
+                f"had open, so there is no answer for the ceiling to have counted. Edges since "
+                f"the request: {edges}. Engine log tail: {self._log_since(asking)[-5:]}"
             )
         if edges[False] < edges[True]:
             raise StepFailed(
@@ -5020,22 +5027,35 @@ class Walk:
         The poll is a parameter only so that a test of this loop is a test and
         not a wait; every caller here takes the one the rest of the step uses.
         """
-        edges = self._voice_speech_edges(since=mark)
-        first_voice_at = last_voice_at = time.monotonic() if edges[True] else None
+
+        def activity() -> tuple[dict[bool, int], int]:
+            # **A turn counts as much as an edge.** The Voice may already have
+            # been speaking when the mark was taken — run `20260904T004431Z` had
+            # the span covering the counting answer open 0.8s *before* the
+            # request landed, and never close until the answer ended — so a
+            # watch that only counted edges saw nothing happening through four
+            # minutes of speech. `_VoiceWatch` asks "has the Voice said anything
+            # since the last poll", and a `transcript/done` is it saying
+            # something.
+            return self._voice_speech_edges(since=mark), len(self._voice_said_lines(since=mark))
+
+        edges, said = activity()
+        spoke = bool(any(edges.values()) or said)
+        first_voice_at = last_voice_at = time.monotonic() if spoke else None
         expiry = time.monotonic() + deadline_seconds
         while time.monotonic() < expiry:
             if self._call_is_down():
                 break
             time.sleep(poll_seconds)
-            seen = self._voice_speech_edges(since=mark)
-            if seen != edges:
-                edges = seen
+            seen, seen_said = activity()
+            if (seen, seen_said) != (edges, said):
+                edges, said = seen, seen_said
                 last_voice_at = time.monotonic()
                 if first_voice_at is None:
                     first_voice_at = last_voice_at
             elif (
                 quiet_seconds is not None
-                and edges[True] > 0
+                and (edges[True] > 0 or edges[False] > 0 or said > 0)
                 and edges[False] >= edges[True]
                 and last_voice_at is not None
                 and time.monotonic() - last_voice_at >= quiet_seconds
