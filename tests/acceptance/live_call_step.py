@@ -47,6 +47,7 @@ THE_QUESTION_ASKED = journey_module.THE_QUESTION_ASKED
 UNDELIVERED = journey_module.UNDELIVERED
 _address_of = journey_module._address_of
 _history_reading = journey_module._history_reading
+_newest_message = journey_module._newest_message
 _receipt_fields = journey_module._receipt_fields
 
 
@@ -433,29 +434,6 @@ def _unaccounted_voice_turns(lines: list[str], receipts: tuple[str, ...]) -> int
     after = lines[at + 1 :]
     return len(support.matching_lines(after, VOICE_SAID_PATTERN)) - len(
         support.matching_lines(after, MID_CALL_SPOKEN_PATTERN)
-    )
-
-
-def _newest_message(brief: str) -> str:
-    """The Session's newest message, as a Session Brief hands it over (#187).
-
-    One line of a printed brief, read the way a person reads it. A module-level
-    function with no walk behind it for `_hand_over_of_more_than_one`'s reason:
-    two steps read this line — `brief` on the walk's own Session and the folded
-    `live call` on the Session a call was dialled about — and a second parser is
-    a second thing to keep in step with the surface.
-
-    Empty when the brief carries no such line, which is the caller's to complain
-    about: what a missing `newest` means differs between a brief taken after a
-    turn and one taken of a Session that has not spoken.
-    """
-    return next(
-        (
-            line.strip().removeprefix("newest: ")
-            for line in brief.splitlines()
-            if line.strip().startswith("newest: ")
-        ),
-        "",
     )
 
 

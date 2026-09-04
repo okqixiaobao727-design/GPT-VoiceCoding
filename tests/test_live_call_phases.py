@@ -13,6 +13,18 @@ import support
 
 
 def test_no_phase_selection_grades_the_whole_walk_in_ticket_order() -> None:
+    assert live_call_step.PHASES == (
+        "dial",
+        "hand-over",
+        "relay",
+        "detail",
+        "history",
+        "long answer",
+        "mid-call news",
+        "hang-up",
+        "undelivered",
+    )
+
     selected = live_call_step.select_phases()
 
     assert selected.graded == live_call_step.PHASES
@@ -52,6 +64,17 @@ def test_repeated_phase_selection_is_deduplicated_in_ticket_order() -> None:
 
 
 def test_every_phase_has_backwards_only_declared_ground() -> None:
+    assert live_call_step.PHASE_GROUND == {
+        "dial": (),
+        "hand-over": ("dial",),
+        "relay": ("dial",),
+        "detail": ("dial", "relay"),
+        "history": ("dial", "relay"),
+        "long answer": ("dial",),
+        "mid-call news": ("dial", "relay"),
+        "hang-up": ("dial",),
+        "undelivered": (),
+    }
     assert tuple(live_call_step.PHASE_GROUND) == live_call_step.PHASES
     for phase, ground in live_call_step.PHASE_GROUND.items():
         assert set(ground) <= {"dial", "relay"}
@@ -71,6 +94,13 @@ def test_heard_fragments_come_from_the_sentences_put_on_the_track(tmp_path) -> N
         fragment in settings.requests[variant]
         for variant, fragment in live_call.HEARD_FRAGMENTS.items()
     )
+
+
+def test_brief_and_live_call_share_one_newest_message_reader() -> None:
+    printed = "二号工位 · Reply READY\n  state: idle\n  newest: the dictated reply\n"
+
+    assert live_call_step._newest_message is journey._newest_message
+    assert journey._newest_message(printed) == "the dictated reply"
 
 
 def test_an_unknown_phase_refuses_with_the_phase_list() -> None:

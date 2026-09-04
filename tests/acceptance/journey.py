@@ -409,6 +409,18 @@ def _history_reading(printed: str) -> HistoryReading:
     return HistoryReading(entries=tuple(entries), older=older)
 
 
+def _newest_message(brief: str) -> str:
+    """Read the one newest-message field shared by Brief and Live Call (#187, #223)."""
+    return next(
+        (
+            line.strip().removeprefix("newest: ")
+            for line in brief.splitlines()
+            if line.strip().startswith("newest: ")
+        ),
+        "",
+    )
+
+
 ACKNOWLEDGE = Instruction(
     words="Reply with the single word READY. Do not use any tools, and do not ask anything."
 )
@@ -1397,14 +1409,7 @@ class Walk:
         brief = self.bridgectl("brief", self.address)
         if not brief.ok:
             raise StepFailed(f"`bridgectl brief {self.address}` refused: {brief.text}")
-        newest = next(
-            (
-                line.strip().removeprefix("newest: ")
-                for line in brief.text.splitlines()
-                if line.strip().startswith("newest: ")
-            ),
-            None,
-        )
+        newest = _newest_message(brief.text)
         if not newest:
             raise StepFailed(
                 f"`bridgectl brief {self.address}` carried no newest message after a turn: "
