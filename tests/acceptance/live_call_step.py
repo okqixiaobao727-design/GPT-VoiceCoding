@@ -271,9 +271,10 @@ MID_CALL_UNDELIVERED_PATTERN = (
 VOICE_SAID_PATTERN = re.escape(VOICE_SAID_LINE.split("%s")[0])
 
 #: What #173 §6 pins in the sentence the user hears when their last reply never
-#: arrived — "你上次的回复没送到，因为…". Matched as a **substring per #181**,
-#: and the substring is the negated verb rather than the whole phrase, because
-#: the Voice composes the sentence and this run does not get to predict it.
+#: arrived — one clause of reason, in the Voice's own words. Matched as a
+#: **substring per #181**, and the substring is a negation with the verb it
+#: negates, because the Voice composes the sentence and this run does not get to
+#: predict it.
 #:
 #: Mandarin and Cantonese negations vary, so pinning one spelling would grade
 #: the product's own language rule — a Session
@@ -281,7 +282,17 @@ VOICE_SAID_PATTERN = re.escape(VOICE_SAID_LINE.split("%s")[0])
 #: (`instructions/catalogue.py`, `voice.notice.*`) — as a failure. What cannot
 #: vary is that the user is told the words did **not** go: the negation and the
 #: verb. That is what is pinned, and nothing around it.
-UNDELIVERED_SPOKEN_PATTERN = r"[没冇未]送"
+#:
+#: **The verb is not one verb.** This was `[没冇未]送`, which reads the sentence
+#: as being about sending. Run `20260904T091550Z`'s codex lane had the Voice say
+#: `上次没来得及收到回复，因为已经超时了` — the same fact from the reply's side, with
+#: the negation three characters from its verb — and the run graded shipped
+#: behaviour as a failure. Since #224 the instruction says the reason is spoken
+#: "in your own words" (`core/instructions/voice.py`), so the product's own text
+#: is what forbids pinning the wording; what it cannot drop is the negation and
+#: a verb of the words travelling or being received. Simon widened the detector
+#: on 2026-09-04 (#198); the graded fact is unchanged.
+UNDELIVERED_SPOKEN_PATTERN = r"[没沒冇未][^，,。.；;！!？?]{0,6}(?:送|收到|到达|抵达|传达|转达)"
 
 #: The fragment of `live_call.relay_request` the engine's user-speech line has to
 #: carry, chosen the way the other three were: the middle of the sentence, and

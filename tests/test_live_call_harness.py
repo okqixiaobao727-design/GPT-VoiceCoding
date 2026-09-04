@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import wave
 from pathlib import Path
 
@@ -838,6 +839,43 @@ def test_the_spoken_fragment_drops_terminal_punctuation_the_voice_changes() -> N
 
     assert live_call_step._spoken_fragment(f"{words}？") == words
     assert live_call_step._spoken_fragment(f"{words}?") == words
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "上次没来得及收到回复,因为已经超时了。",
+        "你上次的回复没送到,因为超时了。",
+        "上一条回复未送达,原因是超时。",
+        "你的回复冇送到。",
+        "上次的回复没能到达,因为已经超时。",
+    ],
+)
+def test_a_reply_the_voice_says_never_arrived_is_read_however_it_words_it(said: str) -> None:
+    """The Voice words the reason itself (#224), so the detector reads the negation.
+
+    The first of these is run `20260904T091550Z`'s codex lane, which the old
+    `[没冇未]送` graded as the Voice never having spoken the reason at all.
+    """
+    assert re.search(live_call_step.UNDELIVERED_SPOKEN_PATTERN, said)
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "已转达。",
+        "收到,等它这轮结束送进去。",
+        "二号工位没有新的消息。",
+        "我没看到别的会话。",
+    ],
+)
+def test_a_relay_that_did_arrive_is_never_read_as_one_that_did_not(said: str) -> None:
+    """#173 §6's two receipts carry the verb without the negation, and stay out.
+
+    The queued one carries `送` outright, which is why the negation is half of
+    what is matched and the distance between the two halves is bounded.
+    """
+    assert not re.search(live_call_step.UNDELIVERED_SPOKEN_PATTERN, said)
 
 
 def test_a_message_shorter_than_the_fragment_is_the_whole_message() -> None:
