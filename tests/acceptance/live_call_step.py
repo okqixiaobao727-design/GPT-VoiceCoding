@@ -1357,6 +1357,32 @@ class _LiveCallRun:
         counted = self._one_question_the_hand_over_answers(variant=live_call.NEEDS, facts=facts)
         runs_before = counted.ask.wrapper_mark
         asking = counted.ask.landed_at
+        # **This question's own facts are graded before the next one is asked.**
+        # The narrowing ask's quiet-track gate waits for Voice activity that a
+        # first question nobody answered never produced, and blocks the lane —
+        # so a graded product fact would leave as a ground failure, which is the
+        # one thing `LaneBlocked` may never carry (#223 story 3).
+        facts.check(
+            "general question heard",
+            counted.ask.heard,
+            (
+                f"the call came up holding the briefing and the engine never logged the "
+                f"question within {LIVE_CALL_HEARD_SECONDS:.0f}s. The utterance the harness "
+                f"put on the track is {live_call.NEEDS_REQUEST!r} and the line looked for "
+                f"carries {LIVE_CALL_NEEDS_HEARD_SUBSTRING!r}. The call now: "
+                f"{self._call_line()!r}. Engine log tail: {self._log_since(asking)[-8:]}"
+            ),
+        )
+        facts.check(
+            "general question answered",
+            counted.answered,
+            (
+                f"the question reached the engine and the Voice never answered within "
+                f"{LIVE_CALL_ANSWER_SECONDS:.0f}s. A Voice with nothing to say invents rather "
+                f"than going quiet (ADR 0018), so silence here is the call being gone rather "
+                f"than the hand-over being empty: {self._call_line()!r}"
+            ),
+        )
         # **The absence is the narrowing question's**, and the mark is taken
         # here. See the complaint below for why the general question's runs are
         # recorded rather than graded.
@@ -1405,27 +1431,6 @@ class _LiveCallRun:
         facts.record(
             "narrowed answer carried stopped question",
             self._voice_said_something_carrying(stopped_on, since=narrowing),
-        )
-        facts.check(
-            "general question heard",
-            counted.ask.heard,
-            (
-                f"the call came up holding the briefing and the engine never logged the "
-                f"question within {LIVE_CALL_HEARD_SECONDS:.0f}s. The utterance the harness "
-                f"put on the track is {live_call.NEEDS_REQUEST!r} and the line looked for "
-                f"carries {LIVE_CALL_NEEDS_HEARD_SUBSTRING!r}. The call now: "
-                f"{self._call_line()!r}. Engine log tail: {self._log_since(asking)[-8:]}"
-            ),
-        )
-        facts.check(
-            "general question answered",
-            counted.answered,
-            (
-                f"the question reached the engine and the Voice never answered within "
-                f"{LIVE_CALL_ANSWER_SECONDS:.0f}s. A Voice with nothing to say invents rather "
-                f"than going quiet (ADR 0018), so silence here is the call being gone rather "
-                f"than the hand-over being empty: {self._call_line()!r}"
-            ),
         )
         facts.check(
             "general answer carried a count",
