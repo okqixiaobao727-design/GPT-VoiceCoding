@@ -492,6 +492,26 @@ class TestTheVoiceHearsProse:
         assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
         assert at == sorted(at), dict(zip(marks, at, strict=True))
 
+    def test_the_undelivered_reply_is_spoken_between_the_state_and_the_newest(
+        self, instructions
+    ) -> None:
+        """#224: the shape rule names the field, so it is not left to the model."""
+        marks = (
+            "stopped on something the engine could not read",
+            "did not arrive",
+            "what it most recently said",
+        )
+        at = [instructions.voice.text.find(mark) for mark in marks]
+        assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
+        assert at == sorted(at), dict(zip(marks, at, strict=True))
+
+    def test_both_forms_of_the_undelivered_sentence_are_named(self, instructions) -> None:
+        """Briefing words one of two arrivals (#197), and neither may be invented."""
+        assert "did not arrive" in instructions.voice.text
+        assert "may not have arrived" in instructions.voice.text
+        assert "whichever of the two it said" in instructions.voice.text
+        assert "say that it did not and" not in instructions.voice.text
+
     def test_the_post_relay_sentences_are_the_ones_round_1_settled(self, instructions) -> None:
         assert "已转达" in instructions.voice.text
         assert "收到，等它这轮结束送进去" in instructions.voice.text

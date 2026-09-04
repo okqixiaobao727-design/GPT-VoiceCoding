@@ -88,7 +88,7 @@ from gpt_voicecoding.seams.call import (
     UserSpeech,
     VoiceSpeech,
 )
-from gpt_voicecoding.seams.delivery import Delivery
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 from gpt_voicecoding.seams.identity import new_request_id
 
 _log = logging.getLogger(__name__)
@@ -499,7 +499,7 @@ class CallTime:
         del now
         self._dial_owed = False
 
-    def spoke(self, now: float) -> None:
+    def spoke(self, now: float, *, delivered_at: float | None) -> None:
         """A brief was handed to the call — delivered, refused, or raised on.
 
         All three stamp the interval and clear the flag, by #195's rule that one
@@ -507,9 +507,31 @@ class CallTime:
         the next gap holding a reading it had already taken, which is the replay
         ADR 0017 forbids in another shape; the next wake-worthy event arms it
         again, and that one is news.
+
+        **A delivered hand-off restarts the silence window** (#225), exactly as
+        the dial does for the hand-over brief: words in the Voice's hands are a
+        working moment of the call, not silence. The Voice's own first delta is a
+        later event, and the two clocks can leave less than one model-response
+        latency between them — a ring that consumed the shared interval is enough
+        to land the word inside a ceiling that has been counting since the last
+        answer. What this does *not* do is set the speaking flag: the settle
+        window and the gap stay driven by real speech edges, so a Voice that
+        never opens still ends the call, one full ceiling from here.
+
+        A speak that reached nobody restarts nothing, and `delivered_at` is None
+        for it: the outcome is the receipt the shell saw, which is why it comes
+        in rather than being assumed here.
+
+        **Two moments, not one.** `now` opened the gap and paces the interval;
+        `delivered_at` is when the receipt came back, which is later by however
+        long the wire took to accept the append — and it is the window's start,
+        because a window begun before the hand-off is short by exactly the time
+        the hand-off took.
         """
         self._focus_owed = False
         self._last_sounded_at = now
+        if delivered_at is not None:
+            self._note_activity(delivered_at)
 
     def nothing_to_speak(self, now: float) -> None:
         """The Briefer answered `None` at the gap: the word is cancelled, silently.
@@ -886,16 +908,24 @@ class CallKeeper:
         **The attempt is stamped whether or not it lands.** The interval is
         recorded before the refusal travels on, so an adapter that raises cannot
         be asked again in the same gap; `_unattended` writes down what happened.
+        The *receipt*, though, is carried into `spoke`: only a delivered hand-off
+        restarts the Silence Ceiling (#225), and an adapter that raised has no
+        receipt at all. The clock is read **again** for it. `now` was read before
+        the wire was awaited, and the window has to start where the hand-off
+        finished — otherwise a `speak` the wire took ten seconds to accept buys
+        ten seconds less than the ceiling it is owed.
         """
         brief = self._briefer.focus_brief()
         if brief is None:
             _log.info(MID_CALL_NOTHING_LINE)
             self._time.nothing_to_speak(now)
             return
+        receipt: DeliveryReceipt | None = None
         try:
             receipt = await self._call.speak(brief, request_id=new_request_id())
         finally:
-            self._time.spoke(now)
+            landed = receipt is not None and receipt.is_delivered
+            self._time.spoke(now, delivered_at=self._clock() if landed else None)
         if receipt.outcome is Delivery.DELIVERED:
             # The Session's name, and nothing else off the brief: a whole-lane
             # run has no other way to tell *which* Session was announced, and
