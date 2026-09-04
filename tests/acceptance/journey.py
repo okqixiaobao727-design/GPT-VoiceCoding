@@ -624,7 +624,7 @@ def _spoken_fragment(said: str, *, longest: int = 12) -> str:
 
     Twelve characters because both lanes' driven turns answer with a dictated
     line (`ACKNOWLEDGE`, `ASK_A_QUESTION`) whose opening words are the whole of
-    what there is to quote — `Should I continue?` is seventeen — and because a
+    what there is to quote — `ACKNOWLEDGE`'s `READY` is five — and because a
     fragment long enough to span a clause boundary is one the Voice will have
     reworded. Empty in, empty out: the caller checks.
     """
@@ -1018,7 +1018,24 @@ ACKNOWLEDGE = Instruction(
 #: and what phase 2 grades the narrowed answer against, and reading it back out
 #: with a `split(":")` was a parse that held only while the sentence carried one
 #: colon — `ASK_A_QUESTION_THEN_SAY` carries two.
-THE_QUESTION_ASKED = "Should I continue?"
+#:
+#: **Chinese, for `live_call.DICTATED_REPLY`'s reason.** It was `Should I
+#: continue?`, and run `20260903T235107Z`'s claude lane had the Voice answer
+#: `它最近问:「要继续吗?」` — a faithful translation sharing no character with it,
+#: graded as the Voice failing to say what the Session last said. The Voice
+#: speaks the user's language (`instructions/catalogue.py`), so any English line
+#: it is asked to quote is one it will render rather than repeat. The
+#: full-width `？` is the interrogative `core/briefing.py::_ASKS` is surest of:
+#: that rule takes either width and its own comment calls the English side
+#: uncertain (#176 §1.2).
+THE_QUESTION_ASKED = "需要我把这件事做完吗？"
+
+#: The fragment of it the Voice's answer is graded on. Punctuation is left out
+#: because the Voice has been seen to re-punctuate a quotation — `「要继续吗?」`
+#: for a line ending `?` — and the words are what the grade is about. It shares
+#: no run with `LIVE_CALL_DICTATED_REPLY_SUBSTRING`, so the question and the
+#: answer to it cannot pass for each other.
+QUESTION_ASKED_SPOKEN_SUBSTRING = "把这件事做完"
 
 ASK_A_QUESTION = Instruction(
     words=(
@@ -3277,7 +3294,7 @@ class Walk:
         is `newest` (`seams/call.py`), and those are two readings of one turn that
         land at different times. What this waits for is the one the walk grades.
         """
-        wanted = _spoken_fragment(THE_QUESTION_ASKED)
+        wanted = QUESTION_ASKED_SPOKEN_SUBSTRING
         landed = support.wait_for(
             lambda: (
                 _unspaced(wanted)
@@ -3438,10 +3455,12 @@ class Walk:
         # what the engine was holding when the call came up rather than anything
         # the answers themselves moved.
         newest = _newest_message(self._brief_of(focus_address))
-        if not newest:
+        if QUESTION_ASKED_SPOKEN_SUBSTRING not in _unspaced(newest):
             raise LaneBlocked(
-                f"`bridgectl brief {focus_address}` carries no `newest` line, so there is "
-                f"nothing for the narrowed answer to be compared against"
+                f"`bridgectl brief {focus_address}` holds {newest[:200]!r} as its newest "
+                f"message, which is not the question this Session was told to stop on "
+                f"({THE_QUESTION_ASKED!r}), so there is nothing for the narrowed answer to be "
+                f"compared against"
             )
         runs_before = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         asking = len(self.engine.log_lines())
@@ -3484,7 +3503,7 @@ class Walk:
             )
         ]
         answered_narrowly = self._voice_said_lines(since=narrowing)
-        stopped_on = _spoken_fragment(THE_QUESTION_ASKED)
+        stopped_on = QUESTION_ASKED_SPOKEN_SUBSTRING
         # What this call came up holding, so the recorded runs can be read
         # against it: a Call Agent re-reading a roster it was handed ten items of
         # is the thing #194's instruction rewording was for.
@@ -3550,7 +3569,9 @@ class Walk:
         # `SpokenBrief` carries the newest message (`seams/call.py`), so an
         # answer naming the Session and quoting what it last said is one taken
         # from a Session Brief, whichever half fetched it.
-        if not self._voice_said_something_carrying(_spoken_fragment(newest), since=narrowing):
+        if not self._voice_said_something_carrying(
+            QUESTION_ASKED_SPOKEN_SUBSTRING, since=narrowing
+        ):
             raise StepFailed(
                 f"the user narrowed to {focus_name!r} and the Voice named it without saying "
                 f"what it last said. A Session Brief is its project and task, its agent, where "

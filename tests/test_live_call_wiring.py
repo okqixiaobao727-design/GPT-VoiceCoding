@@ -858,7 +858,7 @@ def test_every_utterance_that_asks_about_a_session_names_it(tmp_path: Path) -> N
 def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
     """Phase 3 is an *answer* to the question the Session stopped on (#198).
 
-    The Session asked `Should I continue?` (`journey.ASK_A_QUESTION`), so the
+    The Session asked `journey.THE_QUESTION_ASKED`, so the
     payload is what the user says back — and what the Session's next turn then
     carries, which is what the step reads. Deliberately not `收到`: that is the
     wording the Voice says for a **queued** receipt (`instructions/voice.py`),
@@ -869,6 +869,33 @@ def test_the_answer_utterance_carries_the_words_the_session_is_told() -> None:
 
     assert journey.LIVE_CALL_ANSWER_SUBSTRING in said
     assert journey.RELAY_RECEIPT_QUEUED not in said
+
+
+def test_the_question_a_session_stops_on_is_one_the_voice_reads_out() -> None:
+    """The Voice speaks the user's language, so an English line it quotes it renders.
+
+    Run `20260903T235107Z`'s claude lane answered `它最近问:「要继续吗?」` of a
+    Session told to say `Should I continue?` — a faithful translation, graded as
+    the Voice failing to say what the Session last said. The dictated question is
+    Chinese for `live_call.DICTATED_REPLY`'s reason, and what is graded is its
+    words without the punctuation the Voice has been seen to change.
+    """
+    question = journey.THE_QUESTION_ASKED
+
+    assert question in journey.ASK_A_QUESTION.words
+    assert journey.QUESTION_ASKED_SPOKEN_SUBSTRING in question
+    # Either width satisfies `core/briefing.py::_ASKS`; the full-width mark is
+    # the one that rule's own comment is surest of (#176 §1.2).
+    assert question.endswith("？")
+    # Not a run of the answer to it, or the two could pass for each other.
+    assert journey.QUESTION_ASKED_SPOKEN_SUBSTRING not in live_call.DICTATED_REPLY
+    assert journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING not in question
+    # No punctuation in either graded fragment, for the same reason.
+    for fragment in (
+        journey.QUESTION_ASKED_SPOKEN_SUBSTRING,
+        journey.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
+    ):
+        assert not any(mark in fragment for mark in "?？。，,「」“”:：")
 
 
 def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
