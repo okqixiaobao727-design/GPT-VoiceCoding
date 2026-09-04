@@ -75,31 +75,51 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Never
 
+import hand_started
+import journey as journey_module
+import live_call_step
 import pytest
+import support
 
-from gpt_voicecoding.seams.identity import AgentKind
-
-pytest.importorskip(
-    "telethon",
-    reason="the acceptance's one actor is a Telegram user account: pip install -e '.[acceptance]'",
-)
-
-import hand_started  # noqa: E402
-import journey as journey_module  # noqa: E402
-import live_call_step  # noqa: E402
-import support  # noqa: E402 - after the skip, so a venv without the extra collects cleanly
-import telegram_person  # noqa: E402
-
-from gpt_voicecoding.adapters.companion_channel.telegram.api import (  # noqa: E402
+from gpt_voicecoding.adapters.companion_channel.telegram.api import (
     TelegramError,
     Transport,
     http_transport,
 )
-from gpt_voicecoding.adapters.companion_channel.telegram.settings import (  # noqa: E402
+from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
     DEFAULT_API_ROOT,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
 )
-from gpt_voicecoding.config import default_socket_path  # noqa: E402
+from gpt_voicecoding.config import default_socket_path
+from gpt_voicecoding.seams.identity import AgentKind
+
+#: Why a run without the `acceptance` extra cannot walk a lane.
+ACTOR_MISSING = (
+    "the acceptance's one actor is a Telegram user account: pip install -e '.[acceptance]'"
+)
+
+#: `telegram_person` is the only module in this suite that reaches telethon
+#: (`pyproject.toml`'s `pythonpath` note says the same of `journey`'s side), so it
+#: is the only import the extra gates.
+#:
+#: **Imported lazily, and the skip moved onto the tests, because this file used to
+#: skip at import.** A module-level `importorskip` aborts the whole conftest before
+#: any hook it defines is registered — including `pytest_addoption` and the
+#: `--phase requires --step 'live call'` refusal below, which are facts about the
+#: *command line* and not about the environment. CI installs `.[dev]` and not
+#: `.[acceptance]` (`.github/workflows/ci.yml`), so under the old order that
+#: refusal was unreachable exactly where it is graded (#198).
+try:
+    import telegram_person
+except ModuleNotFoundError:  # pragma: no cover - the extra is installed on the run machine
+    telegram_person = None  # type: ignore[assignment]
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """The actor's absence skips the tests that need it, not this file's import."""
+    if telegram_person is None and "acceptance" in item.keywords:
+        pytest.skip(ACTOR_MISSING)
+
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 
