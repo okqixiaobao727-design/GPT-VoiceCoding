@@ -775,10 +775,32 @@ def _as_value(value: Any) -> str:
 # --- the engine under test --------------------------------------------------
 
 #: How long the engine gets to bind its socket before the run gives up on it.
-#: The engine's start is a config load, an adapter import and a bind — no network
-#: and no subprocess — so this is generous rather than derived; a slow one is a
-#: finding, and the log says why.
+#: Generous rather than derived; a slow one is a finding, and the log says why.
+#:
+#: **Deliberately not raised for a loaded machine.** On 2026-09-04 three runs
+#: refused here at 22–31s while another session held this Mac at load 20–49; a
+#: `sample` of a starting engine sat in `waitpid`, which is fork/exec starvation
+#: rather than a child slow by design. A deadline long enough to pass under that
+#: load would also have to stretch the Cool-down window, the Silence Ceiling and
+#: the Voice watch — every one of which is a *measurement*, not a wait. A walk
+#: that passed by widening them would be grading the machine. So the refusal
+#: says what the load was (`load_now`) and the run is made again when it drops.
 ENGINE_START_SECONDS = 30.0
+
+
+def load_now() -> str:
+    """The machine's load averages, so a refusal can say whether it was the machine.
+
+    Read at the moment of the complaint rather than at the start of the run: what
+    a reader needs to know is what this engine was competing with while it failed
+    to bind.
+    """
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:  # pragma: no cover - POSIX always has it; a refusal still reads
+        return "load unavailable"
+    return f"load {one:.1f} / {five:.1f} / {fifteen:.1f} (1/5/15 min)"
+
 
 #: The grace a stopped engine gets to unlink its socket and let its Sessions go.
 ENGINE_STOP_SECONDS = 20.0
@@ -899,7 +921,7 @@ class Engine:
         self.stop()
         raise EngineRefused(
             f"the engine did not bind {self._config.socket_path} within "
-            f"{ENGINE_START_SECONDS:.0f}s; log at {self._config.log_path}"
+            f"{ENGINE_START_SECONDS:.0f}s at {load_now()}; log at {self._config.log_path}"
         )
 
     def stop(self) -> None:

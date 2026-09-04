@@ -34,6 +34,7 @@ from pathlib import Path
 import journey
 import live_call
 import pytest
+import support
 
 from gpt_voicecoding.adapters.call.realtime import cues
 from gpt_voicecoding.adapters.call.realtime.webrtc import FRAME_SAMPLES, SAMPLE_RATE
@@ -747,6 +748,25 @@ def test_a_queued_receipt_is_a_receipt_too() -> None:
 def test_a_receipt_the_recogniser_put_a_space_inside_is_still_a_receipt() -> None:
     """Run `20260902T093755Z`'s inserted space, on the Voice's side (#181)."""
     assert journey._unaccounted_voice_turns([_said("已转 达了")], RECEIPTS) == 0
+
+
+def test_a_refusal_to_bind_says_what_the_machine_was_doing() -> None:
+    """A bind deadline missed under load is the machine, not the engine (#198).
+
+    Three runs on 2026-09-04 refused at 22–31s while another session held this
+    Mac at load 20–49, and a `sample` of a starting engine sat in `waitpid`. The
+    refusal is the only place a reader learns that, so it carries the load rather
+    than leaving the next person to guess — and the deadline stays where it is,
+    because every other timed read in the walk is a measurement that widening it
+    would spoil.
+    """
+    said = support.load_now()
+
+    assert said.startswith("load ")
+    assert said.endswith("(1/5/15 min)")
+    averages = said.removeprefix("load ").removesuffix(" (1/5/15 min)").split(" / ")
+    assert len(averages) == 3
+    assert all(float(average) >= 0 for average in averages)
 
 
 def test_a_window_with_no_receipt_in_it_is_not_this_rules_complaint() -> None:
