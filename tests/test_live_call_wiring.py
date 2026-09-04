@@ -576,12 +576,14 @@ def test_a_new_voice_span_restarts_the_settle_window_before_the_next_ask(
     monkeypatch.setattr(walk, "_voice_was_active", lambda *, since: True, raising=False)
     facts = live_call_step._PhaseFacts("graded")
 
-    walk._wait_for_a_quiet_track(live_call.LONG, since=17, facts=facts)
+    walk._wait_for_a_quiet_track(live_call.LONG, since=17, activity_owed=True, facts=facts)
 
     assert clock.now == pytest.approx(6.5)
     assert facts.graded == {}
     assert facts.failed == []
-    assert facts.recorded["voice track waits"] == [f"{live_call.LONG}: settled=True, waited=6.5s"]
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.LONG}: owed=True, settled=True, waited=6.5s"
+    ]
 
 
 def test_no_edges_wait_for_the_delayed_voice_answer_before_settling(
@@ -615,11 +617,54 @@ def test_no_edges_wait_for_the_delayed_voice_answer_before_settling(
     monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
     facts = live_call_step._PhaseFacts("graded", phase="history")
 
-    walk._wait_for_a_quiet_track(live_call.HISTORY, since=0, facts=facts)
+    walk._wait_for_a_quiet_track(live_call.HISTORY, since=0, activity_owed=True, facts=facts)
 
     assert clock.now == pytest.approx(6.0)
     assert facts.recorded["voice track waits"] == [
-        f"{live_call.HISTORY}: settled=True, waited=6.0s"
+        f"{live_call.HISTORY}: owed=True, settled=True, waited=6.0s"
+    ]
+
+
+def test_a_mark_that_owes_no_activity_settles_on_an_empty_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A call opened under `ask_for_nothing` is quiet by contract (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="hand-over")
+
+    walk._wait_for_a_quiet_track(live_call.NEEDS, since=0, activity_owed=False, facts=facts)
+
+    assert clock.now == pytest.approx(2.0)
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.NEEDS}: owed=False, settled=True, waited=2.0s"
+    ]
+
+
+def test_a_mark_that_owes_activity_still_blocks_when_voice_never_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The silent-opening carve-out cannot weaken a real stimulus (#223)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_ANSWER_SECONDS", 1.0)
+    monkeypatch.setattr(live_call_step, "LIVE_CALL_POLL_SECONDS", 0.5)
+    walk = _walk(tmp_path)
+    monkeypatch.setattr(walk, "_call_is_down", lambda: False)
+    monkeypatch.setattr(walk, "_speech_settle_seconds", lambda: 2.0)
+    facts = live_call_step._PhaseFacts("graded", phase="history")
+
+    with pytest.raises(support.LaneBlocked):
+        walk._wait_for_a_quiet_track(live_call.HISTORY, since=0, activity_owed=True, facts=facts)
+
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.HISTORY}: owed=True, settled=False, waited=3.5s"
     ]
 
 
@@ -630,7 +675,7 @@ def _arranged_relay(
         tmp_path,
         lines=[_said("older activity"), _said(live_call_step.VOICE_QUIET_LINE)],
     )
-    walk._voice_track_mark = 1
+    walk._voice_track = live_call_step._VoiceTrackMark(at=1, activity_owed=False)
     walk.lane = SimpleNamespace(name="claude")
     walk.journal = lambda *_, **__: None
 
@@ -665,14 +710,20 @@ def _arranged_relay(
 @pytest.mark.parametrize(
     ("decision", "expected_mark"),
     (
-        (live_call_step.MID_CALL_SPOKEN_LINE % ("the dictated reply", "none"), 2),
-        (live_call_step.MID_CALL_NOTHING_LINE, 1),
+        (
+            live_call_step.MID_CALL_SPOKEN_LINE % ("the dictated reply", "none"),
+            live_call_step._VoiceTrackMark(at=2, activity_owed=True),
+        ),
+        (
+            live_call_step.MID_CALL_NOTHING_LINE,
+            live_call_step._VoiceTrackMark(at=1, activity_owed=False),
+        ),
     ),
 )
 def test_arranged_relay_marks_only_a_decision_that_made_voice_speak(
     tmp_path: Path,
     decision: str,
-    expected_mark: int,
+    expected_mark: live_call_step._VoiceTrackMark,
 ) -> None:
     """The relay invocation is the latest stimulus only when Keeper spoke it (#223)."""
     walk, state = _arranged_relay(tmp_path, decision)
@@ -680,7 +731,7 @@ def test_arranged_relay_marks_only_a_decision_that_made_voice_speak(
 
     walk._arrange_relay(state, facts)
 
-    assert walk._voice_track_mark == expected_mark
+    assert walk._voice_track == expected_mark
     assert decision in facts.recorded["mid-call decision"]
 
 
@@ -700,7 +751,7 @@ def test_focus_stop_becomes_the_latest_voice_stimulus_before_it_is_driven(
 ) -> None:
     """The next ask must wait on Voice activity caused by mid-call Focus news (#223)."""
     walk = _walk(tmp_path)
-    walk._voice_track_mark = 0
+    walk._voice_track = live_call_step._VoiceTrackMark(at=0, activity_owed=False)
     focus = object()
     ringing = object()
 
@@ -709,7 +760,9 @@ def test_focus_stop_becomes_the_latest_voice_stimulus_before_it_is_driven(
             walk.engine._lines.append(_said("the non-Focus Session rang"))
             return
         assert session is focus
-        assert walk._voice_track_mark == len(walk.engine.log_lines())
+        assert walk._voice_track == live_call_step._VoiceTrackMark(
+            at=len(walk.engine.log_lines()), activity_owed=True
+        )
         walk.engine._lines.extend(
             (
                 _said(live_call_step.VOICE_QUIET_LINE),
@@ -771,13 +824,15 @@ def test_an_unsettled_voice_track_blocks_the_phase_before_the_next_ask(
     facts = live_call_step._PhaseFacts("graded", phase="long answer")
 
     with pytest.raises(support.LaneBlocked) as blocked:
-        walk._wait_for_a_quiet_track(live_call.PLAIN, since=0, facts=facts)
+        walk._wait_for_a_quiet_track(live_call.PLAIN, since=0, activity_owed=True, facts=facts)
 
     assert "phase 'long answer'" in str(blocked.value)
     assert f"variant {live_call.PLAIN!r}" in str(blocked.value)
     assert "waited 3.5s" in str(blocked.value)
     assert last_words in str(blocked.value)
-    assert facts.recorded["voice track waits"] == [f"{live_call.PLAIN}: settled=False, waited=3.5s"]
+    assert facts.recorded["voice track waits"] == [
+        f"{live_call.PLAIN}: owed=True, settled=False, waited=3.5s"
+    ]
 
 
 def test_ask_by_voice_never_queues_after_the_track_wait_blocks(
@@ -785,12 +840,12 @@ def test_ask_by_voice_never_queues_after_the_track_wait_blocks(
 ) -> None:
     """The pacing gate is inside the one ask primitive, ahead of its only queue (#223)."""
     walk = _walk(tmp_path)
-    walk._voice_track_mark = 23
-    waited: list[tuple[str, int]] = []
+    walk._voice_track = live_call_step._VoiceTrackMark(at=23, activity_owed=False)
+    waited: list[tuple[str, int, bool]] = []
     queued: list[str] = []
 
-    def block(variant: str, *, since: int, facts: object) -> None:  # noqa: ARG001
-        waited.append((variant, since))
+    def block(variant: str, *, since: int, activity_owed: bool, facts: object) -> None:  # noqa: ARG001
+        waited.append((variant, since, activity_owed))
         raise support.LaneBlocked("the Voice track did not settle")
 
     monkeypatch.setattr(walk, "_wait_for_a_quiet_track", block)
@@ -799,8 +854,32 @@ def test_ask_by_voice_never_queues_after_the_track_wait_blocks(
     with pytest.raises(support.LaneBlocked):
         walk._ask_by_voice(live_call.LONG, live_call_step._PhaseFacts("graded"))
 
-    assert waited == [(live_call.LONG, 23)]
+    assert waited == [(live_call.LONG, 23, False)]
     assert queued == []
+
+
+def test_a_queued_ask_becomes_the_next_activity_owed_mark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    walk = _walk(tmp_path, lines=[_said("before"), _said("opening")])
+    walk._voice_track = live_call_step._VoiceTrackMark(at=1, activity_owed=False)
+    waited: list[tuple[int, bool]] = []
+
+    monkeypatch.setattr(
+        walk,
+        "_wait_for_a_quiet_track",
+        lambda _variant, *, since, activity_owed, facts: waited.append(  # noqa: ARG005
+            (since, activity_owed)
+        ),
+    )
+    monkeypatch.setattr(live_call, "ask_next", lambda *_args: None)
+    monkeypatch.setattr(walk, "_while_the_call_is_up", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(walk, "_user_speech_landed_at", lambda *_args, **_kwargs: 2)
+
+    walk._ask_by_voice(live_call.LONG, live_call_step._PhaseFacts("graded"))
+
+    assert waited == [(1, False)]
+    assert walk._voice_track == live_call_step._VoiceTrackMark(at=2, activity_owed=True)
 
 
 def test_both_edges_of_the_voice_are_counted_off_the_engine_log(tmp_path: Path) -> None:

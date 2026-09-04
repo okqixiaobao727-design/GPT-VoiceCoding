@@ -485,6 +485,14 @@ def _no_call_is_up(call_line: str) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class _VoiceTrackMark:
+    """One log position and whether its stimulus owes Voice activity (#223)."""
+
+    at: int
+    activity_owed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _SpokenAsk:
     """The two pre-ask marks and the engine line where the words landed (#223)."""
 
@@ -707,7 +715,7 @@ class _LiveCallRun:
     def __init__(self, walk: journey_module.Walk, selection: PhaseSelection | None = None) -> None:
         self.walk = walk
         self.selection = selection if selection is not None else select_phases()
-        self._voice_track_mark: int | None = None
+        self._voice_track: _VoiceTrackMark | None = None
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.walk, name)
@@ -773,7 +781,7 @@ class _LiveCallRun:
                 live_call.ask_for_nothing(self.config.call_wav_directory)
                 mark = len(self.engine.log_lines())
 
-            self._voice_track_mark = mark
+            self._voice_track = _VoiceTrackMark(at=mark, activity_owed=False)
             state = _LiveCallState(
                 focus=_ExtraSession(focus, focus_at, focus_address),
                 ringing=_ExtraSession(ringing, ringing_at, ringing_address),
@@ -926,12 +934,17 @@ class _LiveCallRun:
 
     def _ask_by_voice(self, variant: str, facts: _PhaseFacts) -> _SpokenAsk:
         """Queue one WAV into a quiet track and return both marks plus its landing (#223)."""
-        assert self._voice_track_mark is not None
-        self._wait_for_a_quiet_track(variant, since=self._voice_track_mark, facts=facts)
+        assert self._voice_track is not None
+        self._wait_for_a_quiet_track(
+            variant,
+            since=self._voice_track.at,
+            activity_owed=self._voice_track.activity_owed,
+            facts=facts,
+        )
         engine_mark = len(self.engine.log_lines())
         wrapper_mark = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         heard_fragment = HEARD_FRAGMENTS[variant]
-        self._voice_track_mark = engine_mark
+        self._voice_track = _VoiceTrackMark(at=engine_mark, activity_owed=True)
         live_call.ask_next(self.config.call_wav_directory, variant)
         heard = self._while_the_call_is_up(
             lambda: bool(self._user_speech_lines(heard_fragment, since=engine_mark)),
@@ -944,7 +957,14 @@ class _LiveCallRun:
             heard=heard,
         )
 
-    def _wait_for_a_quiet_track(self, variant: str, *, since: int, facts: _PhaseFacts) -> None:
+    def _wait_for_a_quiet_track(
+        self,
+        variant: str,
+        *,
+        since: int,
+        activity_owed: bool,
+        facts: _PhaseFacts,
+    ) -> None:
         """Hold the next utterance until prior Voice spans and their gap settle (#223)."""
         started = time.monotonic()
         settle = self._speech_settle_seconds()
@@ -952,7 +972,7 @@ class _LiveCallRun:
 
         def track_settled() -> bool:
             nonlocal quiet_since
-            if not self._voice_was_active(since=since):
+            if activity_owed and not self._voice_was_active(since=since):
                 quiet_since = None
                 return False
             if self._a_voice_span_is_open(since=since):
@@ -972,7 +992,7 @@ class _LiveCallRun:
         if not isinstance(waits, list):
             waits = []
             facts.record("voice track waits", waits)
-        waits.append(f"{variant}: settled={settled}, waited={waited:.1f}s")
+        waits.append(f"{variant}: owed={activity_owed}, settled={settled}, waited={waited:.1f}s")
         if not settled:
             said = self._voice_said_lines(since=since)
             raise LaneBlocked(
@@ -1029,7 +1049,7 @@ class _LiveCallRun:
     def _arrange_relay(self, state: _LiveCallState, facts: _PhaseFacts) -> str:
         """A direct Relay settles both History and Brief ground (#223 story 15)."""
         address = state.focus.address(self)
-        assert self._voice_track_mark is not None
+        assert self._voice_track is not None
         stimulus_mark = len(self.engine.log_lines())
         relayed = self.bridgectl(
             "relay",
@@ -1109,7 +1129,7 @@ class _LiveCallRun:
         outcome, line = decision
         facts.record("mid-call decision", line)
         if outcome == "spoken":
-            self._voice_track_mark = stimulus_mark
+            self._voice_track = _VoiceTrackMark(at=stimulus_mark, activity_owed=True)
         return (
             f"direct Relay to {address} answered {relayed.text!r}; History and Brief newest "
             f"both carried {LIVE_CALL_DICTATED_REPLY_SUBSTRING!r} at {read_at}"
@@ -2224,7 +2244,7 @@ class _LiveCallRun:
         # a Session the reading finds no longer needs the user cancels the word
         # silently and correctly (`call_keeper.py::nothing_to_speak`).
         owing = len(self.engine.log_lines())
-        self._voice_track_mark = owing
+        self._voice_track = _VoiceTrackMark(at=owing, activity_owed=True)
         self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION)
         # **What the brief will be about**, waited for rather than read once: the
         # announcement is spoken from a reading taken at the gap (ADR 0017), so
