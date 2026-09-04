@@ -3631,12 +3631,15 @@ class Walk:
         * **the Call Agent ran `relay`** — a lower bound of one run of that verb,
           whatever else it ran. Which Session it chose is recorded and not
           graded: grading it would grade the Voice;
-        * **that Session's next turn carries the answer.** Read through
-          `bridgectl history`, which is the surface a user gets, rather than off
-          a record this harness took no ground truth for. The address is read
-          again first: a row is re-keyed as the lane learns more about it, and an
-          address held across a turn can name a row the registry no longer holds
-          (`sessions.py::_better_known`, run `20260903T111253Z`);
+        * **that Session's next turn is the one only a relay produces.** Read
+          through `bridgectl history`, which is the surface a user gets, rather
+          than off a record this harness took no ground truth for. The address is
+          read again first: a row is re-keyed as the lane learns more about it,
+          and an address held across a turn can name a row the registry no longer
+          holds (`sessions.py::_better_known`, run `20260903T111253Z`). What is
+          looked for is `live_call.DICTATED_REPLY` and not the relayed words:
+          a Claude Session's record drops them with the plumbing (#222), so the
+          effect is the fact and the words are recorded beside it;
         * **the Voice said the grade the engine gave those words.** `已转达` for
           a delivered relay, `收到` for one queued behind that Session's turn
           (#193 §Voice). One of the two, because a run cannot choose which grade
@@ -3686,15 +3689,29 @@ class Walk:
             lambda: bool(self._voice_said_matching(RECEIPT_SPOKEN_PATTERNS, since=at_relay)),
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
         )
-        # The Session's own next turn, through the surface a user reads it on.
-        # Budget is one turn plus the Relay's own deadline: the words wait in the
-        # Reply Window until the Session can take them.
+        # **Delivery is read off the Session's next turn, not off the record
+        # holding the words.** `ASK_A_QUESTION_THEN_SAY` has this Session answer
+        # a further message with `live_call.DICTATED_REPLY`, so that line is one
+        # only a Session the relay reached can say — the effect, which is how the
+        # `relay` step §3 cites proves delivery too.
+        #
+        # The words themselves are recorded and not graded, because one lane's
+        # record does not carry them: a relay arrives at a Claude Session as
+        # `promptSource=system`, `stop_analysis.is_visible` drops every such
+        # record and `history()` reads through `transcript_tail.visible`, so the
+        # user's words go out with the plumbing (#222). Run `20260904T000509Z`'s
+        # claude lane has entries 9 and 10 both `assistant` with nothing between
+        # them; codex's carries it. Before the reply was dictated this passed by
+        # accident — that Session quoted the words back in its own answer.
         carried = support.wait_for(
             lambda: self._history_of_a_session_carries(
-                focus_at, focus_address, LIVE_CALL_ANSWER_SUBSTRING
+                focus_at, focus_address, LIVE_CALL_DICTATED_REPLY_SUBSTRING
             ),
             deadline_seconds=turn + support.RELAY_DEADLINE_SECONDS,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
+        )
+        relayed_words_kept = self._history_of_a_session_carries(
+            focus_at, focus_address, LIVE_CALL_ANSWER_SUBSTRING
         )
         # Read after the Session's turn has landed, so the window this counts
         # over is the one the payment would have fallen in.
@@ -3720,7 +3737,9 @@ class Walk:
             f"does not grade: {premature or 'none'}, against the relay at "
             f"{self._verbs_run(since=runs_before)[-1:] or 'nothing'}; "
             f"what the Call Agent ran before the relay: "
-            f"{self._verbs_run(since=runs_before)[:-1] or 'nothing'}",
+            f"{self._verbs_run(since=runs_before)[:-1] or 'nothing'}; whether "
+            f"{LIVE_CALL_ANSWER_SUBSTRING!r} itself is kept in {focus_address}'s record — "
+            f"recorded, not graded (#222): {relayed_words_kept}",
         )
         if not heard:
             raise StepFailed(
@@ -3737,11 +3756,12 @@ class Walk:
             )
         if not carried:
             raise StepFailed(
-                f"the Call Agent relayed with {relays} and {LIVE_CALL_ANSWER_SUBSTRING!r} never "
-                f"reached {focus_address}'s own record within "
+                f"the Call Agent relayed with {relays} and {focus_address} never went on to say "
+                f"{live_call.DICTATED_REPLY!r} within "
                 f"{turn + support.RELAY_DEADLINE_SECONDS:.0f}s. The relay is the user's answer "
-                f"to the question that Session stopped on, so its next turn is where the words "
-                f"have to be. What `bridgectl history` holds: "
+                f"to the question that Session stopped on, and this Session was told to answer "
+                f"a further message with that line — so it is one only a Session the words "
+                f"reached can say. What `bridgectl history` holds: "
                 f"{self._history_page(address=self._extra_address(focus_at, focus_address))}"
             )
         if not receipted:
