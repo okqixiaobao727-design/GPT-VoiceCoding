@@ -4593,7 +4593,24 @@ class Walk:
         # Session; what the Voice made of it is the transcript. A run where the
         # word was paid and the Voice said something stale or about something
         # else would pass every line above.
-        if not self._voice_said_something_carrying(_spoken_fragment(fresh), since=owing):
+        # **The `speak` line is not the user hearing it.** It is written when the
+        # brief is handed to the call: run `20260904T010524Z`'s claude lane spoke
+        # at 13:18:35.928 and the Voice's turn landed at 13:18:46.119, ten
+        # seconds later, and the step read the transcript in between and found
+        # nothing. So the transcript is waited for, and only once every line
+        # above has had its say about *whether* a brief was spoken at all.
+        #
+        # Matched on the question's words without its punctuation, for
+        # `QUESTION_ASKED_SPOKEN_SUBSTRING`'s reason: the same run had the Voice
+        # quote `需要我把这件事做完吗?` for a line ending `？`. `fresh` is what the
+        # engine holds, and `_await_the_question` has already established that it
+        # is this Stop's question rather than the answer the relay drove.
+        if not self._while_the_call_is_up(
+            lambda: self._voice_said_something_carrying(
+                QUESTION_ASKED_SPOKEN_SUBSTRING, since=owing
+            ),
+            deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
+        ):
             raise StepFailed(
                 f"the engine spoke the Focus Session's brief into the call "
                 f"({announcements[0].strip()!r}) and the Voice never said what that Session "
