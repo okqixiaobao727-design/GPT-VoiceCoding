@@ -19,7 +19,7 @@ The part of Bridge Core that keeps the Live Call's time: when a call is dialled,
 _Avoid_: interlock (the mechanism it grew from), call manager, scheduler
 
 **Silence Ceiling**:
-The automatic hang-up: a call ends after a configured stretch in which neither the user spoke nor the call's own voice sounded. Time spent while the voice is speaking does not count. Governed by the Auto Hang-up Switch.
+The automatic hang-up: a call ends after a configured stretch in which neither the user spoke nor the call's own voice sounded. Time spent while the voice is speaking does not count. Handing the voice a Session Brief starts the stretch afresh — words in the voice's hands are the call working, not the call silent — but it is only that: the voice is not treated as speaking, so a voice that never begins still ends the call one full stretch later. Governed by the Auto Hang-up Switch.
 _Avoid_: idle timeout, inactivity timer
 
 **Session Brief**:

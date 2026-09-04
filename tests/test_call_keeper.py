@@ -55,6 +55,7 @@ from gpt_voicecoding.seams.call import (
     UserSpeech,
     VoiceSpeech,
 )
+from gpt_voicecoding.seams.delivery import Delivery, DeliveryReceipt
 
 COOL_DOWN = 30.0
 CEILING = 60.0
@@ -829,6 +830,128 @@ class TestMidCallNewsSpeaksInTheGapAndRingsForTheRest:
         self.gap(keeper)
         keeper.wait(COOL_DOWN * 2)
         assert keeper.briefer.focus_readings == 1
+
+
+class TestADeliveredHandOffRestartsTheSilenceCeiling:
+    """#225: handing words to the Voice is a working moment of the call.
+
+    The Voice's first delta is a later event than the append being accepted, and
+    the two clocks can leave less than one model-response latency between them:
+    on run `20260904T063610Z` an EVENT ring had consumed the shared interval, the
+    Focus brief was handed over eighteen seconds before a ceiling that had been
+    counting since the previous answer, no `VoiceSpeech(speaking=True)` arrived,
+    and the call ended with the user hearing nothing.
+
+    So a **delivered** hand-off restarts the window, exactly as the dial does.
+    What it does not do is claim the Voice has started: the settle window and the
+    gap stay driven by real speech edges, so the Keeper never holds a call open
+    on a Voice that never opened. With no Voice start the call still ends, one
+    full ceiling after the hand-off.
+    """
+
+    #: The moment the brief is handed over, on the timeline `hand_off` builds.
+    HANDED_OVER = 1_000.0 + 60.0
+
+    def hand_off(self, *, call: FakeCall | None = None) -> Keeper:
+        """The incident's shape: an answer, a ring that eats the interval, a brief.
+
+        The ring is what makes the two clocks disagree. It stamps the shared
+        interval without touching the silence window, so the Focus word waits out
+        an interval that ends inside the ceiling still running from the answer.
+        """
+        keeper = Keeper(call=call)
+        #: A fake that spends time inside `speak` moves this Keeper's clock.
+        keeper.call.held_by = keeper  # type: ignore[attr-defined]
+        keeper.toggle()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.now += 15.0
+        keeper.hear(VoiceSpeech(speaking=False))  # the ceiling counts from here
+        keeper.wait(15.0)
+        keeper.wake(focus=False)  # the ring, consuming the shared interval
+        keeper.wake(focus=True)
+        keeper.wait(COOL_DOWN)  # the interval runs out, and the word is paid
+        return keeper
+
+    def test_the_old_ceiling_does_not_end_the_call_the_brief_was_handed_into(self) -> None:
+        keeper = self.hand_off()
+        assert keeper.call.spoken == [FOCUS]
+        assert keeper.now == self.HANDED_OVER, "the timeline the rest of these read from"
+        keeper.wait(CEILING - 40.0)  # past the ceiling the answer had been running
+        assert keeper.call.calls_ended == 0
+
+    def test_with_no_voice_start_the_call_ends_one_full_ceiling_after_the_hand_off(self) -> None:
+        keeper = self.hand_off()
+        keeper.wait(CEILING - 1.0)
+        assert keeper.call.calls_ended == 0
+        keeper.wait(2.0)
+        assert keeper.call.calls_ended == 1
+
+    def test_a_refused_hand_off_leaves_the_window_where_it_was(self) -> None:
+        """Nothing reached the Voice, so nothing about the call has happened."""
+
+        class RefusingCall(FakeCall):
+            async def speak(self, brief: SpokenBrief, *, request_id: object) -> object:  # type: ignore[override]
+                return DeliveryReceipt(
+                    request_id=request_id,  # type: ignore[arg-type]
+                    outcome=Delivery.FAILED,
+                    reason="the wire would not take it",
+                )
+
+        keeper = self.hand_off(call=RefusingCall())
+        keeper.wait(CEILING - 40.0)
+        assert keeper.call.calls_ended == 1
+
+    def test_the_hand_off_does_not_pretend_the_voice_is_speaking(self) -> None:
+        """A ceiling held open by a Voice that never opened would never end.
+
+        The proof is that the call *does* end while nothing has spoken since:
+        were the hand-off setting the speaking flag, the ceiling would be held
+        for as long as the call was up.
+        """
+        keeper = self.hand_off()
+        keeper.wait(CEILING * 2)
+        assert keeper.call.calls_ended == 1
+
+    def test_a_voice_that_does_start_holds_and_restarts_the_window_as_today(self) -> None:
+        keeper = self.hand_off()
+        keeper.hear(VoiceSpeech(speaking=True))
+        keeper.wait(CEILING * 2)
+        assert keeper.call.calls_ended == 0, "speech holds the call open"
+        keeper.hear(VoiceSpeech(speaking=False))
+        keeper.wait(CEILING + SETTLE - 1.0)
+        assert keeper.call.calls_ended == 0, "the stop restarts it, settle window and all"
+        keeper.wait(2.0)
+        assert keeper.call.calls_ended == 1
+
+    def test_the_window_starts_where_the_wire_accepted_the_append_not_before_it(self) -> None:
+        """The tick's `now` was read before the hand-off; the receipt comes later.
+
+        A `speak` the wire takes twenty seconds to accept would otherwise buy
+        twenty seconds less than the ceiling it is owed — the same shortfall this
+        ticket is about, one await further down.
+        """
+        accepting = 20.0
+
+        class SlowCall(FakeCall):
+            async def speak(self, brief: SpokenBrief, *, request_id: object) -> object:  # type: ignore[override]
+                self.held_by.now += accepting  # type: ignore[attr-defined]
+                return await super().speak(brief, request_id=request_id)  # type: ignore[arg-type]
+
+        keeper = self.hand_off(call=SlowCall())
+        assert keeper.now == self.HANDED_OVER + accepting, "the wire spent that time"
+        keeper.wait(CEILING - 1.0)
+        assert keeper.call.calls_ended == 0
+        keeper.wait(2.0)
+        assert keeper.call.calls_ended == 1
+
+    def test_the_hand_off_still_paces_the_next_ring_by_the_shared_interval(self) -> None:
+        """The sound interval is untouched: this is a silence rule, not a pacing one."""
+        keeper = self.hand_off()
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 1, "the ring from before the hand-off"
+        keeper.wait(COOL_DOWN)
+        keeper.wake(focus=False)
+        assert keeper.call.cues.count(Cue.EVENT) == 2
 
 
 class TestTheStateMachineOnItsOwn:
