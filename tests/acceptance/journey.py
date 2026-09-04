@@ -3809,10 +3809,11 @@ class Walk:
         `LIVE_CALL_DICTATED_REPLY_SUBSTRING`, since the relayed answer dictated
         the reply that `newest` now is.
 
-        **`--before` is graded on the argv and not on the answer.** Which entry
-        the Call Agent's own older page held is its cursor's business; that it
-        paged at all is the fact the ticket asks for, and it is written in the
-        wrapper log.
+        **`--before` is graded on the argv and not on the answer, and across the
+        two History questions rather than under one of them.** Which entry the
+        Call Agent's own older page held is its cursor's business, and so is
+        which sentence provoked the fetch; that it paged at all is the fact the
+        ticket asks for, and it is written in the wrapper log.
         """
         address = self._extra_address(focus_at, focus_address)
         brief = self.bridgectl("brief", address)
@@ -3881,6 +3882,16 @@ class Walk:
         # (`seams/call.py`), so no hand-over can answer "what did it say before"
         # — the Voice has to hand this one off, and a run where `history` never
         # ran is a defect rather than the model's discretion.
+        # **The paging fact is graded across both History questions, not under
+        # the one that provoked it.** Run `20260903T235107Z`'s codex lane paged
+        # back inside the *History* turn — which is the verb doing its job, and
+        # the opening read still carried no cursor — and then answered `再往前`
+        # out of the page it already held, running nothing. §3a's fact is that
+        # the product pages an older record on the user's behalf and says it
+        # (#171): the walk sees `--before` run and hears the older page's entry.
+        # Which sentence provoked the fetch is the Call Agent's working order,
+        # the same class as Detail's verb (#220) and phase 2's half.
+        runs_before_history = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         history = self._one_read_asked_for_by_voice(
             variant=live_call.HISTORY,
             heard=LIVE_CALL_HISTORY_HEARD_SUBSTRING,
@@ -3897,6 +3908,7 @@ class Walk:
                 f"{newest_page.entries!r}. The walk fills this Session's history before it "
                 f"dials, so an empty older page is the fill not having taken"
             )
+        runs_before_earlier = len(support.cli_wrapper_runs(self.config.cli_wrapper_log))
         earlier = self._one_read_asked_for_by_voice(
             variant=live_call.EARLIER,
             heard=LIVE_CALL_EARLIER_HEARD_SUBSTRING,
@@ -3904,9 +3916,33 @@ class Walk:
             address=address,
             wanted=tuple(_spoken_fragment(text) for _, text in older_page.entries),
             about=f"an entry on the page before ordinal {cursor} ({older_page.entries!r})",
-            argv=HISTORY_CURSOR_OPTION,
+            verb_is_graded=False,
         )
-        return f"{detail}; {history}; {earlier}"
+        paged = [
+            verb
+            for verb in self._verbs_since(runs_before_history, Action.HISTORY)
+            if address in verb and HISTORY_CURSOR_OPTION in verb
+        ]
+        under_earlier = [
+            verb
+            for verb in self._verbs_since(runs_before_earlier, Action.HISTORY)
+            if address in verb and HISTORY_CURSOR_OPTION in verb
+        ]
+        self.journey.observe(
+            "live call the older page paged for",
+            f"the Call Agent paged {address} with {HISTORY_CURSOR_OPTION} {len(paged)} time(s) "
+            f"across the two History questions ({paged or 'none'}); {len(under_earlier)} of "
+            f"them under `再往前` — which question provoked the fetch is recorded, not graded",
+        )
+        if not paged:
+            raise StepFailed(
+                f"the user asked for the older page and the Call Agent never ran `"
+                f"{Action.HISTORY}` with `{HISTORY_CURSOR_OPTION}` for {address} under either "
+                f"History question. Paging is the cursor, and an answer with no cursor behind "
+                f"it anywhere came out of the newest page (#171). What it ran across both: "
+                f"{self._verbs_run(since=runs_before_history) or 'nothing at all'}"
+            )
+        return f"{detail}; {history}; {earlier}, paged with {paged}"
 
     def _one_read_asked_for_by_voice(
         self,
@@ -3918,7 +3954,6 @@ class Walk:
         wanted: tuple[str, ...],
         about: str,
         verb_is_graded: bool = True,
-        argv: str | None = None,
         without: str | None = None,
     ) -> str:
         """One spoken question that the user gets an answer to, and how it was answered.
@@ -3942,12 +3977,16 @@ class Walk:
           `SpokenBrief` holds `newest` and nothing before it. The Voice cannot
           answer without handing off, so the verb is **graded**, and with it the
           `--before` cursor that makes the second one paging (#171).
+        * *Earlier* asks for what History may already have fetched: the Call
+          Agent pages back inside the History turn when one page is not enough,
+          and then answers `再往前` out of what it holds. So its verb is
+          **recorded**, and the paging fact is graded across both questions by
+          the caller — see `_detail_and_history_are_asked_for_by_voice`.
 
         `wanted` is a set of acceptable fragments and any one of them passes: a
         History page holds several entries and the Voice picks which to read out,
         so pinning one would grade the choice rather than whether it answered out
-        of the record. `argv` is an option that must appear in the verb's own
-        argv; `without` is one the **first** read must not carry — the read that
+        of the record. `without` is an option the **first** read must not carry — the read that
         opens this question is not a paged one, and a cursor on it would answer
         the *older-page* question before it was asked.
 
@@ -3987,7 +4026,7 @@ class Walk:
         self.journey.observe(
             f"live call {variant} by voice",
             f"the Call Agent ran {verbs or 'nothing'}, {len(about_it)} of them naming "
-            f"{address} — {'graded' if verb_is_graded else 'recorded, not graded (#220)'}; "
+            f"{address} — {'graded' if verb_is_graded else 'recorded, not graded'}; "
             f"the Voice said {said or 'nothing recorded'}; what the engine was holding: {about}",
         )
         if not arrived:
@@ -4005,12 +4044,6 @@ class Walk:
                 f"newest message and nothing before it (`seams/call.py`) — so this one cannot "
                 f"be answered without the verb. What it ran: "
                 f"{self._verbs_run(since=runs_before) or 'nothing at all'}"
-            )
-        if argv is not None and not any(argv in verb for verb in about_it):
-            raise StepFailed(
-                f"the user asked for the older page and the Call Agent ran `{action}` without "
-                f"`{argv}`: {about_it}. Paging is the cursor, and a read that did not carry one "
-                f"answered out of the newest page (#171)"
             )
         if without is not None and about_it and without in about_it[0]:
             raise StepFailed(
