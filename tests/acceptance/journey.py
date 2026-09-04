@@ -611,6 +611,35 @@ def _stop_notices(lines: Sequence[str], *, address: str) -> list[tuple[int, list
     return notices
 
 
+def _notice_wording(text: str) -> str:
+    """One Stop Notice as its words alone, however the surface carrying it spaced them.
+
+    The chat carries the brief's own lines and the engine's log carries those
+    same lines under a timestamped header, so one notice is one set of words
+    written twice (`core/briefing.py::text`). Compared stripped and line by line,
+    because how either surface indents them is not news either way.
+    """
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _stop_notice_wordings(lines: Sequence[str], *, address: str) -> frozenset[str]:
+    """Every Stop Notice about `address` in `lines`, worded as the chat would carry it.
+
+    The log's own header is dropped and the brief's labelled lines kept, which is
+    what the carrier sends — mirrored rather than imported, the rule
+    `_undelivered_cleared_pattern` is mirrored under, and
+    `tests/test_journey_switches_anchor.py` is what breaks loudly when the mirror
+    drifts.
+    """
+    wordings = set()
+    for _, block in _stop_notices(lines, address=address):
+        header = _STOP_HEADLINE.search(block[0])
+        if header is None:  # pragma: no cover - `_stop_notices` matched on this line
+            continue
+        wordings.add(_notice_wording("\n".join([header["headline"], *block[1:]])))
+    return frozenset(wordings)
+
+
 def _stop_notice_reading(lines: Sequence[str], *, address: str) -> _StopNoticeReading:
     """Read #226's outcomes off one window of the engine's log.
 
@@ -2260,6 +2289,23 @@ class Walk:
         off = self.bridgectl("switch", "duty", "off")
         if not off.ok:
             raise StepFailed(f"`switch duty off` refused: {off.text}")
+        # #227: the chat read below spans the switch, and Telegram's delivery lag
+        # is longer than the flip is. A Stop the engine published *while Duty was
+        # still on* can land after this step's mark and be read as a push it
+        # never was — the run #227 was opened from graded a notice the engine had
+        # already logged as legitimately reaching an outlet, and the run this
+        # anchor was written from graded the `companion inbound` step's.
+        #
+        # So the notices already published are read off the engine's log the
+        # moment Duty is acknowledged off, and a message whose words are one of
+        # them is in flight rather than intruding. An anchor, not a wait: it
+        # costs one log read before the window, and the window below still
+        # asserts the absence it always did, over its whole length.
+        #
+        # A notice the engine pushed *after* this point is never one of these:
+        # the turn that follows ends on a permission, so its wording carries the
+        # dialog and a later `last activity` than anything published here could.
+        already_published = _stop_notice_wordings(self.engine.log_lines(), address=self.address)
 
         actionable = self.lane.actionable(self.config.workspace)
         target = actionable.path_in(self.config.workspace)
@@ -2279,13 +2325,17 @@ class Walk:
         if not status.ok:
             raise StepFailed(f"with Duty off, `status` refused: {status.text}")
         intruder = self._await_own_message(
-            mark, deadline_seconds=self.far_side.absence_window_seconds
+            mark,
+            deadline_seconds=self.far_side.absence_window_seconds,
+            matching=lambda seen: _notice_wording(seen.text) not in already_published,
         )
         if intruder is not None:
             self.bridgectl("switch", "duty", "on")
             raise StepFailed(
                 f"with Duty off a message about this Session still reached the chat: "
-                f"{intruder.id} {intruder.text!r}"
+                f"{intruder.id} {intruder.text!r}. It is none of the {len(already_published)} "
+                f"notice(s) the engine had published about this Session before the switch, so "
+                f"it was not one of those still in flight"
             )
 
         mark = self.person.latest_message_id()
