@@ -80,6 +80,37 @@ class RealtimeProbeUnavailable(Exception):
     """The required external probe cannot be used by this acceptance run."""
 
 
+#: **Every paid turn this run drives is pinned here, and nowhere else.** A run
+#: spends tokens in three places — each lane's hand-started Session and the three
+#: extra Sessions started the same way (`live_call_step` reuses the lane's own
+#: `arguments`), and the Delegated Turn the Call Agent hands to the Codex
+#: app-server — and until #198 none of them named a model. All three therefore
+#: read whichever config the person happened to be carrying: measured on run
+#: `20260904T124243Z`, that was `opus[1m]` on the Claude side (859,329 cache-read
+#: tokens at the 1M-context tier, for 26 assistant turns of five short
+#: instructions) and `gpt-5.6-sol` at `xhigh` on the Codex side. Neither was ever
+#: chosen for this run; both were the top tier of a personal setting leaking in.
+#:
+#: **Pinned rather than defaulted, and cheap rather than strong, because nothing
+#: here grades a model.** Every step reads the *product's* rows, transcripts,
+#: prompts and ledger; the only thing an agent has to be good enough at is
+#: following a short instruction. The three steps where that shows first are
+#: `child`, `question` and `stop notice` — a red on one of those, and nowhere
+#: else, is what "the pin was cut too fine" looks like.
+#:
+#: The realtime Voice is deliberately absent: its model is mechanism identity
+#: rather than a dial (`realtime/settings.py`), so it is not a cost lever this
+#: run may turn.
+CLAUDE_LANE_MODEL = "sonnet"
+CLAUDE_LANE_EFFORT = "medium"
+
+#: One Codex-side pin, spent twice: the Codex lane's own Session and — as
+#: `DELEGATED_TURN_MODEL` — the work the Call Agent hands off during a Live Call.
+#: They are one name because they are one bill, against one app-server.
+CODEX_LANE_MODEL = "gpt-5.6-luna"
+CODEX_LANE_REASONING_EFFORT = "high"
+DELEGATED_TURN_MODEL = CODEX_LANE_MODEL
+
 #: Darwin caps an AF_UNIX path at 103 bytes, so the run's socket cannot live in
 #: the run directory — that path is already 70 characters before the run id. The
 #: same reasoning `config.RUNTIME_ROOT` applies, applied again.
@@ -805,6 +836,17 @@ def derive_config(
     """
     run_directory.mkdir(parents=True, exist_ok=True)
     document = tomllib.loads(source.read_text())
+
+    # The Delegated Turn's cost pin, and it is set here rather than left to the
+    # source config for the reason the lane flags exist: the source config is the
+    # person's, `[delegate] model` is the one key in it the engine calls "the cost
+    # lever" outright (`config.py:199`), and a run that copied it would bill
+    # whatever they were last using. Unconditional, so no path through this
+    # function can leave a run spending on a model it did not name.
+    delegate = dict(document["delegate"])
+    delegate["model"] = DELEGATED_TURN_MODEL
+    document["delegate"] = delegate
+
     engine = dict(document.get("engine", {}))
     engine["socket_path"] = str(socket_path)
     engine["state_path"] = str(run_directory / "state.json")

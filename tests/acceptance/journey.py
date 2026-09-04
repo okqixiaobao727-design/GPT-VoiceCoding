@@ -900,6 +900,22 @@ class Lane:
 #: observe; here the user's own setting is what pre-approves it, and the flag is
 #: what restores the observation. The rule is kept, its direction reversed, and
 #: the reason is recorded on the verdict rather than left in a diff.
+#:
+#: `--model sonnet --effort medium` is the **cost** pin, and it is here for the
+#: same reason the permission flag is: without it a bare `claude` reads the
+#: person's own `~/.claude/settings.json`, and on this machine that says
+#: `"model": "opus[1m]"` — the premium long-context tier. Measured on run
+#: `20260904T124243Z`: one walk of this lane billed 859,329 cache-read and 48,097
+#: cache-write tokens at that tier, against 26 assistant turns of five short
+#: instructions. Nothing this lane grades is a judgement about model quality —
+#: every step reads the *product's* rows, transcripts and permission prompts —
+#: so the cheapest model that reliably follows an instruction is the right one to
+#: grade them on. What the pin does risk is a red that belongs to the model
+#: rather than the product, on the three steps that need instruction-following
+#: (`child` starts a subagent, `question` asks with options, `stop notice` types
+#: `ACKNOWLEDGE`); sonnet at medium effort is chosen as the cheapest tier still
+#: comfortably above that bar, and a red on one of those three is the reading
+#: that should send a person back to this comment first.
 CLAUDE = Lane(
     name="claude",
     agent="claude",
@@ -911,7 +927,14 @@ CLAUDE = Lane(
     binary="claude",
     # The first lane keeps the engine's own configured variable, untouched.
     token_env_suffix="",
-    arguments=("--permission-mode", "default"),
+    arguments=(
+        "--permission-mode",
+        "default",
+        "--model",
+        support.CLAUDE_LANE_MODEL,
+        "--effort",
+        support.CLAUDE_LANE_EFFORT,
+    ),
     # Launched silent. No boot gate of the Codex kind has been measured here —
     # `claude` boots into an empty composer — and a Session nobody has typed into
     # is what `roster` and `stable name`'s three reads want to find.
@@ -921,7 +944,8 @@ CLAUDE = Lane(
     asking=None,
     question=asking_the_claude_question,
     question_answer=CLAUDE_ANSWER,
-    # The flag the harness passes *is* the whole policy on this lane, and Claude
+    # The permission flag the harness passes *is* the whole policy on this lane
+    # — the other two pin cost, which is nothing a policy readback would name — and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
     # nothing that can disagree. Sound by construction, and said out loud here so
     # the asymmetry with the Codex lane is a measurement rather than an oversight.
@@ -942,7 +966,8 @@ CLAUDE = Lane(
     ),
 )
 
-#: `--sandbox workspace-write` pins the **sandbox**, and nothing else. It is the
+#: `--sandbox workspace-write` pins the **sandbox**, and it is the only thing
+#: here that pins any part of what the run *grades*. It is the
 #: Codex config surface #105 asks this lane to name, and it is chosen because it
 #: is the one thing here the product never asserts: `turn/start` pins
 #: `approvalPolicy` and `approvalsReviewer` on every relayed turn
@@ -979,6 +1004,18 @@ CLAUDE = Lane(
 #:   `session_id` at the first read instead of the `""` it used to carry — the
 #:   evidence line `roster` prints changes shape, and the pid join it rests on
 #:   does not.
+#:
+#: The **cost** pin, `-m gpt-5.6-luna -c model_reasoning_effort="high"`, is the
+#: Codex half of the pin the Claude lane carries for the same reason: without it
+#: a bare `codex` reads the person's own `~/.codex/config.toml`, and on this
+#: machine that says `gpt-5.6-sol` at `xhigh` — the top of both dials. Measured
+#: on run `20260904T124243Z`: `gpt-5.6-sol` and `xhigh` in this lane's own status
+#: line, 31 reads each, for five short instructions. It touches nothing this lane
+#: grades — `policy_at` reads `turn_context`'s sandbox and approval fields, and
+#: the model is not one of them — and it is passed as flags rather than left to
+#: the config file because the config file is the person's and this run does not
+#: get to edit it. Both spellings are in `processes.VALUE_TAKING_OPTIONS`, so the
+#: engine's own argv reader still sees a Session here and not a subcommand.
 CODEX = Lane(
     name="codex",
     agent="codex",
@@ -988,7 +1025,14 @@ CODEX = Lane(
     binary="codex",
     # The second bot, which already exists and messages the same user chat.
     token_env_suffix="_2",
-    arguments=("--sandbox", "workspace-write"),
+    arguments=(
+        "--sandbox",
+        "workspace-write",
+        "-m",
+        support.CODEX_LANE_MODEL,
+        "-c",
+        f'model_reasoning_effort="{support.CODEX_LANE_REASONING_EFFORT}"',
+    ),
     boot=hand_started.BootPrompt(words=ACKNOWLEDGE.words, turn_over=hand_started.codex_turn_over),
     # Measured 2026-08-27 through the shared daemon with the product's own pin
     # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a

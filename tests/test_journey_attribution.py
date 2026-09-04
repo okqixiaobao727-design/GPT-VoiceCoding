@@ -398,8 +398,34 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
 
 
 class TestTheCodexPermissionPolicyReadbackRemainsExact:
-    def test_the_lane_pins_only_workspace_write(self) -> None:
-        assert journey.CODEX.arguments == ("--sandbox", "workspace-write")
+    def test_the_lane_pins_the_sandbox_and_nothing_the_product_asserts(self) -> None:
+        """The lane may pin the sandbox and its own cost. It may not pin a policy.
+
+        The sandbox pin is what #105 asks this lane to name, and the model and
+        reasoning pins are cost — neither is a field `policy_at` grades. The
+        approval family *is*: `turn/start` asserts `approvalPolicy` and
+        `approvalsReviewer` on every relayed turn, and a lane that pinned either
+        at the keyboard would pre-arrange the assertion #77's approval route has
+        to make for itself. So this names the pins that are allowed and refuses
+        the rest by exhaustion, rather than freezing a tuple that now also
+        carries values no assertion depends on.
+        """
+        arguments = journey.CODEX.arguments
+
+        assert arguments[:2] == ("--sandbox", "workspace-write")
+        assert set(arguments[2:]) == {
+            "-m",
+            support.CODEX_LANE_MODEL,
+            "-c",
+            f'model_reasoning_effort="{support.CODEX_LANE_REASONING_EFFORT}"',
+        }
+        # Every approval-touching spelling `codex --help` carries on 0.153.0.
+        assert not set(arguments) & {
+            "-a",
+            "--ask-for-approval",
+            "--approve-for-me",
+            "--dangerously-bypass-approvals-and-sandbox",
+        }
 
     def test_the_exact_product_policy_is_sound(self, tmp_path: Path) -> None:
         rollout = self._rollout(

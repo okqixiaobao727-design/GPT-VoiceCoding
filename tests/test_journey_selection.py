@@ -336,6 +336,24 @@ def test_each_lane_binds_its_own_token_variable_in_the_derived_config(tmp_path: 
     assert len(set(variables.values())) == len(journey.LANES), variables
 
 
+def test_the_delegated_turn_is_pinned_to_the_runs_own_model(tmp_path: Path) -> None:
+    """The source config's `[delegate] model` never reaches a run.
+
+    It is the person's, and the engine calls it "the cost lever" outright
+    (`config.py:199`), so a run that copied it would bill whatever they were last
+    using — which is how the Claude lane came to spend 859,329 cache-read tokens
+    at the `opus[1m]` tier on run `20260904T124243Z`. `A_CONFIG` says `a-model`,
+    and no lane may see it.
+    """
+    import tomllib
+
+    for lane in journey.LANES:
+        written = tomllib.loads(_derived(tmp_path, lane).path.read_text())
+
+        assert written["delegate"]["model"] == support.DELEGATED_TURN_MODEL
+        assert written["delegate"]["model"] != "a-model"
+
+
 def test_each_lane_gets_its_own_codex_app_server_socket_directory(tmp_path: Path) -> None:
     """Two engines cannot share one app-server socket: the product refuses the second."""
     import tomllib
