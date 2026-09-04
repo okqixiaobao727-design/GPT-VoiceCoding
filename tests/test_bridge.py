@@ -80,6 +80,16 @@ from gpt_voicecoding.seams.identity import AgentKind, SessionTarget
 from hub import CLAUDE, CODEX, TEN_MINUTES, Hub
 
 
+def _field_lines(caplog) -> list[str]:  # noqa: ANN001
+    """Every Bridge Core line about a change to a row's `undelivered` field (#226).
+
+    Both lines say `its brief`, because both are about what the Session's brief
+    will say from here on; nothing else the hub logs does.
+    """
+    said = (record.getMessage() for record in caplog.records)
+    return [line for line in said if ", and its brief " in line]
+
+
 class DeafCall(FakeCall):
     """A Call adapter whose speakers raise instead of playing (#186).
 
@@ -1319,6 +1329,65 @@ class TestTheRelayPipelineEndToEnd:
         )
 
         assert hub.state.sessions.resolve(CODEX).undelivered is None
+
+    def test_a_ceiling_that_lands_on_the_row_says_so_in_the_log(self, caplog) -> None:
+        """#226: the write the field's two readers disagree over is on the record.
+
+        `brief` and the Stop Notice read one row at two moments, so a run that
+        finds them disagreeing has to be able to ask what happened in between.
+        Only a line at the write can answer that.
+        """
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+        hub = Hub()
+        hub.emit(InboundText(text="ship it"))
+        (queued,) = hub.state.relays.pending()
+
+        hub.now += TEN_MINUTES
+        hub.tick()
+
+        assert _field_lines(caplog) == [
+            f"a Relay to {CODEX} did not arrive, and its brief now says so: "
+            f"relay={queued.request_id} reason={RelayReason.CEILING_PASSED} grade=None"
+        ]
+
+    def test_a_receipt_that_clears_the_row_says_so_in_the_log(self, caplog) -> None:
+        """The other half of #226, and the one the `relay` acceptance reads."""
+        hub = Hub(voice=False)
+        hub.agent.outcome = Delivery.UNKNOWN
+        hub.agent.reason = "no readback"
+        hub.emit(InboundText(text="ship it"))
+        hub.emit(ReplyWindowChanged(target=CODEX, window=ReplyWindow.OPEN))
+        hub.now += TEN_MINUTES
+        hub.tick()
+        hub.emit(InboundText(text="and this"))
+        (queued,) = hub.state.relays.pending()
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+
+        hub.emit(
+            RelayReceipt(
+                target=CODEX,
+                receipt=DeliveryReceipt(
+                    request_id=queued.request_id,
+                    outcome=Delivery.DELIVERED,
+                    reason="the Session acknowledged it",
+                ),
+            )
+        )
+
+        assert _field_lines(caplog) == [
+            f"a Relay to {CODEX} arrived after all, and its brief no longer says so: "
+            f"relay={queued.request_id}"
+        ]
+
+    def test_a_write_that_changes_nothing_says_nothing(self, caplog) -> None:
+        """The common case stays silent: only a change to the field is news."""
+        hub = Hub(window=ReplyWindow.OPEN)
+        caplog.set_level("INFO", logger="gpt_voicecoding.core.bridge")
+
+        hub.emit(InboundText(text="ship it"))
+
+        assert hub.state.sessions.resolve(CODEX).undelivered is None
+        assert _field_lines(caplog) == []
 
     def test_a_relay_still_queued_leaves_the_field_exactly_as_it_stands(self) -> None:
         hub = Hub()
