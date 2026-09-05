@@ -394,6 +394,24 @@ def found(
     return (reader or children.Children()).under(parent_row(state), transcript)
 
 
+def append(transcript: Path, *records: dict) -> None:
+    """The parent writing another record, which is the only way its file grows."""
+    with transcript.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(f"{json.dumps(record)}\n")
+
+
+def noise(count: int) -> list[dict]:
+    """Enough of the parent talking to itself to span several read blocks."""
+    return [
+        dict(
+            SAID,
+            message={"role": "assistant", "content": [{"type": "text", "text": "x" * 4096}]},
+        )
+        for _ in range(count)
+    ]
+
+
 def teammate_on_disk(transcript: Path, **overrides) -> Path:
     """One named in-process teammate on disk, in the same tree a subagent uses."""
     return write_child(
@@ -622,16 +640,6 @@ class TestReadingTheParentBackwardFromItsEnd:
     Session's, because **the answer is always written after the spawn**.
     """
 
-    def noise(self, count: int) -> list[dict]:
-        """Enough of the parent talking to itself to span several read blocks."""
-        return [
-            dict(
-                SAID,
-                message={"role": "assistant", "content": [{"type": "text", "text": "x" * 4096}]},
-            )
-            for _ in range(count)
-        ]
-
     def test_the_scan_stops_at_the_record_that_started_the_child(self, tmp_path: Path) -> None:
         """Everything before the spawn is unread, and the file says so.
 
@@ -653,7 +661,7 @@ class TestReadingTheParentBackwardFromItsEnd:
         and the parent has been working ever since, so the answer is nowhere
         near the end of the file.
         """
-        transcript = transcript_for(tmp_path, [STARTED, FINISHED, *self.noise(200)])
+        transcript = transcript_for(tmp_path, [STARTED, FINISHED, *noise(200)])
         write_child(transcript)
         assert found(transcript) == ()
 
@@ -689,7 +697,7 @@ class TestReadingTheParentBackwardFromItsEnd:
         child dropped is one the roster stopped mentioning while it worked.
         """
         monkeypatch.setattr(children, "SCAN_LIMIT_BYTES", 1024)
-        transcript = transcript_for(tmp_path, [STARTED, FINISHED, *self.noise(50)])
+        transcript = transcript_for(tmp_path, [STARTED, FINISHED, *noise(50)])
         write_child(transcript)
         assert len(found(transcript)) == 1
 
@@ -950,6 +958,212 @@ class TestATeammateIsAChildToo:
         teammate_on_disk(transcript)
         write_child(transcript, "aearlier-delta-writer-0000", meta=RECORDED_TEAMMATE_META)
         assert len(found(transcript, state=SessionState.IDLE)) == 2
+
+
+class TestATeammateWokenAgainComesBack:
+    """A teammate's rest is not its end, and the roster has to be able to say so (#236).
+
+    **Measured, and the measurement opened this ticket.** The #231 reviewer read
+    `61537e10-0bce-4823-88c6-edda270fb209.jsonl`: `probe-two` reported itself
+    idle at 22:42:34Z, was working again from 22:42:55Z, and never returned to
+    the roster. #231 settled a teammate the way a classic subagent is settled —
+    once, and remembered for the life of the engine — so the `SendMessage` that
+    woke it reached a name nothing would ask about again.
+
+    So the two kinds settle differently, and each for its own reason. A classic
+    subagent's `tool_result` is the end of a tool call, and a tool call that came
+    back cannot come back again: remembering it is remembering a fact. A
+    teammate's idle notification is a state it is in, and a state can change —
+    the newest marker for its name is the answer, on every read, which is what
+    the reference implementation did (`legacy@1d32845:bridge/transcript.py:1078-1110`,
+    now *ported* rather than adapted).
+
+    The cost the memory was bought to avoid does not come back with it: what is
+    remembered here is not the verdict alone but **how far into the file it was
+    read from**, so a tick pays for what the parent wrote since the last one and
+    never for the file's whole history. Everything from
+    `test_a_record_half_written_when_it_was_read_is_read_whole_next_time` down is
+    that bound: what it saves, and the three ways an offset into a growing file
+    can be wrong.
+    """
+
+    def settled_idle(self, tmp_path: Path) -> tuple[Path, children.Children]:
+        """One teammate that has rested, and the reader that watched it do so."""
+        transcript = transcript_for(tmp_path, [SPAWNED, SPAWN_ANSWERED, WENT_IDLE])
+        teammate_on_disk(transcript)
+        reader = children.Children()
+        assert found(transcript, reader, SessionState.IDLE) == ()
+        return transcript, reader
+
+    def test_a_teammate_its_session_wakes_is_listed_again(self, tmp_path: Path) -> None:
+        """The `SendMessage` that measured this, arriving a tick after the rest.
+
+        #231 already listed a teammate woken *before* the tick that would have
+        settled it (`test_a_teammate_the_parent_has_spoken_to_since_is_working
+        _again`), which is the same file read in one pass. This is the same file
+        read in two, and it is the case the reviewer caught.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        append(transcript, SENT_TO)
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+
+    def test_a_teammate_that_speaks_again_is_listed_again(self, tmp_path: Path) -> None:
+        """A teammate reporting is a teammate working, whenever it reports."""
+        transcript, reader = self.settled_idle(tmp_path)
+        append(transcript, REPORTED)
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+
+    def test_the_row_it_comes_back_as_is_the_row_it_left_as(self, tmp_path: Path) -> None:
+        """Re-listing is the same row, not a new kind of one.
+
+        Everything #231 pinned about a teammate's row is a fact about its
+        `meta.json` and its parent, and neither changed while it rested — so this
+        would be hard to break. It is asserted because "the roster row for a
+        re-listed teammate is the same row shape as before it settled" is a claim
+        this ticket makes, and a claim nothing reads is a claim nobody keeps.
+        """
+        transcript = transcript_for(tmp_path, [SPAWNED, SPAWN_ANSWERED])
+        teammate_on_disk(transcript)
+        reader = children.Children()
+        before = found(transcript, reader, SessionState.IDLE)[0]
+
+        append(transcript, WENT_IDLE)
+        assert found(transcript, reader, SessionState.IDLE) == ()
+        append(transcript, SENT_TO)
+        assert found(transcript, reader, SessionState.IDLE) == (before,)
+
+    def test_a_teammate_with_nothing_newer_than_its_rest_stays_unlisted(
+        self, tmp_path: Path
+    ) -> None:
+        """The parent has gone on working; none of it was about this teammate."""
+        transcript, reader = self.settled_idle(tmp_path)
+        append(transcript, SAID)
+        assert found(transcript, reader, SessionState.IDLE) == ()
+
+    def test_a_teammate_that_rests_again_is_unlisted_again(self, tmp_path: Path) -> None:
+        """Newest-marker-wins runs in both directions, or it is just a slower memory."""
+        transcript, reader = self.settled_idle(tmp_path)
+        append(transcript, SENT_TO)
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+        append(transcript, WENT_IDLE)
+        assert found(transcript, reader, SessionState.IDLE) == ()
+
+    def test_a_classic_child_that_finished_cannot_come_back(self, tmp_path: Path) -> None:
+        """The other kind, and the line between them: a finished tool call is final.
+
+        Its `tool_use` record spoken of again would list it under the teammate
+        rule. It does not, because the two memories are different memories.
+        """
+        transcript = transcript_for(tmp_path, [STARTED, FINISHED])
+        write_child(transcript)
+        reader = children.Children()
+        assert found(transcript, reader) == ()
+        append(transcript, STARTED)
+        assert found(transcript, reader) == ()
+
+    def test_a_record_half_written_when_it_was_read_is_read_whole_next_time(
+        self, tmp_path: Path
+    ) -> None:
+        """The parent is writing while this reads, so its last line is routinely half a record.
+
+        Reading only what the file gained is only safe if "gained" starts at the
+        last *complete* record. Starting it at the previous end of file would cut
+        the record in two and lose it for good — and the marker lost would be
+        exactly the one that wakes a teammate.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        woken = json.dumps(SENT_TO)
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(woken[: len(woken) // 2])
+        assert found(transcript, reader, SessionState.IDLE) == ()
+
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(f"{woken[len(woken) // 2 :]}\n")
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+
+    def test_a_transcript_shorter_than_what_was_read_is_read_afresh(self, tmp_path: Path) -> None:
+        """An offset into a file is only about that file, and a shorter one is another.
+
+        Nothing measured writes a Claude transcript backwards, so this is the
+        safe direction rather than a case: what cannot be trusted is re-read.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        transcript_for(tmp_path, [SPAWNED, SPAWN_ANSWERED])
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+
+    def test_a_parent_that_has_not_written_since_is_not_read_at_all(self, tmp_path: Path) -> None:
+        """The bound, at its cheapest end: no growth, no read.
+
+        Not "reads it and finds the same answer" — does not open it. The file is
+        removed, which a reader that still opened it would notice.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        transcript.unlink()
+        assert reader.under(parent_row(SessionState.IDLE), transcript) == ()
+
+    def test_a_parent_still_there_and_still_the_same_length_is_not_read_either(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The same claim about the file that is still there, which the answer cannot show.
+
+        A read of a file that has not grown finds nothing and changes nothing, so
+        the answer above is the answer either way and the test before this one
+        would stay green with the saving deleted. What is being claimed is that
+        no read is set up at all, so that is what is watched: `_Tail` is the only
+        thing here that opens a transcript.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        prepared: list[Path] = []
+
+        class Watched(children._Tail):
+            def __init__(self, path: Path, floor: int = 0) -> None:
+                prepared.append(path)
+                super().__init__(path, floor)
+
+        monkeypatch.setattr(children, "_Tail", Watched)
+        assert reader.under(parent_row(SessionState.IDLE), transcript) == ()
+        assert prepared == []
+
+        # And the watch itself works: one byte more and it reads again.
+        append(transcript, SENT_TO)
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
+        assert prepared == [transcript]
+
+    def test_what_was_already_read_is_never_read_again(self, tmp_path: Path, monkeypatch) -> None:
+        """The bound, at the end that matters: a parent writing steadily.
+
+        The idle notification sits 800 KB back, and the parent has written every
+        one of those bytes since. `SCAN_LIMIT_BYTES` is then cut to a thousandth
+        of that distance, which puts the marker out of reach of any scan that
+        starts at the end of the file — the control below is a fresh reader
+        failing to reach it. A reader that remembers where it read to answers
+        from a couple of hundred bytes.
+        """
+        transcript = transcript_for(tmp_path, [SPAWNED, SPAWN_ANSWERED, WENT_IDLE, *noise(200)])
+        teammate_on_disk(transcript)
+        reader = children.Children()
+        assert found(transcript, reader, SessionState.IDLE) == ()
+
+        monkeypatch.setattr(children, "SCAN_LIMIT_BYTES", 1024)
+        append(transcript, SAID)
+        assert found(transcript, reader, SessionState.IDLE) == ()
+        assert len(found(transcript, children.Children(), SessionState.IDLE)) == 1
+
+    def test_a_scan_that_gave_up_short_of_what_it_remembered_trusts_nothing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The one case where the memory is dropped rather than kept, and why.
+
+        A parent that wrote more between two ticks than a scan will read leaves
+        a gap, and a marker in the gap is newer than anything remembered. Reading
+        the memory over it could hide a teammate that had been woken inside it,
+        which is the very failure this ticket removes — so a scan that gave up
+        answers the way every other unfinished reading here answers: listed.
+        """
+        transcript, reader = self.settled_idle(tmp_path)
+        monkeypatch.setattr(children, "SCAN_LIMIT_BYTES", 1024)
+        append(transcript, *noise(50))
+        assert len(found(transcript, reader, SessionState.IDLE)) == 1
 
 
 class TestTheTwoShapesDoNotReachIntoEachOther:
