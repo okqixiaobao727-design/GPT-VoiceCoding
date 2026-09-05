@@ -1287,7 +1287,9 @@ def test_a_call_that_drops_mid_answer_and_comes_back_is_still_the_ceiling_bug(
         tmp_path, monkeypatch, stopped_at=None, down_at=70.0, back_up_after_the_drop=True
     )
 
-    assert facts.recorded["call went down"] is False
+    # The recorded facts say the same thing the failure text does: the call
+    # went down, and the watch did not run out of patience.
+    assert facts.recorded["call went down"] is True
     assert facts.recorded["watch ran out"] is False
     assert facts.graded["Voice spans closed"] is False
     assert "the bug itself (#169)" in facts.failure

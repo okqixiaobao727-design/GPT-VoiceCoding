@@ -548,7 +548,9 @@ class _ReadAnswer:
 class _VoiceWatch:
     """Voice edges and activity after one engine-log mark, on the walk's clock (#184)."""
 
-    #: Whether the call went down before the step gave up waiting for it.
+    #: Whether the call went down before the step gave up waiting for it —
+    #: either seen down by the watch itself, or down when it was asked on the
+    #: way out.
     went_down: bool
     #: The edges this call produced, as of the last poll.
     edges: dict[bool, int]
@@ -2930,9 +2932,14 @@ class _LiveCallRun:
         started_at = time.monotonic()
         expiry = started_at + deadline_seconds
         ran_out = True
+        # The call being down is why the watch stops, so it is remembered rather
+        # than re-read afterwards: a call that flapped is one that went down,
+        # whatever the reading taken on the way out says (#243).
+        saw_down = False
         while time.monotonic() < expiry:
             if self._call_is_down():
                 ran_out = False
+                saw_down = True
                 break
             time.sleep(poll_seconds)
             seen, seen_said = activity()
@@ -2951,7 +2958,7 @@ class _LiveCallRun:
                 ran_out = False
                 break
         return _VoiceWatch(
-            went_down=self._call_is_down(),
+            went_down=saw_down or self._call_is_down(),
             edges=edges,
             first_voice_at=first_voice_at,
             last_voice_at=last_voice_at,
