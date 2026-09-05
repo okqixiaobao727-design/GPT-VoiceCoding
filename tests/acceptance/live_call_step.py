@@ -606,6 +606,20 @@ def _the_question_it_stopped_on(brief: str) -> str:
     return ""
 
 
+def _the_question_is_held(brief: str) -> bool:
+    """Whether the question is one the lane *holds*, rather than one it said.
+
+    Journalled, and graded nowhere. `_the_question_it_stopped_on` reads either
+    field on purpose, so a Claude Session that answered the drive with plain
+    text instead of calling the tool would satisfy every reader — and the run
+    would take the ADR 0013 inbox route while its journal read exactly like one
+    that took the ADR 0015 hook route. That is the one thing the two-field
+    reading cannot say by itself, so the walk writes it down: the field the
+    question arrived on is what says which route its answer will ride.
+    """
+    return _unspaced(QUESTION_ASKED_SPOKEN_SUBSTRING) in _unspaced(_asked_prompt(brief))
+
+
 def _what_a_brief_holds(brief: str) -> str:
     """Both fields `_the_question_it_stopped_on` reads, for a complaint to name."""
     return f"newest {_newest_message(brief)[:120]!r}, asked {_asked_prompt(brief)[:120]!r}"
@@ -1359,6 +1373,7 @@ class _LiveCallRun:
             lane=self.lane.name,
             workspace=str(workspace),
             asked=asked[:200],
+            held=_the_question_is_held(brief),
         )
         return asked
 

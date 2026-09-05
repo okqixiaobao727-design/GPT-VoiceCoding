@@ -894,6 +894,20 @@ def test_a_brief_holding_neither_is_read_as_holding_no_question() -> None:
     assert live_call_step._the_question_it_stopped_on(A_BRIEF) == ""
 
 
+def test_the_journal_says_whether_the_question_was_held_or_only_said() -> None:
+    """The one fact the two-field reading cannot say by itself (#238).
+
+    A Claude Session that answered its drive with plain text instead of calling
+    the tool satisfies every reader here, and its answer would then ride the ADR
+    0013 inbox route while the journal read exactly like a run that took the ADR
+    0015 hook route. The field the question arrived on is what tells them apart,
+    so the walk writes it down beside the question.
+    """
+    assert live_call_step._the_question_is_held(A_HELD_QUESTION_BRIEF)
+    assert not live_call_step._the_question_is_held(A_SAID_QUESTION_BRIEF)
+    assert not live_call_step._the_question_is_held(A_BRIEF)
+
+
 def test_both_fields_are_named_when_neither_carried_the_question() -> None:
     """A complaint that says which readings it took, rather than one of them."""
     said = live_call_step._what_a_brief_holds(A_HELD_QUESTION_BRIEF)
