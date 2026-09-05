@@ -11,7 +11,8 @@ run, which is the same degraded start the adapter already takes when its approva
 socket will not bind, and it says so twice: in the log, and in the loaded-report
 ADR 0003 makes the authority on what an engine actually loaded.
 
-Every test here runs under a `base_dir` of its own. The real
+Every test here reads and writes an address file of its own, handed to it by
+`conftest.published_address`. The real
 `~/Library/Application Support/GPT-VoiceCoding/engine/address.json` belongs to
 whatever engine the developer has running, and a test that wrote it would be
 taking his route away — which is the very defect this file pins.
@@ -32,14 +33,6 @@ from gpt_voicecoding.adapters.agent.claude.bootstrap import approval_socket_path
 from gpt_voicecoding.adapters.agent.claude.settings import ClaudeSettings
 
 
-@pytest.fixture
-def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """The published address, moved off this machine's real one for the test."""
-    path = tmp_path / "engine" / "address.json"
-    monkeypatch.setattr(bootstrap, "address_path", lambda base_dir=None: path)
-    return path
-
-
 def adapter_for(socket_root: Path, claude_config_directory: Path) -> ClaudeAgentAdapter:
     return ClaudeAgentAdapter(
         progress_capture=PROGRESS_CAPTURE,
@@ -54,23 +47,23 @@ def adapter_for(socket_root: Path, claude_config_directory: Path) -> ClaudeAgent
     )
 
 
-def a_peer_engine_holding(published: Path, socket_root: Path) -> socket.socket:
+def a_peer_engine_holding(published_address: Path, socket_root: Path) -> socket.socket:
     """Another engine, reduced to the two things that make it a holder: a socket
     somebody answers, and its address in the file."""
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_root / "peer.sock"))
     server.listen(1)
     bootstrap.publish_address(socket_root / "peer.sock", ClaudeSettings())
-    assert published.exists()
+    assert published_address.exists()
     return server
 
 
 def test_a_refused_engine_still_connects_and_names_the_holder(
-    published: Path, socket_root: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    published_address: Path, socket_root: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Losing one route must never cost the two that still work."""
-    peer = a_peer_engine_holding(published, socket_root)
-    before = published.read_bytes()
+    peer = a_peer_engine_holding(published_address, socket_root)
+    before = published_address.read_bytes()
     adapter = adapter_for(socket_root, tmp_path / "claude")
 
     async def scenario() -> None:
@@ -83,13 +76,13 @@ def test_a_refused_engine_still_connects_and_names_the_holder(
     finally:
         peer.close()
 
-    assert published.read_bytes() == before, "the holder's address is left byte-for-byte"
+    assert published_address.read_bytes() == before, "the holder's address is left byte-for-byte"
     assert str(socket_root / "peer.sock") in caplog.text
     assert approval_socket_path_in({}) == socket_root / "peer.sock"
 
 
 def test_a_refused_engine_reports_the_refusal_in_its_loaded_report(
-    published: Path, socket_root: Path, tmp_path: Path
+    published_address: Path, socket_root: Path, tmp_path: Path
 ) -> None:
     """ADR 0003: a liveness check reads what the engine actually loaded.
 
@@ -98,7 +91,7 @@ def test_a_refused_engine_reports_the_refusal_in_its_loaded_report(
     headline; an engine that answered "another engine has the address" and
     nothing else would have hidden it.
     """
-    peer = a_peer_engine_holding(published, socket_root)
+    peer = a_peer_engine_holding(published_address, socket_root)
     config_directory = tmp_path / "claude"
     adapter = adapter_for(socket_root, config_directory)
 
@@ -121,7 +114,7 @@ def test_a_refused_engine_reports_the_refusal_in_its_loaded_report(
 
 
 def test_an_unheld_address_is_claimed_and_handed_back(
-    published: Path, socket_root: Path, tmp_path: Path
+    published_address: Path, socket_root: Path, tmp_path: Path
 ) -> None:
     adapter = adapter_for(socket_root, tmp_path / "claude")
 
@@ -129,7 +122,7 @@ def test_an_unheld_address_is_claimed_and_handed_back(
         await adapter.connect()
         claimed = approval_socket_path_in({})
         await adapter.aclose()
-        return claimed, published.exists()
+        return claimed, published_address.exists()
 
     claimed, still_there = asyncio.run(scenario())
 
@@ -138,11 +131,11 @@ def test_an_unheld_address_is_claimed_and_handed_back(
 
 
 def test_a_refused_engine_does_not_withdraw_the_holders_address(
-    published: Path, socket_root: Path, tmp_path: Path
+    published_address: Path, socket_root: Path, tmp_path: Path
 ) -> None:
     """The defect in the other direction: the first engine to stop used to
     unlink whatever was there, taking the route from an engine still up."""
-    peer = a_peer_engine_holding(published, socket_root)
+    peer = a_peer_engine_holding(published_address, socket_root)
     adapter = adapter_for(socket_root, tmp_path / "claude")
 
     async def scenario() -> None:
@@ -158,7 +151,7 @@ def test_a_refused_engine_does_not_withdraw_the_holders_address(
 
 
 def test_a_refused_engine_with_an_empty_roster_does_not_report_pass(
-    published: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    published_address: Path, socket_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The false green ADR 0003 exists to prevent.
 
@@ -171,7 +164,7 @@ def test_a_refused_engine_with_an_empty_roster_does_not_report_pass(
     """
     from gpt_voicecoding.installation import claude_hooks
 
-    peer = a_peer_engine_holding(published, socket_root)
+    peer = a_peer_engine_holding(published_address, socket_root)
     config_directory = tmp_path / "claude"
     # Installed hooks, so the report gets past its first gate and reaches the
     # roster branch this test is about.

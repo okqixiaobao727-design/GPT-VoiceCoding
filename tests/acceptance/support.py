@@ -46,6 +46,7 @@ from typing import Any
 import live_call
 
 from gpt_voicecoding.adapters.agent.claude.settings import DEFAULT_ACK_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.agent.codex import processes as codex_processes
 from gpt_voicecoding.adapters.companion_channel.telegram.api import TelegramError, Transport
 from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -202,22 +203,48 @@ PATH_SCRIPT = f"printf '{PATH_SENTINEL}%s{PATH_SENTINEL}' \"$PATH\""
 PATH_TIMEOUT_SECONDS = 10.0
 
 
+def _read(command: list[str], *, timeout_seconds: float) -> str | None:
+    """One command's stdout, or `None` for every way running it can fail.
+
+    Its callers want the same thing — what the command printed, if it could be
+    run at all — and what they do about `None` is what differs, so that stays
+    with them: a PATH this harness cannot read is a refusal, a `vm_stat` it
+    cannot read is a `null` on the verdict.
+
+    **The budget is the caller's and is never defaulted here.** One of the two
+    is a login shell mirroring the product's own budget, the other is a kernel
+    read that answers in milliseconds; a shared default would tie the second to
+    the first, and the first is pinned to a Swift literal by
+    `tests/test_app_bundle.py`. Moving the product's shell budget must not
+    silently move how long a `vm_stat` is waited on.
+
+    The return code is deliberately not consulted. Every caller parses what it
+    got and answers `None` when it cannot make sense of it, so a command that
+    printed a usable answer and exited non-zero would be thrown away twice for
+    one reason.
+    """
+    try:
+        finished = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return finished.stdout
+
+
 def login_shell_path() -> str | None:
     """The user's own PATH, or None — never a guess, never a partial answer."""
     shell = os.environ.get("SHELL")
     if not shell or not os.access(shell, os.X_OK):
         return None
-    try:
-        finished = subprocess.run(
-            [shell, "-lic", PATH_SCRIPT],
-            capture_output=True,
-            text=True,
-            stdin=subprocess.DEVNULL,
-            timeout=PATH_TIMEOUT_SECONDS,
-        )
-    except (subprocess.TimeoutExpired, OSError):
+    printed = _read([shell, "-lic", PATH_SCRIPT], timeout_seconds=PATH_TIMEOUT_SECONDS)
+    if printed is None:
         return None
-    parts = finished.stdout.split(PATH_SENTINEL)
+    parts = printed.split(PATH_SENTINEL)
     if len(parts) != 3:  # exactly two sentinels bound exactly one answer
         return None
     answer = parts[1].strip(" \t")
@@ -226,6 +253,125 @@ def login_shell_path() -> str | None:
     if not any(entry.startswith("/") for entry in answer.split(":")):
         return None
     return answer
+
+
+# --- the machine a run has to have to itself --------------------------------
+
+
+def foreign_codex_refusal(
+    *,
+    run: codex_processes.Runner = codex_processes.run_command,
+    now: codex_processes.Clock = time.time,
+) -> str | None:
+    """Why this run cannot be isolated from the Codex Sessions already open, or None.
+
+    **Codex discovery is machine-wide by construction, and that is the product
+    behaving as written.** The adapter lists every live interactive `codex` TUI
+    on the machine from one `ps` (`adapters/agent/codex/processes.py`), and the
+    per-lane `socket_directory` this run derives isolates the app-server socket,
+    not that scan. Both lanes' engines load both agent adapters. So a Codex
+    window the operator left open registers with **both** acceptance engines and
+    sits on the roster for the whole walk: on run `20260904T091550Z` one did, in
+    586 of the run's 687 `bridgectl` readings, and `roster`, `stable name` and
+    `switches` each read a row — and a Stop source — that the walk had not
+    created. The run graded anyway (#228).
+
+    What is missing is not a narrower scan; it is the harness refusing to grade
+    a walk it cannot isolate. So this asks **the adapter's own enumeration**
+    rather than reading the process table a second way: a second scanner would
+    be a second answer to "is this a Session", and the whole reason a foreign
+    TUI reaches the roster is the answer the adapter gives.
+
+    **Unconditional on `--lane`.** The polluted roster is not the Codex lane's
+    problem alone — both lanes' engines load both adapters, so a `--lane claude`
+    run reads the same foreign row.
+
+    **What the run owns is decided by place, not by a launch record.** This runs
+    before the first hand-start, so in an ordinary run nothing of the walk's
+    exists yet to be miscounted. The acceptance criterion is stronger than that
+    ordering — a Session the walk hand-started is *never* foreign — and an ordering
+    nobody can see is not a rule, so a candidate whose workspace is inside
+    `acceptance_root()` is the walk's own: every run directory and every lane
+    workspace is made there (`new_run_directory`, `workspace_path`). Both sides
+    are resolved before comparison, because `lsof` reports a real path and an
+    overridden root may be reached through a symlink (`/tmp` is one).
+
+    What place costs, said out loud: a TUI opened by hand inside an *earlier*
+    run's workspace — to read what that run left there — reads as this run's own
+    and is waved through. That is the ordering rule's behaviour exactly, so the
+    containment rule is never worse than the ordering it strengthens; it is the
+    one case where it is not better.
+
+    **A candidate the adapter cannot name a workspace for is not reported**, and
+    that is inherited rather than decided here: `enumerate_sessions` drops a row
+    whose cwd `lsof` will not give up. Reporting it would need the second scanner
+    this deliberately does not have.
+
+    **The clock is read once, here, and handed down.** `enumerate_sessions`
+    dates every `etime` against one reading taken before its `ps`; passing that
+    same moment in means the elapsed times in the refusal are computed against
+    the moment the starts were, and keeps the read on the safe side of the `ps`
+    (`processes.START_TIME_RESOLUTION_SECONDS`).
+
+    Harness only, so #228 says the legacy-citation rule does not apply — and the
+    citation is here anyway because it is short and it was checked. Legacy never
+    enumerated the process table for Codex at all: its one `pgrep` matches its
+    own bundle executable (`legacy@1d32845:bridge/host.py:795`) and its one `ps`
+    reads a pid it already holds (`legacy@1d32845:bridge/codex.py:205`). A
+    Session it had not started did not exist for it, so there is no preflight
+    and no foreign-Session refusal to port. **Dropped, because** legacy has no
+    such behaviour.
+    """
+    sampled_at = now()
+    try:
+        live = asyncio.run(codex_processes.enumerate_sessions(run=run, now=lambda: sampled_at))
+    except (OSError, TimeoutError) as unreadable:
+        return (
+            "the process table could not be read, so this run cannot tell whether a Codex "
+            f"Session it did not hand-start is live and would join both lanes' rosters: "
+            f"{unreadable!r}"
+        )
+    owned = acceptance_root().expanduser().resolve(strict=False)
+    foreign = [
+        candidate
+        for candidate in live
+        if not candidate.workspace.expanduser().resolve(strict=False).is_relative_to(owned)
+    ]
+    if not foreign:
+        return None
+    named = "; ".join(
+        f"pid {candidate.pid} in {candidate.workspace}"
+        f"{_uptime_text(sampled_at, candidate.started_at)}"
+        for candidate in foreign
+    )
+    return (
+        f"a Codex Session this run did not hand-start is live on this machine, and both lanes' "
+        f"engines bridge every Codex TUI on it — so it would sit on the roster the walk is "
+        f"graded on: {named}. Quit these Codex sessions and re-run; this run will not "
+        "stop them for you."
+    )
+
+
+def _uptime_text(sampled_at: float, started_at: float | None) -> str:
+    """How long a Session has been up, in the compact form the refusal reads in.
+
+    **The `None` arm is unreachable today and kept anyway.** `enumerate_sessions`
+    drops a row whose `etime` it cannot parse, so nothing it returns is missing a
+    start — but `Candidate.started_at` is typed `float | None`, no CI gate type-
+    checks (`.github/workflows/ci.yml`), and this is called from a session-scoped
+    autouse fixture whose whole promise is `REFUSED` or pass, never a traceback
+    (`conftest.py`'s docstring). A dead branch that keeps a typed contract from
+    becoming an unrefused error is worth its one line; omitting the duration
+    invents nothing, which is what makes it the safe thing to omit.
+    """
+    if started_at is None:
+        return ""
+    whole = max(int(sampled_at - started_at), 0)
+    hours, rest = divmod(whole, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f", up {hours}h{minutes:02d}m"
+    return f", up {minutes}m{seconds:02d}s" if minutes else f", up {seconds}s"
 
 
 # --- provenance -------------------------------------------------------------
@@ -258,6 +404,118 @@ GEN1_HOOK = GEN1_RUNTIME / "bridge-hook"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
 
+#: The `vm_stat` lines a new allocation could actually be served from. "Pages
+#: free" alone is near zero on any warm macOS, so a block built on it would
+#: record what looks like pressure on every host and distinguish nothing —
+#: which is the one thing these numbers exist to do.
+AVAILABLE_PAGES = ("Pages free", "Pages inactive", "Pages speculative")
+PAGE_SIZE = re.compile(r"page size of (\d+) bytes")
+SWAP_USED = re.compile(r"\bused\s*=\s*([\d.]+)M")
+MEGABYTE = 1024 * 1024
+
+#: What a host reading is waited on. `vm_stat` and `sysctl` are local kernel
+#: reads that answer in milliseconds, so this is three orders of magnitude of
+#: headroom and still turns a wedged one into a `null` on the verdict rather
+#: than a run that hangs. Its own constant, and not `PATH_TIMEOUT_SECONDS`:
+#: that one mirrors the product's login-shell budget and is pinned to a Swift
+#: literal, and these two have nothing to do with either.
+HOST_READ_TIMEOUT_SECONDS = 5.0
+
+
+def free_memory_from(vm_stat: str) -> int | None:
+    """`vm_stat`'s available pages, at the page size it names — or `None`.
+
+    The page size is read rather than assumed because Apple silicon pages at
+    16K and Intel at 4K, and this harness runs on both. A count it cannot find
+    is no answer at all: a recorded number nobody can trust is worse than a
+    recorded `null`, because only one of the two ever gets checked.
+    """
+    sized = PAGE_SIZE.search(vm_stat)
+    if sized is None:
+        return None
+    pages = 0
+    for name in AVAILABLE_PAGES:
+        # The counts carry a trailing period, which is what a bare `int()` on
+        # the last field chokes on.
+        found = re.search(rf"^{name}:\s+(\d+)\.?\s*$", vm_stat, re.MULTILINE)
+        if found is None:
+            return None
+        pages += int(found.group(1))
+    return pages * int(sized.group(1))
+
+
+def swap_used_from(swapusage: str) -> int | None:
+    """How deep the swap file is, out of `sysctl -n vm.swapusage` — or `None`."""
+    found = SWAP_USED.search(swapusage)
+    if found is None:
+        return None
+    return int(float(found.group(1)) * MEGABYTE)
+
+
+@dataclass(frozen=True)
+class HostPressure:
+    """What the machine itself was doing, as one reading (#230).
+
+    **Why a verdict carries this at all.** Three runs of byte-identical
+    `adapters/call/realtime/` gave zero, two and four undrained playouts, and
+    the candidate cause for that spread is not in the code: an event loop
+    starved by paging delivers inbound frames in bursts, which keeps the
+    speaker's last-frame stamp fresh and holds `drained` False without the
+    remote peer changing anything. It fits the run ordering — the clean run on
+    a fresher machine, the stalled ones after many more hours of uptime — and
+    it is unconfirmed, because no artefact recorded the host's state during any
+    of them. Recording it costs one `vm_stat`; reconstructing it afterwards is
+    impossible, which is exactly why the hypothesis is still a hypothesis.
+
+    **Unknown is `None` and never a zero.** A machine that would not answer and
+    a machine with no swap in use are opposite readings, and a block that spelt
+    both as `0` would retire the hypothesis on the strength of a missing tool.
+
+    One value rather than three loose keys, for the reason `webrtc.Playout` is
+    one: the three are read within a few milliseconds of each other and mean
+    something only together — free memory beside a swap depth from a different
+    minute describes no machine that ever existed.
+    """
+
+    free_memory_bytes: int | None
+    swap_used_bytes: int | None
+    load_average: tuple[float, ...] | None
+
+    @classmethod
+    def read(cls) -> HostPressure:
+        """Take the reading now, answering `None` for whatever will not answer.
+
+        These are notes on the side of a verdict: the acceptance grades the
+        product, a missing `vm_stat` is not a finding about the product, and
+        raising here would turn one into a refused run.
+        """
+        vm_stat = _read(["vm_stat"], timeout_seconds=HOST_READ_TIMEOUT_SECONDS)
+        swapusage = _read(
+            ["sysctl", "-n", "vm.swapusage"], timeout_seconds=HOST_READ_TIMEOUT_SECONDS
+        )
+        try:
+            load: tuple[float, ...] | None = tuple(os.getloadavg())
+        except OSError:
+            load = None
+        return cls(
+            free_memory_bytes=None if vm_stat is None else free_memory_from(vm_stat),
+            swap_used_bytes=None if swapusage is None else swap_used_from(swapusage),
+            load_average=load,
+        )
+
+    def as_facts(self) -> dict[str, Any]:
+        """The reading as the verdict's `environment` block carries it.
+
+        Prefixed `host_`, because everything else in that block is about what is
+        *installed* on this machine and this is about what it was *doing*.
+        """
+        return {
+            "host_free_memory_bytes": self.free_memory_bytes,
+            "host_swap_used_bytes": self.swap_used_bytes,
+            "host_load_average": None if self.load_average is None else list(self.load_average),
+        }
+
+
 def environment_facts() -> dict[str, Any]:
     """What else is installed over the Sessions this run starts — recorded, not refused.
 
@@ -283,6 +541,11 @@ def environment_facts() -> dict[str, Any]:
     Refusing on any of this would deadlock the map — the disposal is last and
     this run is first — so it is written down instead, on the verdict where a
     reader of a green run can see what the green was measured beside.
+
+    `HostPressure` rides in the same block for the same reason, one step
+    further out: not what is installed over this run, but what the machine was
+    doing underneath it. Same question — what was this green or this red
+    measured beside — so the same block is where a reader will look.
     """
     hooks: list[str] = []
     if CLAUDE_SETTINGS.exists():
@@ -297,6 +560,11 @@ def environment_facts() -> dict[str, Any]:
     functions: list[str] = []
     if shell and os.access(shell, os.X_OK):
         for name in ("claude", "codex"):
+            # Deliberately not routed through `_read`: that would answer `None`
+            # on a probe that timed out, and an empty `shell_wrappers` would
+            # then mean both "there are none" and "this run could not tell".
+            # They are different facts about what a green was measured beside,
+            # so a probe that cannot run still stops the run (#230's review).
             probe = subprocess.run(
                 [shell, "-lic", f"type {name} 2>/dev/null"],
                 capture_output=True,
@@ -318,6 +586,7 @@ def environment_facts() -> dict[str, Any]:
             if name.startswith("CLAUDE_CODE_")
             or name in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT")
         ),
+        **HostPressure.read().as_facts(),
     }
 
 

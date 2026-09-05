@@ -22,13 +22,13 @@ withdrew that line of the brief on the strength of this.
 derivable and is not derived; it arrives on the `SessionStart` registration
 (`registration.py`), and this module is handed it.
 
-**Liveness is two conditions, and this file holds one.** A child row exists
-while (a) the parent is `RUNNING` and (b) the parent's own record does not yet
-carry the result of the tool call that started the child. (a) is the caller's,
-because it is already on the parent's inspection and costs nothing; alone, (b)
-would keep a child abandoned mid-turn — Esc on the parent — in the roster until
-the parent exited. A finished child is **dropped, not kept as an ended row**:
-Claude's own roster has no row for it, so *listed* can only mean *alive*.
+**Liveness is two conditions.** A classic child's row exists while (a) the
+parent is `RUNNING` and (b) the parent's own record does not yet carry the
+result of the tool call that started the child. Alone, (b) would keep a child
+abandoned mid-turn — Esc on the parent — in the roster until the parent exited.
+A finished child is **dropped, not kept as an ended row**: Claude's own roster
+has no row for it, so *listed* can only mean *alive*. The second shape below
+answers both conditions differently, and that is the whole of #231.
 
 **Condition (b) is the parent's record, and that took three probes to get
 right.** The obvious marker — the child's own last record carrying
@@ -65,8 +65,62 @@ is remembered here and never asked about again. A Session whose children are all
 over never opens its transcript at all, and one that spawned nothing costs a
 single failed `iterdir`.
 
+**A Session spawns children in two shapes, and everything above describes one
+of them** (#231). A parent that passes `name` to the `Agent` tool does not get a
+Task subagent; it gets an addressable in-process teammate, written into the same
+tree and answered for in a different place. Measured on claude 2.1.260, the
+acceptance run `20260904T124243Z`:
+
+| | classic subagent | named teammate |
+| --- | --- | --- |
+| `meta.json` | `toolUseId`, `spawnDepth` 1 | `name`, `spawnDepth` **0**, `taskKind` |
+| the spawn's `tool_result` | arrives when the child is over | arrives in **99 ms** |
+| the parent, meanwhile | frozen for the child's whole life | idle, Stop hook and all |
+
+All three readings above fail on it at once, which is why no teammate ever
+reached the roster: the caller's `RUNNING` gate hid it for its whole life, the
+absent `toolUseId` left `calls` empty so nothing could settle it, and depth 0
+would have produced a row naming nobody. It is **shape-dependent, not
+version-dependent** — the same 2.1.261 that offered a classic subagent
+correctly writes this shape the moment the parent names one.
+
+So the two liveness conditions are read per shape. A classic child still needs
+its parent `RUNNING`, because a subagent abandoned mid-turn — Esc on the parent
+— never gets its `tool_result` written and would sit in the roster until its
+Session exited. A teammate needs no such backstop and could not survive one: its
+Session goes idle *while it works*, and it is its Session that later records its
+idle notification either way. Both conditions now live here, because both are
+answered from the same two documents — the child's `meta.json` and the parent's
+record — and splitting them across two modules is what let one shape fall
+between them.
+
+**The teammate's marker is the parent's record again, and it is legacy's.**
+`<teammate-message teammate_id="…">` wraps a body whose `type` is
+`idle_notification`; the wrapper is not the marker, because a teammate reports
+through the same envelope it goes idle through. Read newest-first, the first
+thing the parent says about a name answers for it: an idle notification or an
+approved shutdown means stopped, any `SendMessage` addressed to that name — the
+one that asks it to stop included, because a request is a wish and not a state —
+means its Session set it going again, and the `Agent` call that named it bounds
+the scan the way a `tool_use` id bounds the classic one. *Adapted* from
+`legacy@1d32845:bridge/transcript.py:1339-1355,1435-1455,1078-1110`, which
+tracked exactly these three markers from the parent's own transcript — same
+place, same markers, different question: gen-1 asked whether a Stop Notice could
+sound, this asks whether a roster row still exists. Legacy's newest-marker-wins
+is *adapted* rather than ported in one respect: settlement is remembered here,
+as the classic path remembers it, so no scan runs per tick for a child already
+answered for. A teammate that goes idle and is woken again on a **later** tick
+is therefore not re-listed; one woken before its first settling tick is.
+
+**A cross-session peer is addressed through the identical field.** `SendMessage`
+carries `to` for a teammate and for a Session on another socket alike, so the
+recipient is matched against the names this Session's own tree says it started
+and nothing else — the distinction legacy drew in as many words
+(`legacy@1d32845:bridge/transcript.py:1412-1420`).
+
 **Version-bound, and said out loud.** This layout is claude 2.1.246/2.1.247
-on-disk behaviour, and it is not what the reference implementation saw:
+on-disk behaviour for the classic shape and 2.1.260/2.1.261 for the teammate
+one, and it is not what the reference implementation saw:
 `legacy@1d32845:bridge/transcript.py:1477-1500` filtered `isSidechain` records
 out of the parent's *own* file, because that is where they were written then —
 **adapted**, same rule ("a child's work is not the parent's turn"), different
@@ -81,7 +135,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -106,14 +162,59 @@ CHILD_PREFIX: Final = "agent-"
 CHILD_SUFFIX: Final = ".jsonl"
 META_SUFFIX: Final = ".meta.json"
 
-#: The builds every shape here was read off, on Simon's machine on 2026-08-27.
-#: Documentation for the next re-probe, never a gate — the same decision
-#: `claude/discovery.py` took, for the same reason.
-PROVEN_AGAINST_VERSIONS: Final = ("2.1.246", "2.1.247")
+#: The builds every shape here was read off: the classic subagent on Simon's
+#: machine on 2026-08-27, the named teammate from the acceptance runs
+#: `20260904T124243Z` and `20260904T202319Z` on 2026-09-05. Documentation for
+#: the next re-probe, never a gate — the same decision `claude/discovery.py`
+#: took, for the same reason.
+PROVEN_AGAINST_VERSIONS: Final = ("2.1.246", "2.1.247", "2.1.260", "2.1.261")
 
-#: The field of `meta.json` that ties a child to the tool call that started it.
-#: The only one this module reads, apart from `spawnDepth`.
+#: The field of `meta.json` that ties a classic subagent to the tool call that
+#: started it. A teammate's `meta.json` does not carry one.
 TOOL_USE_ID: Final = "toolUseId"
+
+#: What tells the two shapes apart, and the value that says "named in-process
+#: teammate". Read rather than inferred from the absence of `TOOL_USE_ID`,
+#: because absence is also what a `meta.json` written a moment ago looks like.
+TASK_KIND: Final = "taskKind"
+TEAMMATE_TASK_KIND: Final = "in_process_teammate"
+
+#: The field of a teammate's `meta.json` that carries the address its Session
+#: reaches it by. It is what the parent's record names it as, and so the only
+#: thing that can tie a teammate to anything the parent later says.
+TEAMMATE_NAME: Final = "name"
+
+#: The tool that starts a child in either shape, and the field of its input that
+#: is present only when the child being asked for is a teammate.
+SPAWN_TOOL: Final = "Agent"
+
+#: The tool a Session addresses a teammate through, and the two fields carrying
+#: the recipient. The same tool reaches a Session on another
+#: socket, so a recipient is only a teammate if this Session's own tree says it
+#: started one by that name.
+MESSAGE_TOOL: Final = "SendMessage"
+RECIPIENT: Final = "to"
+
+#: How a teammate's own message arrives in the record of the Session that
+#: started it, and the one body `type` that says it has stopped working. Prose
+#: is an ordinary report and a structured body of any other type is this
+#: marker's wording having moved; neither settles anything, which leaves the row
+#: listed — the safe direction, as everywhere else here.
+TEAMMATE_MESSAGE: Final = re.compile(
+    r'<teammate-message\b[^>]*\bteammate_id="([^"]*)"[^>]*>(.*?)</teammate-message>',
+    re.DOTALL,
+)
+
+#: The two bodies that mean a teammate has stopped working, and they are not the
+#: same kind of stop. `idle_notification` is a teammate resting between pieces of
+#: work, and `shutdown_approved` is one agreeing to end — measured 2026-08-12 on
+#: claude 2.1.235 in `61537e10-…jsonl`, where a Session wound down two teammates
+#: and each answered its own shutdown by name. Both are *not listed*, because
+#: this module asks one question and it is not "will it work again" but "is it
+#: working now".
+IDLE_NOTIFICATION: Final = "idle_notification"
+SHUTDOWN_APPROVED: Final = "shutdown_approved"
+STOPPED_WORKING: Final = frozenset({IDLE_NOTIFICATION, SHUTDOWN_APPROVED})
 
 #: What the parent's answer says when the tool call has **not** finished the
 #: child: a subagent started `run_in_background` gets its `tool_result` at once,
@@ -127,10 +228,12 @@ TOOL_USE_ID: Final = "toolUseId"
 #: dropped is one the roster stopped mentioning while it was still working.
 LAUNCHED_NOT_FINISHED: Final = "async_launched"
 
-#: The `spawnDepth` of a subagent the Session itself started. Deeper than this
-#: is unmeasured — the probes drove one subagent, at depth 1 — so a deeper child
-#: names no parent rather than naming the wrong one.
+#: The `spawnDepth` of a subagent the Session itself started, and the one a
+#: teammate of that Session carries. Deeper than either is unmeasured — the
+#: probes drove one subagent at depth 1 and one teammate at depth 0 — so a
+#: deeper child names no parent rather than naming the wrong one.
 DIRECT_SPAWN_DEPTH: Final = 1
+DIRECT_TEAMMATE_DEPTH: Final = 0
 
 #: How much of the parent's transcript is read at a time, scanning back from its
 #: end. One record can be large — the lane's whole-file reader measured 258 KB
@@ -180,6 +283,21 @@ class Children:
         guessed: the directory-name flattening replaces `/`, `.` *and* `_` with
         `-`, which #73 rediscovered the hard way.
 
+        **The parent's own state is one of the two liveness conditions, and it
+        applies to one shape only.** A classic subagent is offered only while its
+        Session is `RUNNING`, because that is the backstop for the child whose
+        `tool_result` is never written — the parent was interrupted mid-turn. A
+        teammate is offered whatever its Session is doing, because its Session
+        goes idle *while it works* (#231) and its own marker arrives either way.
+        The rule reads here rather than at the caller because it is a fact about
+        the child's shape, and the shape is a document this method already holds.
+        A child whose `meta.json` has not landed yet has no shape to read, and is
+        treated as the classic one — the stricter of the two, so an unread
+        document can only hide a row and never invent one. That window is the
+        classic shape's own: the run that measured it wrote the transcript 24
+        seconds before the metadata, while the teammate measured here had its
+        metadata first.
+
         Nothing here raises. A tree that cannot be read is a Session with no
         children — the same answer as a Session that spawned none, and the right
         one either way, because the alternative is a whole lane's discovery
@@ -188,28 +306,24 @@ class Children:
         if transcript is None or parent.target.pid is None:
             return ()
         directory = transcript.parent / transcript.stem / CHILD_DIRECTORY
-        unsettled = [
-            (agent_id, path)
+        unsettled = (
+            _Child(agent_id, self._describe(directory, path))
             for agent_id, path in _candidates(directory)
             if agent_id not in self._finished
-        ]
-        if not unsettled:
-            # The ordinary case for a Session that never spawned anything, and
-            # for one whose children are all over: the parent's transcript is
-            # never opened.
+        )
+        working = parent.state is SessionState.RUNNING
+        listed = [child for child in unsettled if working or not child.needs_a_working_parent]
+        if not listed:
+            # The ordinary case for a Session that never spawned anything, for
+            # one whose children are all over, and for a stopped Session whose
+            # only children are classic: the parent's transcript is never opened.
             return ()
 
-        documents = {agent_id: self._describe(directory, path) for agent_id, path in unsettled}
-        calls = {
-            agent_id: document[TOOL_USE_ID]
-            for agent_id, document in documents.items()
-            if isinstance(document.get(TOOL_USE_ID), str)
-        }
-        self._finished |= _answered(transcript, calls)
+        calls = {child.agent_id: child.call for child in listed if child.call is not None}
+        teammates = {child.agent_id: child.name for child in listed if child.name is not None}
+        self._finished |= _answered(transcript, calls, teammates)
         return tuple(
-            _row(parent, agent_id, documents[agent_id].get("spawnDepth"))
-            for agent_id, _ in unsettled
-            if agent_id not in self._finished
+            _row(parent, child) for child in listed if child.agent_id not in self._finished
         )
 
     def _describe(self, directory: Path, path: Path) -> dict[str, Any]:
@@ -250,9 +364,10 @@ class Children:
 def _candidates(directory: Path) -> list[tuple[str, Path]]:
     """Every subagent transcript in this tree, by the agent id its name carries.
 
-    The `.meta.json` beside it names an `agentType`, a `description` and a
-    `toolUseId`, and no id — the id is the filename. A file that is not one of
-    these is not a child, and is skipped rather than guessed at.
+    The `.meta.json` beside it names an `agentType`, a `description` and — by
+    shape — either a `toolUseId` or a `name`, and no id: the id is the filename,
+    in both shapes. A file that is not one of these is not a child, and is
+    skipped rather than guessed at.
     """
     try:
         entries = sorted(directory.iterdir())
@@ -277,12 +392,81 @@ def _read_meta(path: Path) -> dict[str, Any]:
     return document if isinstance(document, dict) else {}
 
 
-def _answered(transcript: Path, calls: Mapping[str, str]) -> set[str]:
+@dataclass(frozen=True)
+class _Child:
+    """One `agent-<agentId>` pair on disk, read as the shape its metadata says.
+
+    **The document is read for its shape in one place — `teammate` — and every
+    other difference is expressed in terms of that one predicate**: what can
+    settle this child, what `spawnDepth` means "started by the Session that owns
+    this directory", and whether the parent has to be mid-turn for it to be
+    offered at all. They stay properties of one type rather than two
+    implementations because a caller never chooses between them: it holds
+    whatever the directory gave it and asks the same four questions either way.
+    What #231 fixed was those answers being spread across the four call sites
+    that needed them, which is how one shape fell between two of them.
+
+    `document` is the child's `meta.json`, which is empty until it lands. An
+    unread document has no shape, and every property below answers for it the
+    way it answers for a document that names nothing: as the classic shape,
+    which is the stricter of the two.
+    """
+
+    agent_id: str
+    document: Mapping[str, Any]
+
+    @property
+    def teammate(self) -> bool:
+        """Whether this is a named in-process teammate rather than a Task subagent."""
+        return self.document.get(TASK_KIND) == TEAMMATE_TASK_KIND
+
+    @property
+    def call(self) -> str | None:
+        """The tool call that started a classic subagent, if its document names one."""
+        called = self.document.get(TOOL_USE_ID)
+        return called if not self.teammate and isinstance(called, str) else None
+
+    @property
+    def name(self) -> str | None:
+        """The address a teammate answers to, if its document names one.
+
+        A child that has neither this nor a `call` can be settled by nothing —
+        and an unsettled child is listed, which is the safe way round and the
+        same answer #79 gave a `meta.json` that named no `toolUseId`.
+        """
+        named = self.document.get(TEAMMATE_NAME)
+        return named if self.teammate and isinstance(named, str) and named.strip() else None
+
+    @property
+    def own_depth(self) -> int:
+        """The `spawnDepth` that means "started by the Session that owns this tree"."""
+        return DIRECT_TEAMMATE_DEPTH if self.teammate else DIRECT_SPAWN_DEPTH
+
+    @property
+    def needs_a_working_parent(self) -> bool:
+        """Whether this child is offered only while its Session is mid-turn.
+
+        The classic subagent is, because a `tool_result` that never arrives —
+        Esc on the parent — leaves nothing else to end it. A teammate is not,
+        and could not be: its Session goes idle while it works, which is the
+        whole of #231.
+        """
+        return not self.teammate
+
+
+def _answered(
+    transcript: Path,
+    calls: Mapping[str, str],
+    teammates: Mapping[str, str],
+) -> set[str]:
     """Which of these children the parent's own record says are over.
 
-    `calls` is `agentId → toolUseId`. The parent's transcript is scanned
+    `calls` is `agentId → toolUseId` for classic subagents and `teammates` is
+    `agentId → name` for teammates. The parent's transcript is scanned
     **backward from its end**, and each child is settled by the first thing said
-    about its call, reading newest first:
+    about it, reading newest first.
+
+    For a classic subagent that is its tool call:
 
     - a `tool_result` for it — the call came back, so the child is over, unless
       it says `LAUNCHED_NOT_FINISHED`, which is a background subagent answering
@@ -292,24 +476,48 @@ def _answered(transcript: Path, calls: Mapping[str, str]) -> set[str]:
       after the spawn, so once the spawn is reached there is nothing further
       back to find.
 
+    For a teammate it is its name (`_teammate_mentions`), and the two are kept
+    in separate namespaces rather than one: a `toolUseId` is Claude's to mint and
+    a teammate name is the parent model's to invent, so nothing rules out a
+    teammate called `toolu_…` and one namespace would let it answer for a call.
+
+    **One name can belong to more than one file, and then it answers for all of
+    them.** Claude Code's own rule for a reused teammate name is that the latest
+    wins, so a long Session can leave two `agent-…` files claiming one address.
+    The name is the only handle the parent's record offers, so a marker for it
+    settles every child holding it: the alternative is that the older file, which
+    nothing can ever name again, stays listed for the life of the engine — a dead
+    row, which is the one outcome this module exists to prevent.
+
     A child neither record mentions stays unsettled, and an unsettled child is
     listed. That covers the transcript that cannot be read at all, the one whose
     spawn record lies beyond `SCAN_LIMIT_BYTES`, and the child launched by a
     build that writes something this one does not recognise.
     """
-    if not calls:
+    if not calls and not teammates:
         return set()
     waiting = {call: agent for agent, call in calls.items()}
+    named: dict[str, set[str]] = {}
+    for agent, name in teammates.items():
+        named.setdefault(name, set()).add(agent)
     finished: set[str] = set()
     for record in _backward(transcript):
-        for call, over in _mentions(record):
-            agent = waiting.pop(call, None)
-            if agent is None:
-                continue
-            if over:
-                finished.add(agent)
-            if not waiting:
-                return finished
+        # Each namespace stops reading the moment it has nothing left to settle.
+        # The ordinary Session has children of one shape only, so the other scan
+        # is pure cost — and it is not small: one record measured 258 KB on this
+        # machine, and the teammate reading is a regular expression over all of it.
+        if waiting:
+            for call, over in _mentions(record):
+                agent = waiting.pop(call, None)
+                if agent is not None and over:
+                    finished.add(agent)
+        if named:
+            for name, over in _teammate_mentions(record):
+                agents = named.pop(name, None)
+                if agents is not None and over:
+                    finished |= agents
+        if not waiting and not named:
+            return finished
     return finished
 
 
@@ -332,6 +540,95 @@ def _mentions(record: Mapping[str, Any]) -> Iterator[tuple[str, bool]]:
             if isinstance(called, str):
                 # Reached the spawn without having seen a result: still out.
                 yield called, False
+
+
+def _teammate_mentions(record: Mapping[str, Any]) -> Iterator[tuple[str, bool]]:
+    """Every teammate this record speaks about, and whether it says one has stopped.
+
+    Three markers, all of them things the Session itself did or was told, which
+    is why one file answers for all of them
+    (`legacy@1d32845:bridge/transcript.py:1078-1110`, *adapted*):
+
+    - a `<teammate-message>` from that name whose body is an `idle_notification`
+      or a `shutdown_approved` — it has stopped working. Any other body is that
+      teammate *speaking*, which is a teammate working: prose is an ordinary
+      report, and a structured body of some other type is this marker's wording
+      having moved;
+    - a `SendMessage` addressed to that name — its Session set it going again;
+    - the `Agent` call that named it — the spawn, which bounds the scan exactly
+      as the classic path's `tool_use` id does.
+
+    **Two markers this record may carry are deliberately not read.**
+
+    A `SendMessage` whose body is `{"type": "shutdown_request"}` is terminal in
+    the reference implementation (`legacy@1d32845:bridge/transcript.py:1409-1414`)
+    — *adapted, because* settlement there was rebuilt from the whole file on
+    every read and here it is remembered. A request is the parent's *wish*, not
+    the child's state, and reading newest-first it can only be the answering
+    marker when no approval lies newer than it: precisely the case where the
+    teammate has **not** agreed. Measured — the first request to one probe
+    teammate at 00:04:07Z did not take, and a retry drew its approval 50 s later
+    — so under a memory that cannot be taken back it would drop a live teammate
+    for good. One ended without ever approving stays listed instead, which is the
+    direction everything else here already chose.
+
+    `{"type": "teammate_terminated"}` is **dropped, because** it cannot be
+    attributed: it arrives under `teammate_id="system"` and names its teammate
+    only in the prose of its `message`. Costless — it was measured in the *same
+    record* as that teammate's own `shutdown_approved`, which names itself.
+
+    Every one of them answers, and reading newest-first is what makes the newest
+    answer win. A recipient this Session's tree never named is a cross-session
+    peer reached through the identical field, and the caller's `pop` is what
+    keeps one from moving a teammate's row.
+
+    The wrapper arrives in a `user` record whose `message.content` is a **string**
+    — the Session is told what its teammate said the way it is told what a person
+    said — while the two tool calls are blocks in a list. Measured on 2.1.258
+    and 2.1.260; a `last-prompt` record echoing the same text carries no
+    `message` at all and so is never read twice.
+    """
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if isinstance(content, str):
+        for name, body in TEAMMATE_MESSAGE.findall(content):
+            yield name, _protocol_type(body) in STOPPED_WORKING
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+            continue
+        spoken = block.get("input")
+        if not isinstance(spoken, Mapping):
+            continue
+        called = block.get("name")
+        if called == MESSAGE_TOOL:
+            addressed = spoken.get(RECIPIENT)
+        elif called == SPAWN_TOOL:
+            addressed = spoken.get(TEAMMATE_NAME)
+        else:
+            continue
+        if isinstance(addressed, str):
+            yield addressed, False
+
+
+def _protocol_type(body: str) -> str | None:
+    """The `type` of a teammate's structured message, or `None` if it is prose.
+
+    A teammate's own message is quoted into its Session's record as text, so the
+    body arrives as text and is read as text. Prose is what a teammate reporting
+    looks like, and it says nothing about whether that teammate has stopped.
+    """
+    text = body.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        document: Any = json.loads(text)
+    except ValueError:
+        return None
+    kind = document.get("type") if isinstance(document, Mapping) else None
+    return kind if isinstance(kind, str) else None
 
 
 def _merely_launched(record: Mapping[str, Any]) -> bool:
@@ -387,7 +684,7 @@ def _parsed(line: bytes) -> dict[str, Any] | None:
     return record if isinstance(record, dict) else None
 
 
-def _row(parent: SessionInspection, agent_id: str, depth: object) -> SessionInspection:
+def _row(parent: SessionInspection, child: _Child) -> SessionInspection:
     """One live child, as the seam holds it.
 
     **`RUNNING`, because it is.** A child is only a row while it is working, so
@@ -399,10 +696,19 @@ def _row(parent: SessionInspection, agent_id: str, depth: object) -> SessionInsp
     The workspace is the parent's. Measured rather than assumed: every record in
     both probes' child transcripts carried the parent's own `cwd`, because a
     subagent runs where its Session runs.
+
+    **The depth that means "this Session's own" differs by shape**, which is the
+    third of #231's three facts: a classic subagent the Session started is at
+    depth 1 and a teammate it started is at depth 0. Read against the one
+    constant, a teammate produced a row naming nobody, and the acceptance step's
+    next assertion failed on it.
     """
-    direct = depth == DIRECT_SPAWN_DEPTH and not isinstance(depth, bool)
+    depth = child.document.get("spawnDepth")
+    direct = depth == child.own_depth and not isinstance(depth, bool)
     return SessionInspection(
-        target=SessionTarget(agent=AgentKind.CLAUDE, session_id=agent_id, pid=parent.target.pid),
+        target=SessionTarget(
+            agent=AgentKind.CLAUDE, session_id=child.agent_id, pid=parent.target.pid
+        ),
         workspace=parent.workspace,
         lifecycle=SessionLifecycle.LIVE,
         state=SessionState.RUNNING,
@@ -422,5 +728,9 @@ def _row(parent: SessionInspection, agent_id: str, depth: object) -> SessionInsp
         # A Child Process is never named (#78). Said here as well as in the
         # registry because a name composed and then dropped is a name that
         # existed for one hop, and the rule reads better where the row is made.
+        # A teammate is the one shape that carries an address of its own —
+        # `meta.json`'s `name`, the handle its Session reaches it by — and that
+        # is not a Session Name (`CONTEXT.md`), so here the rule is applied
+        # rather than merely inherited.
         name=None,
     )

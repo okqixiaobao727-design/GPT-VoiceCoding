@@ -620,6 +620,14 @@ def preflight(
             f"this run will not stop it for you."
         )
 
+    # After the engine socket for the same reason it is beside it: both are
+    # "something on this machine would be inside this run", and both are read
+    # before any engine starts. `support.foreign_codex_refusal`'s docstring says
+    # why this is not the Codex lane's check alone.
+    foreign_codex = support.foreign_codex_refusal()
+    if foreign_codex is not None:
+        _refuse(foreign_codex)
+
     for lane in selected_lanes:
         if shutil.which(lane.binary, path=engine_path) is None:
             _refuse(

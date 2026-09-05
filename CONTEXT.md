@@ -54,6 +54,10 @@ _Avoid_: debounce, back-off, grace period, rate limit
 A short sound played on the user's own speakers to mark a moment of the Live Call rather than to carry words: the call connected, the call ended, or — mid-call — something happened. The term names the moment; which notes are heard for it belong to the Call adapter, and were chosen by ear. Played by the engine on the configured output device, on its own stream, so the sound for a call that has ended does not depend on that call's audio path still being open.
 _Avoid_: tone, beep, chime, earcon, notification sound
 
+**Playout**:
+The span of the Voice's audio still being played out after the model has sent its last frame of it. The jitter buffer, the engine's own playback buffer and the output device all sit between that frame and the last audible sample, so the Voice has not stopped speaking until the span is empty — which is the fact the system waits for before saying it has. What the engine records about one span, at the moment it ends and again when the wait for it runs out: how many inbound frames arrived, how long ago the last one did, the longest silence between two of them, and how much audio is still queued for the device.
+_Avoid_: drain, playback (the buffer, not the span), audio tail
+
 **Voice**:
 The Live Call's speaking half — the model the user hears and talks to. It has no tools: it composes speech from what the engine hands it, and hands anything that reads as a job to the Call Agent. It is addressed in plain prose, never in code-like text.
 _Avoid_: voice model, realtime model, assistant (unqualified), voice thread
@@ -115,8 +119,8 @@ One interactive terminal run of Claude Code or Codex. The system sees every Sess
 _Avoid_: task, job, window, launched Session (the system launches nothing)
 
 **Child Process**:
-A process a Session spawns — a subagent, a review crew. It appears in the roster under its Session and nothing more: no Relay, no Stop Notice, no name.
-_Avoid_: child Session, subagent (the agent's mechanism word), crew
+A process a Session spawns — a subagent, a review crew, a named in-process teammate. Which of those an agent builds it as is the agent's own mechanism and changes nothing here: it appears in the roster under its Session and nothing more, with no Relay, no Stop Notice and no Session Name. A child the agent addresses by a name of its own is still nameless in this sense — that address is the agent's handle on it, never something the user says to reach it.
+_Avoid_: child Session, subagent and teammate (the agent's mechanism words), crew
 
 **Session Name**:
 What the user and the system call one Session: `<project> · <task>`, where the project is the
