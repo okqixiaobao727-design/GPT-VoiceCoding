@@ -55,7 +55,7 @@ A short sound played on the user's own speakers to mark a moment of the Live Cal
 _Avoid_: tone, beep, chime, earcon, notification sound
 
 **Playout**:
-The span of the Voice's audio still being played out after the model has sent its last frame of it. The jitter buffer, the engine's own playback buffer and the output device all sit between that frame and the last audible sample, so the Voice has not stopped speaking until the span is empty — which is the fact the system waits for before saying it has. What the engine records about one span, at the moment it ends and again when the wait for it runs out: how many inbound frames arrived, how long ago the last one did, the longest silence between two of them, and how much audio is still queued for the device.
+The span of the Voice's audio still being played out after the model has sent its last frame of it. The jitter buffer, the engine's own playback buffer and the output device all sit between that frame and the last audible sample, so the Voice has not stopped speaking until the span is empty — which is the fact the system waits for before saying it has. What the engine records about one span, at the moment it ends and again when the wait for it runs out: how many inbound frames arrived, how long ago the last one did, the longest silence between two of them, how much audio is still queued for the device, and which fact closed the span — the server's word that its audio finished, or inbound audio going quiet.
 _Avoid_: drain, playback (the buffer, not the span), audio tail
 
 **Voice**:
