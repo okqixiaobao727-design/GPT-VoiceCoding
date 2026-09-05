@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import fractions
+import json
 import logging
 import threading
 import time
@@ -68,8 +70,16 @@ FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE
 #: as the end of a sentence, and longer than the jitter between two frames of one
 #: continuous utterance. It bounds only the *recognition* of the end, never the
 #: playout itself — the buffer being empty is the other half of the answer, and
-#: both must hold.
+#: both must hold. Since #235 this is the *fallback* recognition: a peer that
+#: keeps streaming silence after the Voice has finished never goes quiet, and
+#: the server's own word (`OutputAudioEvent.FINISHED`) closes a span there.
 PLAYBACK_QUIET_FRAMES = 3
+
+#: The label of the events data channel this adapter offers. The backend's SDP
+#: expects one to be described; since #235 it is also read, for the family of
+#: events above. Every *other* event this adapter acts on still arrives as a
+#: JSON-RPC notification on the app-server socket.
+EVENTS_CHANNEL = "realtime-events"
 
 #: How often `playback_drained` looks: one frame, because a poll finer than the
 #: thing it is measuring buys nothing but wake-ups.
@@ -94,16 +104,70 @@ class VoiceDependencyError(Exception):
     """The voice extra is not installed, so there is no audio path to build."""
 
 
+class OutputAudioEvent(enum.Enum):
+    """The server's own words about a response's audio playing out (#235).
+
+    OpenAI Realtime API server events, documented as **WebRTC/SIP only** and
+    delivered on the client-created events data channel (the realtime-webrtc
+    guide, "Set up data channel for sending and receiving events"). Per
+    response, not per buffer: each carries the `response_id` it is about.
+
+    `FINISHED` is `output_audio_buffer.stopped`: "Emitted when the output audio
+    buffer has been completely drained on the server, and no more audio is
+    forthcoming. This event is emitted after the full response data has been
+    sent to the client (`response.done`)." Fields: `event_id`, `response_id`,
+    `type`. `STARTED` is its opening word, `output_audio_buffer.started`.
+    Verified 2026-09-05 against `openai/openai-python` main,
+    `src/openai/types/realtime/realtime_server_event.py:79-113`
+    (`OutputAudioBufferStarted`, `OutputAudioBufferStopped`; last changed
+    2026-08-10), whose docstrings link
+    https://platform.openai.com/docs/guides/realtime-conversations#client-and-server-events-for-audio-in-webrtc
+    — the rendered reference at developers.openai.com surfaces the family only
+    through those SDK types.
+
+    **Whether this backend sends them is what the next run decides.** The call
+    is codex's `realtime/calls` proxy (`intent=quicksilver&architecture=avas`,
+    v3 vocabulary: `turn.done`, `output_audio.delta`), not the public API, and
+    codex itself has no WebRTC client that reads the channel, so no source
+    settles it. `_WebRtcTransport` therefore logs each event type the channel
+    carries, once per call, and the stop-edge line names the fact that closed
+    it — the run's engine log answers the question either way.
+
+    `STARTED`'s one job here is to take back a `FINISHED` that arrived for the
+    previous response after the quiet rule had already closed that span —
+    left latched, it would close the next span the moment its buffer was
+    empty. Any other event type on the channel is not this family and is
+    dropped where the channel is read.
+    """
+
+    STARTED = "output_audio_buffer.started"
+    FINISHED = "output_audio_buffer.stopped"
+
+
+class SpanClosedBy(enum.Enum):
+    """Which fact closed a span of the Voice's playout (#235).
+
+    The value is the clause the stop-edge line carries, so the log and the code
+    cannot name the same fact two ways. `SERVER` is the rule; `QUIET` is the
+    fallback for a peer that never says so; a wait that ran out its bound has
+    no member here, because nothing closed it.
+    """
+
+    SERVER = "the server said its audio had finished"
+    QUIET = "inbound audio went quiet"
+
+
 @dataclass(frozen=True)
 class Playout:
     """What the speaker saw over one stretch of waiting — the four facts (#230).
 
-    `drained` is decided by two things this side cannot influence and did not
-    report: whether inbound frames stopped for `PLAYBACK_QUIET_FRAMES` frames,
-    and whether the device still has audio queued. So a stop edge that ran out
-    its bound said only that it had, and two entirely different causes — a
-    remote peer that keeps RTP flowing through silence, and an event loop
-    starved into delivering frames in bursts — arrived at the same one line.
+    Until #235, `drained` was decided by two things this side cannot influence
+    and did not report: whether inbound frames stopped for
+    `PLAYBACK_QUIET_FRAMES` frames, and whether the device still has audio
+    queued. So a stop edge that ran out its bound said only that it had, and
+    two entirely different causes — a remote peer that keeps RTP flowing
+    through silence, and an event loop starved into delivering frames in
+    bursts — arrived at the same one line.
 
     The four together are what tells them apart. A large `largest_gap_seconds`
     with `frames` still climbing is a starved loop: the pauses were real, and
@@ -207,10 +271,20 @@ class _WebRtcTransport:
         self._connected.add_done_callback(_retrieved)
 
         # The realtime events data channel. The backend expects the offer to
-        # describe one; nothing here reads it, because every event this adapter
-        # acts on arrives as a JSON-RPC notification on the app-server socket
-        # instead — one stream of truth rather than two that can disagree.
-        self._pc.createDataChannel("realtime-events")
+        # describe one. Every event this adapter *acts* on still arrives as a
+        # JSON-RPC notification on the app-server socket — one stream of truth
+        # for the call's course. What is read here is one family only: the
+        # server's word that a response's audio has finished playing out, which
+        # exists nowhere else (#235; `OutputAudioEvent`). Event types seen
+        # on the channel are named in the log once each, so a run shows what
+        # this backend actually sends.
+        self._events_seen: set[str] = set()
+        channel = self._pc.createDataChannel(EVENTS_CHANNEL)
+
+        @channel.on("message")
+        def _on_message(message: Any) -> None:
+            self._read_channel_event(message)
+
         self._pc.addTrack(self._microphone.track())
 
         @self._pc.on("track")
@@ -273,17 +347,51 @@ class _WebRtcTransport:
         so this decides nothing about wording.
         """
         deadline = asyncio.get_running_loop().time() + timeout_seconds
-        while not self._speaker.drained:
+        while (closed_by := self._speaker.closed_by) is None:
             if asyncio.get_running_loop().time() >= deadline:
                 _log.info(
-                    "playout had not drained %gs after the Voice stopped generating; "
+                    "playout had not drained %gs after the Voice stopped generating "
+                    "(neither the server's word nor quiet arrived); "
                     "reporting the stop edge anyway — %s",
                     timeout_seconds,
                     self._speaker.take_playout(),
                 )
                 return
             await asyncio.sleep(PLAYBACK_POLL_SECONDS)
-        _log.info("the Voice's playout drained — %s", self._speaker.take_playout())
+        _log.info(
+            "the Voice's playout drained: %s — %s", closed_by.value, self._speaker.take_playout()
+        )
+
+    def _read_channel_event(self, message: Any) -> None:
+        """One message off the events channel, parsed for the speaker (#235).
+
+        Anything that is not a JSON object with a string `type` is not a server
+        event and is dropped; a type outside `OutputAudioEvent` is dropped here
+        too, so the speaker only ever hears a typed word. Each type is named in
+        the log the first time this call sees it — the engine log has to show,
+        on its own, whether this backend sends `OutputAudioEvent.FINISHED` at all.
+        """
+        if isinstance(message, bytes | bytearray):
+            message = message.decode("utf-8", errors="replace")
+        if not isinstance(message, str):
+            return
+        try:
+            event = json.loads(message)
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if not isinstance(kind, str):
+            return
+        if kind not in self._events_seen:
+            self._events_seen.add(kind)
+            _log.info("the realtime events channel carried %s", kind)
+        try:
+            event = OutputAudioEvent(kind)
+        except ValueError:
+            return
+        self._speaker.heard_from_server(event)
 
     def on_lost(self, handler: LostHandler) -> None:
         self._on_lost = handler
@@ -522,7 +630,30 @@ class _Microphone:
 
 
 class _Speaker:
-    """What the call says, played out — or counted, in a silent run."""
+    """What the call says, played out — or counted, in a silent run.
+
+    **The drain rule, decided from run data (#235).** A span of the Voice's
+    playout is over when nothing is still queued for the device *and* one of:
+
+    1. the server said the response's audio has finished playing out
+       (`OutputAudioEvent.FINISHED`, read off the events data channel) — the rule;
+    2. no inbound frame has arrived for `PLAYBACK_QUIET_FRAMES` frames — the
+       fallback, for a peer that never sends the word;
+
+    and a wait that reaches neither is closed by `playback_drained`'s bound as
+    the last resort, which should then almost never fire.
+
+    Decided by runs `20260905T071849Z`, `075128Z`, `090222Z` and `092046Z`:
+    the bound fired seven times, every time with 0 bytes buffered, the last
+    inbound frame 2-20 ms ago and the largest gap under 0.35 s — around
+    10 000 frames (≈200 s of audio) held open behind a 15-second answer. That
+    is a peer that keeps streaming silence after the Voice has finished, so
+    the quiet rule alone can never close the span; not a starved event loop,
+    which would have shown buffered bytes and large gaps. Whether the peer pads
+    its stream is the peer's business, so what closes a span is now the
+    server's own word, and the quiet rule is kept for the runs — `075128Z`
+    drained 13 of 13 spans on it — where the peer does stop.
+    """
 
     def __init__(self, *, silent: bool, device: int | None) -> None:
         self._silent = silent
@@ -546,23 +677,45 @@ class _Speaker:
         #: boundary — which is what keeps `_window_largest_gap` a gap *between
         #: two frames of this window* and not the idle since the last one.
         self._window_gap_from: float | None = None
+        #: Whether the server has said the current response's audio finished
+        #: playing out (#235). Set from the events channel, taken back by the
+        #: next response starting, and consumed with the window it closed.
+        #: Touched from the data-channel callback and read from
+        #: `playback_drained`, both on the event loop: no lock.
+        self._server_finished = False
+
+    def heard_from_server(self, event: OutputAudioEvent) -> None:
+        """The server's word about the current response's audio: finished, or not yet.
+
+        `STARTED` while a wait is still polling for the previous span erases
+        nothing that matters: the Voice speaking again is what makes that wait
+        stale in the adapter (`speaking_span` moves on), and the span stays
+        open — correctly — until this response's own `FINISHED`.
+        """
+        self._server_finished = event is OutputAudioEvent.FINISHED
 
     @property
-    def drained(self) -> bool:
-        """Whether the last inbound frame has finished playing.
+    def closed_by(self) -> SpanClosedBy | None:
+        """Which fact says the last inbound frame has finished playing, if any.
 
-        Two facts, and both are needed. Nothing has arrived for
-        `PLAYBACK_QUIET_SECONDS`, so what has arrived is the *last* frame; and
-        nothing is still queued for the device, so that frame has been written.
-        A silent run buffers nothing, which leaves the first fact answering on
-        its own — correctly, because there is no speaker for audio to trail in.
+        Nothing still queued for the device is required first: whatever the
+        server or the quiet rule says, audio this side has not yet written is
+        audio the user has not yet heard. A silent run buffers nothing, which
+        leaves the other fact answering on its own — correctly, because there
+        is no speaker for audio to trail in. No frame ever arriving reads as
+        quiet: there is nothing playing that has not finished.
         """
-        if self._last_frame_at is None:
-            return True
         with self._lock:
             if self._buffer:
-                return False
-        return time.monotonic() - self._last_frame_at >= PLAYBACK_QUIET_FRAMES * FRAME_SECONDS
+                return None
+        if self._server_finished:
+            return SpanClosedBy.SERVER
+        if (
+            self._last_frame_at is None
+            or time.monotonic() - self._last_frame_at >= PLAYBACK_QUIET_FRAMES * FRAME_SECONDS
+        ):
+            return SpanClosedBy.QUIET
+        return None
 
     @property
     def playout(self) -> Playout:
@@ -602,6 +755,7 @@ class _Speaker:
         self._window_frames = 0
         self._window_largest_gap = None
         self._window_gap_from = None
+        self._server_finished = False
         return taken
 
     def attach(self, track: Any) -> None:

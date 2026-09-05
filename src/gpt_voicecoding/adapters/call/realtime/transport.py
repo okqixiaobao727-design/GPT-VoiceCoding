@@ -73,10 +73,12 @@ class CallTransport(Protocol):
         than one that arrives a little early, because the whole point of the
         edge is that something downstream is waiting for the gap.
 
-        "Drained" is two facts and both are this side's: nothing more has come
-        in for the transport's own quiet bound, and nothing it did come in with
-        is still queued for the device. A silent run has no device and no queue,
-        so the first fact is the whole answer there — which is correct, not a
+        The span is over when nothing is still queued for the device, and one
+        of two facts about the far side holds: the server said the response's audio has finished
+        playing out, or nothing more has come in for the transport's own quiet
+        bound (#235 — the first is the rule, the second the fallback for a peer
+        that never says so). A silent run has no device and no queue, so the far
+        side's fact is the whole answer there — which is correct, not a
         stand-in: there is no speaker to trail.
         """
         ...
