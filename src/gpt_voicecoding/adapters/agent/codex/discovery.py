@@ -258,6 +258,7 @@ async def discover(
     daemon_note: str = "",
     projects: ProjectNames | None = None,
     reported_non_sessions: set[str] | None = None,
+    reported_unheld_terminals: set[int] | None = None,
 ) -> LaneDiscovery:
     """Every Codex Session on this machine, however well it can be described.
 
@@ -275,6 +276,12 @@ async def discover(
     back to what the daemon still holds. Given nothing, each pass says it once,
     which is what a one-shot reading wants anyway.
 
+    `reported_unheld_terminals` is the same discipline for the same sentence
+    said from the other source (#233): the pids of the live terminals this lane
+    has already said answer to nothing on its roster. It is pruned back to the
+    pids still running, because a pid is reused and a terminal remembered after
+    it exited would silence the next one to land on that number.
+
     **A drop is logged like an errand, and for the same reason.** A daemon-held
     user root that did not become a row leaves a stated reason (#201): the first
     diagnosis of that bug was wrong precisely because the drop was silent, and
@@ -289,6 +296,18 @@ async def discover(
     threads, daemon_error = await _threads(client, reported_non_sessions)
     composed = roster.compose(threads, terminals)
     _report(composed.drops, reported_non_sessions)
+    # Said only where the daemon was actually read. The sentence itself is about
+    # this roster and so is true whatever the daemon did (`NOTHING_TO_VOUCH_FOR`
+    # says why), but on a reading with no daemon in it every live terminal on
+    # the machine would earn one, and each is remembered per pid — a page of
+    # latched lines whose real subject is the one fact `degraded` is already
+    # carrying, that the daemon did not answer. The prune below still runs, so
+    # the set stays roster-sized across a daemon that is down for a while.
+    _report_unheld_terminals(
+        composed.unheld if daemon_error is None else (),
+        reported_unheld_terminals,
+        live={terminal.candidate.pid for terminal in terminals},
+    )
 
     names = projects or ProjectNames()
     rows: list[SessionInspection] = []
@@ -327,6 +346,47 @@ def _report(drops: tuple[roster.Drop, ...], reported_non_sessions: set[str] | No
             continue
         reported.add(drop.thread_id)
         _log.info("thread %s is not a Session row: %s", drop.thread_id, drop.reason)
+
+
+def _report_unheld_terminals(
+    unheld: tuple[roster.UnheldTerminal, ...],
+    reported_unheld_terminals: set[int] | None,
+    *,
+    live: set[int],
+) -> None:
+    """Say once, per pid, that a live `codex` answers to nothing on this roster.
+
+    The same sentence `_report` says about a thread, said about a terminal, and
+    it exists because that one could not reach this case: `_report` only speaks
+    about threads the daemon holds, and the degradation note only where a user
+    root was read in the terminal's workspace — so a TUI outside the daemon
+    entirely, which is what a `-c` override makes, produced neither a row nor a
+    word (#233).
+
+    **A note and never a row.** A Session this lane cannot identify is
+    under-reported and said to be, never invented (ADR 0020); this is the
+    saying-so, not a way in.
+
+    Pruned to the pids still running, unlike `_report`'s thread ids, which
+    `_threads` prunes for it. Both are the same rule — this set may not grow all
+    day — but a pid carries a second reason: the machine reuses it, and a
+    terminal remembered past its exit would silence its successor.
+    """
+    if reported_unheld_terminals is None:
+        reported = set()
+    else:
+        reported_unheld_terminals &= live
+        reported = reported_unheld_terminals
+    for terminal in unheld:
+        if terminal.pid in reported:
+            continue
+        reported.add(terminal.pid)
+        _log.info(
+            "a live codex terminal (pid %s) in %s is not a Session row: %s",
+            terminal.pid,
+            terminal.workspace,
+            roster.NOTHING_TO_VOUCH_FOR,
+        )
 
 
 def progress_from(thread: Mapping[str, Any], *, capture: ProgressCapture) -> ProgressObservation:

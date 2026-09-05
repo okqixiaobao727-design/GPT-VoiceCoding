@@ -198,6 +198,10 @@ class CodexAgentAdapter:
         #: reason `_turns` is: the cadence calls `discover` every five seconds,
         #: and "once per thread id" needs something that outlives one call.
         self._reported_non_sessions: set[str] = set()
+        #: Which live terminals this lane has already said answer to nothing on
+        #: its roster (#233). Kept beside the set above and for its reason: the
+        #: sentence is once per pid, and one call cannot remember a pid.
+        self._reported_unheld_terminals: set[int] = set()
         #: The project half of every Session Name this lane composes, read once
         #: per workspace and kept for the life of the adapter (#78).
         self._projects = ProjectNames()
@@ -375,6 +379,7 @@ class CodexAgentAdapter:
             daemon_note=self._daemon.note,
             projects=self._projects,
             reported_non_sessions=self._reported_non_sessions,
+            reported_unheld_terminals=self._reported_unheld_terminals,
         )
         if not lane.enumerated:
             return lane

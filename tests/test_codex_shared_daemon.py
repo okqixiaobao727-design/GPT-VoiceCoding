@@ -141,6 +141,18 @@ class TestTheVersionMismatch:
         assert "0.148.0" in address.note
         assert "0.149.1" in address.note
 
+    def test_a_mismatch_is_not_read_as_a_prediction_about_joining(self) -> None:
+        """#233: measured on 2026-09-05, a CLI 0.153.0 TUI *does* join a 0.149.1
+        daemon — its thread appears in `thread/loaded/list`. Only a `-c` override
+        keeps one out, and that is not a version fact. The note may report the
+        disagreement it read; it may not predict what the disagreement will do.
+        """
+        note = DaemonAddress(
+            socket_path=SOCKET, cli_version="0.153.0", app_server_version="0.149.1"
+        ).note
+
+        assert "join" not in note
+
     def test_matching_versions_have_nothing_to_say(self) -> None:
         assert (
             DaemonAddress(
