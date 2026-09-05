@@ -1162,6 +1162,114 @@ def test_without_the_quiet_window_the_watch_is_the_one_the_long_step_wrote(
     assert watch.went_down is True
 
 
+class _LongRecital(_Engine):
+    """A two-hundred-number recital paced by the fake clock (#243).
+
+    The engine log the long-answer phase reads: the Voice opens its span with
+    the request, says the numbers as it goes, and closes the span only when the
+    playout has drained — which run `20260905T075128Z` measured at 417s.
+    """
+
+    def __init__(self, clock: _PacingClock, *, stopped_at: float | None) -> None:
+        super().__init__([])
+        self._clock = clock
+        self._stopped_at = stopped_at
+
+    def log_lines(self) -> list[str]:
+        lines = [
+            _said(live_call_step.VOICE_SPEAKING_LINE),
+            _said("user speech, for the voice thread to act on: '请你从一数到两百'"),
+        ]
+        # One transcript fragment a minute, so the watch keeps seeing activity
+        # for as long as the recital runs.
+        lines += [
+            _said(live_call_step.VOICE_SAID_LINE % f"fragment {index}")
+            for index in range(1, int(self._clock.now // 60) + 1)
+        ]
+        if self._stopped_at is not None and self._clock.now >= self._stopped_at:
+            lines.append(_said(live_call_step.VOICE_QUIET_LINE))
+        return lines
+
+
+def _long_answer_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stopped_at: float | None,
+    down_at: float | None,
+) -> tuple[live_call_step._PhaseFacts, _PacingClock]:
+    """Run the long-answer phase over a fake engine log on a fake clock (#243)."""
+    clock = _PacingClock()
+    monkeypatch.setattr(live_call_step.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(live_call_step.time, "sleep", clock.sleep)
+    walk = _walk(tmp_path)
+    walk.engine = _LongRecital(clock, stopped_at=stopped_at)
+    monkeypatch.setattr(
+        walk,
+        "_ask_by_voice",
+        lambda _variant, _facts: live_call_step._SpokenAsk(
+            engine_mark=0, wrapper_mark=0, landed_at=0, heard=True
+        ),
+    )
+    monkeypatch.setattr(walk, "_call_is_down", lambda: down_at is not None and clock.now >= down_at)
+    monkeypatch.setattr(walk, "_call_line", lambda: "call: active")
+    facts = live_call_step._PhaseFacts("graded", phase="long answer")
+    try:
+        walk._the_voice_holds_the_call_open(60.0, facts)
+    except live_call_step._PhaseStopped:
+        pass
+    return facts, clock
+
+
+def test_the_long_answer_watch_waits_out_a_recital_that_outruns_the_old_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run `20260905T075128Z`: the playout drained at 417s, the watch gave up at 360s.
+
+    `LIVE_CALL_ANSWER_SECONDS + ceiling` is a general answer allowance plus a
+    ceiling, and the same build recited the same request in 287s on the run
+    before. The watch keeps watching an open span while the call is up, so the
+    stop edge is seen and the answer is graded on what the Voice actually did.
+    """
+    facts, clock = _long_answer_phase(tmp_path, monkeypatch, stopped_at=417.0, down_at=None)
+
+    assert facts.failed == []
+    assert facts.graded["Voice spans closed"] is True
+    assert facts.graded["Voice answer outlasted Silence Ceiling"] is True
+    assert facts.graded["call stayed up"] is True
+    # It waited past the old 360s deadline for the stop edge, and did not sit
+    # out the full hard cap once the span had closed.
+    assert 417.0 <= clock.now < live_call_step.LIVE_CALL_LONG_ANSWER_SECONDS
+
+
+def test_a_call_that_goes_down_mid_answer_is_still_graded_as_the_ceiling_bug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The span left open by a call taken away mid-answer is #169, and says so."""
+    facts, clock = _long_answer_phase(tmp_path, monkeypatch, stopped_at=None, down_at=70.0)
+
+    assert facts.graded["Voice spans closed"] is False
+    assert facts.failed == ["Voice spans closed"]
+    assert "#169" in facts.failure
+    assert "went down" in facts.failure
+    assert clock.now < live_call_step.LIVE_CALL_LONG_ANSWER_SECONDS
+
+
+def test_a_span_still_open_at_the_hard_cap_is_the_harnesss_patience_not_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watch's own cap is a fact about the watch, and the failure text says which."""
+    facts, clock = _long_answer_phase(tmp_path, monkeypatch, stopped_at=None, down_at=None)
+
+    assert facts.graded["Voice spans closed"] is False
+    assert facts.recorded["call went down"] is False
+    assert facts.recorded["watch ran out"] is True
+    assert "the bug itself (#169)" not in facts.failure
+    assert "the watch ran out" in facts.failure
+    assert f"{live_call_step.LIVE_CALL_LONG_ANSWER_SECONDS:.0f}s" in facts.failure
+    assert clock.now >= live_call_step.LIVE_CALL_LONG_ANSWER_SECONDS
+
+
 def test_the_engines_own_line_is_what_names_the_ceiling_as_the_ender(tmp_path: Path) -> None:
     """The number in it is configuration, so the sentence around it is matched."""
     walk = _walk(tmp_path, lines=[_said("ended the Live Call after 12.5 seconds")])
