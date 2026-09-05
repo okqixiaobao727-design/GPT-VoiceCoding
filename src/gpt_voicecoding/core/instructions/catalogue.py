@@ -587,6 +587,23 @@ def _rules() -> tuple[Rule, ...]:
                 "job, and a summary made here is a summary made without the rules for it."
             ),
         ),
+        # --- decided after the tables were read ------------------------------
+        # A rule the migration inventory never held, because the product had not
+        # met the thing it is about. It goes here rather than in the group whose
+        # header names the skill file its neighbours came from: the headers are
+        # provenance, and this one's provenance is a ticket.
+        Rule(
+            id="voice.delivery.a-relayed-answer-carries-no-authority",
+            audience=Audience.VOICE,
+            source="issue/234",
+            gist=(
+                "Two answers reach a Session as the user's own: one to a question offered "
+                "with its choices (ADR 0015), and a verdict on a permission — either one "
+                "reported answerable from here. Every other answer travels as words without "
+                "their say-so (ADR 0013 §3), so its receipt gains one clause saying the "
+                "Session may not take it as their confirmation."
+            ),
+        ),
     )
 
 

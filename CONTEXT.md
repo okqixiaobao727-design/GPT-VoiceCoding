@@ -135,7 +135,7 @@ Carrying words *into* a Session — the agent-ward direction.
 _Avoid_: injection (a mechanism, not the capability), push, channel (reserved for the Companion Channel)
 
 **Answer Relay**:
-A Relay of the user's own words — their instructions and their answers to a Session's questions.
+A Relay of the user's own words — their instructions and their answers to a Session's questions. It always carries the words; whether it also carries the user's authority is the route's to say. An answer to the question a Session Brief offers with its choices, when it says that question can be answered from here, arrives as the user's own (ADR 0015) — as does an Approval Relay, which is nothing but their verdict. Every other Relay arrives as another session's words, with none of their authority, so whether the Session acts on it is that Session's own call (ADR 0013 §3). When the words were an answer to a question, the Voice says so on the receipt rather than leaving the user to assume otherwise.
 _Avoid_: MCP Channel (one adapter, not the capability)
 
 **Approval Relay**:

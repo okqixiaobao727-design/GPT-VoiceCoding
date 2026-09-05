@@ -194,6 +194,68 @@ def _sections() -> tuple[Section, ...]:
                         "Do not go back and check on it unless they ask you to."
                     ),
                 ),
+                # **The receipt was true and still left the user believing the
+                # wrong thing.** #234, from the #198 full run: the extra Session
+                # had ended its turn on a plain-text question, the user's spoken
+                # `可以继续` went over the inbox, and the two runs read it
+                # opposite ways — `124243Z` complied, `202319Z` refused it as
+                # another session's words and asked for the user in person. The
+                # product behaved as ADR 0013 §3 decides, and that decision
+                # stands (Simon, 2026-09-05): on that route words travel and
+                # authority does not. What the Voice owed the user was to say
+                # so, because 已转达 alone is heard as "it took your answer".
+                #
+                # **Told apart by what the engine handed over, not by a new
+                # field.** A route carrying the user's authority is open for two
+                # things: a question the engine offered with its choices (ADR
+                # 0015's held hook) and a permission it is waiting on (the
+                # Approval Relay, whose whole content is the user's verdict) —
+                # either one *and* said to be answerable from here. Both halves
+                # are already in the Voice's hands — the shape rule makes it
+                # speak the second as "whether they can answer it from here" —
+                # so the clause is conditional on nothing new and `SessionBrief`
+                # grows nothing for it. **Choices are not the test, in either
+                # direction.** A
+                # brief carries a question read off the transcript whether or
+                # not its writer is still parked (`core/briefing.py`,
+                # `core/bridge.py::_question_answerable`), and words the user
+                # sends mid-turn take the inbox even then (`core/relays.py`,
+                # `RelayRoute.SUPPLEMENT`). Keyed on choices alone, the Voice
+                # would tell the user their answer was their own on a route that
+                # carries nobody's — and, in the other direction, would put the
+                # clause on a spoken permission verdict, which has no choices to
+                # offer (`core/briefing.py`, `Decision(tool=…, summary=…)`) and
+                # is the one answer that is unambiguously theirs.
+                #
+                # **The Voice predicts nothing.** Two runs of one build went
+                # both ways, so which it will be is not knowable here, and a
+                # Voice that guessed would be inventing under this set's own
+                # first paragraph.
+                #
+                # **Legacy (ADR 0010): no such behaviour, and it could not have
+                # had one.** The first generation carried the user's words with
+                # authority by launching every Session through its own channel
+                # (`legacy@1d32845:bridge/claude.py:472-476`, serving
+                # `legacy@1d32845:claude-channel/channel.mjs`), so it never had
+                # a route that dropped authority to warn anybody about. That
+                # wrapper is dropped, because ADR 0020 / #67 / #68 — this
+                # product bridges Sessions the user already started. **New**,
+                # for this route.
+                Block(
+                    covers=("voice.delivery.a-relayed-answer-carries-no-authority",),
+                    text=(
+                        "What they say reaches a session as their own in two cases only: "
+                        "they answered the question the engine gave you with its choices, or "
+                        "they gave their verdict on a permission it is waiting on — either "
+                        "one the engine said they can answer from here. There you add "
+                        "nothing. Every other answer — to a question a session merely said on "
+                        "its way past, or to one the engine no longer offers from here — "
+                        "still goes, but that session cannot tell it was them speaking, so "
+                        "add one clause to the receipt: 不过这是转达进去的，它不一定当成你本人的"
+                        "确认. What it does with them is its own to decide, and you never "
+                        "guess which way."
+                    ),
+                ),
                 Block(
                     text=(
                         "A short tone during the call means news has come in. It is not a cue "

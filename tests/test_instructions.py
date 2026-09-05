@@ -145,8 +145,19 @@ class TestTheTableIsSettled:
         "voice.notice.reads-progress-when-asked-for-more",
     )
 
-    def test_exactly_the_nine_voice_rules_survive(self) -> None:
-        assert ids_for(Audience.VOICE) == self.SURVIVING
+    #: Voice rules decided after #173's table, each by the ticket that ruled it.
+    #: A separate set rather than a tenth line in `SURVIVING`, because that set
+    #: is a record of one reading and must keep saying what it said then; a rule
+    #: added later is a second decision and is written down as one (#234).
+    ADDED_SINCE = frozenset(
+        {
+            "voice.delivery.a-relayed-answer-carries-no-authority",
+        }
+    )
+
+    def test_the_voice_set_is_those_nine_and_what_was_decided_since(self) -> None:
+        """The nine #173 kept, and nothing else but what a later ticket ruled in."""
+        assert ids_for(Audience.VOICE) == self.SURVIVING | self.ADDED_SINCE
 
     def test_every_retired_rule_is_gone_from_the_catalogue(self) -> None:
         known = {rule.id for rule in RULES}
@@ -202,12 +213,13 @@ class TestTheTableIsSettled:
     def test_the_catalogue_owes_exactly_these_rules_and_no_others(self) -> None:
         """The proof that nothing left unread, carried by ids rather than by lines.
 
-        `SURVIVING` pins the nine Voice rules #173 kept; this pins everything
-        else the catalogue still holds. A rule deleted because a diff was
-        convenient fails here by name, and adding one is a decision somebody
-        writes down in the same commit.
+        `SURVIVING` pins the nine Voice rules #173 kept and `ADDED_SINCE` the
+        Voice rules ruled in after it; this pins everything else the catalogue
+        still holds. A rule deleted because a diff was convenient fails here by
+        name, and adding one is a decision somebody writes down in the same
+        commit — in one of the three sets, which is the decision.
         """
-        assert {rule.id for rule in RULES} == self.RETAINED | self.SURVIVING
+        assert {rule.id for rule in RULES} == self.RETAINED | self.SURVIVING | self.ADDED_SINCE
 
     def test_the_history_rule_moved_to_the_call_agent_under_its_own_name(self) -> None:
         """#190's deferred key: a read belongs to the acting half, so the id says so."""
@@ -471,9 +483,10 @@ class TestTheVoiceHearsProse:
         )
         assert elsewhere.text == voice_instructions(CONTEXT).text
 
-    def test_it_is_nine_paragraphs_in_the_order_the_ticket_fixes(self, instructions) -> None:
+    def test_it_is_ten_paragraphs_in_the_order_the_ticket_fixes(self, instructions) -> None:
+        """Nine from #173's order, plus the authority clause #234 added after the receipt."""
         paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
-        assert len(paragraphs) == 9
+        assert len(paragraphs) == 10
 
     def test_the_paragraphs_run_in_the_0901_order(self, instructions) -> None:
         """#173 §3: who you are, the opened call, the two briefs, and so on to hanging up."""
@@ -485,6 +498,7 @@ class TestTheVoiceHearsProse:
             "five at a time",
             "their own words",
             "已转达",
+            "不一定当成你本人的确认",
             "wait to be asked",
             "the half behind you",
         )
@@ -517,12 +531,17 @@ class TestTheVoiceHearsProse:
         assert "收到，等它这轮结束送进去" in instructions.voice.text
 
     @staticmethod
-    def _receipt_paragraph(instructions) -> str:
-        """The one paragraph #173 §3.7 fixes, found by the word it settles on."""
+    def _paragraph_with(instructions, mark: str) -> str:
+        """The one paragraph carrying `mark`, and a failure when it is not one."""
         paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
-        receipts = [part for part in paragraphs if "已转达" in part]
-        assert len(receipts) == 1, receipts
-        return receipts[0]
+        found = [part for part in paragraphs if mark in part]
+        assert len(found) == 1, found
+        return found[0]
+
+    @classmethod
+    def _receipt_paragraph(cls, instructions) -> str:
+        """The one paragraph #173 §3.7 fixes, found by the word it settles on."""
+        return cls._paragraph_with(instructions, "已转达")
 
     def test_the_hand_off_moment_is_spoken_of_before_the_receipt(self, instructions) -> None:
         """#221: the Voice said 已转达 at hand-off, seconds before the relay ran.
@@ -548,6 +567,52 @@ class TestTheVoiceHearsProse:
         paragraph = self._receipt_paragraph(instructions)
         assert "comes once" in paragraph
         assert "only then" in paragraph
+
+    @classmethod
+    def _authority_paragraph(cls, instructions) -> str:
+        """The paragraph #234 added, found by the clause it dictates."""
+        return cls._paragraph_with(instructions, "不一定当成你本人的确认")
+
+    def test_the_two_answers_that_carry_authority_escape_the_clause(self, instructions) -> None:
+        """ADR 0013 §3 as the user hears it: which answers are the user's own.
+
+        Two are: an answer to a question the engine offered with its choices
+        (ADR 0015's held hook), and a verdict on a permission (the Approval
+        Relay) — either one *and* reported answerable from here. Both halves
+        matter in both directions. Choices alone are not the hook — a brief
+        carries a question read off the transcript after its writer has gone,
+        and mid-turn words take the inbox regardless — and a permission has no
+        choices at all, so an exemption written around choices would put the
+        clause on the one answer that is unambiguously the user's.
+        """
+        paragraph = self._authority_paragraph(instructions)
+        assert "with its choices" in paragraph
+        assert "verdict on a permission" in paragraph
+        assert "said they can answer from here" in paragraph
+
+    def test_every_other_answer_gets_the_clause(self, instructions) -> None:
+        """Both of the two ways a question can fall outside the hook are named."""
+        paragraph = self._authority_paragraph(instructions)
+        marks = (
+            "Every other answer",
+            "merely said",
+            "no longer offers from here",
+            "不一定当成你本人的确认",
+        )
+        at = [paragraph.find(mark) for mark in marks]
+        assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
+        assert at == sorted(at), dict(zip(marks, at, strict=True))
+
+    def test_the_authority_clause_predicts_nothing_about_the_session(self, instructions) -> None:
+        """#234's evidence: two runs, same product, opposite readings by the Session.
+
+        Which way it goes is the Session's own call, so the Voice says what the
+        words are and stops — a guess either way is the invention this set's
+        first paragraph forbids.
+        """
+        paragraph = self._authority_paragraph(instructions)
+        assert "its own" in paragraph
+        assert "guess" in paragraph
 
     def test_the_hand_off_sentence_repeats_no_receipt_wording(self, instructions) -> None:
         """Naming the word to forbid it is how the Voice comes to say it.

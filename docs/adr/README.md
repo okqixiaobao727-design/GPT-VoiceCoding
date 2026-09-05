@@ -12,7 +12,7 @@
 | [0010](0010-legacy-is-the-behaviour-spec.md) | The seam architecture stays, and the first generation is the behaviour spec it must satisfy |
 | [0011](0011-the-claude-hooks-are-a-fingerprinted-block-in-the-user-settings-file.md) | The Claude hooks are a fingerprinted block in the user's settings file |
 | [0012](0012-installation-runs-at-first-launch.md) | Installation runs at first launch, from a package that needs no engine |
-| [0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md) | The Claude Answer Relay rides the Session's own inbox socket, and an accepted write is not a receipt — **amended by 0015** |
+| [0013](0013-the-answer-relay-rides-the-sessions-own-inbox-socket.md) | The Claude Answer Relay rides the Session's own inbox socket, and an accepted write is not a receipt — **amended by 0015**, and **amended 2026-09-05**: decision 3 stands, and the Voice says what a relayed answer is not |
 | [0014](0014-question-answers-ride-the-approval-hook.md) | A question answer rides the Approval Relay as a typed verdict — **superseded by 0015** |
 | [0015](0015-a-held-question-opens-the-reply-window.md) | A held question opens the Reply Window and the Answer Relay selects its hook route — **amended 2026-09-01**: the engine keeps no clock on a held hook |
 | [0016](0016-progress-publishes-a-roster-summary-or-exact-detail.md) | Progress publishes one observation as a roster summary or exact detail |
