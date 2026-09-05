@@ -1364,6 +1364,56 @@ def test_the_question_a_session_stops_on_is_one_the_voice_reads_out() -> None:
         assert not any(mark in fragment for mark in "?？。，,「」“”:：")
 
 
+def test_the_claude_lane_holds_its_question_and_the_codex_lane_says_it() -> None:
+    """#238: the route the Detail answer rides is the lane's, and only the route.
+
+    A plain-text question ends the turn as text, so the Answer Relay rides the
+    inbox and Claude Code announces it to the Session as a peer's words (ADR
+    0013, 2026-09-05 amendment) — the same build read that wrapper both ways on
+    two runs, which is the red this ticket closes. Asked through
+    `AskUserQuestion` the question is *held*, the Relay takes the ADR 0015 hook
+    route, and what the phase grades stops resting on a model's reading.
+
+    The Codex lane keeps the plain-text question because the product has no held
+    question there at all: its adapter projects `PERMISSION` and `UNKNOWN` and
+    never `QUESTION`, the same fact `Lane.question` records for #128.
+    """
+    assert "AskUserQuestion" in journey.CLAUDE.call_asking.words
+    assert journey.CLAUDE.call_asking is journey.ASK_A_QUESTION_THROUGH_THE_TOOL
+    assert "AskUserQuestion" not in journey.CODEX.call_asking.words
+    assert journey.CODEX.call_asking is journey.ASK_A_QUESTION_THEN_SAY
+    # Two to four is what the tool takes, and both labels are offered by name so
+    # the walk knows every word it put in front of the Voice.
+    assert len(journey.CALL_QUESTION_OPTIONS) == 2
+    for label in journey.CALL_QUESTION_OPTIONS:
+        assert label in journey.CLAUDE.call_asking.words
+
+
+def test_the_offered_labels_share_no_run_with_anything_graded() -> None:
+    """An option label rides the brief's own `option:` lines into the hand-over.
+
+    So a label spelling a graded fragment is a fragment the Voice can say while
+    reading the question out, passing a check about a different field. The
+    labels are also not the spoken answer: what arrives through the held hook is
+    the user's own words, which match no label — the Answer Relay carries words
+    rather than a choice (ADR 0015).
+    """
+    graded = (
+        journey.QUESTION_ASKED_SPOKEN_SUBSTRING,
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
+        live_call_step.LIVE_CALL_ANSWER_SUBSTRING,
+        live_call_step.RELAY_RECEIPT_QUEUED,
+        live_call_step.RELAY_RECEIPT_DELIVERED,
+    )
+    for label in journey.CALL_QUESTION_OPTIONS:
+        for fragment in graded:
+            assert fragment not in label
+            assert label not in fragment
+        for lane in journey.LANES:
+            for workspace in lane.call_workspaces:
+                assert workspace not in label
+
+
 def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
     """#198 §3a grades the Voice's Detail answer against the Session's `newest`.
 
@@ -1377,8 +1427,12 @@ def test_the_focus_session_is_told_what_to_answer_a_relay_with() -> None:
     """
     reply = live_call.DICTATED_REPLY
 
-    assert reply in journey.ASK_A_QUESTION_THEN_SAY.words
-    assert journey.THE_QUESTION_ASKED in journey.ASK_A_QUESTION_THEN_SAY.words
+    # **Every lane's drive**, because the route the question is held on is the
+    # lane's since #238 and the dictation is not: whichever way the Focus
+    # Session is stopped, the line Detail grades is one the walk wrote.
+    for lane in journey.LANES:
+        assert reply in lane.call_asking.words
+        assert journey.THE_QUESTION_ASKED in lane.call_asking.words
     # Not the plain turn: phases 4 and 5 re-drive with it and their turn has to
     # end on the question, not on an answer to the drive itself.
     assert reply not in journey.ASK_A_QUESTION.words
