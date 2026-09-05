@@ -530,10 +530,20 @@ class ClaudeAgentAdapter:
         The other thing the roster cannot say is **what a Session has spawned**
         (#79). A Task subagent is not a process and is not on the official
         roster — measured, `children.py` — so its rows are found from the
-        parent's own transcript tree and listed straight after it. The two reads
-        are mutually exclusive and that is what keeps both off the hot path: a
-        stopped Session gets its transcript read and can have no live child,
-        while a `RUNNING` one is never opened and is the only kind that can.
+        parent's own transcript tree and listed straight after it.
+
+        **The parent-state condition on that read moved into `children.py` and
+        did not go away** (#231). It was held here while it was true of every
+        child: a Session not mid-turn has no child mid-turn, and a subagent whose
+        file has no ending — the parent was interrupted — stops being listed the
+        moment its parent stops working. A named in-process teammate breaks the
+        premise rather than the rule, because its Session goes idle *while it
+        works*; and telling the two apart needs the child's own `meta.json`, so
+        the condition now lives where that document is read. A stopped Session
+        can therefore have a live child after all, and the two reads here are no
+        longer mutually exclusive. What keeps the second off the hot path is its
+        own gates: a Session that spawned nothing costs one failed `iterdir`, and
+        one whose children are all settled opens no transcript of theirs at all.
         """
         lane = await claude_discovery.discover(projects=self._projects)
         if not lane.enumerated:
@@ -541,26 +551,13 @@ class ClaudeAgentAdapter:
         rows: list[SessionInspection] = []
         for row in lane.rows:
             rows.append(self._row_with_stop(row))
-            rows.extend(self._children_under(row))
+            rows.extend(self._children.under(row, self._transcript_path(row.target)))
         projected = tuple(rows)
         return replace(
             lane,
             rows=projected,
             degraded=source_degradation(projected, lane.degraded),
         )
-
-    def _children_under(self, row: SessionInspection) -> tuple[SessionInspection, ...]:
-        """Every Child Process this row is running, or none because it is not running.
-
-        The first of #79's two liveness conditions, held here because this is
-        where the parent's state is: a Session that is not mid-turn has no child
-        mid-turn, and a child whose file has no ending — the parent was
-        interrupted — stops being listed the moment its parent stops working.
-        The second condition is the child's own last record (`children.py`).
-        """
-        if row.state is not SessionState.RUNNING:
-            return ()
-        return self._children.under(row, self._transcript_path(row.target))
 
     def _row_with_stop(self, row: SessionInspection) -> SessionInspection:
         """One roster row, with everything its own transcript says about it.
