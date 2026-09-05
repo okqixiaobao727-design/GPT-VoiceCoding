@@ -23,6 +23,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import hand_started
 import journey
 import pytest
 import support
@@ -398,8 +399,89 @@ class TestTheAcceptanceRunArrangesDistinctAndActionableGround:
 
 
 class TestTheCodexPermissionPolicyReadbackRemainsExact:
-    def test_the_lane_pins_only_workspace_write(self) -> None:
-        assert journey.CODEX.arguments == ("--sandbox", "workspace-write")
+    def test_the_lane_pins_the_sandbox_and_nothing_the_product_asserts(self) -> None:
+        """The lane may pin the sandbox and its own cost. It may not pin a policy.
+
+        The sandbox pin is what #105 asks this lane to name, and the model pin is
+        cost — neither is a field `policy_at` grades. The approval family *is*:
+        `turn/start` asserts `approvalPolicy` and `approvalsReviewer` on every
+        relayed turn, and a lane that pinned either at the keyboard would
+        pre-arrange the assertion #77's approval route has to make for itself. So
+        this names the pins that are allowed and refuses the rest by exhaustion,
+        rather than freezing a tuple that now also carries values no assertion
+        depends on.
+        """
+        arguments = journey.CODEX.arguments
+
+        assert arguments[:2] == ("--sandbox", "workspace-write")
+        assert set(arguments[2:]) == {"-m", support.CODEX_LANE_MODEL}
+        # Every approval-touching spelling `codex --help` carries on 0.153.0.
+        assert not set(arguments) & {
+            "-a",
+            "--ask-for-approval",
+            "--approve-for-me",
+            "--dangerously-bypass-approvals-and-sandbox",
+        }
+
+    def test_the_lane_carries_no_config_override(self) -> None:
+        """#232: a `-c` here costs the lane every step, not one setting.
+
+        A `-c` override makes codex-tui run its own core instead of joining the
+        shared daemon, and the Codex roster composes a row from a daemon-held user
+        thread plus a live terminal in its workspace — so a lane launched with one
+        has no row for any step to read. Measured 2026-09-05 on codex-cli 0.153.0
+        against a shared app-server 0.149.1: `--sandbox workspace-write` joins,
+        `… -m gpt-5.6-luna` joins, and either of those plus
+        `-c model_reasoning_effort="high"` does not.
+
+        Named as its own test rather than folded into the tuple assertion above,
+        because it is a different claim: that one is "these are the pins this lane
+        is allowed", this one is "this *spelling* is not available to this lane at
+        any value". The reason and the table live beside the pin block in
+        `support.py`; the run-time guard is `settle_daemon_membership`.
+        """
+        assert not [
+            argument for argument in journey.CODEX.arguments if support.is_config_override(argument)
+        ]
+        assert not hasattr(support, "CODEX_LANE_REASONING_EFFORT")
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "-c",
+            "-cmodel_reasoning_effort=high",
+            "-c=model_reasoning_effort=high",
+            "-config",
+            "--config",
+            "--config=sandbox_mode=danger",
+        ],
+    )
+    def test_every_spelling_of_a_config_override_is_one(self, flag: str) -> None:
+        """A short flag that takes a value swallows the rest of its own argument.
+
+        All of these were accepted by codex-cli 0.153.0 on this machine, `-config`
+        included — `clap` reads that one as `-c` with the value `onfig`. Every one
+        of them fills `cli_kv_overrides`, and `can_reuse_implicit_local_daemon`
+        requires it to be empty (`tui/src/lib.rs:919-921`), so every one of them
+        keeps this lane's TUI out of the daemon.
+        """
+        assert support.is_config_override(flag)
+
+    @pytest.mark.parametrize("flag", ["--sandbox", "workspace-write", "-m", "--cd", "gpt-5.6-luna"])
+    def test_nothing_else_is_mistaken_for_one(self, flag: str) -> None:
+        """A pin refused by a prefix nobody checked is the same bug pointed the other way."""
+        assert not support.is_config_override(flag)
+
+    def test_the_codex_lane_is_the_one_that_answers_for_its_daemon(self) -> None:
+        """Membership is load-bearing on this lane and does not arise on the other.
+
+        A Claude Session is discovered from its own registration and its
+        transcript, with no daemon in the path; a Codex Session *is* a daemon
+        thread a terminal vouches for (ADR 0020). `None` on the Claude lane is
+        that difference written down, not a check nobody got round to.
+        """
+        assert journey.CODEX.daemon_membership is not None
+        assert journey.CLAUDE.daemon_membership is None
 
     def test_the_exact_product_policy_is_sound(self, tmp_path: Path) -> None:
         rollout = self._rollout(
@@ -450,6 +532,47 @@ class TestTheCodexPermissionPolicyReadbackRemainsExact:
     def _rollout(tmp_path: Path, payload: dict[str, object]) -> Path:
         rollout = tmp_path / "codex.jsonl"
         rollout.write_text(json.dumps({"type": "turn_context", "payload": payload}) + "\n")
+        return rollout
+
+
+class TestTheThreadTheDaemonWouldHaveToHold:
+    """What the Session calls itself, read for `settle_daemon_membership` (#232).
+
+    Read from the rollout at the moment it is asked rather than from the cached
+    `GroundTruth`, because that is resolved once — before the boot turn, when
+    `codex` has written no rollout and the id is `""`.
+    """
+
+    #: The id shape `codex` writes into `session_meta`, from a real rollout.
+    THREAD = "01998f4c-0d5a-7c31-9f2b-6a0c1e77aa10"
+
+    def test_the_id_comes_off_the_records_first_line(self, tmp_path: Path) -> None:
+        rollout = self._meta(tmp_path, {"session_id": self.THREAD, "cwd": str(tmp_path)})
+
+        assert hand_started.codex_thread_id(rollout) == self.THREAD
+
+    def test_a_session_that_has_written_nothing_yet_names_no_thread(self) -> None:
+        """The `None` a `record_now` answers before the first turn — not an absence."""
+        assert hand_started.codex_thread_id(None) == ""
+
+    def test_a_record_whose_first_line_is_not_session_meta_names_no_thread(
+        self, tmp_path: Path
+    ) -> None:
+        rollout = tmp_path / "codex.jsonl"
+        rollout.write_text(json.dumps({"type": "turn_context", "payload": {}}) + "\n")
+
+        assert hand_started.codex_thread_id(rollout) == ""
+
+    def test_a_record_that_cannot_be_read_names_no_thread(self, tmp_path: Path) -> None:
+        rollout = tmp_path / "codex.jsonl"
+        rollout.write_text("{not json\n")
+
+        assert hand_started.codex_thread_id(rollout) == ""
+
+    @staticmethod
+    def _meta(tmp_path: Path, payload: dict[str, object]) -> Path:
+        rollout = tmp_path / "codex.jsonl"
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": payload}) + "\n")
         return rollout
 
 
