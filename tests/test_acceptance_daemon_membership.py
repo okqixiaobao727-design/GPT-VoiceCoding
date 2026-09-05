@@ -6,14 +6,9 @@ and because both are answers to one JSON-RPC call they are pinned against a fake
 daemon: no real `codex` is run by this file, no socket is opened, and none is
 needed.
 
-The measurement this whole ticket rests on, taken on 2026-09-05 with the same pty
-launch in a trusted workspace, asking the daemon `thread/loaded/list` for the
-TUI's own thread id:
-
-    --sandbox workspace-write                                  → held
-    --sandbox workspace-write -m gpt-5.6-luna                   → held
-    --sandbox workspace-write -c model_reasoning_effort="high"  → NOT held
-    --sandbox workspace-write -m … -c model_reasoning_effort=…  → NOT held
+The 2026-09-05 measurement this ticket rests on has one home, beside the pin block
+in `support.py`, and is not copied here: a table restated in four files is a table
+that will be edited in one of them.
 """
 
 from __future__ import annotations

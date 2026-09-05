@@ -446,13 +446,28 @@ class TestTheCodexPermissionPolicyReadbackRemainsExact:
         assert not hasattr(support, "CODEX_LANE_REASONING_EFFORT")
 
     @pytest.mark.parametrize(
-        "flag", ["-c", "--config", "-c=model_reasoning_effort=high", "--config=sandbox_mode=danger"]
+        "flag",
+        [
+            "-c",
+            "-cmodel_reasoning_effort=high",
+            "-c=model_reasoning_effort=high",
+            "-config",
+            "--config",
+            "--config=sandbox_mode=danger",
+        ],
     )
     def test_every_spelling_of_a_config_override_is_one(self, flag: str) -> None:
-        """`clap` fills `cli_kv_overrides` from the joined form too, so both count."""
+        """A short flag that takes a value swallows the rest of its own argument.
+
+        All of these were accepted by codex-cli 0.153.0 on this machine, `-config`
+        included — `clap` reads that one as `-c` with the value `onfig`. Every one
+        of them fills `cli_kv_overrides`, and `can_reuse_implicit_local_daemon`
+        requires it to be empty (`tui/src/lib.rs:919-921`), so every one of them
+        keeps this lane's TUI out of the daemon.
+        """
         assert support.is_config_override(flag)
 
-    @pytest.mark.parametrize("flag", ["--sandbox", "workspace-write", "-m", "--cd", "-config"])
+    @pytest.mark.parametrize("flag", ["--sandbox", "workspace-write", "-m", "--cd", "gpt-5.6-luna"])
     def test_nothing_else_is_mistaken_for_one(self, flag: str) -> None:
         """A pin refused by a prefix nobody checked is the same bug pointed the other way."""
         assert not support.is_config_override(flag)
@@ -465,8 +480,8 @@ class TestTheCodexPermissionPolicyReadbackRemainsExact:
         thread a terminal vouches for (ADR 0020). `None` on the Claude lane is
         that difference written down, not a check nobody got round to.
         """
-        assert journey.CODEX.daemon_thread is hand_started.codex_thread_id
-        assert journey.CLAUDE.daemon_thread is None
+        assert journey.CODEX.daemon_membership is not None
+        assert journey.CLAUDE.daemon_membership is None
 
     def test_the_exact_product_policy_is_sound(self, tmp_path: Path) -> None:
         rollout = self._rollout(

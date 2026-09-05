@@ -59,15 +59,13 @@ A fourth, measured on #110 (2026-08-27, `codex-cli` 0.150.0):
   silently destroy the attachment the run exists to measure. **Never reach for
   `-c` at all, whatever it is being reached for.**
 
-  That sentence used to end "to solve a boot gate", and the narrower version is
-  what #232 cost. `cli_kv_overrides.is_empty()` does not care *which* key was
-  overridden — a `-c` for cost keeps the TUI out of the daemon exactly as a `-c`
-  for the update prompt does — and `6a44f1b` passed `-c model_reasoning_effort`
-  for cost, under a rule that read as if it were about boot gates. Run
-  `20260904T202319Z` then failed at `roster` and SKIPPED the nine steps behind
-  it, with the mechanism already written down here. The rule is now about the
-  flag, and `journey.Walk.settle_daemon_membership` measures the attachment on
-  every run rather than trusting anyone to have read this paragraph.
+  That sentence used to end "to solve a boot gate", and #232 is what the narrower
+  version cost: `cli_kv_overrides.is_empty()` does not care which key was
+  overridden, so a `-c` passed for *cost* got past a rule that read as if it were
+  about boot gates. The measurement, the flags and the run are recorded once,
+  beside the pin block in `support.py`. What replaces trust in this paragraph is
+  `journey.Walk.settle_daemon_membership`, which measures the attachment on every
+  run.
 
   This gate is *skipped*, not arranged, and that is what makes it unlike
   `TrustGate`: nothing of the user's is edited, `version.json` is not written, and

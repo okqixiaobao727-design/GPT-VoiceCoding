@@ -462,23 +462,38 @@ DAEMON_ROSTER_METHOD = codex_discovery.ROSTER_METHOD
 DaemonLocator = Callable[[str], Awaitable[tuple[codex_shared_daemon.DaemonAddress | None, str]]]
 DaemonDial = Callable[..., Awaitable[Any]]
 
-#: Every spelling of a config override `codex --help` carries on 0.153.0, in both
-#: the separated and the `=`-joined form. One list, because the tuple test and the
-#: refusal's own reading of the flags have to agree about what a `-c` looks like.
-CONFIG_OVERRIDE_FLAGS = ("-c", "--config")
+#: The long spelling of a config override, and the only one that can be written
+#: out in full. One name, because the tuple test and the refusal's own reading of
+#: the flags have to agree about what a `-c` looks like.
+CONFIG_OVERRIDE_LONG = "--config"
+
+#: The short one. Everything after it on the same argument is its **value**, which
+#: is why this is a prefix rather than a word — see `is_config_override`.
+CONFIG_OVERRIDE_SHORT = "-c"
 
 
 def is_config_override(flag: str) -> bool:
-    """Whether one launch argument is a `-c` override, in either spelling.
+    """Whether one launch argument is a `-c` override, in any spelling `clap` accepts.
 
-    The `=`-joined form matters as much as the separated one: `clap` accepts
-    `-c=key=value` and `--config=key=value`, and `cli_kv_overrides` fills the same
-    way from both — so a check that only knew `("-c", "--config")` would wave
-    through the exact flag #232 exists to keep out.
+    **A short flag that takes a value swallows the rest of its own argument**, and
+    that is what makes this a prefix test rather than a membership test. Measured
+    on codex-cli 0.153.0 on this machine, all four accepted: `-c key=value`,
+    `-ckey=value`, `--config key=value`, `--config=key=value`. `-config` is
+    accepted too — `clap` reads it as `-c` with the value `onfig` — so a
+    single-dash argument beginning `-c` is a config override whatever follows,
+    and there is no `-c`-prefixed short flag on this CLI it could be confused
+    with.
+
+    The first draft of this tested `flag in ("-c", "--config")` plus the
+    `=`-joined forms, and both review axes caught the same hole: a
+    `-cmodel_reasoning_effort=high` in the lane's tuple would have passed the
+    test that exists to refuse it, kept the TUI out of the daemon, and then been
+    reported by `DaemonMembership.refusal` as "no `-c` override in those flags" —
+    the run asserting the absence of the exact cause that was present.
     """
-    return flag in CONFIG_OVERRIDE_FLAGS or flag.startswith(
-        tuple(f"{name}=" for name in CONFIG_OVERRIDE_FLAGS)
-    )
+    if flag.startswith("--"):
+        return flag == CONFIG_OVERRIDE_LONG or flag.startswith(f"{CONFIG_OVERRIDE_LONG}=")
+    return flag.startswith(CONFIG_OVERRIDE_SHORT)
 
 
 @dataclass(frozen=True)

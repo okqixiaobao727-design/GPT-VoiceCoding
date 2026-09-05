@@ -883,9 +883,16 @@ class Lane:
     #: turn look like a turn that never grew the record, which is exactly how
     #: `_drive_turn` decides a turn is over.
     record_now: Callable[[hand_started.GroundTruth, float], Path | None]
-    #: How this lane names the thread a shared daemon would have to hold for the
-    #: product to see the Session the harness started, given that Session's own
-    #: record — or `None` on a lane with no daemon to be outside of.
+    #: Whether the daemon this lane's Sessions live in holds the one the harness
+    #: started, given that Session's own record — or `None` on a lane with no
+    #: daemon to be outside of.
+    #:
+    #: **The whole reading rather than half of it.** A first draft carried only
+    #: the *thread id* here and let `settle_daemon_membership` name
+    #: `support.codex_daemon_membership` itself, which made the field a hook a
+    #: second lane could never use: the walk would have gone on asking the Codex
+    #: daemon about it. Both halves belong to the lane that knows which daemon it
+    #: means.
     #:
     #: **Only the Codex lane has one, and that is a fact about the product rather
     #: than a gap here.** ADR 0020 defines a Codex Session as a daemon thread a
@@ -894,7 +901,7 @@ class Lane:
     #: transcript, with no daemon in the path (`adapters/agent/claude`). A lane
     #: that answers `None` is not skipping a check, it is saying the question does
     #: not arise.
-    daemon_thread: Callable[[Path | None], str] | None = None
+    daemon_membership: Callable[[Path | None], support.DaemonMembership] | None = None
 
     def token_variable(self, configured: str) -> str:
         """This lane's bot token variable, given the one the engine's config names."""
@@ -1052,7 +1059,9 @@ CODEX = Lane(
     # The daemon this lane's Session has to be inside for any step to read a row.
     # `roster` is where its absence used to surface, as a red with nine SKIPPED
     # behind it; naming it here is what lets the boot wait refuse instead (#232).
-    daemon_thread=hand_started.codex_thread_id,
+    daemon_membership=lambda record: support.codex_daemon_membership(
+        hand_started.codex_thread_id(record)
+    ),
     # Measured 2026-08-27 through the shared daemon with the product's own pin
     # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a
     # 0.149.1 app-server: a write to a path outside the workspace raises
@@ -1425,11 +1434,10 @@ class Walk:
         **dropped, because** gen 1 drove a per-Session app-server it spawned
         itself and had no shared daemon a Session could be outside of.
         """
-        name_thread = self.lane.daemon_thread
-        if name_thread is None:
+        read_membership = self.lane.daemon_membership
+        if read_membership is None:
             return
-        thread_id = name_thread(self._record_now())
-        membership = support.codex_daemon_membership(thread_id)
+        membership = read_membership(self._record_now())
         self.journal(
             "daemon.membership",
             lane=self.lane.name,
@@ -1442,7 +1450,7 @@ class Walk:
         self.journey.observe(
             "daemon membership",
             f"the shared Codex daemon {'holds' if membership.held else 'was not read for'} "
-            f"thread {thread_id or '<none written yet>'} — {membership.reason}. A Codex "
+            f"thread {membership.thread_id or '<none written yet>'} — {membership.reason}. A Codex "
             f"Session is a daemon thread a terminal vouches for (ADR 0020), so this is what "
             f"stands between the launch flags and every row the steps below read (#232). "
             f"Launched with {list(self.lane.arguments)}. Arranged and recorded by the "
