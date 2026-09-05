@@ -620,6 +620,18 @@ def _unspaced(text: str) -> str:
     return "".join(text.split())
 
 
+def _carries(fragment: str, said: str) -> bool:
+    """Whether one recorded line carries a graded fragment (#181).
+
+    The one owner of the containment rule every read here grades by: the user
+    speech the engine logs, a Session's own `history` entries, and the Voice's
+    transcript. Spaceless on both sides because all three come back from the
+    same recogniser-adjacent path, which has been seen to put a boundary inside
+    a word. What is asked is only whether the words are in there.
+    """
+    return _unspaced(fragment) in _unspaced(said)
+
+
 def _asked_prompt(brief: str) -> str:
     """What a Session Brief says the Session is asking, off its `asked:` line.
 
@@ -657,7 +669,7 @@ def _the_question_it_stopped_on(brief: str) -> str:
     it should have been.
     """
     for reading in (_asked_prompt(brief), _newest_message(brief)):
-        if _unspaced(QUESTION_ASKED_SPOKEN_SUBSTRING) in _unspaced(reading):
+        if _carries(QUESTION_ASKED_SPOKEN_SUBSTRING, reading):
             return reading
     return ""
 
@@ -673,7 +685,7 @@ def _the_question_is_held(brief: str) -> bool:
     reading cannot say by itself, so the walk writes it down: the field the
     question arrived on is what says which route its answer will ride.
     """
-    return _unspaced(QUESTION_ASKED_SPOKEN_SUBSTRING) in _unspaced(_asked_prompt(brief))
+    return _carries(QUESTION_ASKED_SPOKEN_SUBSTRING, _asked_prompt(brief))
 
 
 def _what_a_brief_holds(brief: str) -> str:
@@ -1856,7 +1868,7 @@ class _LiveCallRun:
         page = self._history_read_yet(self._extra_address(workspace, fallback))
         if page is None:
             return False
-        return any(_unspaced(fragment) in _unspaced(text) for _, text in page.entries)
+        return any(_carries(fragment, text) for _, text in page.entries)
 
     def _detail_asked_for_by_voice(
         self, focus_at: Path, focus_address: str, facts: _PhaseFacts
@@ -3034,7 +3046,7 @@ class _LiveCallRun:
         return [
             line
             for line in support.matching_lines(self._log_since(since), USER_SPEECH_LINE)
-            if _unspaced(carrying) in _unspaced(line)
+            if _carries(carrying, line)
         ]
 
     def _user_speech_landed_at(self, carrying: str, *, since: int) -> int:
@@ -3044,7 +3056,7 @@ class _LiveCallRun:
             (
                 since + at
                 for at, line in enumerate(window)
-                if re.search(USER_SPEECH_LINE, line) and _unspaced(carrying) in _unspaced(line)
+                if re.search(USER_SPEECH_LINE, line) and _carries(carrying, line)
             ),
             since,
         )
@@ -3105,14 +3117,10 @@ class _LiveCallRun:
     def _voice_said_something_carrying(self, fragment: str, *, since: int) -> bool:
         """Whether the Voice's transcript since a mark carries a fragment (#181, #198).
 
-        Spaceless on both sides for `_user_speech_lines`' reason, and for one
-        more of its own: the Voice transcript comes back from the same
-        recogniser-adjacent path and has been seen to put a boundary inside a
-        word. What is asked is only whether the words are in there.
+        Line by line through `_carries`, which is the reading a fast test can
+        put a recorded utterance in front of without a call (#244).
         """
-        return any(
-            _unspaced(fragment) in _unspaced(line) for line in self._voice_said_lines(since=since)
-        )
+        return any(_carries(fragment, line) for line in self._voice_said_lines(since=since))
 
     def _arm_auto_hangup(self) -> None:
         """Auto Hang-up on, which is the switch the Silence Ceiling answers to.

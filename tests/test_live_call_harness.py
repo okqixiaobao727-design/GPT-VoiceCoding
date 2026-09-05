@@ -929,6 +929,43 @@ def test_the_spoken_fragment_drops_terminal_punctuation_the_voice_changes() -> N
     assert live_call_step._spoken_fragment(f"{words}?") == words
 
 
+#: Every rendering of `journey.THE_QUESTION_ASKED` the Voice has been recorded
+#: saying in a narrowed answer, newest first, each beside the run it came from.
+#: The hand-over fact grades this and nothing else, so the fragment it grades on
+#: is the run of characters all of these share (#244).
+RECORDED_QUESTION_RENDERINGS = (
+    ("20260905T092046Z", '它说 READY,问需要它现在做完吗,选项是"现在就做"或"以后再说"。'),
+    ("20260905T090222Z", "它问需要不需要把这件事做完"),
+    ("20260905T075128Z", "它刚问:需要我把这件事做完吗"),
+    ("20260905T071849Z", "需要它把这件事做完吗"),
+    ("20260905T071849Z", "需要把这件事做完吗"),
+)
+
+
+@pytest.mark.parametrize(("run_id", "said"), RECORDED_QUESTION_RENDERINGS)
+def test_a_recorded_rendering_of_the_question_grades_as_carrying_it(run_id: str, said: str) -> None:
+    """#244: the Voice renders the question in its own words, and every one counts.
+
+    `20260905T092046Z`'s claude lane named the Session, said what it is waiting
+    on, quoted both option labels and rendered the question as `需要它现在做完吗`
+    — a Voice doing what `core/instructions/voice.py` asks. Graded on the
+    sentence's rephrasable middle it went red at `hand-over` and skipped every
+    later phase, so what is graded is the part every rendering kept.
+    """
+    assert live_call_step._carries(live_call_step.QUESTION_ASKED_SPOKEN_SUBSTRING, said), run_id
+
+
+def test_an_answer_that_never_says_the_question_still_grades_as_not_carrying_it() -> None:
+    """The fact is about the question, so naming the Session and its options is not it.
+
+    This is the answer #244's fragment must keep failing: everything a
+    `SpokenBrief` carries except what the Session is asking.
+    """
+    said = '项目二号工位,用的是 Claude,正在等你决定。选项是"现在就做"或"以后再说"。'
+
+    assert not live_call_step._carries(live_call_step.QUESTION_ASKED_SPOKEN_SUBSTRING, said)
+
+
 @pytest.mark.parametrize(
     "said",
     [

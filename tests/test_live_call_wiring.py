@@ -1537,6 +1537,32 @@ def test_the_claude_lane_holds_its_question_and_the_codex_lane_says_it() -> None
         assert label in journey.CLAUDE.call_asking.words
 
 
+def test_the_question_fragment_shares_no_run_with_the_answers_to_it() -> None:
+    """#244 shortened the graded fragment to `做完`, and short runs collide.
+
+    The question and its answer both reach the Voice out of the same brief, so a
+    run either could carry is a fact that grades the wrong utterance. Asserted
+    through `_carries`, which is what the hand-over grades by: the check the
+    neighbouring test makes about the labels is plain containment, and this one
+    is about the fragments passing for each other *under the grade*, which folds
+    whitespace out of both sides. Both ways round, so shortening the fragment
+    again — or rewording a reply or a label — cannot quietly make the question
+    and its answer pass for each other.
+
+    The dictated reply is named whole as well as by its graded substring: the
+    Focus Session says the whole line and the Voice can read any of it back.
+    """
+    fragment = journey.QUESTION_ASKED_SPOKEN_SUBSTRING
+    for other in (
+        live_call.DICTATED_REPLY,
+        live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING,
+        live_call_step.LIVE_CALL_ANSWER_SUBSTRING,
+        *journey.CALL_QUESTION_OPTIONS,
+    ):
+        assert not live_call_step._carries(fragment, other)
+        assert not live_call_step._carries(other, fragment)
+
+
 def test_the_offered_labels_share_no_run_with_anything_graded() -> None:
     """An option label rides the brief's own `option:` lines into the hand-over.
 
