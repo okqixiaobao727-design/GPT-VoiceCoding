@@ -106,11 +106,42 @@ the scan the way a `tool_use` id bounds the classic one. *Adapted* from
 `legacy@1d32845:bridge/transcript.py:1339-1355,1435-1455,1078-1110`, which
 tracked exactly these three markers from the parent's own transcript — same
 place, same markers, different question: gen-1 asked whether a Stop Notice could
-sound, this asks whether a roster row still exists. Legacy's newest-marker-wins
-is *adapted* rather than ported in one respect: settlement is remembered here,
-as the classic path remembers it, so no scan runs per tick for a child already
-answered for. A teammate that goes idle and is woken again on a **later** tick
-is therefore not re-listed; one woken before its first settling tick is.
+sound, this asks whether a roster row still exists.
+
+**The newest marker wins on every read, and that is the difference between the
+two kinds of memory here** (#236). A classic subagent's `tool_result` is the end
+of a tool call, and a tool call that has come back cannot come back again, so
+remembering it is remembering a fact. A teammate's idle notification is a *state
+it is in*, and a state changes: #231 remembered it the classic way and the #231
+reviewer measured the cost in `61537e10-…jsonl` — `probe-two` idle at 22:42:34Z,
+working again from 22:42:55Z, never re-listed, because the `SendMessage` that
+woke it reached a name nothing would ask about again. Legacy rebuilt its answer
+from the file on every read for exactly this reason
+(`legacy@1d32845:bridge/transcript.py:1078-1110`), and that is now *ported*
+rather than adapted.
+
+**What is remembered instead is where the file was read to, and legacy has no
+such behaviour — that is a citation too.** Rebuilding per read must not mean
+re-parsing a growing transcript per tick, the cost the #231 memory was bought to
+avoid. Legacy paid that cost: `legacy@1d32845:bridge/transcript.py:1934-1957`
+starts from `size` on every read and keeps no offset between two of them, and
+what bounded it was a wall-clock deadline checked inside the loop
+(`legacy@1d32845:bridge/transcript.py:1894-1896`, `_check_read_deadline`), which
+abandoned the read where it stood. That is **dropped, because** a deadline makes
+the roster's answer depend on how busy the machine was — the same file read
+twice gives two answers — where this reads the same bytes every time. In its
+place: a parent's teammate verdicts are kept beside the offset they were read
+from, and the next read starts there, so a tick pays for what the parent wrote
+since the last one and never for the Session's history. A parent that has
+written nothing since is not opened at all.
+
+The two ways that bound can be wrong are answered rather than assumed. A file
+shorter than the offset is not the file the offset was about, and is read
+afresh. And `SCAN_LIMIT_BYTES` is still the budget legacy's deadline was —
+*adapted* from it, in bytes rather than seconds so that hitting it is a fact
+about the file — so a read that gives up before reaching the offset leaves a gap
+no memory may be trusted across, and every name it did not settle goes back to
+*listed*.
 
 **A cross-session peer is addressed through the identical field.** `SendMessage`
 carries `to` for a teammate and for a Session on another socket alike, so the
@@ -137,7 +168,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
@@ -255,21 +286,35 @@ SCAN_LIMIT_BYTES: Final = 4 * 1024 * 1024
 class Children:
     """Every Session's live Child Processes, and the ones already known to be over.
 
-    **The memory is the whole reason this is a class.** A child that has
-    finished cannot start again, so the answer is worth keeping — and keeping it
-    is what stops a Session with old subagent files from re-reading its
-    transcript every five seconds for a question that was settled the first
-    time. It holds one short string per child ever seen under this engine.
+    **The memory is the whole reason this is a class**, and there are two of
+    them because the two shapes stop differently (#236).
+
+    A **classic subagent** that has finished cannot start again — its
+    `tool_result` is the end of a tool call — so the answer is kept for good, and
+    that is what stops a Session with old subagent files from re-reading its
+    transcript every five seconds for a question that was settled the first time.
+    One short string per such child ever seen under this engine.
+
+    A **teammate** only ever *rests*, and its Session can set it going again, so
+    no verdict about one is final: the newest marker for its name is the answer,
+    every read. What is kept for it is that verdict beside the offset it was read
+    from, so re-reading costs what the parent's file gained since the last tick
+    rather than the whole of it. One entry per parent transcript, holding one
+    boolean per teammate under it.
     """
 
     def __init__(self) -> None:
-        #: Every `agentId` the parent's own record has answered for.
+        #: Every `agentId` the parent's own record has answered for. Classic
+        #: subagents only: a teammate is never settled for good.
         self._finished: set[str] = set()
         #: `agent-<agentId>.meta.json` by the path it was read from. The file is
         #: written once, at launch, and never again, so this is one read per
         #: child per engine rather than one per tick — the claim the docstring
         #: below makes, held by this dict rather than by hope.
         self._meta: dict[Path, dict[str, Any]] = {}
+        #: What each parent's record last said about its teammates, and how far
+        #: into that record it was read from.
+        self._standing: dict[Path, _Standing] = {}
 
     def under(
         self,
@@ -315,16 +360,64 @@ class Children:
         listed = [child for child in unsettled if working or not child.needs_a_working_parent]
         if not listed:
             # The ordinary case for a Session that never spawned anything, for
-            # one whose children are all over, and for a stopped Session whose
-            # only children are classic: the parent's transcript is never opened.
+            # one whose classic children are all over, and for a stopped Session
+            # whose only children are classic: the transcript is never opened.
+            # A Session whose only children are *resting teammates* reaches the
+            # line below instead, and is not opened there either — `_settled`
+            # answers from what it remembers when the file has not grown.
             return ()
 
         calls = {child.agent_id: child.call for child in listed if child.call is not None}
         teammates = {child.agent_id: child.name for child in listed if child.name is not None}
-        self._finished |= _answered(transcript, calls, teammates)
-        return tuple(
-            _row(parent, child) for child in listed if child.agent_id not in self._finished
-        )
+        over = self._settled(transcript, calls, teammates)
+        self._finished |= over & calls.keys()
+        return tuple(_row(parent, child) for child in listed if child.agent_id not in over)
+
+    def _settled(
+        self,
+        transcript: Path,
+        calls: Mapping[str, str],
+        teammates: Mapping[str, str],
+    ) -> set[str]:
+        """Which of these children are over, reading no more of the file than it must.
+
+        `calls` is `agentId → toolUseId` for classic subagents and `teammates` is
+        `agentId → name` for teammates. A classic subagent is over once and for
+        all, and the caller keeps that; a teammate is over for as long as the
+        newest thing said about its name says so, and that is kept here.
+
+        How much of the file that costs is `_floor`'s answer and what to keep of
+        it is `_Standing.record`'s; both live where they do so that this method
+        reads as the four steps it is.
+        """
+        if not calls and not teammates:
+            return set()
+        size = _size(transcript)
+        standing = self._standing_for(transcript, size)
+        floor = _floor(standing, size, mid_call=bool(calls), agents=teammates)
+        if floor is None:
+            return standing.over(teammates)
+
+        named: dict[str, set[str]] = {}
+        for agent, name in teammates.items():
+            named.setdefault(name, set()).add(agent)
+        tail = _Tail(transcript, floor)
+        finished, spoke_of = _read(tail, calls, named.keys())
+        standing.record(named, spoke_of, tail)
+        return finished | standing.over(teammates)
+
+    def _standing_for(self, transcript: Path, size: int | None) -> _Standing:
+        """What is remembered about this parent's teammates, if it is still about it.
+
+        An offset only means anything against the file it was taken from, and a
+        transcript shorter than one it was already read past is not that file.
+        Nothing measured rewrites a Claude transcript backwards, so this is the
+        safe direction rather than a case: what cannot be trusted is read afresh.
+        """
+        standing = self._standing.setdefault(transcript, _Standing())
+        if size is not None and size < standing.read_through:
+            standing = self._standing[transcript] = _Standing()
+        return standing
 
     def _describe(self, directory: Path, path: Path) -> dict[str, Any]:
         """`agent-<agentId>.meta.json`, read once it says anything, then remembered.
@@ -342,10 +435,12 @@ class Children:
         parent was RUNNING, for the life of the engine, against this ticket's
         "a finished child is dropped, not kept as a dead row".
 
-        Re-reading costs one 126-byte file per *unsettled* child per tick, and a
-        child that is settled is never asked about again. That is the smaller
-        cost by far: the one this cache was written to avoid was re-parsing the
-        parent's growing transcript, which `_settled` still prevents.
+        Re-reading costs one 126-byte file per child per tick whose document has
+        still not landed — a settled classic child is never asked about again,
+        and a resting teammate is asked but answered from this dict. That is the
+        smaller cost by far: the one this cache was written to avoid was
+        re-parsing the parent's growing transcript, which `_settled` still
+        prevents.
         """
         meta = directory / f"{path.stem}{META_SUFFIX}"
         if meta not in self._meta:
@@ -357,8 +452,116 @@ class Children:
         return self._meta[meta]
 
     def forget(self, agent_ids: Iterable[str]) -> None:
-        """Drop what is remembered about these children. For tests and for restarts."""
-        self._finished.difference_update(agent_ids)
+        """Drop what is remembered about these children. For tests and for restarts.
+
+        Both memories, because a child could be in either: a classic subagent's
+        settlement and a teammate's standing verdict are dropped alike. The
+        offset each parent was read to is kept — it is a fact about a file rather
+        than about a child, and a name with no verdict is read for from the
+        beginning anyway.
+        """
+        dropped = set(agent_ids)
+        self._finished.difference_update(dropped)
+        for standing in self._standing.values():
+            for agent in dropped:
+                standing.stopped.pop(agent, None)
+
+
+@dataclass
+class _Standing:
+    """What one parent's record last said about its teammates, and how far in.
+
+    Held per `agentId` rather than per name, though the marker names only a name:
+    one name can belong to two files (Claude Code's rule for a reused teammate
+    name is that the latest wins), and a file that has never been read for is
+    what sends the next read back to the beginning. Keyed by the thing that
+    appears and disappears, the two follow from each other.
+    """
+
+    #: `agentId → that teammate has stopped working`, as of `read_through`.
+    #: Absent means never read for, which is not the same as read for and found
+    #: working: the first sends the next read to the file's beginning.
+    stopped: dict[str, bool] = field(default_factory=dict)
+    #: The offset every record below which has been read whole. Where the next
+    #: read starts, and what keeps it costing the file's growth rather than its
+    #: length.
+    read_through: int = 0
+
+    def over(self, agents: Iterable[str]) -> set[str]:
+        """Which of these teammates the newest marker read so far says has stopped."""
+        return {agent for agent in agents if self.stopped.get(agent, False)}
+
+    def unread(self, agents: Iterable[str]) -> bool:
+        """Whether any of these has never been read for, and so has no offset to resume from."""
+        return any(agent not in self.stopped for agent in agents)
+
+    def record(
+        self,
+        named: Mapping[str, set[str]],
+        spoke_of: Mapping[str, bool],
+        tail: _Tail,
+    ) -> None:
+        """Keep what one read said, and how far it got. The whole scheme is these three arms.
+
+        `named` is every teammate the read was asked about, as `name → the
+        agentIds holding it`; `spoke_of` is what it found for the names the
+        stretch it read mentioned. A name it did not mention is answered by which
+        stretch that was:
+
+        - a read that gave up at `SCAN_LIMIT_BYTES` never reached the offset it
+          was resuming from, so records newer than everything here lie unread in
+          between. Trusting the memory across that gap could hide a teammate
+          woken inside it — the failure #236 exists to remove — so it is dropped,
+          and the name is listed until a read reaches it;
+        - a read from the file's beginning found no word about the name at all,
+          which is a teammate working;
+        - a read of what the file gained simply says nothing about the name, and
+          what was already known still stands.
+        """
+        for name, agents in named.items():
+            if name in spoke_of:
+                self.stopped.update(dict.fromkeys(agents, spoke_of[name]))
+            elif tail.gave_up:
+                for agent in agents:
+                    self.stopped.pop(agent, None)
+            elif tail.floor == 0:
+                self.stopped.update(dict.fromkeys(agents, False))
+        self.read_through = max(self.read_through, tail.complete_through)
+
+
+def _floor(
+    standing: _Standing,
+    size: int | None,
+    *,
+    mid_call: bool,
+    agents: Iterable[str],
+) -> int | None:
+    """Where the next read of this parent starts, or `None` for no read at all.
+
+    Three answers, and the middle one is the whole saving. A classic subagent
+    still unsettled, or a teammate this parent has never been read for, needs the
+    scan that runs back to the record that started it — there is no offset either
+    could resume from. A file that has gained nothing since needs no read at all.
+    Everything else needs only what it gained.
+    """
+    if mid_call or standing.unread(agents):
+        return 0
+    if size is None or size <= standing.read_through:
+        return None
+    return standing.read_through
+
+
+def _size(path: Path) -> int | None:
+    """How long this transcript is, or `None` if that cannot be asked.
+
+    A file that cannot be stat'ed has not grown as far as this is concerned: it
+    is gone, or unreachable, and neither is a marker. What is remembered about it
+    stands until something newer is actually read.
+    """
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
 
 
 def _candidates(directory: Path) -> list[tuple[str, Path]]:
@@ -454,19 +657,28 @@ class _Child:
         return not self.teammate
 
 
-def _answered(
-    transcript: Path,
+def _read(
+    tail: _Tail,
     calls: Mapping[str, str],
-    teammates: Mapping[str, str],
-) -> set[str]:
-    """Which of these children the parent's own record says are over.
+    names: Iterable[str],
+) -> tuple[set[str], dict[str, bool]]:
+    """What the stretch of the parent's record `tail` covers says about these children.
 
-    `calls` is `agentId → toolUseId` for classic subagents and `teammates` is
-    `agentId → name` for teammates. The parent's transcript is scanned
-    **backward from its end**, and each child is settled by the first thing said
-    about it, reading newest first.
+    `calls` is `agentId → toolUseId` for classic subagents and `names` is the
+    teammate names to watch for. The records arrive **newest first**, and each
+    child is answered for by the first thing said about it. The two answers are
+    returned apart because they are kept apart: the classic one is which
+    subagents have finished for good, and the teammate one is what the newest
+    marker said about each name — `True` for stopped, `False` for working, and
+    absent for a name this stretch never mentions, which is
+    `_Standing.record`'s cue to leave what it already knew alone.
 
-    For a classic subagent that is its tool call:
+    A teammate answer is by name and not by `agentId` because that is what the
+    record offers; `_Standing` is where the two are tied together, and it is
+    also what reads `tail`'s two marks — how far this got, and whether it gave
+    up — once this has driven it.
+
+    For a classic subagent the marker is its tool call:
 
     - a `tool_result` for it — the call came back, so the child is over, unless
       it says `LAUNCHED_NOT_FINISHED`, which is a background subagent answering
@@ -494,14 +706,11 @@ def _answered(
     spawn record lies beyond `SCAN_LIMIT_BYTES`, and the child launched by a
     build that writes something this one does not recognise.
     """
-    if not calls and not teammates:
-        return set()
     waiting = {call: agent for agent, call in calls.items()}
-    named: dict[str, set[str]] = {}
-    for agent, name in teammates.items():
-        named.setdefault(name, set()).add(agent)
+    unanswered = set(names)
     finished: set[str] = set()
-    for record in _backward(transcript):
+    spoke_of: dict[str, bool] = {}
+    for record in tail:
         # Each namespace stops reading the moment it has nothing left to settle.
         # The ordinary Session has children of one shape only, so the other scan
         # is pure cost — and it is not small: one record measured 258 KB on this
@@ -511,14 +720,14 @@ def _answered(
                 agent = waiting.pop(call, None)
                 if agent is not None and over:
                     finished.add(agent)
-        if named:
+        if unanswered:
             for name, over in _teammate_mentions(record):
-                agents = named.pop(name, None)
-                if agents is not None and over:
-                    finished |= agents
-        if not waiting and not named:
-            return finished
-    return finished
+                if name in unanswered:
+                    unanswered.discard(name)
+                    spoke_of[name] = over
+        if not waiting and not unanswered:
+            break
+    return finished, spoke_of
 
 
 def _mentions(record: Mapping[str, Any]) -> Iterator[tuple[str, bool]]:
@@ -562,15 +771,20 @@ def _teammate_mentions(record: Mapping[str, Any]) -> Iterator[tuple[str, bool]]:
 
     A `SendMessage` whose body is `{"type": "shutdown_request"}` is terminal in
     the reference implementation (`legacy@1d32845:bridge/transcript.py:1409-1414`)
-    — *adapted, because* settlement there was rebuilt from the whole file on
-    every read and here it is remembered. A request is the parent's *wish*, not
-    the child's state, and reading newest-first it can only be the answering
-    marker when no approval lies newer than it: precisely the case where the
-    teammate has **not** agreed. Measured — the first request to one probe
-    teammate at 00:04:07Z did not take, and a retry drew its approval 50 s later
-    — so under a memory that cannot be taken back it would drop a live teammate
-    for good. One ended without ever approving stays listed instead, which is the
-    direction everything else here already chose.
+    — *dropped* here, and #231's stated reason for dropping it no longer holds.
+    That reason was the memory: settlement there was rebuilt from the whole file
+    on every read and here it was remembered, so a request read as terminal
+    would have dropped for good a teammate that never agreed — measured, the
+    first request to one probe teammate at 00:04:07Z did not take and a retry
+    drew its approval 50 s later. #236 gave the teammate shape legacy's
+    rebuild-per-read back, so a request read as terminal could now be taken back
+    by the very next thing that teammate said. **Reading it is therefore an open
+    question again, and it is not this ticket's** (#236 out of scope): what it
+    would change is `test_a_teammate_that_never_agreed_stays_listed`, which #231
+    pinned deliberately, and unpinning it wants its own measurement of what a
+    teammate that never answers actually does. Until then a request stays the
+    parent's *wish* rather than the child's state, and one ended without ever
+    approving stays listed — the direction everything else here already chose.
 
     `{"type": "teammate_terminated"}` is **dropped, because** it cannot be
     attributed: it arrives under `teammate_id="system"` and names its teammate
@@ -637,41 +851,85 @@ def _merely_launched(record: Mapping[str, Any]) -> bool:
     return isinstance(outcome, Mapping) and outcome.get("status") == LAUNCHED_NOT_FINISHED
 
 
-def _backward(path: Path) -> Iterator[dict[str, Any]]:
+class _Tail:
     """This transcript's records, newest first, in blocks from the end.
 
-    A line that does not parse is skipped rather than ending the scan — the last
+    A line that does not parse is skipped rather than ending the read — the last
     line of a live transcript is routinely half-written, and the reference
     implementation's lesson was that treating format drift as an error failed
     ~99% of real transcripts (`legacy@1d32845:bridge/transcript.py:1213-1240`,
     *ported* as a rule if not as code).
+
+    **`floor` is where this stops, and it is why re-reading a growing transcript
+    stays cheap** (#236). Given the offset a previous read finished at, this
+    reads only what the file has gained since; given 0, it is the whole scan back
+    to the record that started the child. The floor is always the first byte of a
+    record, because that is what `complete_through` reports — a half-written last
+    line lies *above* it and is read again, whole, next time.
+
+    That last fact is legacy's: `legacy@1d32845:bridge/transcript.py:1934-1957`
+    measured the same boundary on every read, marking its newest range an
+    `incomplete_tail` "when the writer has not appended its newline yet", and
+    skipped what did not parse there. **Adapted**, because legacy needed it only
+    to forgive one unparsable record *inside* a read and here it is also the
+    offset the *next* read starts at — the same measurement, carrying twice the
+    weight, which is why it is reported rather than merely acted on.
+
+    Two facts about the read itself are left behind for the caller, and neither
+    can be had before it: how far in it may next start (`complete_through`) and
+    whether it stopped at `SCAN_LIMIT_BYTES` rather than where it was told to
+    (`gave_up`), which is the caller's warning that a stretch of the file went
+    unread and no older answer covers it.
     """
-    try:
-        with path.open("rb") as handle:
-            end = handle.seek(0, 2)
-            carry = b""
-            read = 0
-            while end > 0 and read < SCAN_LIMIT_BYTES:
-                block = min(BLOCK_BYTES, end)
-                end -= block
-                handle.seek(end)
-                carry = handle.read(block) + carry
-                read += block
-                lines = carry.split(b"\n")
-                # The first piece may be half a record, because a block boundary
-                # lands wherever it lands. It is carried into the next read, or
-                # yielded below once the file's own beginning is reached.
-                carry = lines[0]
-                for line in reversed(lines[1:]):
-                    record = _parsed(line)
+
+    def __init__(self, path: Path, floor: int = 0) -> None:
+        self.path = path
+        self.floor = max(0, floor)
+        #: The offset every record below which has now been read whole. It
+        #: stays `floor` for a read that found no line ending at all, and for
+        #: one the file refused — either way, nothing new was read whole.
+        self.complete_through = self.floor
+        #: Whether the read ran out of budget before reaching `floor`.
+        self.gave_up = False
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        try:
+            with self.path.open("rb") as handle:
+                size = handle.seek(0, 2)
+                end = size
+                carry = b""
+                read = 0
+                measured = False
+                while end > self.floor:
+                    if read >= SCAN_LIMIT_BYTES:
+                        self.gave_up = True
+                        return
+                    block = min(BLOCK_BYTES, end - self.floor)
+                    end -= block
+                    handle.seek(end)
+                    carry = handle.read(block) + carry
+                    read += block
+                    lines = carry.split(b"\n")
+                    if not measured and len(lines) > 1:
+                        # The bytes after the file's last line ending are as much
+                        # of a record as has been written, and no more. The next
+                        # read starts where they start.
+                        measured = True
+                        self.complete_through = size - len(lines[-1])
+                    # The first piece may be half a record, because a block
+                    # boundary lands wherever it lands. It is carried into the
+                    # next read, or yielded below once the floor is reached.
+                    carry = lines[0]
+                    for line in reversed(lines[1:]):
+                        record = _parsed(line)
+                        if record is not None:
+                            yield record
+                if end == self.floor:
+                    record = _parsed(carry)
                     if record is not None:
                         yield record
-            if end == 0:
-                record = _parsed(carry)
-                if record is not None:
-                    yield record
-    except OSError as unreadable:
-        _log.info("could not read %s to settle its children: %s", path, unreadable)
+        except OSError as unreadable:
+            _log.info("could not read %s to settle its children: %s", self.path, unreadable)
 
 
 def _parsed(line: bytes) -> dict[str, Any] | None:
