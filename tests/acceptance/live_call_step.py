@@ -592,15 +592,27 @@ class _ReadAnswer:
 class _VoiceWatch:
     """Voice edges and activity after one engine-log mark, on the walk's clock (#184)."""
 
-    #: Whether the call went down before the step gave up waiting for it.
+    #: Whether the call went down before the step gave up waiting for it —
+    #: either seen down by the watch itself, or down when it was asked on the
+    #: way out.
     went_down: bool
     #: The edges this call produced, as of the last poll.
     edges: dict[bool, int]
     #: When the Voice was first, and last, seen to have said anything.
     first_voice_at: float | None
     last_voice_at: float | None
-    #: When the call was seen to be down, or when the watch gave up.
+    #: When the watch began, and when it stopped — the latter being the call
+    #: seen down, the spans closed and quiet, or the deadline reached.
+    started_at: float
     down_at: float
+    #: Whether the watch reached its deadline, rather than stopping because the
+    #: call went down or the Voice's spans closed and stayed quiet (#243).
+    ran_out: bool = False
+
+    @property
+    def seconds(self) -> float:
+        """How long the watch ran, on its own clock rather than a caller's (#243)."""
+        return self.down_at - self.started_at
 
 
 def _unspaced(text: str) -> str:
@@ -808,6 +820,19 @@ LIVE_CALL_ANSWER_SECONDS = 300.0
 #: read, so it is cheap; frequent enough that the measured duration means
 #: something and rare enough not to be a load on the engine mid-call.
 LIVE_CALL_POLL_SECONDS = 2.0
+
+#: How long the long-answer watch waits for a Voice span it has seen open to
+#: close, while the call is up (#243). This is the harness's own patience, not
+#: an allowance the product has to meet: two runs of one build recited the same
+#: two hundred numbers in 287s (`20260905T071849Z`) and 417s
+#: (`20260905T075128Z`), a 130-second spread that is the model's pace alone. So
+#: a watch sized as a general answer allowance plus a ceiling (300 + 60) reads
+#: the slower of those as a product bug. This is the slower run plus more than
+#: three times that spread, and the case it caps — a span wedged open with the
+#: call still up — is rare on its own terms: a Voice that has stopped producing
+#: audio lets the Silence Ceiling end the call, which stops the watch far
+#: sooner.
+LIVE_CALL_LONG_ANSWER_SECONDS = 900.0
 
 #: How long a hand-off gets to appear before the walk's hand-over phase grades that none
 #: did. Measured rather than guessed: the Call Agent ran `bridgectl live` four to
@@ -2071,9 +2096,12 @@ class _LiveCallRun:
         # pre-request mark, so it includes that first edge without borrowing an
         # earlier answer's tail (#223 story 5; run 20260904T043017Z).
         watching = time.monotonic()
+        # **The watch's patience, not the product's allowance** (#243). An open
+        # span on a call that is up is an answer in progress; the watch waits
+        # for the stop edge, the call going down, or its own hard cap.
         watch = self._watch_the_voice(
             ask.engine_mark,
-            deadline_seconds=LIVE_CALL_ANSWER_SECONDS + ceiling,
+            deadline_seconds=LIVE_CALL_LONG_ANSWER_SECONDS,
             quiet_seconds=LIVE_CALL_CUE_SECONDS,
         )
         edges = watch.edges
@@ -2085,6 +2113,8 @@ class _LiveCallRun:
         facts.record("Voice start edges", edges[True])
         facts.record("Voice stop edges", edges[False])
         facts.record("call went down", watch.went_down)
+        facts.record("watch seconds", watch.seconds)
+        facts.record("watch ran out", watch.ran_out)
         facts.check(
             "long answer heard",
             ask.heard,
@@ -2105,16 +2135,35 @@ class _LiveCallRun:
                 f"the request: {edges}. Engine log tail: {self._log_since(asking)[-5:]}"
             ),
         )
+        # **Two ways to leave a span open, and only one of them is #169** (#243).
+        # The ceiling taking the call away mid-answer is the bug; the watch
+        # reaching its own cap on a call that is still up is this harness's
+        # patience running out. Which one it was is how the watch stopped, not
+        # whether the call happens to be down when it is asked afterwards — a
+        # call that drops mid-answer and is back up by then is still #169.
         facts.check(
             "Voice spans closed",
             edges[False] >= edges[True],
             (
-                f"the Voice left a span open: {edges[True]} start and {edges[False]} stop "
-                f"edge(s). That is the bug itself (#169) — the ceiling firing mid-answer takes "
-                f"the call away before the `transcript/done` that would have closed the span. "
-                f"The Voice was answering for {answered_for:.0f}s against a {ceiling:.0f}s "
-                f"ceiling; the call is {self._call_line()!r}"
-            ),
+                (
+                    f"the watch ran out after {watch.seconds:.0f}s with the Voice still speaking "
+                    f"and the call still up: {edges[True]} start and {edges[False]} stop "
+                    f"edge(s), the last of them {answered_for:.0f}s after the request. No "
+                    f"ceiling fired and nothing took the call away — this is the "
+                    f"{LIVE_CALL_LONG_ANSWER_SECONDS:.0f}s the watch waits for a span to close, "
+                    f"not #169"
+                )
+                if watch.ran_out
+                else (
+                    f"the call went down {watch.seconds:.0f}s into the answer with a span still "
+                    f"open, the Voice's last word {answered_for:.0f}s in: {edges[True]} start "
+                    f"and {edges[False]} stop edge(s). That is the bug itself (#169) — the "
+                    f"ceiling firing mid-answer takes the call away before the "
+                    f"`transcript/done` that would have closed the span, against a "
+                    f"{ceiling:.0f}s ceiling"
+                )
+            )
+            + f"; the call is {self._call_line()!r}",
         )
         facts.check(
             "Voice answer outlasted Silence Ceiling",
@@ -2924,9 +2973,17 @@ class _LiveCallRun:
         edges, said = activity()
         spoke = bool(any(edges.values()) or said)
         first_voice_at = last_voice_at = time.monotonic() if spoke else None
-        expiry = time.monotonic() + deadline_seconds
+        started_at = time.monotonic()
+        expiry = started_at + deadline_seconds
+        ran_out = True
+        # The call being down is why the watch stops, so it is remembered rather
+        # than re-read afterwards: a call that flapped is one that went down,
+        # whatever the reading taken on the way out says (#243).
+        saw_down = False
         while time.monotonic() < expiry:
             if self._call_is_down():
+                ran_out = False
+                saw_down = True
                 break
             time.sleep(poll_seconds)
             seen, seen_said = activity()
@@ -2942,13 +2999,16 @@ class _LiveCallRun:
                 and last_voice_at is not None
                 and time.monotonic() - last_voice_at >= quiet_seconds
             ):
+                ran_out = False
                 break
         return _VoiceWatch(
-            went_down=self._call_is_down(),
+            went_down=saw_down or self._call_is_down(),
             edges=edges,
             first_voice_at=first_voice_at,
             last_voice_at=last_voice_at,
+            started_at=started_at,
             down_at=time.monotonic(),
+            ran_out=ran_out,
         )
 
     def _verbs_run(self, *, since: int = 0) -> list[str]:
