@@ -604,6 +604,18 @@ def _rules() -> tuple[Rule, ...]:
                 "Session may not take it as their confirmation."
             ),
         ),
+        Rule(
+            id="voice.delegation.older-entries-are-not-held",
+            audience=Audience.VOICE,
+            source="issue/240",
+            gist=(
+                "The hand-over holds what each Session is waiting on and its newest "
+                "message, and nothing older or fuller. A request for what a Session said "
+                "before that is therefore not answerable from here and goes to the half "
+                "behind, whose answer is spoken when it comes; meanwhile the contents are "
+                "neither guessed at nor declared absent."
+            ),
+        ),
     )
 
 

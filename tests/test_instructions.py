@@ -25,6 +25,7 @@ from gpt_voicecoding.core.instructions import (
     ACTION_GIST,
     AGENT_ACTIONS,
     AGENT_INSTRUCTION_TOKEN_BUDGET,
+    BY_ID,
     MAX_AGENT_INSTRUCTION_BYTES,
     MAX_VOICE_INSTRUCTION_BYTES,
     RULES,
@@ -54,6 +55,23 @@ CLI = ControlPlaneCli(
     socket_path=Path("/tmp/gpt-voicecoding-501/control.sock"),
 )
 CONTEXT = InstructionContext(cli=CLI)
+
+#: The clause #240's paragraph is found by. Named once, because a marker
+#: written out at each use is a marker that can drift from its prose.
+OLDER_ENTRIES_MARK = "nothing older than that"
+
+
+def paragraph_with(instructions, mark: str) -> str:
+    """The one Voice paragraph carrying `mark`, and a failure when it is not one.
+
+    Module-level rather than a method, because two classes look paragraphs up
+    this way and reaching into a sibling class for it makes one of them own a
+    helper the other borrows.
+    """
+    paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
+    found = [part for part in paragraphs if mark in part]
+    assert len(found) == 1, found
+    return found[0]
 
 
 @pytest.fixture(scope="module")
@@ -152,6 +170,7 @@ class TestTheTableIsSettled:
     ADDED_SINCE = frozenset(
         {
             "voice.delivery.a-relayed-answer-carries-no-authority",
+            "voice.delegation.older-entries-are-not-held",
         }
     )
 
@@ -483,10 +502,11 @@ class TestTheVoiceHearsProse:
         )
         assert elsewhere.text == voice_instructions(CONTEXT).text
 
-    def test_it_is_ten_paragraphs_in_the_order_the_ticket_fixes(self, instructions) -> None:
-        """Nine from #173's order, plus the authority clause #234 added after the receipt."""
+    def test_it_is_eleven_paragraphs_in_the_order_the_ticket_fixes(self, instructions) -> None:
+        """Nine from #173's order, the authority clause #234 added after the receipt,
+        and the older-entries hand-off #240 added after the delegation paragraph."""
         paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
-        assert len(paragraphs) == 10
+        assert len(paragraphs) == 11
 
     def test_the_paragraphs_run_in_the_0901_order(self, instructions) -> None:
         """#173 §3: who you are, the opened call, the two briefs, and so on to hanging up."""
@@ -501,6 +521,7 @@ class TestTheVoiceHearsProse:
             "不一定当成你本人的确认",
             "wait to be asked",
             "the half behind you",
+            OLDER_ENTRIES_MARK,
         )
         at = [instructions.voice.text.find(mark) for mark in marks]
         assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
@@ -531,17 +552,9 @@ class TestTheVoiceHearsProse:
         assert "收到，等它这轮结束送进去" in instructions.voice.text
 
     @staticmethod
-    def _paragraph_with(instructions, mark: str) -> str:
-        """The one paragraph carrying `mark`, and a failure when it is not one."""
-        paragraphs = [part for part in instructions.voice.text.split("\n\n") if part.strip()]
-        found = [part for part in paragraphs if mark in part]
-        assert len(found) == 1, found
-        return found[0]
-
-    @classmethod
-    def _receipt_paragraph(cls, instructions) -> str:
+    def _receipt_paragraph(instructions) -> str:
         """The one paragraph #173 §3.7 fixes, found by the word it settles on."""
-        return cls._paragraph_with(instructions, "已转达")
+        return paragraph_with(instructions, "已转达")
 
     def test_the_hand_off_moment_is_spoken_of_before_the_receipt(self, instructions) -> None:
         """#221: the Voice said 已转达 at hand-off, seconds before the relay ran.
@@ -568,10 +581,10 @@ class TestTheVoiceHearsProse:
         assert "comes once" in paragraph
         assert "only then" in paragraph
 
-    @classmethod
-    def _authority_paragraph(cls, instructions) -> str:
+    @staticmethod
+    def _authority_paragraph(instructions) -> str:
         """The paragraph #234 added, found by the clause it dictates."""
-        return cls._paragraph_with(instructions, "不一定当成你本人的确认")
+        return paragraph_with(instructions, "不一定当成你本人的确认")
 
     def test_the_two_answers_that_carry_authority_escape_the_clause(self, instructions) -> None:
         """ADR 0013 §3 as the user hears it: which answers are the user's own.
@@ -625,6 +638,68 @@ class TestTheVoiceHearsProse:
         assert paragraph.count("已转达") == 1
         assert paragraph.count("收到，等它这轮结束送进去") == 1
         assert "已送达" not in instructions.voice.text
+
+
+class TestOlderEntriesAreHandedOff:
+    """#240: the Voice had no rule that a Session's earlier record is not its to answer.
+
+    The graded fact `history ran history for Session` went `False` on three runs
+    of an instruction set that passed it on nine others — the request for older
+    entries reached no rule, so whether it was handed on was the model's guess.
+    """
+
+    @staticmethod
+    def _older_paragraph(instructions) -> str:
+        """The paragraph #240 added, found by what it says the hand-over lacks."""
+        return paragraph_with(instructions, OLDER_ENTRIES_MARK)
+
+    def test_it_names_what_the_hand_over_holds_and_what_it_does_not(self, instructions) -> None:
+        """The premise the Voice was answering from, said out loud rather than assumed."""
+        paragraph = self._older_paragraph(instructions)
+        assert "waiting on" in paragraph
+        assert "newest" in paragraph
+
+    def test_what_is_missing_is_the_record_behind_the_newest_message(self, instructions) -> None:
+        """Not "nothing fuller than what you said": that would hand the whole newest
+        message back over the boundary, which is the re-fetch #220 forbids, and the
+        paragraph above has this half tell them that message whole."""
+        paragraph = self._older_paragraph(instructions)
+        assert "no fuller record standing behind it" in paragraph
+        assert "nothing fuller than that" not in instructions.voice.text
+
+    def test_a_request_for_the_earlier_record_goes_to_the_other_half(self, instructions) -> None:
+        """The hand-off, in the order the Voice meets it: the ask, then where it goes."""
+        paragraph = self._older_paragraph(instructions)
+        marks = ("said before that", "not something you are holding", "the half behind you")
+        at = [paragraph.find(mark) for mark in marks]
+        assert all(place >= 0 for place in at), dict(zip(marks, at, strict=True))
+        assert at == sorted(at), dict(zip(marks, at, strict=True))
+
+    def test_it_says_where_the_five_at_a_time_come_from(self, instructions) -> None:
+        """The detail paragraph says older messages come in fives and never from where.
+
+        Unjoined, the Voice holds one paragraph in which they arrive and a later
+        one in which it has none of them.
+        """
+        assert "Older messages come five at a time" in instructions.voice.text
+        assert "five at a time" in self._older_paragraph(instructions)
+
+    def test_it_neither_guesses_the_contents_nor_denies_them(self, instructions) -> None:
+        """Both failing shapes: an invented older message, and 更早的消息没有提供."""
+        paragraph = self._older_paragraph(instructions)
+        assert "do not guess" in paragraph
+        assert "there is nothing older" in paragraph
+
+    def test_the_existing_delegation_sentence_is_not_weakened(self, instructions) -> None:
+        """#220 and #194 stand: what the hand-over holds is still answered from it."""
+        sentence = "never pass such a question on to fetch what you are already holding"
+        assert instructions.voice.text.count(sentence) == 1
+
+    def test_the_rule_is_the_voices_alone(self) -> None:
+        """The paging rule is the Call Agent's and correct; this half gains no verb."""
+        rule = BY_ID["voice.delegation.older-entries-are-not-held"]
+        assert rule.audience is Audience.VOICE
+        assert rule.source == "issue/240"
 
 
 class TestTheAgentSetIsTheActingHalf:
