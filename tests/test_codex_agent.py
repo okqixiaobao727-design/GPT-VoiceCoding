@@ -44,6 +44,8 @@ from gpt_voicecoding.adapters.agent.codex.processes import Candidate
 from gpt_voicecoding.adapters.agent.codex.shared_daemon import DaemonAddress, SharedDaemon
 from gpt_voicecoding.adapters.agent.codex.threads import ApprovalRouting
 from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings, SettingsError
+from gpt_voicecoding.core.sessions import SessionRegistry
+from gpt_voicecoding.engine.composition import DEFAULT_DISCOVERY_SECONDS
 from gpt_voicecoding.installation import codex_launch_agent
 from gpt_voicecoding.seams.agent import (
     ApprovalRequest,
@@ -53,6 +55,7 @@ from gpt_voicecoding.seams.agent import (
     ReplyWindow,
     ReplyWindowChanged,
     SessionEnded,
+    SessionState,
     SessionStopped,
     WaitingKind,
 )
@@ -64,6 +67,9 @@ ROOT_THREAD = "01a02110-d18f-74a0-916d-de1208e9977b"
 TARGET = SessionTarget(agent=AgentKind.CODEX, session_id=THREAD)
 TURN = "01a02110-d9ab-7763-a185-7079c7fbffe0"
 APPROVAL = "item/commandExecution/requestApproval"
+
+#: An arbitrary clock reading, for the roster readings that need one.
+NOW = 1_000.0
 
 _names = itertools.count()
 
@@ -2015,6 +2021,81 @@ class TestWhatACodexRowSaysItStoppedOn:
         # Same rule on the roster row as in the announcement — one extractor
         # builds both, which is why it could only ever be one answer (#109).
         assert "rm -rf build" not in (row.waiting_for.detail or "")
+
+    async def row_without_a_dialog(self, server: Codex, sink: Sink, adapter):
+        del server, sink
+        lane = await adapter.discover()
+        return next(row for row in lane.rows if row.target.session_id == THREAD)
+
+    def a_lane(self, socket_path: Path, status: str, read):
+        """One scripted thread in the given status, read by `read` and torn down."""
+
+        async def scenario():
+            async with Codex(socket_path).script(status=status) as server:
+                sink = Sink()
+                adapter = await joined(server, sink)
+                try:
+                    return await read(server, sink, adapter)
+                finally:
+                    await adapter.aclose()
+
+        return asyncio.run(scenario())
+
+    def test_a_row_holding_a_dialog_is_not_a_row_mid_turn(self, socket_path: Path) -> None:
+        """The dialog decides the state, on this path as on the Stop path (#245).
+
+        The defect and the rule are stated on `CodexAgentAdapter._stopped_on`;
+        what this pins is that a thread the daemon calls `active` still reads
+        `WAITING` while this lane holds its approval.
+        """
+        row = self.a_lane(socket_path, "active", self.row_with_a_dialog)
+
+        assert row.state is SessionState.WAITING
+        assert row.waiting_for.kind is WaitingKind.PERMISSION
+        assert row.waiting_for.caught_up
+
+    def test_an_active_thread_holding_no_dialog_is_still_mid_turn(self, socket_path: Path) -> None:
+        """The control: the dialog moves the state, and nothing else does."""
+        row = self.a_lane(socket_path, "active", self.row_without_a_dialog)
+
+        assert row.state is SessionState.RUNNING
+        assert row.waiting_for.kind is WaitingKind.NONE
+
+    def test_an_idle_thread_holding_no_dialog_is_still_idle(self, socket_path: Path) -> None:
+        """The second control: a thread between turns keeps the thread's own state."""
+        row = self.a_lane(socket_path, "idle", self.row_without_a_dialog)
+
+        assert row.state is SessionState.IDLE
+        assert row.waiting_for.kind is WaitingKind.NONE
+
+    def test_the_roster_reads_waiting_for_as_long_as_the_lane_holds_the_dialog(
+        self, socket_path: Path
+    ) -> None:
+        """The two halves together: this lane's real passes, folded into a real roster.
+
+        The run this comes from polled `status` — which reads the roster — 92
+        times across three cadences and was told `running` every time. So the
+        assertion that matters is made where that reader stands, over passes the
+        adapter really took against an app-server holding a real approval, not
+        over rows a test wrote by hand.
+        """
+
+        async def readings(server: Codex, sink: Sink, adapter):
+            del sink
+            await adapter.discover()
+            await server.ask_all(APPROVAL, {"threadId": THREAD, "command": "rm -rf build"})
+            await _until_row_has_a_dialog(adapter)
+            return [await adapter.discover() for _ in range(3)]
+
+        lanes = self.a_lane(socket_path, "active", readings)
+        registry = SessionRegistry()
+        for tick, lane in enumerate(lanes):
+            registry.observe(AgentKind.CODEX, lane, now=NOW + DEFAULT_DISCOVERY_SECONDS * tick)
+
+        (held,) = [row for row in registry.live() if row.target.session_id == THREAD]
+        assert held.state is SessionState.WAITING
+        assert held.waiting_for.kind is WaitingKind.PERMISSION
+        assert held.reply_window is ReplyWindow.CLOSED
 
     def test_the_row_carries_the_handle_the_verdict_is_answered_with(
         self, socket_path: Path
