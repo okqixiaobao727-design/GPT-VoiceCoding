@@ -324,3 +324,57 @@ class TestChildrenStayWhereTheyWere:
 
         assert composed.rows == ()
         assert reasons(composed)[OTHER_THREAD]
+
+
+class TestATerminalTheDaemonHoldsNothingFor:
+    """#233: a live TUI outside the shared daemon left no row and no sentence.
+
+    The degradation note above speaks only when the daemon holds user roots in
+    the terminal's workspace, so a terminal running its own core — a TUI started
+    with a `-c` override — fell between the two rules and was never mentioned at
+    all. These are the terminals the other sentence cannot reach; together the
+    two account for every live terminal that composed no row.
+    """
+
+    def test_a_terminal_in_a_workspace_with_no_daemon_root_is_carried_back(self) -> None:
+        composed = compose([], [terminal()])
+
+        assert [(held.pid, str(held.workspace)) for held in composed.unheld] == [(68633, WORKSPACE)]
+
+    def test_a_workspace_holding_only_threads_that_dropped_is_carried_back_too(self) -> None:
+        """And the sentence stays true, which is why it is about rows.
+
+        Each of these is a workspace the daemon holds *something* in, so "the
+        daemon holds no user root there" would be a claim the rule cannot make:
+        the errand may be one it mislabelled, the `notLoaded` thread was a root
+        until the daemon let it go, and the sourceless one is unclassified
+        rather than shown to be an errand. What is observed is that none of them
+        is a row.
+        """
+        for held in (
+            thread(source="compaction"),
+            thread(status=roster.NOT_LOADED),
+            thread(source=None),
+        ):
+            composed = compose([held], [terminal()])
+
+            assert composed.rows == ()
+            assert [unheld.pid for unheld in composed.unheld] == [68633]
+            assert composed.note is None
+
+    def test_a_terminal_that_composed_a_row_is_not_carried_back(self) -> None:
+        assert compose([thread()], [terminal()]).unheld == ()
+
+    def test_a_terminal_behind_a_process_only_row_is_not_carried_back(self) -> None:
+        """A row the daemon never offered still accounts for the terminal under it."""
+        composed = compose([], [terminal(session_id=THREAD, rollout_root=True)])
+
+        assert targets(composed) == [(THREAD, 68633)]
+        assert composed.unheld == ()
+
+    def test_the_terminal_the_degradation_note_speaks_for_is_not_said_twice(self) -> None:
+        """The two sentences partition the terminals; neither says the other's."""
+        composed = compose([thread(created_at=EARLIER_CREATED_AT)], [terminal()])
+
+        assert composed.note is not None
+        assert composed.unheld == ()

@@ -352,11 +352,17 @@ def daemon_versions(
             "the shared daemon answered without saying its versions: "
             f"{CLI_VERSION_FIELD}={cli!r}, {APP_SERVER_VERSION_FIELD}={app_server!r}"
         )
+    # A disagreement, reported as a disagreement (#233). This said "a Session
+    # started by this CLI will not speak to that daemon", which is a prediction
+    # and a wrong one: measured on 2026-09-05, a plain `codex --sandbox
+    # workspace-write` from CLI 0.153.0 joins the 0.149.1 daemon and its thread
+    # appears in `thread/loaded/list`. What keeps a TUI out is a `-c` override,
+    # which makes it run its own core, and that is not a fact about versions.
+    # The engine's own copy of this sentence is `codex/shared_daemon.py`'s
+    # `DaemonAddress.note`, corrected in the same ticket — the two are the same
+    # claim to a reader and were wrong in the same way.
     if cli != app_server:
-        return (
-            f"the CLI is {cli!r} and the running app-server is {app_server!r} — "
-            "a Session started by this CLI will not speak to that daemon"
-        )
+        return f"the CLI is {cli!r} and the running app-server is {app_server!r}, so they disagree"
     return f"the shared daemon is answering, CLI and app-server both {cli!r}"
 
 

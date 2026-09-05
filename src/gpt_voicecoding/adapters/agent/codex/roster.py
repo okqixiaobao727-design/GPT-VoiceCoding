@@ -41,8 +41,14 @@ timestamps-as-identity stands.
 **The accepted cost, stated deliberately.** `codex --last` and the interactive
 picker resume an older thread with no id in argv, so under this rule they get no
 row. This roster may under-report; it must never invent. It is not silent about
-it: a live terminal that vouches for nothing while its workspace holds daemon
-user roots is reported through `note`.
+it, and since #233 it is not silent about any of it: a live terminal that
+vouches for nothing while a user root was read in its workspace is reported
+through `note`, and one where none was is carried back in `unheld`. The two
+together account for every live terminal that composed no row — before #233 the
+second kind fell between them and was never mentioned at all. **Read, not
+held**, in both sentences: what the split turns on is the user roots this pass
+put in `classified`, which is all this function can see (`NOTHING_TO_VOUCH_FOR`
+says why the difference matters).
 
 **Every drop leaves a reason.** A daemon-held user root that does not become a
 row is returned in `drops` with why, on the principle `errand_of` already
@@ -210,6 +216,29 @@ AMBIGUOUS_TERMINAL: Final = (
 )
 NO_LIVE_TREE: Final = "no live root holds its Session tree"
 
+#: Why a live terminal composed no row and the degradation note has nothing to
+#: say about it either (#233). The note beside it speaks only where a user root
+#: was read in the terminal's workspace — a Session that *may* be
+#: missing — and a terminal running its own core, the shape a `-c` override
+#: gives a TUI, is not that case. Before #233 such a terminal fell between the
+#: two rules and was never mentioned; run `20260904T202319Z` had one live for
+#: two minutes and the codex engine log has no line about it.
+#:
+#: **It is a sentence about this roster, not about the daemon's holdings**, and
+#: that is deliberate rather than coy. "The daemon holds no user root there" is
+#: a claim this function is in no position to make: a thread whose `thread/read`
+#: failed is one the daemon holds and this pass never saw, a `notLoaded` root
+#: was let go between the two readings, and a thread naming no source this build
+#: recognises is not thereby shown to be an errand — each of them leaves a
+#: workspace looking emptier here than it is. What `compose` *did* observe in
+#: full is its own rows, so that is what this says. Every thread that is not one
+#: leaves its own reason in `drops`, which is where a reader goes next (#96:
+#: never claim anything about the daemon this build did not observe).
+NOTHING_TO_VOUCH_FOR: Final = (
+    "no thread the daemon holds in its workspace is a row on this roster, so there is "
+    "nothing there for it to vouch for"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ProcessObservation:
@@ -239,6 +268,34 @@ class Drop:
 
 
 @dataclass(frozen=True, slots=True)
+class UnheldTerminal:
+    """One live terminal that composed no row and that `note` cannot speak for.
+
+    `Drop`'s counterpart from the other source: that one carries back a thread
+    the daemon offered and this rule refused, and this one carries back a
+    terminal the machine offered that nothing on this roster answers to. Both
+    exist for the same reason — a Session somebody is sitting in and cannot see
+    is a Session they come looking for, and the lane has to have said something.
+
+    It carries no reason of its own, unlike `Drop`, because there is only ever
+    one: `NOTHING_TO_VOUCH_FOR`, which the caller names where it says it.
+
+    It is a reading, never a row: a Session this lane cannot identify is
+    under-reported and said to be, never invented (ADR 0020).
+
+    **Legacy citation** (ADR 0010). `legacy@1d32845:bridge/daemon.py:1192-1257`
+    — **dropped, because** generation 1's roster was Sessions registering
+    themselves through its hook, so a terminal it had not launched was not
+    something it could see, let alone something it could report a gap about.
+    Reading the process table for terminals nobody registered is this
+    generation's (`processes.py`), and so is the silence this ends.
+    """
+
+    pid: int
+    workspace: Path
+
+
+@dataclass(frozen=True, slots=True)
 class Row:
     """One composed Session row, beside the daemon document it was read from.
 
@@ -262,6 +319,9 @@ class Roster:
     drops: tuple[Drop, ...] = ()
     #: Why this roster may be under-reporting, or `None` if it is not.
     note: str | None = None
+    #: Every live terminal that composed no row and that `note` cannot speak
+    #: for, because this pass read no user root where it is running (#233).
+    unheld: tuple[UnheldTerminal, ...] = ()
 
 
 def compose(
@@ -374,10 +434,23 @@ def compose(
         rows.append(Row(inspection=_from_process(matches[0].candidate, thread_id, pid)))
         accounted.update(match.candidate.pid for match in matches)
 
+    # The terminals nothing here spoke for, split by the one fact that decides
+    # which sentence they get: whether this pass read a user root where they are
+    # running. One split rather than a predicate and its negation, so that
+    # "exhaustive, and never both" is the shape of the code rather than a claim
+    # a comment makes about two list comprehensions (#233).
+    beside_a_root, alone = _split_on_roots(
+        [terminal for terminal in terminals if terminal.candidate.pid not in accounted],
+        _root_workspaces(classified),
+    )
     return Roster(
         rows=tuple(_linked_to_their_parents(rows)),
         drops=tuple(drops),
-        note=_under_reporting(terminals, accounted, classified),
+        note=_under_reporting(beside_a_root),
+        unheld=tuple(
+            UnheldTerminal(pid=terminal.candidate.pid, workspace=terminal.candidate.workspace)
+            for terminal in alone
+        ),
     )
 
 
@@ -430,11 +503,42 @@ def _why_no_terminal(thread: Mapping[str, Any], *, ambiguous: bool) -> str:
     return NO_TERMINAL if _created_at(thread) is not None else NO_CREATION_TIME
 
 
-def _under_reporting(
-    terminals: Sequence[ProcessObservation],
-    accounted: set[int],
+def _root_workspaces(
     classified: Sequence[tuple[Mapping[str, Any], ChildClassification]],
-) -> str | None:
+) -> set[str]:
+    """Every workspace a user root was read in on this pass, by realpath.
+
+    Read rather than held: these are the threads that reached `classified`, and
+    a workspace missing from this set is one no user root came back from — not
+    one the daemon is known to hold none in (`NOTHING_TO_VOUCH_FOR`).
+    """
+    return {
+        workspace
+        for thread, child in classified
+        if child.is_main and (workspace := _workspace_of(thread)) is not None
+    }
+
+
+def _split_on_roots(
+    unaccounted: Sequence[ProcessObservation],
+    roots: set[str],
+) -> tuple[list[ProcessObservation], list[ProcessObservation]]:
+    """The terminals behind no row, split on whether a user root was read where they run.
+
+    `unaccounted` is every terminal that ended up behind no row, by either
+    route, so a terminal that composed a process-only row is in neither half.
+    Each workspace is resolved once here, which is the other reason this is one
+    pass: `realpath` is the only filesystem call this module makes.
+    """
+    beside_a_root: list[ProcessObservation] = []
+    alone: list[ProcessObservation] = []
+    for terminal in unaccounted:
+        where = os.path.realpath(terminal.candidate.workspace)
+        (beside_a_root if where in roots else alone).append(terminal)
+    return beside_a_root, alone
+
+
+def _under_reporting(beside_a_root: Sequence[ProcessObservation]) -> str | None:
     """Why this roster may be thinner than the machine, when it may be.
 
     `codex --last` and the interactive picker resume a thread whose id appears
@@ -443,22 +547,15 @@ def _under_reporting(
     cost of never inventing a row — and the ticket's condition for accepting it
     is that the lane says so rather than passing silently.
 
-    `accounted` is every terminal that ended up behind a row, by either route,
-    so a terminal that composed a process-only row is not also reported as
-    having vouched for nothing.
+    A terminal running where no user root does is not this sentence's business:
+    nothing is known to be missing there, and `NOTHING_TO_VOUCH_FOR` is what
+    there is to say about it instead.
     """
-    roots = {
-        workspace
-        for thread, child in classified
-        if child.is_main and (workspace := _workspace_of(thread)) is not None
-    }
     reasons = [
         f"a live codex terminal (pid {terminal.candidate.pid}) in "
         f"{terminal.candidate.workspace} vouches for no thread the daemon holds there, "
         "so a Session may be missing from this roster"
-        for terminal in terminals
-        if terminal.candidate.pid not in accounted
-        if os.path.realpath(terminal.candidate.workspace) in roots
+        for terminal in beside_a_root
     ]
     return "; ".join(reasons) or None
 

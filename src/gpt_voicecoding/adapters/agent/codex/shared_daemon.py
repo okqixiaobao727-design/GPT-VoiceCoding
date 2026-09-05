@@ -108,6 +108,29 @@ class DaemonAddress:
         document carrying neither field makes them both empty, and `"" == ""`
         would report a daemon that said nothing at all as one whose versions
         agree (`installation/codex_launch_agent.py:301-306`, the same trap).
+
+        **A disagreement is reported as a disagreement, and as nothing more**
+        (#233). Until then this sentence ended "a Session started by this CLI
+        will not join that daemon", which is a prediction and a wrong one:
+        measured on 2026-09-05, a plain `codex --sandbox workspace-write` from
+        CLI 0.153.0 joins the 0.149.1 daemon — its thread appears in
+        `thread/loaded/list`. What keeps a TUI out is a `-c` override, which
+        makes it run its own core, and that is not a fact about versions. The
+        rule this restores is #96's, and it is the one this whole module is held
+        to: never claim anything about the daemon this build did not observe.
+
+        **Legacy citation** (ADR 0010): **adapted** from
+        `legacy@1d32845:bridge/codex.py:96-124`. Generation 1 had a CLI version
+        gate and switched it off — "Version gate DISABLED (user decision
+        2026-08-04) … pinning to one `validatedVersion` meant every upgrade
+        disabled the Adapter … The user accepts the drift risk: an app-server
+        whose protocol moved will now **fail at the request** rather than at
+        startup." That is this correction's own principle, reached there four
+        weeks earlier: a version difference is not evidence of what will happen,
+        and the request is what finds out. What is adapted rather than ported is
+        the half gen 1 did not have — it went silent about the drift it had
+        accepted, and #67's no-pin ruling keeps the silence out by reporting the
+        disagreement on `LaneDiscovery.degraded`.
         """
         if not self.cli_version or not self.app_server_version:
             return (
@@ -118,8 +141,8 @@ class DaemonAddress:
         if self.cli_version != self.app_server_version:
             return (
                 f"the Codex CLI is {self.cli_version!r} and the running app-server is "
-                f"{self.app_server_version!r} — a Session started by this CLI will not "
-                "join that daemon"
+                f"{self.app_server_version!r}, so this lane is reading through a version "
+                "disagreement"
             )
         return ""
 

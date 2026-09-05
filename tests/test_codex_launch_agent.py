@@ -476,13 +476,21 @@ def test_matching_versions_are_reported_as_answering(tmp_path: Path) -> None:
 
 
 def test_a_version_mismatch_says_which_side_is_which(tmp_path: Path) -> None:
-    """#82's proven failure: CLI 0.148.0 against daemon 0.149.1. A Session the
-    user starts with that CLI will not speak to the daemon this job started."""
+    """#82's measurement: CLI 0.148.0 against daemon 0.149.1, reported as read.
+
+    It says the disagreement and stops there. This used to end "a Session
+    started by this CLI will not speak to that daemon", and #233 measured that
+    false on 2026-09-05: a plain `codex --sandbox workspace-write` from CLI
+    0.153.0 joins the 0.149.1 daemon and its thread appears in
+    `thread/loaded/list`. What keeps a TUI out is a `-c` override, which is not
+    a fact about versions.
+    """
     said = agent.daemon_versions(
         codex_home(tmp_path),
         lambda _: (0, '{"cliVersion": "0.148.0", "appServerVersion": "0.149.1"}'),
     )
     assert "0.148.0" in said and "0.149.1" in said
+    assert "will not" not in said
 
 
 @pytest.mark.parametrize(

@@ -1375,3 +1375,75 @@ class TestSayingSoWithoutSayingItTwelveTimesAMinute:
         said = [line for line in caplog.messages if THREAD in line]
         assert len(said) == 1
         assert roster.NO_TERMINAL in said[0]
+
+    def test_a_terminal_the_daemon_holds_nothing_for_says_so_once(self, caplog) -> None:
+        """#233: a live TUI outside the daemon was silence, not even a note.
+
+        Run `20260904T202319Z` held one for two minutes and the codex engine log
+        has no line about it: `_report` speaks only about threads the daemon
+        holds, and the degradation note only where it holds user roots.
+        """
+        daemon = daemon_holding()
+        seen: set[int] = set()
+
+        with caplog.at_level(logging.INFO, logger=discovery.__name__):
+            for _ in range(3):
+                asyncio.run(
+                    discover(
+                        daemon,  # type: ignore[arg-type]
+                        evidence=discovery.ProcessEvidence(
+                            list_sessions=listing(running(4321, "/tmp/w"))  # type: ignore[arg-type]
+                        ),
+                        reported_unheld_terminals=seen,
+                        projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
+                    )
+                )
+
+        said = [line for line in caplog.messages if "4321" in line]
+        assert len(said) == 1
+        assert "/tmp/w" in said[0]
+        assert roster.NOTHING_TO_VOUCH_FOR in said[0]
+
+    def test_a_terminal_that_has_gone_is_forgotten(self) -> None:
+        """Roster-sized, like the thread set beside it: this may not grow all day.
+
+        A pid is reused, so remembering one that is no longer running would also
+        silence the next terminal that happened to land on it.
+        """
+        seen = {9999}
+        asyncio.run(
+            discover(
+                daemon_holding(),  # type: ignore[arg-type]
+                evidence=discovery.ProcessEvidence(
+                    list_sessions=listing(running(4321, "/tmp/w"))  # type: ignore[arg-type]
+                ),
+                reported_unheld_terminals=seen,
+                projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
+            )
+        )
+        assert seen == {4321}
+
+    def test_a_daemon_that_did_not_answer_is_not_said_to_hold_nothing(self, caplog) -> None:
+        """#96's rule, met from #233's side: never claim what was not observed.
+
+        "The daemon holds no user root there" is a claim about what the daemon
+        holds, and a daemon that did not answer was not observed to hold
+        anything. `degraded` already says why this reading is thin.
+        """
+        seen: set[int] = set()
+
+        with caplog.at_level(logging.INFO, logger=discovery.__name__):
+            lane = asyncio.run(
+                discover(
+                    None,
+                    evidence=discovery.ProcessEvidence(
+                        list_sessions=listing(running(4321, "/tmp/w"))  # type: ignore[arg-type]
+                    ),
+                    reported_unheld_terminals=seen,
+                    projects=ProjectNames(ask=not_a_repository()),  # type: ignore[arg-type]
+                )
+            )
+
+        assert not [line for line in caplog.messages if roster.NOTHING_TO_VOUCH_FOR in line]
+        assert lane.degraded
+        assert seen == set()
