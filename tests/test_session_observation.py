@@ -21,6 +21,7 @@ from gpt_voicecoding.core.sessions import (
     NoNameMatchError,
     SessionRegistry,
 )
+from gpt_voicecoding.engine.composition import DEFAULT_DISCOVERY_SECONDS
 from gpt_voicecoding.seams.agent import (
     ChildClassification,
     ChildKind,
@@ -900,6 +901,96 @@ class TestWhatAStopWritesIntoTheRow:
         )
 
         assert registry.live()[0].state is SessionState.RUNNING
+
+
+#: A Codex permission as the lane's own projection builds it — the request the
+#: app-server handed the adapter, in the seam's vocabulary
+#: (`codex/adapter.py::_dialog_waiting`). Caught up because the dialog *is* the
+#: record: nothing is being inferred from a transcript that may not have flushed.
+A_PERMISSION = WaitingFor(
+    kind=WaitingKind.PERMISSION,
+    tool_name="a file change",
+    approval_id="item/fileChange/requestApproval:4309",
+)
+
+
+class TestTheRegistryHalfOfACodexPermission:
+    """What the roster does with the readings a held Codex dialog produces (#245).
+
+    The defect and its rule are stated once, where the projection lives
+    (`codex/adapter.py::_stopped_on`); what is pinned here is the other half —
+    that a Stop's `WAITING` and the discovery readings that follow it compose
+    into one answer rather than alternating. The projection itself is proved
+    against a real app-server in
+    `tests/test_codex_agent.py::TestWhatACodexRowSaysItStoppedOn`, including the
+    roster this registry builds from it; these three are the registry contract
+    those readings rely on, written in registry terms.
+    """
+
+    TARGET = SessionTarget(agent=AgentKind.CODEX, session_id="01a070e7", pid=4309)
+
+    def a_row(self, **fields: object) -> SessionInspection:
+        return codex_row(session_id=self.TARGET.session_id, pid=self.TARGET.pid, **fields)
+
+    def registry_at_the_dialog(self) -> SessionRegistry:
+        """The roster the moment the Stop landed: a Codex Session, mid-turn, stopped."""
+        registry = SessionRegistry()
+        registry.observe(AgentKind.CODEX, seeing(self.a_row(state=SessionState.RUNNING)), now=NOW)
+        registry.set_stop_reading(
+            self.TARGET, waiting_for=A_PERMISSION, progress=ProgressObservation(), now=NOW
+        )
+        return registry
+
+    def holding_the_dialog(self) -> SessionInspection:
+        """The row the Codex lane builds while it still holds the dialog.
+
+        Its state is the wait's own `stopped_state`, which is the single rule
+        `_stopped_on` applies — written that way rather than as the word
+        `WAITING`, so this row keeps saying what the lane says if the rule ever
+        changes.
+        """
+        return self.a_row(state=A_PERMISSION.stopped_state, waiting_for=A_PERMISSION)
+
+    def test_the_stop_writes_waiting(self) -> None:
+        assert self.registry_at_the_dialog().live()[0].state is SessionState.WAITING
+
+    def test_the_next_pass_with_the_dialog_still_held_keeps_waiting(self) -> None:
+        """One cadence later, and every cadence after it — not a transient."""
+        registry = self.registry_at_the_dialog()
+
+        for tick in range(1, 4):
+            registry.observe(
+                AgentKind.CODEX,
+                seeing(self.holding_the_dialog()),
+                now=NOW + DEFAULT_DISCOVERY_SECONDS * tick,
+            )
+
+        held = registry.live()[0]
+        assert held.state is SessionState.WAITING
+        assert held.waiting_for == A_PERMISSION
+
+    def test_the_pass_after_the_dialog_is_answered_returns_the_threads_own_state(self) -> None:
+        """The control, and the reason this is a projection and not kept state.
+
+        Once the dialog is answered the lane holds nothing, `_stopped_on` adds
+        nothing, and the row is the thread's own status again — a `WAITING` that
+        outlived its dialog would be the ghost `with_waiting_for` exists to
+        refuse.
+        """
+        registry = self.registry_at_the_dialog()
+        registry.observe(
+            AgentKind.CODEX, seeing(self.holding_the_dialog()), now=NOW + DEFAULT_DISCOVERY_SECONDS
+        )
+
+        registry.observe(
+            AgentKind.CODEX,
+            seeing(self.a_row(state=SessionState.RUNNING)),
+            now=NOW + 2 * DEFAULT_DISCOVERY_SECONDS,
+        )
+
+        held = registry.live()[0]
+        assert held.state is SessionState.RUNNING
+        assert held.waiting_for == WaitingFor()
 
 
 class TestAReadingThatHasNotCaughtUp:

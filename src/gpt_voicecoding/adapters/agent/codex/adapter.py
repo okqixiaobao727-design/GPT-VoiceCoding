@@ -589,9 +589,23 @@ class CodexAgentAdapter:
         source answering the same question with worse evidence, and the port
         table left exactly that behind (P6, P13). What this projects is the
         request the app-server handed us, which is the thing itself.
+
+        **The state comes with the dialog** (#245). A thread sitting at an
+        approval is `active` to the daemon, so `roster.from_thread` reads it
+        `RUNNING` — it reads the thread and cannot see the dialog, which is held
+        here. Leaving the state as the thread status gave it made this pass
+        disagree with the Stop path every cadence: the Stop writes the state
+        `WaitingFor.stopped_state` derives (`SessionRegistry.set_stop_reading`,
+        #213) and the next discovery pass overwrote it, so `status` answered
+        `running` beside a caught-up permission and the Reply Window derived
+        from that state (`derive_reply_window`) read closed. Run
+        `20260905T092046Z` held that shape for 92 consecutive polls. One rule in
+        one place: wherever the dialog is read, it decides the state.
         """
         waiting = _dialog_waiting(self._threads.get(row.target))
-        return row if waiting is None else replace(row, waiting_for=waiting)
+        if waiting is None:
+            return row
+        return replace(row, waiting_for=waiting, state=waiting.stopped_state)
 
     def _daemon_let_go(self, reason: str) -> None:
         """The shared daemon's connection went away. Forget what rode on it.
