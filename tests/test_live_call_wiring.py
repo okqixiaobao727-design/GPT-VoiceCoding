@@ -1197,6 +1197,7 @@ def _long_answer_phase(
     *,
     stopped_at: float | None,
     down_at: float | None,
+    back_up_after_the_drop: bool = False,
 ) -> tuple[live_call_step._PhaseFacts, _PacingClock]:
     """Run the long-answer phase over a fake engine log on a fake clock (#243)."""
     clock = _PacingClock()
@@ -1211,7 +1212,19 @@ def _long_answer_phase(
             engine_mark=0, wrapper_mark=0, landed_at=0, heard=True
         ),
     )
-    monkeypatch.setattr(walk, "_call_is_down", lambda: down_at is not None and clock.now >= down_at)
+    dropped: list[bool] = []
+
+    def call_is_down() -> bool:
+        if down_at is None or clock.now < down_at:
+            return False
+        # A call that flapped: down for the reading that stops the watch, and
+        # up again by the one the watch takes on its way out.
+        if back_up_after_the_drop and dropped:
+            return False
+        dropped.append(True)
+        return True
+
+    monkeypatch.setattr(walk, "_call_is_down", call_is_down)
     monkeypatch.setattr(walk, "_call_line", lambda: "call: active")
     facts = live_call_step._PhaseFacts("graded", phase="long answer")
     try:
@@ -1250,9 +1263,34 @@ def test_a_call_that_goes_down_mid_answer_is_still_graded_as_the_ceiling_bug(
 
     assert facts.graded["Voice spans closed"] is False
     assert facts.failed == ["Voice spans closed"]
-    assert "#169" in facts.failure
-    assert "went down" in facts.failure
+    assert "the bug itself (#169)" in facts.failure
+    # The seconds named for the call going down are the watch's, not the last
+    # thing the Voice was heard to say — both are there, and they differ.
+    assert (
+        f"the call went down {facts.recorded['watch seconds']:.0f}s into the answer"
+        in facts.failure
+    )
+    assert facts.recorded["watch seconds"] > facts.recorded["Voice answer seconds"]
     assert clock.now < live_call_step.LIVE_CALL_LONG_ANSWER_SECONDS
+
+
+def test_a_call_that_drops_mid_answer_and_comes_back_is_still_the_ceiling_bug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """How the watch stopped is what says which bug it was, not a later reading.
+
+    The call being up again by the time the watch is asked would read as the
+    harness's own patience — the misdiagnosis this grading exists to prevent —
+    if the wording keyed off that reading rather than the watch's exit.
+    """
+    facts, _ = _long_answer_phase(
+        tmp_path, monkeypatch, stopped_at=None, down_at=70.0, back_up_after_the_drop=True
+    )
+
+    assert facts.recorded["call went down"] is False
+    assert facts.recorded["watch ran out"] is False
+    assert facts.graded["Voice spans closed"] is False
+    assert "the bug itself (#169)" in facts.failure
 
 
 def test_a_span_still_open_at_the_hard_cap_is_the_harnesss_patience_not_the_ceiling(
