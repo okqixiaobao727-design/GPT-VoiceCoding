@@ -454,7 +454,24 @@ THE_QUESTION_ASKED = "需要我把这件事做完吗？"
 #: for a line ending `?` — and the words are what the grade is about. It shares
 #: no run with `LIVE_CALL_DICTATED_REPLY_SUBSTRING`, so the question and the
 #: answer to it cannot pass for each other.
-QUESTION_ASKED_SPOKEN_SUBSTRING = "把这件事做完"
+#:
+#: **The verb, not the sentence's middle** (#244). This was `把这件事做完`, which
+#: about twenty runs' renderings happened to keep. Run `20260905T092046Z`'s
+#: claude lane said `它说 READY,问需要它现在做完吗,选项是"现在就做"或"以后再说"。`
+#: — the Session named, what it is waiting on said, both labels quoted, and the
+#: question rendered in the Voice's own words, which is what
+#: `core/instructions/voice.py` asks of it. That graded False and took the whole
+#: `hand-over` phase red. The fact's name is about the *meaning*, so the run
+#: graded on is the one every recorded rendering kept, including the two
+#: pronoun rewrites of `20260905T071849Z` and the paraphrase above: the verb
+#: `做完`. Do not widen it back into the rephrasable middle — the sentence
+#: between `需要` and `吗` is the Voice's to word.
+#:
+#: Short runs collide, so what it must not share a run with is pinned by
+#: `test_the_question_fragment_shares_no_run_with_the_answers_to_it`: the reply
+#: the Focus Session dictates, the answer relayed to it, and both option labels
+#: are the other things the Voice can read out of this same brief.
+QUESTION_ASKED_SPOKEN_SUBSTRING = "做完"
 
 ASK_A_QUESTION = Instruction(
     words=(
