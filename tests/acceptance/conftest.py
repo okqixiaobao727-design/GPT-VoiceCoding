@@ -121,6 +121,44 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
         pytest.skip(ACTOR_MISSING)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_codex_daemon() -> None:
+    """`tests/conftest.py`'s guard, lifted here and only here — a read, never a turn (#232).
+
+    **What the parent guard is for is the fast suite.** It monkeypatches
+    `shared_daemon._run` to refuse `codex app-server daemon version`, and its
+    reason is exact: that lookup answers with the socket the machine's own daemon
+    listens on, and *"from there a Relay is a `turn/start` in somebody's open
+    work"*. A unit test must never find somebody's open work, and nothing in the
+    fast suite has any business looking.
+
+    **This suite is the one whose whole purpose is the real machine**, and it has
+    been driving that same daemon all along — it starts real `codex` TUIs, relays
+    into them and drives real turns — only ever *through the engine*, which is a
+    separate process inside the bundle and outside this fixture's reach. #232 is
+    the first time the harness process itself has to ask, and the honest answer is
+    to declare the exception here rather than to hand `locate` a `run=` that
+    reaches the machine anyway. A harness that routed around a safety fixture is
+    worse than one that names the case it does not cover.
+
+    **What actually protects somebody else's work in this suite is
+    `support.foreign_codex_refusal`** (#228), not this fixture: it refuses the
+    whole run when any Codex Session the walk did not hand-start is live on the
+    machine. It is called from `preflight`, unconditionally on `--lane`, and
+    `lane_runs` lists `preflight` ahead of every other dependency — so it has
+    already run and already refused before any walk thread exists, and therefore
+    before `Walk.settle_daemon_membership` reads anything.
+
+    **The precedent, said plainly.** `tests/acceptance` is now the one directory
+    in this tree permitted that lookup. What it spends the permission on is a
+    single `thread/loaded/list` — a read of which threads the daemon holds, which
+    is the fact ADR 0020 makes a roster row out of. **Any new caller here must be
+    a read too.** A `turn/start`, a `thread/*` write, or anything that resolves a
+    permission belongs to the engine under test, never to the harness holding the
+    stopwatch — the harness would then be arranging the very thing it grades.
+    """
+
+
 REPOSITORY = Path(__file__).resolve().parents[2]
 
 #: The far-side waits. `docs/acceptance-design.md` § Deadlines forbids a guess, so
