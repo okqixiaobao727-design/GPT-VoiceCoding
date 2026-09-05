@@ -35,7 +35,7 @@ import subprocess
 import threading
 import time
 import tomllib
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,8 +45,13 @@ from typing import Any
 
 import live_call
 
+from gpt_voicecoding import __version__
 from gpt_voicecoding.adapters.agent.claude.settings import DEFAULT_ACK_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.agent.codex import discovery as codex_discovery
 from gpt_voicecoding.adapters.agent.codex import processes as codex_processes
+from gpt_voicecoding.adapters.agent.codex import shared_daemon as codex_shared_daemon
+from gpt_voicecoding.adapters.codex_app_server import process as codex_app_server
+from gpt_voicecoding.adapters.codex_app_server.settings import CodexSettings
 from gpt_voicecoding.adapters.companion_channel.telegram.api import TelegramError, Transport
 from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -107,8 +112,46 @@ CLAUDE_LANE_EFFORT = "medium"
 #: One Codex-side pin, spent twice: the Codex lane's own Session and — as
 #: `DELEGATED_TURN_MODEL` — the work the Call Agent hands off during a Live Call.
 #: They are one name because they are one bill, against one app-server.
+#:
+#: **There is no reasoning-effort pin here, and it may not be re-added as a `-c`
+#: override** (#232). It was one, for one run: `-c model_reasoning_effort="high"`
+#: alongside the model pin. A `-c` override makes codex-tui run its own core
+#: instead of joining the shared daemon, and the Codex roster composes a row from
+#: a daemon-held user thread plus a live terminal in its workspace — so the pin
+#: made this lane's own Session invisible to the product it was there to grade.
+#: Run `20260904T202319Z` failed at `roster` and SKIPPED the nine steps behind
+#: it, and the engine's codex discovery never mentioned the TUI's thread at all.
+#:
+#: **The mechanism was already written down in this repository**, which is the
+#: part worth carrying forward: `can_reuse_implicit_local_daemon` requires
+#: `cli_kv_overrides.is_empty()` (`tui/src/lib.rs:919-921`, cited in
+#: `hand_started`'s module docstring since #110). It does not test *which* key
+#: was overridden, so there is no such thing as a harmless `-c` here — and the
+#: rule beside that citation said "never reach for `-c` to solve a boot gate",
+#: which is how a `-c` reached for *cost* got past it. The rule now names the
+#: flag rather than the motive, and the table below is the black-box confirmation
+#: of the source read.
+#:
+#: Measured 2026-09-05 with the harness's own pty launch in a trusted workspace,
+#: asking the daemon `thread/loaded/list` for the TUI's own thread id — codex-cli
+#: 0.153.0 against a shared app-server 0.149.1:
+#:
+#: | launch flags                                | daemon holds the thread |
+#: |---------------------------------------------|-------------------------|
+#: | `--sandbox workspace-write`                 | yes                     |
+#: | `… -m gpt-5.6-luna`                         | yes                     |
+#: | `… -c model_reasoning_effort="high"`        | **no**                  |
+#: | `… -m gpt-5.6-luna -c model_reasoning_effort="high"` | **no**         |
+#:
+#: So the model pin stays — it was measured to join — and the effort pin is gone.
+#: `codex --help` on 0.153.0 has no dedicated effort flag, and `-p/--profile` is
+#: another config layer whose effect on daemon membership is **unverified**: it
+#: is not a way around this until somebody measures it the same way. Billing
+#: reasoning effort at all needs a codex feature rather than a change here (#232,
+#: out of scope). What guards this comment is `codex_daemon_membership`, which
+#: reads the fact in the boot wait and refuses the lane rather than grading nine
+#: SKIPPED steps behind a `roster` red, and the fast test that pins the tuple.
 CODEX_LANE_MODEL = "gpt-5.6-luna"
-CODEX_LANE_REASONING_EFFORT = "high"
 DELEGATED_TURN_MODEL = CODEX_LANE_MODEL
 
 #: Darwin caps an AF_UNIX path at 103 bytes, so the run's socket cannot live in
@@ -403,6 +446,223 @@ def _uptime_text(sampled_at: float, started_at: float | None) -> str:
     if hours:
         return f", up {hours}h{minutes:02d}m"
     return f", up {minutes}m{seconds:02d}s" if minutes else f", up {seconds}s"
+
+
+# --- is this Session one the product can see at all? ------------------------
+
+#: What the daemon is asked. Taken from the adapter's own constant rather than
+#: spelled again, because two spellings of one method name is how a harness comes
+#: to ask a question the product does not ask.
+DAEMON_ROSTER_METHOD = codex_discovery.ROSTER_METHOD
+
+#: How the daemon is found, and how it is dialled. Both are the engine's own
+#: functions, defaulted here and injectable only so a test can pin the reading
+#: without a socket — there is deliberately no second route to the daemon under
+#: `tests/acceptance` (advisor ruling on #232).
+DaemonLocator = Callable[[str], Awaitable[tuple[codex_shared_daemon.DaemonAddress | None, str]]]
+DaemonDial = Callable[..., Awaitable[Any]]
+
+#: Every spelling of a config override `codex --help` carries on 0.153.0, in both
+#: the separated and the `=`-joined form. One list, because the tuple test and the
+#: refusal's own reading of the flags have to agree about what a `-c` looks like.
+CONFIG_OVERRIDE_FLAGS = ("-c", "--config")
+
+
+def is_config_override(flag: str) -> bool:
+    """Whether one launch argument is a `-c` override, in either spelling.
+
+    The `=`-joined form matters as much as the separated one: `clap` accepts
+    `-c=key=value` and `--config=key=value`, and `cli_kv_overrides` fills the same
+    way from both — so a check that only knew `("-c", "--config")` would wave
+    through the exact flag #232 exists to keep out.
+    """
+    return flag in CONFIG_OVERRIDE_FLAGS or flag.startswith(
+        tuple(f"{name}=" for name in CONFIG_OVERRIDE_FLAGS)
+    )
+
+
+@dataclass(frozen=True)
+class DaemonMembership:
+    """Whether the shared Codex daemon holds one thread, and how that was learned.
+
+    **`held` is a tri-state and that is the whole design.** `True` and `False`
+    are both observations — the daemon answered and this thread was, or was not,
+    among the ids it named. `None` is *no observation*, and the module this
+    borrows its rule from says why it may not collapse into `False`: never claim
+    anything about the daemon this build did not observe
+    (`adapters/agent/codex/shared_daemon.py`, #96). A daemon that is down, moved
+    or answering a shape this build cannot read is not evidence that a thread is
+    absent from it, and a lane refused on one of those would blame #232's own
+    cause for somebody else's outage.
+    """
+
+    thread_id: str
+    held: bool | None
+    held_threads: tuple[str, ...] = ()
+    daemon: str = ""
+    reason: str = ""
+
+    def refusal(self, flags: Sequence[str]) -> str | None:
+        """Why this lane cannot be walked, or `None` — and it is only ever the observed absence.
+
+        **Why an absence is a refusal rather than a red.** ADR 0020 defines a
+        Codex Session as a daemon thread a terminal vouches for, so a TUI outside
+        the daemon is a Session the product is *right* not to list: `roster`
+        failing on it grades the harness's own ground as a product defect, and
+        the nine steps behind it as SKIPPED with `blocked by roster` — which is
+        the reading run `20260904T202319Z` produced and #232 was opened to
+        replace. Making such a terminal a row is refused by the same ADR and is
+        out of #233's scope too; there is nothing for the product to do here.
+
+        **The flags are quoted rather than diagnosed.** A `-c` override is what
+        was measured to keep a TUI out (2026-09-05), and it is named as that
+        measurement when it is present. When it is not, the sentence says what
+        was launched and stops: a stock explanation printed under a lane that
+        cannot have this cause is how the next person loses an afternoon.
+        """
+        if self.held is not False:
+            return None
+        override = [flag for flag in flags if is_config_override(flag)]
+        measured = (
+            " This lane was launched with a `-c` override, and a `-c` override was measured "
+            "on 2026-09-05 to make codex-tui run its own core instead of joining the shared "
+            "daemon (#232) — which is exactly this."
+            if override
+            else " No `-c` override is in those flags, so this is not the cause #232 measured "
+            "and the daemon-side reason is unknown to this run."
+        )
+        return (
+            f"the Codex Session the harness hand-started writes thread {self.thread_id} into "
+            f"its own rollout, and the shared daemon at {self.daemon} does not hold it — it "
+            f"holds {list(self.held_threads) or 'no threads'}. A Codex Session is a daemon "
+            f"thread a terminal vouches for (ADR 0020), so nothing the product does can give "
+            f"this TUI a roster row, and every step of this lane reads one. Launched with "
+            f"{list(flags)}.{measured}"
+        )
+
+
+def codex_daemon_membership(
+    thread_id: str,
+    *,
+    executable: str | None = None,
+    settings: CodexSettings | None = None,
+    locate: DaemonLocator = codex_shared_daemon.locate,
+    attach: DaemonDial = codex_app_server.attach,
+) -> DaemonMembership:
+    """Ask the shared Codex daemon whether it holds the thread this lane started.
+
+    **The one fact that decides whether this lane can be walked at all.** The
+    Codex roster composes a row from a daemon-held user thread plus a live
+    terminal in its workspace (`adapters/agent/codex/roster.py`), so a TUI whose
+    thread the daemon does not hold is invisible to the product by construction —
+    not under-reported, not degraded, absent. Run `20260904T202319Z` walked such
+    a lane: the engine's codex discovery never mentioned the TUI's thread at all,
+    `roster` failed, and nine steps were SKIPPED behind it (#232).
+
+    **Asked the engine's own way, through the engine's own functions.**
+    `shared_daemon.locate` finds the socket by asking `codex app-server daemon
+    version`, which is the one address that cannot go stale, and
+    `codex_app_server.attach` becomes one more client of a daemon somebody else
+    owns. This is `foreign_codex_refusal`'s rule applied a second time: a harness
+    that implemented the wire again would be a second answer to a question the
+    product already answers, and the product's answer is the one that decides
+    whether a row appears.
+
+    **The connection is let go of on every path.** Join-only is the daemon
+    module's rule and it is this call's too: it opens a client, asks one method,
+    and closes its own end — the user's TUIs are thin clients of that daemon and
+    nothing here may outlive one read of it.
+
+    Harness only, so #232 says the legacy-citation rule does not apply. Checked
+    anyway and it is short: gen 1 had no shared daemon to be outside of — it drove
+    a per-Session app-server it spawned itself
+    (`legacy@1d32845:bridge/codex.py:1319-1347`), so a Session it started was
+    reachable by construction and there was no membership to read. **Dropped,
+    because** legacy has no such behaviour.
+    """
+    if not thread_id.strip():
+        return DaemonMembership(
+            thread_id=thread_id,
+            held=None,
+            reason=(
+                "the agent's own record names no thread yet, so there is nothing to look for "
+                "in the daemon"
+            ),
+        )
+    codex_settings = settings if settings is not None else CodexSettings()
+    return asyncio.run(
+        _codex_daemon_membership(
+            thread_id.strip(),
+            executable=executable or codex_settings.executable,
+            settings=codex_settings,
+            locate=locate,
+            attach=attach,
+        )
+    )
+
+
+async def _codex_daemon_membership(
+    thread_id: str,
+    *,
+    executable: str,
+    settings: CodexSettings,
+    locate: DaemonLocator,
+    attach: DaemonDial,
+) -> DaemonMembership:
+    address, why_not = await locate(executable)
+    if address is None:
+        return DaemonMembership(thread_id=thread_id, held=None, reason=why_not)
+    where = (
+        f"{address.socket_path} (CLI {address.cli_version!r}, "
+        f"app-server {address.app_server_version!r})"
+    )
+    try:
+        connection = await attach(
+            address.socket_path, version=__version__, settings=settings, experimental=False
+        )
+    except Exception as undialled:  # noqa: BLE001 - every way this fails is one fact
+        return DaemonMembership(
+            thread_id=thread_id,
+            held=None,
+            daemon=where,
+            reason=f"the shared Codex daemon at {where} could not be dialled: {undialled!r}",
+        )
+    try:
+        answer = await connection.request(
+            DAEMON_ROSTER_METHOD, {}, timeout_seconds=settings.request_timeout_seconds
+        )
+    except Exception as unanswered:  # noqa: BLE001 - same fact again
+        return DaemonMembership(
+            thread_id=thread_id,
+            held=None,
+            daemon=where,
+            reason=(
+                f"the shared Codex daemon at {where} did not answer "
+                f"{DAEMON_ROSTER_METHOD}: {unanswered!r}"
+            ),
+        )
+    finally:
+        await connection.aclose()
+
+    listed = answer.get("data") if isinstance(answer, dict) else None
+    if not isinstance(listed, list):
+        return DaemonMembership(
+            thread_id=thread_id,
+            held=None,
+            daemon=where,
+            reason=(
+                f"the shared Codex daemon at {where} answered {DAEMON_ROSTER_METHOD} in a "
+                f"shape this run cannot read: {answer!r}"
+            ),
+        )
+    held_threads = tuple(row.strip() for row in listed if isinstance(row, str) and row.strip())
+    return DaemonMembership(
+        thread_id=thread_id,
+        held=thread_id in held_threads,
+        held_threads=held_threads,
+        daemon=where,
+        reason=f"read from {DAEMON_ROSTER_METHOD} at {where}",
+    )
 
 
 # --- provenance -------------------------------------------------------------

@@ -82,7 +82,7 @@ import re
 import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -883,6 +883,18 @@ class Lane:
     #: turn look like a turn that never grew the record, which is exactly how
     #: `_drive_turn` decides a turn is over.
     record_now: Callable[[hand_started.GroundTruth, float], Path | None]
+    #: How this lane names the thread a shared daemon would have to hold for the
+    #: product to see the Session the harness started, given that Session's own
+    #: record — or `None` on a lane with no daemon to be outside of.
+    #:
+    #: **Only the Codex lane has one, and that is a fact about the product rather
+    #: than a gap here.** ADR 0020 defines a Codex Session as a daemon thread a
+    #: terminal vouches for, so membership is load-bearing for every row on that
+    #: lane; a Claude Session is discovered from its own registration and its
+    #: transcript, with no daemon in the path (`adapters/agent/claude`). A lane
+    #: that answers `None` is not skipping a check, it is saying the question does
+    #: not arise.
+    daemon_thread: Callable[[Path | None], str] | None = None
 
     def token_variable(self, configured: str) -> str:
         """This lane's bot token variable, given the one the engine's config names."""
@@ -1005,17 +1017,27 @@ CLAUDE = Lane(
 #:   evidence line `roster` prints changes shape, and the pid join it rests on
 #:   does not.
 #:
-#: The **cost** pin, `-m gpt-5.6-luna -c model_reasoning_effort="high"`, is the
-#: Codex half of the pin the Claude lane carries for the same reason: without it
-#: a bare `codex` reads the person's own `~/.codex/config.toml`, and on this
-#: machine that says `gpt-5.6-sol` at `xhigh` — the top of both dials. Measured
-#: on run `20260904T124243Z`: `gpt-5.6-sol` and `xhigh` in this lane's own status
-#: line, 31 reads each, for five short instructions. It touches nothing this lane
-#: grades — `policy_at` reads `turn_context`'s sandbox and approval fields, and
-#: the model is not one of them — and it is passed as flags rather than left to
-#: the config file because the config file is the person's and this run does not
-#: get to edit it. Both spellings are in `processes.VALUE_TAKING_OPTIONS`, so the
-#: engine's own argv reader still sees a Session here and not a subcommand.
+#: The **cost** pin, `-m gpt-5.6-luna`, is the Codex half of the pin the Claude
+#: lane carries for the same reason: without it a bare `codex` reads the person's
+#: own `~/.codex/config.toml`, and on this machine that says `gpt-5.6-sol` at
+#: `xhigh` — the top of both dials. Measured on run `20260904T124243Z`:
+#: `gpt-5.6-sol` and `xhigh` in this lane's own status line, 31 reads each, for
+#: five short instructions. It touches nothing this lane grades — `policy_at`
+#: reads `turn_context`'s sandbox and approval fields, and the model is not one
+#: of them — and it is passed as a flag rather than left to the config file
+#: because the config file is the person's and this run does not get to edit it.
+#: The spelling is in `processes.VALUE_TAKING_OPTIONS`, so the engine's own argv
+#: reader still sees a Session here and not a subcommand.
+#:
+#: **The effort half of that pin is gone and may not come back as `-c`** (#232).
+#: `-c model_reasoning_effort="high"` rode beside `-m` for one run and made this
+#: lane's own Session invisible to the product: a `-c` override makes codex-tui
+#: run its own core rather than join the shared daemon, and a TUI outside the
+#: daemon is a Session the Codex roster cannot compose a row for (ADR 0020). The
+#: measurement table, and why `-p/--profile` is not a way around it, are beside
+#: the pin block in `support.py`; only the model pin was measured to join. So
+#: this lane now costs whatever `high`'s absence costs, and the run is graded
+#: rather than skipped — which is the trade #232 makes explicitly.
 CODEX = Lane(
     name="codex",
     agent="codex",
@@ -1025,15 +1047,12 @@ CODEX = Lane(
     binary="codex",
     # The second bot, which already exists and messages the same user chat.
     token_env_suffix="_2",
-    arguments=(
-        "--sandbox",
-        "workspace-write",
-        "-m",
-        support.CODEX_LANE_MODEL,
-        "-c",
-        f'model_reasoning_effort="{support.CODEX_LANE_REASONING_EFFORT}"',
-    ),
+    arguments=("--sandbox", "workspace-write", "-m", support.CODEX_LANE_MODEL),
     boot=hand_started.BootPrompt(words=ACKNOWLEDGE.words, turn_over=hand_started.codex_turn_over),
+    # The daemon this lane's Session has to be inside for any step to read a row.
+    # `roster` is where its absence used to surface, as a red with nine SKIPPED
+    # behind it; naming it here is what lets the boot wait refuse instead (#232).
+    daemon_thread=hand_started.codex_thread_id,
     # Measured 2026-08-27 through the shared daemon with the product's own pin
     # and no sandbox override, on codex-cli 0.149.1 and again on 0.150.0 over a
     # 0.149.1 app-server: a write to a path outside the workspace raises
@@ -1286,6 +1305,7 @@ class Walk:
         )
         try:
             boot_mark = self.settle_boot_turn()
+            self.settle_daemon_membership()
             self.arm_switches()
             self.drain_boot_notice(boot_mark)
         except LaneBlocked as unarmed:
@@ -1373,6 +1393,62 @@ class Walk:
                 f"{self._record_size()} bytes. Screen tail: {self.session.screen_tail()[-600:]!r}"
             )
         return self.person.latest_message_id()
+
+    def settle_daemon_membership(self) -> None:
+        """Record whether the product can see this Session at all, and refuse if it cannot.
+
+        **Not a step, and it must not become one.** ADR 0020 defines a Codex
+        Session as a daemon thread a terminal vouches for, so a hand-started TUI
+        the shared daemon does not hold is a Session the product is *right* not
+        to list. Grading that is grading the harness's own ground as a product
+        defect — which is what run `20260904T202319Z` did: `roster` red, nine
+        steps SKIPPED behind it, and the engine's codex discovery never
+        mentioning the TUI's thread at all, because there was nothing in the
+        daemon to mention (#232). The cause was this lane's own launch flags.
+
+        **Here, because here is where the fact first exists and still costs
+        nothing.** The thread id is written into the rollout when the first turn
+        starts, and the turn `settle_boot_turn` has just waited out is that turn;
+        before it, the id is `""` and the question cannot be asked. After it,
+        nothing has been typed, no outlet is armed, no chat mark has been taken —
+        so a lane refused at this line has spent a boot turn and nothing else.
+
+        **It records on every path and refuses on one.** A daemon that is down,
+        moved or answering a shape this run cannot read is not evidence that a
+        thread is absent from it (`support.DaemonMembership`), and a run that
+        refused on one of those would blame #232's own cause for somebody else's
+        outage. So the journal always carries the reading — that is the ticket's
+        "the journal names the daemon-membership fact" — and only an observed
+        absence raises.
+
+        Harness only (#232), and the legacy citation is `codex_daemon_membership`'s:
+        **dropped, because** gen 1 drove a per-Session app-server it spawned
+        itself and had no shared daemon a Session could be outside of.
+        """
+        name_thread = self.lane.daemon_thread
+        if name_thread is None:
+            return
+        thread_id = name_thread(self._record_now())
+        membership = support.codex_daemon_membership(thread_id)
+        self.journal(
+            "daemon.membership",
+            lane=self.lane.name,
+            flags=list(self.lane.arguments),
+            **asdict(membership),
+        )
+        refusal = membership.refusal(self.lane.arguments)
+        if refusal is not None:
+            raise LaneBlocked(refusal)
+        self.journey.observe(
+            "daemon membership",
+            f"the shared Codex daemon {'holds' if membership.held else 'was not read for'} "
+            f"thread {thread_id or '<none written yet>'} — {membership.reason}. A Codex "
+            f"Session is a daemon thread a terminal vouches for (ADR 0020), so this is what "
+            f"stands between the launch flags and every row the steps below read (#232). "
+            f"Launched with {list(self.lane.arguments)}. Arranged and recorded by the "
+            f"harness, never graded: a Session outside the daemon is one the product is "
+            f"right not to list.",
+        )
 
     def drain_boot_notice(self, mark: int | None) -> None:
         """Let the boot turn's Stop Notice land before the walk marks the chat for a later one.

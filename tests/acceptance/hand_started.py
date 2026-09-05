@@ -57,7 +57,17 @@ A fourth, measured on #110 (2026-08-27, `codex-cli` 0.150.0):
   *and* makes the TUI refuse the shared daemon (`can_reuse_implicit_local_daemon`
   requires `cli_kv_overrides.is_empty()`, `tui/src/lib.rs:919-921`): it would
   silently destroy the attachment the run exists to measure. **Never reach for
-  `-c` to solve a boot gate.**
+  `-c` at all, whatever it is being reached for.**
+
+  That sentence used to end "to solve a boot gate", and the narrower version is
+  what #232 cost. `cli_kv_overrides.is_empty()` does not care *which* key was
+  overridden — a `-c` for cost keeps the TUI out of the daemon exactly as a `-c`
+  for the update prompt does — and `6a44f1b` passed `-c model_reasoning_effort`
+  for cost, under a rule that read as if it were about boot gates. Run
+  `20260904T202319Z` then failed at `roster` and SKIPPED the nine steps behind
+  it, with the mechanism already written down here. The rule is now about the
+  flag, and `journey.Walk.settle_daemon_membership` measures the attachment on
+  every run rather than trusting anyone to have read this paragraph.
 
   This gate is *skipped*, not arranged, and that is what makes it unlike
   `TrustGate`: nothing of the user's is edited, `version.json` is not written, and
@@ -654,6 +664,24 @@ def codex_rollout(workspace: Path, since: float) -> Path | None:
         if meta is not None and os.path.realpath(str(meta.get("cwd", ""))) == wanted:
             return rollout
     return None
+
+
+def codex_thread_id(rollout: Path | None) -> str:
+    """The thread this Session is, as the Session itself wrote it down.
+
+    **Read from the rollout rather than carried on `GroundTruth`**, and the
+    difference is timing rather than taste. `codex_ground_truth` is resolved once
+    and cached, and it is first asked before the boot turn has finished — at that
+    moment there may be no rollout at all, so the cached `session_id` is `""`.
+    The daemon-membership reading happens after that turn ends (#232), when there
+    certainly is one, and it needs the id as of *then*.
+
+    Empty when there is no record yet or the record has no `session_id`, which is
+    the answer `codex_daemon_membership` reads as "there is nothing to look for"
+    rather than as an absence from the daemon.
+    """
+    meta = _first_session_meta(rollout) if rollout else None
+    return str(meta.get("session_id", "")) if meta else ""
 
 
 @dataclass(frozen=True)
