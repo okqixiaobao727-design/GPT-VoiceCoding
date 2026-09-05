@@ -46,6 +46,7 @@ from typing import Any
 import live_call
 
 from gpt_voicecoding.adapters.agent.claude.settings import DEFAULT_ACK_TIMEOUT_SECONDS
+from gpt_voicecoding.adapters.agent.codex import processes as codex_processes
 from gpt_voicecoding.adapters.companion_channel.telegram.api import TelegramError, Transport
 from gpt_voicecoding.adapters.companion_channel.telegram.settings import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -252,6 +253,125 @@ def login_shell_path() -> str | None:
     if not any(entry.startswith("/") for entry in answer.split(":")):
         return None
     return answer
+
+
+# --- the machine a run has to have to itself --------------------------------
+
+
+def foreign_codex_refusal(
+    *,
+    run: codex_processes.Runner = codex_processes.run_command,
+    now: codex_processes.Clock = time.time,
+) -> str | None:
+    """Why this run cannot be isolated from the Codex Sessions already open, or None.
+
+    **Codex discovery is machine-wide by construction, and that is the product
+    behaving as written.** The adapter lists every live interactive `codex` TUI
+    on the machine from one `ps` (`adapters/agent/codex/processes.py`), and the
+    per-lane `socket_directory` this run derives isolates the app-server socket,
+    not that scan. Both lanes' engines load both agent adapters. So a Codex
+    window the operator left open registers with **both** acceptance engines and
+    sits on the roster for the whole walk: on run `20260904T091550Z` one did, in
+    586 of the run's 687 `bridgectl` readings, and `roster`, `stable name` and
+    `switches` each read a row — and a Stop source — that the walk had not
+    created. The run graded anyway (#228).
+
+    What is missing is not a narrower scan; it is the harness refusing to grade
+    a walk it cannot isolate. So this asks **the adapter's own enumeration**
+    rather than reading the process table a second way: a second scanner would
+    be a second answer to "is this a Session", and the whole reason a foreign
+    TUI reaches the roster is the answer the adapter gives.
+
+    **Unconditional on `--lane`.** The polluted roster is not the Codex lane's
+    problem alone — both lanes' engines load both adapters, so a `--lane claude`
+    run reads the same foreign row.
+
+    **What the run owns is decided by place, not by a launch record.** This runs
+    before the first hand-start, so in an ordinary run nothing of the walk's
+    exists yet to be miscounted. The acceptance criterion is stronger than that
+    ordering — a Session the walk hand-started is *never* foreign — and an ordering
+    nobody can see is not a rule, so a candidate whose workspace is inside
+    `acceptance_root()` is the walk's own: every run directory and every lane
+    workspace is made there (`new_run_directory`, `workspace_path`). Both sides
+    are resolved before comparison, because `lsof` reports a real path and an
+    overridden root may be reached through a symlink (`/tmp` is one).
+
+    What place costs, said out loud: a TUI opened by hand inside an *earlier*
+    run's workspace — to read what that run left there — reads as this run's own
+    and is waved through. That is the ordering rule's behaviour exactly, so the
+    containment rule is never worse than the ordering it strengthens; it is the
+    one case where it is not better.
+
+    **A candidate the adapter cannot name a workspace for is not reported**, and
+    that is inherited rather than decided here: `enumerate_sessions` drops a row
+    whose cwd `lsof` will not give up. Reporting it would need the second scanner
+    this deliberately does not have.
+
+    **The clock is read once, here, and handed down.** `enumerate_sessions`
+    dates every `etime` against one reading taken before its `ps`; passing that
+    same moment in means the elapsed times in the refusal are computed against
+    the moment the starts were, and keeps the read on the safe side of the `ps`
+    (`processes.START_TIME_RESOLUTION_SECONDS`).
+
+    Harness only, so #228 says the legacy-citation rule does not apply — and the
+    citation is here anyway because it is short and it was checked. Legacy never
+    enumerated the process table for Codex at all: its one `pgrep` matches its
+    own bundle executable (`legacy@1d32845:bridge/host.py:795`) and its one `ps`
+    reads a pid it already holds (`legacy@1d32845:bridge/codex.py:205`). A
+    Session it had not started did not exist for it, so there is no preflight
+    and no foreign-Session refusal to port. **Dropped, because** legacy has no
+    such behaviour.
+    """
+    sampled_at = now()
+    try:
+        live = asyncio.run(codex_processes.enumerate_sessions(run=run, now=lambda: sampled_at))
+    except (OSError, TimeoutError) as unreadable:
+        return (
+            "the process table could not be read, so this run cannot tell whether a Codex "
+            f"Session it did not hand-start is live and would join both lanes' rosters: "
+            f"{unreadable!r}"
+        )
+    owned = acceptance_root().expanduser().resolve(strict=False)
+    foreign = [
+        candidate
+        for candidate in live
+        if not candidate.workspace.expanduser().resolve(strict=False).is_relative_to(owned)
+    ]
+    if not foreign:
+        return None
+    named = "; ".join(
+        f"pid {candidate.pid} in {candidate.workspace}"
+        f"{_uptime_text(sampled_at, candidate.started_at)}"
+        for candidate in foreign
+    )
+    return (
+        f"a Codex Session this run did not hand-start is live on this machine, and both lanes' "
+        f"engines bridge every Codex TUI on it — so it would sit on the roster the walk is "
+        f"graded on: {named}. Quit these Codex sessions and re-run; this run will not "
+        "stop them for you."
+    )
+
+
+def _uptime_text(sampled_at: float, started_at: float | None) -> str:
+    """How long a Session has been up, in the compact form the refusal reads in.
+
+    **The `None` arm is unreachable today and kept anyway.** `enumerate_sessions`
+    drops a row whose `etime` it cannot parse, so nothing it returns is missing a
+    start — but `Candidate.started_at` is typed `float | None`, no CI gate type-
+    checks (`.github/workflows/ci.yml`), and this is called from a session-scoped
+    autouse fixture whose whole promise is `REFUSED` or pass, never a traceback
+    (`conftest.py`'s docstring). A dead branch that keeps a typed contract from
+    becoming an unrefused error is worth its one line; omitting the duration
+    invents nothing, which is what makes it the safe thing to omit.
+    """
+    if started_at is None:
+        return ""
+    whole = max(int(sampled_at - started_at), 0)
+    hours, rest = divmod(whole, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f", up {hours}h{minutes:02d}m"
+    return f", up {minutes}m{seconds:02d}s" if minutes else f", up {seconds}s"
 
 
 # --- provenance -------------------------------------------------------------
