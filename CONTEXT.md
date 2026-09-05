@@ -119,8 +119,8 @@ One interactive terminal run of Claude Code or Codex. The system sees every Sess
 _Avoid_: task, job, window, launched Session (the system launches nothing)
 
 **Child Process**:
-A process a Session spawns — a subagent, a review crew. It appears in the roster under its Session and nothing more: no Relay, no Stop Notice, no name.
-_Avoid_: child Session, subagent (the agent's mechanism word), crew
+A process a Session spawns — a subagent, a review crew, a named in-process teammate. Which of those an agent builds it as is the agent's own mechanism and changes nothing here: it appears in the roster under its Session and nothing more, with no Relay, no Stop Notice and no Session Name. A child the agent addresses by a name of its own is still nameless in this sense — that address is the agent's handle on it, never something the user says to reach it.
+_Avoid_: child Session, subagent and teammate (the agent's mechanism words), crew
 
 **Session Name**:
 What the user and the system call one Session: `<project> · <task>`, where the project is the
