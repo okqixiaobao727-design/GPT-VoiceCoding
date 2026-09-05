@@ -304,6 +304,74 @@ def _sections() -> tuple[Section, ...]:
                         "fetch what you are already holding."
                     ),
                 ),
+                # **The sentence above was true and the Voice read it too wide.**
+                # #240, from #238's run `20260905T053806Z`: asked
+                # `它之前说了什么？请你说说更早的记录`, the Voice answered
+                # `更早的消息没有提供。` and handed nothing over, while the engine's
+                # own page for that Session was there and had a page behind it.
+                # The graded fact — the acting half asked for that Session's
+                # older entries — came back `False` on that run and on
+                # `20260904T050406Z` and `054217Z`, and `True` on nine others of
+                # the same set. Nine-and-three is what a rule nobody wrote looks
+                # like: the request reached only the paragraph above, whose two
+                # halves are *acting* and *what is waiting*, and a request for
+                # what a Session said earlier is neither.
+                #
+                # **So the paragraph names what the hand-over does not hold,
+                # rather than forbidding the sentence the Voice said.** The
+                # premise the Voice was reasoning from was correct as far as it
+                # went — it had been handed the sessions at dial time — and
+                # nothing in its set said that what it was handed stops at the
+                # newest message. Told where the hand-over ends, the request
+                # falls to the first half of the paragraph above on its own.
+                # The existing sentence is untouched and still says what it
+                # said: what you are already holding is answered from here
+                # (#194, #220). This one says what is not in that holding.
+                #
+                # **It goes after that paragraph, not inside it.** The two are
+                # one rule read in two directions, and the order is the order
+                # the Voice meets them in — the general hand-off first, then the
+                # thing that looks like an exception to it and is not.
+                #
+                # **It names the five at a time, because the detail paragraph
+                # above already says older messages come in fives without ever
+                # saying from where.** Left unreconciled, the Voice meets one
+                # paragraph in which older messages arrive and a later one in
+                # which it holds none. The clause here is the join: they arrive
+                # because the half behind fetches them.
+                #
+                # **"Older", never "fuller than the newest".** The detail
+                # paragraph has this half tell them the newest message whole, so
+                # a premise that read as "you hold nothing fuller than what you
+                # said" would hand that back over the boundary — the re-fetch
+                # #220 forbids. What is missing from the hand-over is the record
+                # *behind* the newest message, and the sentence says that.
+                #
+                # **Legacy (ADR 0010): the same behaviour, one model earlier.**
+                # Generation 1 was a single skill-driven agent holding the verbs
+                # itself, told to read the skill when the user asked about a
+                # session's progress and to run the progress verb for the one
+                # session they had narrowed to
+                # (`legacy@1d32845:skill/SKILL.md:5,33,94`, serving
+                # `legacy@1d32845:bridge/__main__.py:414`). **Adapted**: the
+                # rewrite split that agent in two, and the half that hears the
+                # request is the half without the verb, so its share of the rule
+                # is to hand the request across. Legacy had no such split and so
+                # no hand-off rule to port.
+                Block(
+                    covers=("voice.delegation.older-entries-are-not-held",),
+                    text=(
+                        "What you were handed when the call opened is what each session is "
+                        "waiting on and the newest thing it said — nothing older than that, "
+                        "and no fuller record standing behind it. So when they ask what one "
+                        "of them said before that, its earlier record or the part that came "
+                        "before what you read out, that is not something you are holding. "
+                        "Pass that request to the half behind you like any other, and say "
+                        "what comes back; that is how the older ones reach you, five at a "
+                        "time. While you wait, do not guess at what those older messages "
+                        "say, and do not tell them there is nothing older."
+                    ),
+                ),
             ),
         ),
     )
