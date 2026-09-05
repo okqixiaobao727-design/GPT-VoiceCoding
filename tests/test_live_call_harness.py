@@ -32,6 +32,7 @@ import re
 import wave
 from pathlib import Path
 
+import journey
 import live_call
 import live_call_step
 import pytest
@@ -826,6 +827,79 @@ def test_the_newest_message_is_read_off_the_line_that_hands_it_over() -> None:
 def test_a_brief_with_no_newest_line_hands_over_nothing() -> None:
     """Phase 3a blocks on this rather than comparing the Voice against an empty string."""
     assert live_call_step._newest_message("二号工位 · Reply READY\n  state: working\n") == ""
+
+
+A_HELD_QUESTION_BRIEF = "\n".join(
+    (
+        "二号工位 · Reply READY",
+        "  state: waiting for you",
+        "  newest: READY",
+        f"  asked: {live_call_step.THE_QUESTION_ASKED}",
+        *(f"  option: {label}" for label in journey.CALL_QUESTION_OPTIONS),
+        "  answer: from here",
+    )
+)
+
+A_SAID_QUESTION_BRIEF = "\n".join(
+    (
+        "五号工位 · Reply READY",
+        "  state: waiting for you",
+        f"  newest: {live_call_step.THE_QUESTION_ASKED}",
+        "  answer: at the terminal",
+    )
+)
+
+
+def test_a_held_question_is_read_off_the_asked_line() -> None:
+    """#238: a Claude Session holding an `AskUserQuestion` briefs it as a decision.
+
+    The adapter cuts the progress tail before the question's own record while it
+    is held (#151), so `newest` is what was said *before* it — here the boot
+    turn's `READY` — and the question is on `asked:`.
+    """
+    assert live_call_step._asked_prompt(A_HELD_QUESTION_BRIEF) == (
+        live_call_step.THE_QUESTION_ASKED
+    )
+    assert live_call_step._the_question_it_stopped_on(A_HELD_QUESTION_BRIEF) == (
+        live_call_step.THE_QUESTION_ASKED
+    )
+
+
+def test_a_said_question_is_still_read_off_the_newest_message() -> None:
+    """The Codex lane says its question, and no field but `newest` carries it."""
+    assert live_call_step._asked_prompt(A_SAID_QUESTION_BRIEF) == ""
+    assert live_call_step._the_question_it_stopped_on(A_SAID_QUESTION_BRIEF) == (
+        live_call_step.THE_QUESTION_ASKED
+    )
+
+
+def test_a_brief_holding_neither_is_read_as_holding_no_question() -> None:
+    """The readers block on this rather than grading the Voice against nothing.
+
+    A permission is briefed on a `permission:` line, so a Session waiting on one
+    is a Session that never asked this walk's question — the same distinction
+    `journey.py::is_question_notice` matches on.
+    """
+    permission = "\n".join(
+        (
+            "二号工位 · Reply READY",
+            "  state: waiting for you",
+            "  newest: READY",
+            "  permission: Write — relay.txt",
+            "  answer: from here",
+        )
+    )
+
+    assert live_call_step._the_question_it_stopped_on(permission) == ""
+    assert live_call_step._the_question_it_stopped_on(A_BRIEF) == ""
+
+
+def test_both_fields_are_named_when_neither_carried_the_question() -> None:
+    """A complaint that says which readings it took, rather than one of them."""
+    said = live_call_step._what_a_brief_holds(A_HELD_QUESTION_BRIEF)
+
+    assert "newest 'READY'" in said
+    assert live_call_step.THE_QUESTION_ASKED in said
 
 
 def test_the_fragment_the_voice_is_asked_for_is_short_and_whitespace_folded() -> None:

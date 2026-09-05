@@ -40,7 +40,6 @@ from gpt_voicecoding.seams.control_plane import Action
 
 ACKNOWLEDGE = journey_module.ACKNOWLEDGE
 ASK_A_QUESTION = journey_module.ASK_A_QUESTION
-ASK_A_QUESTION_THEN_SAY = journey_module.ASK_A_QUESTION_THEN_SAY
 DISCOVERY_SECONDS = journey_module.DISCOVERY_SECONDS
 Instruction = journey_module.Instruction
 QUESTION_ASKED_SPOKEN_SUBSTRING = journey_module.QUESTION_ASKED_SPOKEN_SUBSTRING
@@ -565,6 +564,53 @@ def _unspaced(text: str) -> str:
     return "".join(text.split())
 
 
+def _asked_prompt(brief: str) -> str:
+    """What a Session Brief says the Session is asking, off its `asked:` line.
+
+    The other half of `journey._newest_message`, and a mirror of
+    `core/briefing.py::_decision_lines` rather than an import: a *held* question
+    is a decision, not a message, so it is briefed on this line and on the
+    `option:` lines under it. Empty when the Session is waiting on nothing, or
+    on a permission — whose decision line is `permission:` (the same distinction
+    `journey.py::is_question_notice` matches on).
+    """
+    return next(
+        (
+            line.strip().removeprefix("asked: ")
+            for line in brief.splitlines()
+            if line.strip().startswith("asked: ")
+        ),
+        "",
+    )
+
+
+def _the_question_it_stopped_on(brief: str) -> str:
+    """The question this walk drove, from whichever brief field carries it (#238).
+
+    **Two fields, because the two lanes stop on it two ways.** The Codex lane's
+    Focus Session says the question as ordinary text, so it is that Session's
+    newest message. The Claude lane's asks through `AskUserQuestion`, and while
+    that question is held the adapter cuts the progress tail *before* its own
+    record (#151, `adapters/agent/claude/transcript_tail.py`) — the words ride
+    `asked:` and `newest` holds whatever was said before them.
+
+    Both are the Session Brief, which is what every reader here is really
+    asking about: the summary and the detail are the same facts, whichever field
+    carries them (`CONTEXT.md`, *Session Brief*). Empty when neither does, and
+    the caller says so with both fields in hand rather than guessing which one
+    it should have been.
+    """
+    for reading in (_asked_prompt(brief), _newest_message(brief)):
+        if _unspaced(QUESTION_ASKED_SPOKEN_SUBSTRING) in _unspaced(reading):
+            return reading
+    return ""
+
+
+def _what_a_brief_holds(brief: str) -> str:
+    """Both fields `_the_question_it_stopped_on` reads, for a complaint to name."""
+    return f"newest {_newest_message(brief)[:120]!r}, asked {_asked_prompt(brief)[:120]!r}"
+
+
 #: How the harness's Call adapter words a connection that went away by itself
 #: (`live_call.HarnessCallTransport.on_lost`). The engine raises `CallDropped`
 #: for that, not `CallEnded`.
@@ -803,7 +849,7 @@ class _LiveCallRun:
             if "dial" in self.selection.phases:
                 if "history" in self.selection.phases:
                     self._fill_a_history_worth_paging(focus, focus_at, focus_address, turn)
-                self._drive_extra_session(focus, focus_at, turn, ASK_A_QUESTION_THEN_SAY)
+                self._drive_extra_session(focus, focus_at, turn, self.lane.call_asking)
                 self._await_the_question(focus_at, focus_address, turn)
                 live_call.ask_for_nothing(self.config.call_wav_directory)
                 mark = len(self.engine.log_lines())
@@ -1284,36 +1330,37 @@ class _LiveCallRun:
         because phase 2 grades what the Voice was handed about it and phase 3
         relays an answer to it.
 
-        **Read as the Session's newest message, not as its roster state.** A row
-        leaves `running` the moment the turn ends, but what the hand-over carries
-        is `newest` (`seams/call.py`), and those are two readings of one turn that
-        land at different times. What this waits for is the one the walk grades.
+        **Read out of the Session's own brief, not out of its roster state.** A
+        row leaves `running` the moment the turn ends, but what the hand-over
+        carries is the brief (`seams/call.py`), and those are two readings of one
+        turn that land at different times. What this waits for is the one the
+        walk grades — and which brief *field* carries the question is the lane's
+        (`_the_question_it_stopped_on`, #238).
         """
         wanted = QUESTION_ASKED_SPOKEN_SUBSTRING
         landed = support.wait_for(
-            lambda: (
-                _unspaced(wanted)
-                in _unspaced(
-                    _newest_message(self._brief_of(self._extra_address(workspace, address)))
-                )
+            lambda: bool(
+                _the_question_it_stopped_on(self._brief_of(self._extra_address(workspace, address)))
             ),
             deadline_seconds=turn_seconds,
             poll_seconds=LIVE_CALL_POLL_SECONDS,
         )
-        newest = _newest_message(self._brief_of(self._extra_address(workspace, address)))
+        brief = self._brief_of(self._extra_address(workspace, address))
+        asked = _the_question_it_stopped_on(brief)
         if not landed:
             raise LaneBlocked(
                 f"{address} was asked to stop on a question and {turn_seconds:.0f}s later the "
-                f"engine still reads its newest message as {newest[:120]!r}, not "
-                f"{wanted!r}. Nothing this walk dials about would be the Session it grades"
+                f"engine reads neither field of its brief as {wanted!r}: "
+                f"{_what_a_brief_holds(brief)}. Nothing this walk dials about would be the "
+                f"Session it grades"
             )
         self.journal(
             "extra.session.stopped.on.a.question",
             lane=self.lane.name,
             workspace=str(workspace),
-            newest=newest[:200],
+            asked=asked[:200],
         )
-        return newest
+        return asked
 
     def _the_engine_dials_about_a_session_that_stopped(
         self, mark: int, cool_down: float, facts: _PhaseFacts
@@ -1406,11 +1453,12 @@ class _LiveCallRun:
         # Read before either question, so what the Voice is compared against is
         # what the engine was holding when the call came up rather than anything
         # the answers themselves moved.
-        newest = _newest_message(self._brief_of(focus_address))
-        if QUESTION_ASKED_SPOKEN_SUBSTRING not in _unspaced(newest):
+        brief = self._brief_of(focus_address)
+        stopped_on = _the_question_it_stopped_on(brief)
+        if not stopped_on:
             raise LaneBlocked(
-                f"`bridgectl brief {focus_address}` holds {newest[:200]!r} as its newest "
-                f"message, which is not the question this Session was told to stop on "
+                f"`bridgectl brief {focus_address}` holds {_what_a_brief_holds(brief)}, and "
+                f"neither field is the question this Session was told to stop on "
                 f"({THE_QUESTION_ASKED!r}), so there is nothing for the narrowed answer to be "
                 f"compared against"
             )
@@ -1473,7 +1521,6 @@ class _LiveCallRun:
             )
         ]
         answered_narrowly = self._voice_said_lines(since=narrowing)
-        stopped_on = QUESTION_ASKED_SPOKEN_SUBSTRING
         # What this call came up holding, so the recorded runs can be read
         # against it: a Call Agent re-reading a roster it was handed ten items of
         # is the thing #194's instruction rewording was for.
@@ -1490,7 +1537,7 @@ class _LiveCallRun:
         )
         facts.record(
             "narrowed answer carried stopped question",
-            self._voice_said_something_carrying(stopped_on, since=narrowing),
+            self._voice_said_something_carrying(QUESTION_ASKED_SPOKEN_SUBSTRING, since=narrowing),
         )
         facts.check(
             "general answer carried a count",
@@ -1525,25 +1572,31 @@ class _LiveCallRun:
         )
         # **Which half answers a read question is recorded, never graded** —
         # see the docstring, and #220. What is graded is the answer's shape: a
-        # `SpokenBrief` carries the newest message (`seams/call.py`), so an
-        # answer naming the Session and quoting what it last said is one taken
-        # from a Session Brief, whichever half fetched it.
+        # `SpokenBrief` carries the whole brief (`seams/call.py`), so an answer
+        # naming the Session and quoting what it is waiting on is one taken from
+        # a Session Brief, whichever half fetched it.
+        #
+        # **Whichever field carries the question** (#238). The words the Voice
+        # must say are the same on both lanes; the field they arrived in is not
+        # — a held `AskUserQuestion` is briefed as `asked:` and a said one as
+        # `newest:` — and the brief is one thing, so the check is about the
+        # question rather than about the field.
         facts.check(
-            "narrowed answer carried newest",
+            "narrowed answer carried what the Session stopped on",
             self._voice_said_something_carrying(QUESTION_ASKED_SPOKEN_SUBSTRING, since=narrowing),
             (
                 f"the user narrowed to {focus_name!r} and the Voice named it without saying "
-                f"what it last said. A Session Brief is its project and task, its agent, where "
-                f"it stands, and one sentence of its newest message "
+                f"what it is asking. A Session Brief is its project and task, its agent, where "
+                f"it stands, one sentence of its newest message, and what it is waiting on "
                 f"(`core/instructions/voice.py`); the engine holds "
-                f"{newest[:120]!r} for it. What the Voice said: "
+                f"{stopped_on[:120]!r} for it. What the Voice said: "
                 f"{answered_narrowly or 'nothing this call recorded'}"
             ),
         )
         return (
             f"asked what needed them the Voice answered with counts; asked to narrow to "
-            f"{focus_name!r} it named it and carried the Session's newest; wrapper runs for "
-            "both questions were recorded"
+            f"{focus_name!r} it named it and carried the question that Session stopped on; "
+            "wrapper runs for both questions were recorded"
         )
 
     def _one_question_the_hand_over_answers(
@@ -1590,14 +1643,17 @@ class _LiveCallRun:
             deadline_seconds=LIVE_CALL_ANSWER_SECONDS,
         )
         # **Delivery is read off the Session's next turn, not off the record
-        # holding the words.** `ASK_A_QUESTION_THEN_SAY` has this Session answer
-        # a further message with `live_call.DICTATED_REPLY`, so that line is one
-        # only a Session the relay reached can say — the effect, which is how the
+        # holding the words.** `Lane.call_asking` has this Session answer the
+        # relay with `live_call.DICTATED_REPLY`, so that line is one only a
+        # Session the relay reached can say — the effect, which is how the
         # `relay` step §3 cites proves delivery too.
         #
         # The words themselves are recorded, not graded, because Claude's
-        # visible History may omit the system-sourced relay (#222). The dictated
-        # next reply is the cross-lane delivery effect this phase grades.
+        # visible History may omit the system-sourced relay (#222) — and on that
+        # lane they are not a message at all now: the answer rides the held hook
+        # and arrives as the question's tool result (#238, ADR 0015). The
+        # dictated next reply is the cross-lane delivery effect this phase
+        # grades, and it is unchanged by which route carried the words.
         carried = support.wait_for(
             lambda: self._history_of_a_session_carries(
                 focus_at, focus_address, LIVE_CALL_DICTATED_REPLY_SUBSTRING
@@ -1698,7 +1754,8 @@ class _LiveCallRun:
         )
         return (
             f"the user answered by voice, the Call Agent relayed with {relays}, "
-            f"{LIVE_CALL_ANSWER_SUBSTRING!r} reached {focus_address}'s own next turn, and the "
+            f"{focus_address}'s own next turn carried {LIVE_CALL_DICTATED_REPLY_SUBSTRING!r} — "
+            f"the line only a Session the answer reached says — and the "
             f"Voice gave the user the engine's grade and then stopped "
             f"({len(payments)} payment(s) accounted for)"
         )

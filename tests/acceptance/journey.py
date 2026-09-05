@@ -484,6 +484,61 @@ ASK_A_QUESTION_THEN_SAY = Instruction(
     )
 )
 
+#: The two labels `ASK_A_QUESTION_THROUGH_THE_TOOL` offers. `AskUserQuestion`
+#: takes two to four, so the shape needs them; nothing grades them.
+#:
+#: **They share no run with anything that is graded** — not
+#: `QUESTION_ASKED_SPOKEN_SUBSTRING`, not
+#: `live_call_step.LIVE_CALL_DICTATED_REPLY_SUBSTRING`, and not
+#: `live_call.ANSWER_FRAGMENT`, which is the payload the user speaks. A label
+#: spelling one of those would ride the brief's own `option:` lines into the
+#: hand-over, where the Voice could read it out and pass a grade about a
+#: different field. Chinese for `THE_QUESTION_ASKED`'s reason: an English label
+#: is one the Voice renders rather than repeats.
+#:
+#: Deliberately not the spoken answer either. What comes back through the held
+#: hook is the user's own words (`live_call.ANSWER_FRAGMENT`), which match no
+#: label — that is the Answer Relay carrying words rather than a choice (ADR
+#: 0015), and the instruction below says so, so the Session's next line does not
+#: rest on the answer having been one of these.
+CALL_QUESTION_OPTIONS = ("现在就做", "以后再说")
+
+#: The Claude lane's half of the same drive: the question is **held** rather than
+#: said (#238).
+#:
+#: A plain-text question ends the turn as ordinary text, so no hook is held and
+#: the Answer Relay rides the inbox (ADR 0013). Claude Code then announces those
+#: words to the receiving Session as another session's — a hard-coded constant in
+#: its own binary, quoted in ADR 0013's 2026-09-05 amendment — and two runs of
+#: one build read it opposite ways: `20260904T124243Z` complied and said the
+#: dictated line, `20260904T202319Z` refused it and asked for the user in person.
+#: The phase went red for a model's reading of a wrapper this product neither
+#: writes nor controls.
+#:
+#: Asked through `AskUserQuestion`, the question is held, the Answer Relay takes
+#: the ADR 0015 hook route, and what the Session receives is the user's own
+#: authority as its tool result. What the phase grades then rests on the product.
+#:
+#: **The reply is still dictated, and still through the drive**, for
+#: `ASK_A_QUESTION_THEN_SAY`'s reasons — and `whatever` is load-bearing: the
+#: answer that arrives is the user's spoken words, not one of
+#: `CALL_QUESTION_OPTIONS`.
+#:
+#: The question is no longer this Session's `newest`: the Claude adapter cuts the
+#: progress tail before the question's own record while it is held (#151,
+#: `adapters/agent/claude/transcript_tail.py::recent_before_question`), and the
+#: words ride the brief's `asked:` line instead. `live_call_step` reads both,
+#: which is why nothing else about the walk forks.
+ASK_A_QUESTION_THROUGH_THE_TOOL = Instruction(
+    words=(
+        f"Use AskUserQuestion to ask exactly this one question and nothing else: "
+        f"{THE_QUESTION_ASKED} Offer exactly two option labels, "
+        f"`{CALL_QUESTION_OPTIONS[0]}` and `{CALL_QUESTION_OPTIONS[1]}`. Whatever answer "
+        f"comes back, reply to it with exactly this one line and nothing else: "
+        f"{live_call.DICTATED_REPLY}"
+    )
+)
+
 #: Turn 2 — arrives by Relay and raises a permission on the way. The file and the
 #: word are one shape for both lanes; **where** it is written is the lane's, and
 #: that is what `Lane.relayed` holds. One instruction for both lanes is what left
@@ -859,6 +914,19 @@ class Lane:
     #: records the unsupported route without grading it.
     question: Callable[[Path], Instruction] | None
     question_answer: str | None
+    #: What stops `live call`'s Focus Session on the question phase 3 relays an
+    #: answer to, and what that Session says once the answer lands.
+    #:
+    #: **The lane's, because the route the answer takes is the lane's** (#238).
+    #: The Claude lane holds the question through `AskUserQuestion`, so the Relay
+    #: rides the hook and carries the user's authority (ADR 0015). The Codex lane
+    #: keeps the plain-text question and the inbox route (ADR 0013): Codex
+    #: projects no question dialog at all — its adapter reads only `PERMISSION`
+    #: and `UNKNOWN` — so there is no held question on that lane for the harness
+    #: to ask through, the same fact `question` records for #128. The
+    #: peer-message wrapper the ticket was opened for is Claude Code's own, and
+    #: the Codex lane has never been seen to refuse the words.
+    call_asking: Instruction
     #: The ground the permission was measured on, given the agent's own record of
     #: the Session. `approval` says its `named` half in the evidence line, so a
     #: green step states the ground it stood on rather than implying some
@@ -963,6 +1031,7 @@ CLAUDE = Lane(
     asking=None,
     question=asking_the_claude_question,
     question_answer=CLAUDE_ANSWER,
+    call_asking=ASK_A_QUESTION_THROUGH_THE_TOOL,
     # The permission flag the harness passes *is* the whole policy on this lane
     # — the other two pin cost, which is nothing a policy readback would name — and Claude
     # publishes no per-turn readback of it, so there is nothing to read back and
@@ -1080,6 +1149,7 @@ CODEX = Lane(
     asking=ASK_A_QUESTION,
     question=None,
     question_answer=None,
+    call_asking=ASK_A_QUESTION_THEN_SAY,
     policy_at=lambda record: hand_started.codex_turn_policy(record),
     asks_about=(
         "a write to a path outside the Session's writable roots raises "
