@@ -2550,12 +2550,12 @@ class TestWhatClosesTheVoicesSpan:
         """
         speaker, clock = self.speaker(monkeypatch)
         self.heard(speaker, [0.02] * 5, clock)
-        speaker.server_said(webrtc.OUTPUT_AUDIO_FINISHED)
+        speaker.heard_from_server(webrtc.OutputAudioEvent.FINISHED)
 
         line = self.drained_line(self.transport(speaker), 180.0, caplog)
 
         assert "had not drained" not in line
-        assert webrtc.DrainedBy.SERVER.value in line
+        assert webrtc.SpanClosedBy.SERVER.value in line
         assert "5 inbound frames" in line
         assert "last 0.000s ago" in line
 
@@ -2570,7 +2570,7 @@ class TestWhatClosesTheVoicesSpan:
         line = self.drained_line(self.transport(speaker), 5.0, caplog)
 
         assert "had not drained" not in line
-        assert webrtc.DrainedBy.QUIET.value in line
+        assert webrtc.SpanClosedBy.QUIET.value in line
 
     def test_with_neither_the_bound_fires_and_says_so(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -2597,9 +2597,9 @@ class TestWhatClosesTheVoicesSpan:
 
         with _sounddevice(_Streams(blocks_on=None)), _av(samples=480):
             asyncio.run(scenario())
-        speaker.server_said(webrtc.OUTPUT_AUDIO_FINISHED)
+        speaker.heard_from_server(webrtc.OutputAudioEvent.FINISHED)
 
-        assert speaker.why_drained is None
+        assert speaker.closed_by is None
         assert speaker.playout.buffered_bytes > 0
 
     def test_a_new_response_starting_takes_the_last_ones_word_back(
@@ -2609,13 +2609,19 @@ class TestWhatClosesTheVoicesSpan:
 
         Without this a stale `stopped` would sit latched into the next span and
         close it the moment the buffer was empty — on a silent run, at once.
+        The reset is unconditional, and that is the intended behaviour even
+        while a wait is still polling for the previous span: the Voice speaking
+        again is what makes that wait stale in the adapter, and the span stays
+        open until this response's own `stopped` — which closes it.
         """
         speaker, clock = self.speaker(monkeypatch)
-        speaker.server_said(webrtc.OUTPUT_AUDIO_FINISHED)
-        speaker.server_said(webrtc.OUTPUT_AUDIO_STARTED)
+        speaker.heard_from_server(webrtc.OutputAudioEvent.FINISHED)
+        speaker.heard_from_server(webrtc.OutputAudioEvent.STARTED)
         self.heard(speaker, [0.02] * 3, clock)
+        assert speaker.closed_by is None
 
-        assert speaker.why_drained is None
+        speaker.heard_from_server(webrtc.OutputAudioEvent.FINISHED)
+        assert speaker.closed_by is webrtc.SpanClosedBy.SERVER
 
     def test_closing_the_window_consumes_the_servers_word(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2623,30 +2629,26 @@ class TestWhatClosesTheVoicesSpan:
         """One word closes one span. The next wait starts without it."""
         speaker, clock = self.speaker(monkeypatch)
         self.heard(speaker, [0.02] * 3, clock)
-        speaker.server_said(webrtc.OUTPUT_AUDIO_FINISHED)
-        assert speaker.why_drained is webrtc.DrainedBy.SERVER
+        speaker.heard_from_server(webrtc.OutputAudioEvent.FINISHED)
+        assert speaker.closed_by is webrtc.SpanClosedBy.SERVER
 
         speaker.take_playout()
         self.heard(speaker, [0.02] * 3, clock)
 
-        assert speaker.why_drained is None
+        assert speaker.closed_by is None
 
-    def test_a_cut_off_response_is_finished_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`cleared` is the server saying no more audio is coming, by another route."""
-        speaker, clock = self.speaker(monkeypatch)
-        self.heard(speaker, [0.02] * 3, clock)
-        speaker.server_said(webrtc.OUTPUT_AUDIO_CUT_OFF)
-
-        assert speaker.why_drained is webrtc.DrainedBy.SERVER
-
-    def test_an_event_this_side_does_not_know_changes_nothing(
+    def test_an_event_outside_the_family_changes_nothing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """`cleared`, `response.done` and the rest are dropped where the channel is read."""
         speaker, clock = self.speaker(monkeypatch)
         self.heard(speaker, [0.02] * 3, clock)
-        speaker.server_said("response.done")
+        transport = self.transport(speaker)
 
-        assert speaker.why_drained is None
+        transport._read_channel_event('{"type": "response.done"}')
+        transport._read_channel_event('{"type": "output_audio_buffer.cleared"}')
+
+        assert speaker.closed_by is None
 
     def test_the_events_channel_is_read_for_the_servers_word(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -2661,12 +2663,13 @@ class TestWhatClosesTheVoicesSpan:
         self.heard(speaker, [0.02] * 3, clock)
         transport = self.transport(speaker)
 
+        heard = transport._read_channel_event
         with caplog.at_level(logging.INFO):
-            transport._server_said('{"type": "output_audio_buffer.started", "event_id": "e1"}')
-            transport._server_said(b'{"type": "output_audio_buffer.stopped", "response_id": "r1"}')
-            transport._server_said('{"type": "output_audio_buffer.stopped", "response_id": "r2"}')
+            heard('{"type": "output_audio_buffer.started", "event_id": "e1"}')
+            heard(b'{"type": "output_audio_buffer.stopped", "response_id": "r1"}')
+            heard('{"type": "output_audio_buffer.stopped", "response_id": "r2"}')
 
-        assert speaker.why_drained is webrtc.DrainedBy.SERVER
+        assert speaker.closed_by is webrtc.SpanClosedBy.SERVER
         carried = [
             said for said in (record.getMessage() for record in caplog.records) if "carried" in said
         ]
@@ -2681,9 +2684,9 @@ class TestWhatClosesTheVoicesSpan:
         self.heard(speaker, [0.02] * 3, clock)
         transport = self.transport(speaker)
 
-        transport._server_said("not json")
-        transport._server_said("[1, 2]")
-        transport._server_said('{"event_id": "e1"}')
-        transport._server_said('{"type": 7}')
+        transport._read_channel_event("not json")
+        transport._read_channel_event("[1, 2]")
+        transport._read_channel_event('{"event_id": "e1"}')
+        transport._read_channel_event('{"type": 7}')
 
-        assert speaker.why_drained is None
+        assert speaker.closed_by is None
