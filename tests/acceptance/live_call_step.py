@@ -230,13 +230,57 @@ LIVE_CALL_NEEDS_HEARD_SUBSTRING = live_call.HEARD_FRAGMENTS[live_call.NEEDS]
 #: the Voice have to get right, and this line only asks whether the words landed.
 LIVE_CALL_NARROWING_HEARD_SUBSTRING = live_call.HEARD_FRAGMENTS[live_call.NARROWING]
 
+#: The numerals a count can be written in: Chinese, because the Voice answers
+#: this user in the language they are speaking, and Arabic because a recogniser
+#: transcribing a spoken number is free to choose either.
+ROSTER_COUNT_NUMERAL = r"[一二三四五六七八九十两0-9]"
+
+#: The measure words the Voice uses for Sessions. `个会话` and `项任务` need no
+#: entry of their own — each is one of these followed by a noun.
+ROSTER_COUNT_MEASURE = r"[个项]"
+
+#: The characters that make the numeral after them something other than a
+#: quantity: a numeral led by one of these is asking *which one*, or naming a
+#: position, or pointing — `哪一个`, `第一个`, `另一个`, `每一个`, `这一个` /
+#: `那一个`, and `其中一个` by its `中`. None of them counts anything, so none of
+#: them may satisfy a fact whose name is that the answer carried a count.
+#:
+#: Known limit: this also refuses a genuine count led by `哪` — `哪三项完成了`
+#: grades False. No observed Voice answer has said that, and a run whose journal
+#: shows one reopens this rule rather than working around it.
+ROSTER_COUNT_NOT_A_QUANTITY = r"[哪第另每这那中]"
+
 #: What a counted Roster Brief has to carry, as the Voice is told to say it:
 #: *"give the counts rather than the list … how many have finished, how many are
-#: still working"* (`core/instructions/voice.py`, #167 Q7-Q9). A **number**, and
-#: the numbers are Chinese numerals because the Voice answers this user in the
-#: language they are speaking. `个` is the measure word for the count, so a
-#: numeral followed by it is the smallest distinction from a named list.
-ROSTER_COUNT_PATTERN = r"[一二三四五六七八九十两0-9]+\s*个"
+#: still working"* (`core/instructions/voice.py`, #167 Q7-Q9). A **number** — a
+#: numeral and a measure word — which is the smallest distinction from a named
+#: list.
+#:
+#: Both measure words, and no numeral that `ROSTER_COUNT_NOT_A_QUANTITY` leads,
+#: because #242 caught this reading `个` alone and so grading the offer to narrow
+#: rather than the count. Both failure shapes, from #237's full run
+#: `20260905T075128Z`:
+#:
+#: * codex said `有两项在等你决定,两项已经完成了。你想先听哪一项?…` — two counts, in
+#:   the order the Voice rule asks for — and graded **False**, taking the lane red
+#:   at `hand-over` and skipping every later phase;
+#: * claude said `两项在等你决定,三项已完成,还有两项在运行中。你想先看哪一个?` and
+#:   graded **True** — on the `一个` inside its closing question, its counts in `项`
+#:   matching nothing. `20260904T124243Z` claude passed the same way.
+#:
+#: So a count in `项` graded red while an answer that only offered to narrow would
+#: have graded green: do not narrow this back to one measure word, and do not drop
+#: the exclusion.
+ROSTER_COUNT_PATTERN = (
+    # Not a numeral that is an ordinal or a determiner, spaced too — the numeral
+    # and its measure word are, and it is the same recogniser that puts the
+    # boundary in.
+    rf"(?<!{ROSTER_COUNT_NOT_A_QUANTITY})(?<!{ROSTER_COUNT_NOT_A_QUANTITY}\s)"
+    # Anchored at the numeral run's own start, so a numeral the exclusion refused
+    # cannot be stepped over into the middle of the same run.
+    rf"(?<!{ROSTER_COUNT_NUMERAL})"
+    rf"{ROSTER_COUNT_NUMERAL}+\s*{ROSTER_COUNT_MEASURE}"
+)
 
 #: How the engine says a call it is opening is carrying a briefing (#194). The
 #: hand-over rides `initialItems`, which the Voice holds **silently** and never

@@ -1555,6 +1555,69 @@ def test_a_counted_roster_brief_is_recognised_by_a_numeral_and_its_measure_word(
     assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, listed)
 
 
+def test_a_count_in_the_task_measure_word_is_recognised_and_the_narrowing_offer_is_not() -> None:
+    """#242: both measure words the Voice uses for Sessions, and neither failure shape.
+
+    The four strings are the recorded general answers, copied from the runs'
+    journals (`live call hand-over` observation, `general answer`) with the log
+    prefix dropped:
+
+    * `20260905T075128Z` codex — counts in `项`, closing on `哪一项`. Graded
+      **False** under the `个`-only pattern and took the lane red at `hand-over`.
+    * `20260905T075128Z` claude and `20260904T124243Z` claude — counts in `项`
+      too, and graded **True** only on the `一个` inside their closing `哪一个`.
+      With that closing question removed, the `个`-only pattern had nothing left
+      to match, which is what says the counts themselves never counted.
+
+    So the offer to narrow is graded on its own here: it is the whole of the
+    passing token those two runs matched on, and it must not satisfy the check.
+    """
+    codex_20260905 = (
+        "有两项在等你决定,两项已经完成了。你想先听哪一项?"
+        "空间workspace-codex-20260905的任务,由 codex 负责,正在等你决定,"
+        "它刚问:需要我把这件事做完吗?可以在这里回答。"
+    )
+    claude_20260905_counts_only = "两项在等你决定,三项已完成,还有两项在运行中。"
+    claude_20260904_counts_only = "有两项在等你决定。九项已完成,一项还在运行中。"
+    narrowing_offer_only = "你想先听哪一个?"
+
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, codex_20260905)
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, claude_20260905_counts_only)
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, claude_20260904_counts_only)
+    assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, narrowing_offer_only)
+    assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, "你想先看哪一项?")
+
+
+def test_a_roster_answer_with_no_numeral_at_all_carries_no_count() -> None:
+    """#242: the fact is a count, so an answer that never says a number is False."""
+    assert not re.search(
+        live_call_step.ROSTER_COUNT_PATTERN, "有几个工位在等你决定,还有一些已经完成了。"
+    )
+    assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, "都在跑,没有停下来的。")
+
+
+def test_an_ordinal_or_a_determiner_is_not_a_count_but_a_count_of_one_still_is() -> None:
+    """#242: the lead characters that make the numeral after them not a quantity.
+
+    `哪一个` is the shape the runs recorded, but it is evidence rather than the
+    boundary: `第一个` names a position and the rest point at one Session, and an
+    answer carrying only those carries no count. The last line is the guard on
+    the other side — `一` really is a count when nothing leads it, which is what
+    `20260903T222129Z` said and what a wider exclusion would have broken.
+    """
+    for pointing in ("你想先看第一个?", "其中一个还在跑。", "另一个已经结束。", "每一个都在跑。"):
+        assert not re.search(live_call_step.ROSTER_COUNT_PATTERN, pointing), pointing
+
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, "还有一个停在无法读取的地方。")
+
+
+def test_the_count_measure_words_cover_the_longer_forms_the_voice_uses() -> None:
+    """#242: `个会话` / `项任务` are the measure word plus a noun, not a third word."""
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, "有三个会话在等你决定。")
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, "有三项任务在等你决定。")
+    assert re.search(live_call_step.ROSTER_COUNT_PATTERN, "有 3 个会话在等你决定。")
+
+
 def test_the_folded_walk_is_the_tenth_step_and_the_only_one_that_dials() -> None:
     """#198's fold, read off the contract every build ticket's "Red first" line cites.
 
